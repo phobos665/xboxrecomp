@@ -264,19 +264,37 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /*
      * Parse the kernel thunk table address from the XBE header.
-     * The XBE stores KernelImageThunkAddress at offset 0x0158,
-     * XOR-encrypted with 0x5B6D40B6 for retail builds.
-     * We decrypt it and tell the kernel bridge where to find thunks.
+     * The XBE stores KernelImageThunkAddress at offset 0x0158, XOR-encrypted.
+     * The key differs between retail and debug XBEs, and there is no flag
+     * saying which was used -- decode with both and keep whichever lands in
+     * the mapped address range (this is what tools/xbe_parser does).
+     *
+     * Debug XBEs are not an edge case here: they are the builds most worth
+     * recompiling, since they still carry assert strings and symbols. Halo's
+     * cachebeta.xbe is one, and assuming the retail key decoded its thunk
+     * table to 0xB4F98174 instead of 0x00253090, which silently fell back to
+     * the compile-time default and resolved 0 of 378 kernel imports.
      */
     if (xbe_size >= 0x015C) {
         uint32_t thunk_raw = *(const uint32_t *)(xbe + 0x0158);
-        uint32_t thunk_va = thunk_raw ^ 0x5B6D40B6;  /* retail XOR key */
+        uint32_t thunk_retail = thunk_raw ^ 0x5B6D40B6;  /* retail XOR key */
+        uint32_t thunk_debug  = thunk_raw ^ 0xEFB1F152;  /* debug XOR key  */
+        uint32_t thunk_va;
+
+        if (thunk_retail >= XBOX_BASE_ADDRESS && thunk_retail < XBOX_TOTAL_RAM) {
+            thunk_va = thunk_retail;
+        } else {
+            thunk_va = thunk_debug;
+        }
 
         /* Validate: thunk VA should be within our mapped region */
         if (thunk_va >= XBOX_BASE_ADDRESS && thunk_va < XBOX_TOTAL_RAM) {
             /* Count thunk entries by scanning until we hit 0 */
             uint32_t thunk_count = 0;
-            for (uint32_t t = 0; t < 366; t++) {
+            /* XBOX_KERNEL_THUNK_TABLE_SIZE, not 366: the kernel exports 378
+             * slots, and kernel.h notes 366 is short by 12. A title importing
+             * a high ordinal would have had its table truncated here. */
+            for (uint32_t t = 0; t < XBOX_KERNEL_THUNK_TABLE_SIZE; t++) {
                 uint32_t entry = *(volatile uint32_t *)((uintptr_t)(thunk_va + t * 4) + g_memory_offset);
                 if (entry == 0) break;
                 thunk_count++;

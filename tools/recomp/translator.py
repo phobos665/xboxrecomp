@@ -14,9 +14,11 @@ Produces compilable C code using recomp_types.h macros.
 import json
 import os
 
-from .config import va_to_file_offset, is_code_address, TEXT_VA_START, TEXT_VA_END
+# Import the functions, not the VA constants: configure_from_xbe() rebinds those
+# at startup, so a by-value import would freeze the fallback layout.
+from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
-from .lifter import Lifter, lift_basic_block
+from .lifter import Lifter, lift_basic_block, detect_seh_helpers
 
 
 def _fixup_icall_esp_save(lines):
@@ -94,13 +96,14 @@ class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
-                 abi_db=None):
+                 abi_db=None, seh_prolog=None, seh_epilog=None):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
         label_db: dict - addr → name from labels.json
         classification_db: dict - addr → classification from identified_functions.json
         abi_db: dict - addr → ABI info from abi_functions.json
+        seh_prolog/seh_epilog: override the detected SEH helper addresses
         """
         self.xbe_data = xbe_data
         self.func_db = func_db
@@ -108,7 +111,9 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.disasm = Disassembler()
-        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db, xbe_data=xbe_data)
+        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
+                             xbe_data=xbe_data, seh_prolog=seh_prolog,
+                             seh_epilog=seh_epilog)
 
     def _read_func_bytes(self, start_va, end_va):
         """Read raw bytes for a function from the XBE."""
@@ -462,7 +467,7 @@ class BatchTranslator:
 
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
-                 output_dir=None):
+                 output_dir=None, seh_prolog=None, seh_epilog=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -510,10 +515,21 @@ class BatchTranslator:
                 addr = int(entry["address"], 16)
                 self.abi_db[addr] = entry
 
+        # Detect the SEH helpers once here rather than per-Lifter, so the
+        # result can be reported and overridden from the command line.
+        if seh_prolog is None or seh_epilog is None:
+            found_prolog, found_epilog = detect_seh_helpers(
+                self.func_db, self.xbe_data, verbose=True)
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
+        self.seh_prolog = seh_prolog
+        self.seh_epilog = seh_epilog
+
         # Create translator
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
-            self.classification_db, self.abi_db)
+            self.classification_db, self.abi_db,
+            seh_prolog=seh_prolog, seh_epilog=seh_epilog)
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
         """
@@ -700,6 +716,21 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # Any address called but never defined needs a stub, or the link fails.
+        # These are almost all mid-function entry points the function detector
+        # did not split out: a call lands a few bytes inside (or just past) a
+        # function it already found. Emitting an empty stub keeps the build
+        # linking; hitting one at runtime is a silent no-op, so they are
+        # reported and written to their own file rather than hidden among the
+        # translated chunks.
+        defined = {name for _, name, _ in translations}
+        unresolved = {
+            addr: name
+            for addr, name in self.translator.lifter.referenced_calls.items()
+            if name not in defined
+        }
+        stats["unresolved_stubs"] = len(unresolved)
+
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)
         header_lines = [
@@ -717,6 +748,13 @@ class BatchTranslator:
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
+
+        if unresolved:
+            header_lines.append("")
+            header_lines.append("/* Unresolved call targets (stubbed) */")
+            for addr in sorted(unresolved):
+                header_lines.append(f"void {unresolved[addr]}(void);")
+
         header_lines.extend(["", "#endif /* RECOMP_FUNCS_H */", ""])
 
         with open(header_path, "w", encoding="utf-8") as f:
@@ -750,6 +788,35 @@ class BatchTranslator:
 
             if verbose:
                 print(f"  Wrote {c_path} ({len(chunk)} functions)",
+                      file=sys.stderr)
+
+        # Emit the stub bodies for call targets with no definition.
+        if unresolved:
+            stub_path = os.path.join(output_dir, f"{prefix}_stubs_unresolved.c")
+            stub_lines = [
+                "/**",
+                " * Unresolved call target stubs",
+                f" * {len(unresolved)} addresses called by translated code but not",
+                " * detected as functions - typically mid-function entry points.",
+                " * Auto-generated by tools/recomp.",
+                " */",
+                "",
+                "#define RECOMP_GENERATED_CODE",
+                f'#include "{header_name}"',
+                "",
+            ]
+            for addr in sorted(unresolved):
+                stub_lines.append(
+                    f"void {unresolved[addr]}(void) {{ /* 0x{addr:08X}: not detected */ }}"
+                )
+            stub_lines.append("")
+
+            with open(stub_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(stub_lines))
+            generated_files.append(stub_path)
+
+            if verbose:
+                print(f"  Wrote {stub_path} ({len(unresolved)} stubs)",
                       file=sys.stderr)
 
         # Generate dispatch table

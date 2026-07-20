@@ -8,6 +8,9 @@ import os
 
 def write_summary(stats, output_dir):
     """Write a JSON summary of translation results."""
+    # The split/gen paths never create this directory, so a run that writes its
+    # generated C elsewhere would do all the work and then die at the last step.
+    os.makedirs(output_dir, exist_ok=True)
     summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)

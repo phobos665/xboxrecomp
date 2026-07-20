@@ -1668,6 +1668,39 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
 
 /* ── Initialization ─────────────────────────────────────── */
 
+/*
+ * Where this title's kernel thunk table lives. Defaults to the compile-time
+ * constant, but every XBE puts it somewhere different (it comes from the
+ * header's KernelImageThunkAddress), so xbox_MemoryLayoutInit() parses the
+ * real address out of the binary and overrides it here.
+ *
+ * Halo build 2276 puts it at 0x00253090 against the default's 0x0036B7C0 --
+ * without the override the bridge patches ordinals into whatever happens to
+ * live at the wrong address and every kernel call goes somewhere arbitrary.
+ */
+static uint32_t g_thunk_table_base  = XBOX_KERNEL_THUNK_TABLE_BASE;
+static uint32_t g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
+
+void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
+{
+    if (!xbox_va) {
+        return;
+    }
+
+    g_thunk_table_base = xbox_va;
+
+    /* count indexes g_slot_* arrays, which are sized by the macro. A title
+     * importing more slots than the real kernel exports would run off them. */
+    if (count && count <= XBOX_KERNEL_THUNK_TABLE_SIZE) {
+        g_thunk_table_count = count;
+    } else if (count > XBOX_KERNEL_THUNK_TABLE_SIZE) {
+        fprintf(stderr,
+                "  Kernel thunk bridge: XBE declares %u thunk slots, clamping to %d\n",
+                count, XBOX_KERNEL_THUNK_TABLE_SIZE);
+        g_thunk_table_count = XBOX_KERNEL_THUNK_TABLE_SIZE;
+    }
+}
+
 /**
  * Resolve the kernel thunk table in Xbox memory.
  *
@@ -1686,13 +1719,13 @@ void xbox_kernel_bridge_init(void)
     DWORD old_protect;
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
-            XBOX_KERNEL_THUNK_TABLE_SIZE, XBOX_KERNEL_THUNK_TABLE_BASE);
+            g_thunk_table_count, g_thunk_table_base);
 
     /* The thunk table lives in .rdata which is marked PAGE_READONLY.
      * Temporarily make it writable so we can patch the ordinals. */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)g_thunk_table_base + g_xbox_mem_offset),
+        g_thunk_table_count * 4,
         PAGE_READWRITE,
         &old_protect
     );
@@ -1700,8 +1733,8 @@ void xbox_kernel_bridge_init(void)
     /* Initialize kernel data export values first */
     kernel_data_init();
 
-    for (i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        uint32_t va = XBOX_KERNEL_THUNK_TABLE_BASE + i * 4;
+    for (i = 0; i < g_thunk_table_count; i++) {
+        uint32_t va = g_thunk_table_base + i * 4;
         uint32_t current = BRIDGE_MEM32(va);
 
         if (current & 0x80000000) {
@@ -1738,14 +1771,14 @@ void xbox_kernel_bridge_init(void)
 
     /* Restore original protection */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)g_thunk_table_base + g_xbox_mem_offset),
+        g_thunk_table_count * 4,
         old_protect,
         &old_protect
     );
 
     fprintf(stderr, "  Kernel thunk bridge: %d/%d resolved (%d bridged, %d stub)\n",
-            resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, bridged, unbridged);
+            resolved, g_thunk_table_count, bridged, unbridged);
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 

@@ -17,7 +17,7 @@ Memory model:
 import struct
 
 from .disasm import Instruction, Operand
-from .config import is_code_address, is_data_address, va_to_file_offset, KERNEL_THUNK_ADDR
+from .config import is_code_address, is_data_address, va_to_file_offset
 
 
 # ── Operand formatting ──────────────────────────────────────
@@ -640,15 +640,95 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
 
 # ── Single instruction lifting ───────────────────────────────
 
+# MSVC's __SEH_prolog establishes the caller's frame pointer, so the lifter has
+# to know which function it is. The address is per-title, and hardcoding it
+# meant every other game silently got no frame set up after the call: ebp kept
+# whatever stale value it had, and the first ebp-relative local access read
+# through it. In Halo that surfaced as a read of 0xFFFFFFFC (ebp=0, [ebp-4]).
+#
+# Both helpers are compiler boilerplate with distinctive bodies, so detect them
+# rather than asking every project to look them up by hand.
+#
+#   __SEH_prolog   mov eax, fs:[0]        64 A1 00 00 00 00
+#                  lea ebp, [esp+0x10]    8D 6C 24 10
+#   __SEH_epilog   mov fs:[0], ecx        64 89 0D 00 00 00 00
+#                  leave; push ecx; ret   C9 51 C3
+_SEH_PROLOG_MARKERS = (b"\x64\xa1\x00\x00\x00\x00", b"\x8d\x6c\x24\x10")
+_SEH_EPILOG_MARKERS = (b"\x64\x89\x0d\x00\x00\x00\x00", b"\xc9\x51\xc3")
+
+# Both are tiny; a large match is something else that happens to touch fs:[0].
+_SEH_PROLOG_MAX_SIZE = 128
+_SEH_EPILOG_MAX_SIZE = 64
+
+
+def detect_seh_helpers(func_db, xbe_data, verbose=False):
+    """Locate __SEH_prolog / __SEH_epilog in the target binary.
+
+    Returns (prolog_addr, epilog_addr); either may be None if not found, which
+    is normal for a title whose CRT does not use them.
+    """
+    from .config import va_to_file_offset
+
+    prolog = epilog = None
+
+    def _size_of(info):
+        # "end" is a hex string in functions.json but BatchTranslator rewrites
+        # it to an int in place, so accept either.
+        try:
+            size = int(info.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size:
+            return size
+        end = info.get("end")
+        if isinstance(end, str):
+            try:
+                end = int(end, 16)
+            except ValueError:
+                return 0
+        return (end - addr) if isinstance(end, int) else 0
+
+    for addr in sorted(func_db):
+        info = func_db[addr]
+        size = _size_of(info)
+        if size <= 0 or size > _SEH_PROLOG_MAX_SIZE:
+            continue
+
+        offset = va_to_file_offset(addr)
+        if offset is None or xbe_data is None or offset + size > len(xbe_data):
+            continue
+        body = xbe_data[offset:offset + size]
+
+        if (prolog is None and size <= _SEH_PROLOG_MAX_SIZE
+                and all(m in body for m in _SEH_PROLOG_MARKERS)):
+            prolog = addr
+        elif (epilog is None and size <= _SEH_EPILOG_MAX_SIZE
+                and all(m in body for m in _SEH_EPILOG_MARKERS)):
+            epilog = addr
+
+        if prolog is not None and epilog is not None:
+            break
+
+    if verbose:
+        import sys
+        fmt = lambda a: f"0x{a:08X}" if a else "not found"
+        print(f"  SEH helpers: __SEH_prolog {fmt(prolog)}, "
+              f"__SEH_epilog {fmt(epilog)}", file=sys.stderr)
+
+    return prolog, epilog
+
+
 class Lifter:
     """Translates x86 instructions to C statements."""
 
-    def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None):
+    def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
+                 seh_prolog=None, seh_epilog=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
         abi_db: dict of addr → ABI info (for calling conventions)
         xbe_data: raw XBE file bytes (for reading jump tables)
+        seh_prolog/seh_epilog: override the detected __SEH_prolog/__SEH_epilog
         """
         self.func_db = func_db or {}
         self.label_db = label_db or {}
@@ -657,16 +737,38 @@ class Lifter:
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
+        # Every direct call target we emit a name for, as {addr: name}. The
+        # batch translator diffs this against the functions it actually defined
+        # so it can stub out the remainder (see translate_batch_split).
+        self.referenced_calls = {}
+
+        # Detect if either is missing, so overriding one does not silently
+        # leave the other unset -- that is the bug this whole path fixes.
+        if (seh_prolog is None or seh_epilog is None) and self.func_db:
+            found_prolog, found_epilog = detect_seh_helpers(self.func_db, xbe_data)
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
+        self.SEH_PROLOG = seh_prolog
+        self.SEH_EPILOG = seh_epilog
 
     def _call_target_name(self, addr):
-        """Get the name for a call target address."""
-        if addr in self.label_db:
-            return self.label_db[addr]
+        """Get the name for a call target address.
+
+        func_db wins over label_db. The function definition is emitted from
+        func_db, so consulting labels first meant a renamed function was
+        *defined* as cseries__sub_0008DB80 but *called* as sub_0008DB80 -- the
+        disassembler's generic auto-label -- and the link failed on every
+        function any naming pass had touched. Labels still cover call targets
+        that are not known function starts.
+        """
         if addr in self.func_db:
-            info = self.func_db[addr]
-            name = info.get("name", f"sub_{addr:08X}")
-            return name
-        return f"sub_{addr:08X}"
+            name = self.func_db[addr].get("name", f"sub_{addr:08X}")
+        elif addr in self.label_db:
+            name = self.label_db[addr]
+        else:
+            name = f"sub_{addr:08X}"
+        self.referenced_calls[addr] = name
+        return name
 
     def lift_instruction(self, insn):
         """
@@ -1073,8 +1175,12 @@ class Lifter:
     # SEH prolog/epilog addresses - these functions modify ebp for their
     # caller.  After calling __SEH_prolog, the caller must read back ebp
     # from g_seh_ebp.  Before returning, __SEH_prolog writes g_seh_ebp.
-    SEH_PROLOG = 0x00244784  # __SEH_prolog
-    SEH_EPILOG = 0x002447BF  # __SEH_epilog
+    #
+    # Per-title addresses, detected from the binary by detect_seh_helpers()
+    # and assigned to the instance. The class values are only a fallback for
+    # callers that construct a Lifter without a function database.
+    SEH_PROLOG = None
+    SEH_EPILOG = None
 
     def _lift_call(self, insn, ops):
         # x86 'call' pushes return address then jumps.

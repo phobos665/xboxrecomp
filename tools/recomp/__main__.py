@@ -22,27 +22,70 @@ import os
 import sys
 import time
 
+from . import config
 from .translator import BatchTranslator
 from .output import write_summary, print_stats, generate_header
 
 
-def find_data_files():
-    """Locate the disasm/func_id output files."""
+def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=None):
+    """Locate the disasm/func_id output files.
+
+    Defaults to the in-tree tools/*/output directories. A game project living
+    outside this repo passes --disasm-dir/--func-id-dir (or the per-file
+    overrides) to point at its own pipeline output instead.
+    """
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    disasm_dir = disasm_dir or os.path.join(base, "disasm", "output")
+    func_id_dir = func_id_dir or os.path.join(base, "func_id", "output")
+    abi_dir = abi_dir or os.path.join(base, "abi_analysis", "output")
 
     paths = {
-        "functions": os.path.join(base, "disasm", "output", "functions.json"),
-        "labels": os.path.join(base, "disasm", "output", "labels.json"),
-        "identified": os.path.join(base, "func_id", "output", "identified_functions.json"),
-        "abi": os.path.join(base, "abi_analysis", "output", "abi_functions.json"),
+        "functions": os.path.join(disasm_dir, "functions.json"),
+        "labels": os.path.join(disasm_dir, "labels.json"),
+        "identified": os.path.join(func_id_dir, "identified_functions.json"),
+        "abi": os.path.join(abi_dir, "abi_functions.json"),
+        "summary": os.path.join(disasm_dir, "summary.json"),
     }
+    paths.update({k: v for k, v in (overrides or {}).items() if v})
 
     for key, path in paths.items():
         if not os.path.exists(path):
-            print(f"WARNING: {key} not found at {path}", file=sys.stderr)
+            if key != "summary":
+                print(f"WARNING: {key} not found at {path}", file=sys.stderr)
             paths[key] = None
 
     return paths
+
+
+def check_data_matches_binary(xbe_path, summary_path):
+    """Refuse to lift one binary's code using another binary's disassembly.
+
+    The input paths default to shared in-tree directories, so a stale run from a
+    different game silently produces a full set of plausible-looking C that
+    belongs to the wrong binary. The disassembler records which file it read;
+    compare it and stop if it disagrees.
+    """
+    if not summary_path:
+        return
+
+    try:
+        with open(summary_path, "r", encoding="utf-8") as fh:
+            recorded = json.load(fh).get("binary")
+    except (OSError, ValueError):
+        return
+
+    if not recorded:
+        return
+
+    if os.path.basename(recorded).lower() != os.path.basename(xbe_path).lower():
+        print(
+            f"ERROR: disassembly is for '{os.path.basename(recorded)}' but you "
+            f"asked to recompile '{os.path.basename(xbe_path)}'.\n"
+            f"       Re-run tools.disasm on this binary, or point --disasm-dir "
+            f"at the matching output.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def list_categories(translator):
@@ -87,15 +130,67 @@ def main():
     parser.add_argument("--gen-dir",
                         help="Output dir for split generated files "
                              "(default: src/game/recomp/gen)")
+    parser.add_argument("--disasm-dir",
+                        help="Directory holding tools.disasm output "
+                             "(default: tools/disasm/output)")
+    parser.add_argument("--func-id-dir",
+                        help="Directory holding tools.func_id output "
+                             "(default: tools/func_id/output)")
+    parser.add_argument("--abi-dir",
+                        help="Directory holding tools.abi_analysis output "
+                             "(default: tools/abi_analysis/output)")
+    parser.add_argument("--functions",
+                        help="Path to functions.json (overrides --disasm-dir)")
+    parser.add_argument("--labels",
+                        help="Path to labels.json (overrides --disasm-dir)")
+    parser.add_argument("--identified",
+                        help="Path to identified_functions.json "
+                             "(overrides --func-id-dir)")
+    parser.add_argument("--abi",
+                        help="Path to abi_functions.json (overrides --abi-dir)")
+    parser.add_argument("--skip-binary-check", action="store_true",
+                        help="Allow disassembly recorded for a different binary")
+    parser.add_argument("--seh-prolog", metavar="ADDR",
+                        help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+    parser.add_argument("--seh-epilog", metavar="ADDR",
+                        help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
 
     # Find data files
-    data_files = find_data_files()
+    data_files = find_data_files(
+        disasm_dir=args.disasm_dir,
+        func_id_dir=args.func_id_dir,
+        abi_dir=args.abi_dir,
+        overrides={
+            "functions": args.functions,
+            "labels": args.labels,
+            "identified": args.identified,
+            "abi": args.abi,
+        },
+    )
     if not data_files["functions"]:
         print("ERROR: functions.json not found. Run the disassembler first.",
               file=sys.stderr)
         sys.exit(1)
+
+    if not args.skip_binary_check:
+        check_data_matches_binary(args.xbe_path, data_files.get("summary"))
+
+    # Derive the memory map from the binary we were handed. Skipping this leaves
+    # the fallback layout in place, and every VA outside it lifts as "not code".
+    try:
+        config.configure_from_xbe(args.xbe_path)
+    except Exception as e:
+        print(f"ERROR: could not read section layout from {args.xbe_path}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.verbose:
+        print(f"Section layout from {os.path.basename(args.xbe_path)}: "
+              f"{len(config.SECTIONS)} sections, "
+              f".text 0x{config.TEXT_VA_START:08X}-0x{config.TEXT_VA_END:08X}",
+              file=sys.stderr)
 
     print(f"Loading data files...", file=sys.stderr)
     t0 = time.time()
@@ -107,6 +202,8 @@ def main():
         identified_json_path=data_files.get("identified"),
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
+        seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
+        seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
     )
 
     t_load = time.time() - t0
@@ -196,6 +293,10 @@ def main():
               f"{stats['total_lines']} lines of C, "
               f"{stats['num_chunks']} source files",
               file=sys.stderr)
+        if stats.get("unresolved_stubs"):
+            print(f"{stats['unresolved_stubs']} unresolved call targets stubbed "
+                  f"(addresses called but not detected as functions)",
+                  file=sys.stderr)
         for f_path in stats.get("files", []):
             print(f"  {f_path}", file=sys.stderr)
     else:
