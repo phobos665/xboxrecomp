@@ -5,9 +5,9 @@ Usage:
     py -3 -m tools.disasm <path_to_xbe> [options]
 
 Examples:
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only --stats-only -v
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" -o output/
+    python3 -m tools.disasm game_files/default.xbe --text-only --stats-only -v
+    python3 -m tools.disasm game_files/default.xbe --text-only
+    python3 -m tools.disasm game_files/default.xbe -o output/
 """
 
 import argparse
@@ -19,7 +19,7 @@ from .disasm import Disassembler
 def main():
     parser = argparse.ArgumentParser(
         prog="tools.disasm",
-        description="Burnout 3 XBE Disassembly Tool - "
+        description="Xbox XBE Disassembly Tool - "
                     "Static analysis and function detection for Xbox executables",
     )
 
@@ -37,7 +37,7 @@ def main():
     parser.add_argument(
         "--analysis-json",
         default=None,
-        help="Path to burnout3_analysis.json (auto-detected if not specified)",
+        help="Path to the stage-1 analysis JSON (auto-detected if not specified)",
     )
     parser.add_argument(
         "--text-only",

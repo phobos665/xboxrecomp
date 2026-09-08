@@ -1,5 +1,5 @@
 """
-Configuration constants for Burnout 3 disassembly tool.
+Configuration constants for the XBE disassembly tool.
 
 Defines address ranges, section boundaries, instruction classification,
 and other constants used throughout the disassembler.

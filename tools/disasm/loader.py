@@ -128,20 +128,43 @@ def _parse_hex(s: str) -> int:
     return int(s, 16)
 
 
-def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
-    """Auto-detect the analysis JSON file location."""
-    candidates = [
-        # Same directory as XBE
-        xbe_path.parent / "burnout3_analysis.json",
-        # In the xbe_parser tool directory
-        Path("tools/xbe_parser/burnout3_analysis.json"),
-        # Relative to repo root
-        xbe_path.parent.parent / "tools" / "xbe_parser" / "burnout3_analysis.json",
+# Names we will accept for the stage-1 analysis JSON, most specific first.
+# "<xbe stem>_analysis.json" lets several titles share one directory; the
+# others are the conventional names. "burnout3_analysis.json" is kept only so
+# existing working trees do not break.
+ANALYSIS_JSON_NAMES = (
+    "{stem}_analysis.json",
+    "g_analysis.json",
+    "analysis.json",
+    "xbe_analysis.json",
+    "burnout3_analysis.json",
+)
+
+
+def find_analysis_json(xbe_path: Path) -> Optional[Path]:
+    """Auto-detect the stage-1 analysis JSON produced by tools.xbe_parser.
+
+    Searched next to the XBE first, then in the xbe_parser tool directory.
+    Returns None if nothing matches, in which case the caller should fall back
+    to parsing section headers out of the XBE directly.
+    """
+    xbe_path = Path(xbe_path)
+    search_dirs = [
+        xbe_path.parent,
+        Path("tools/xbe_parser"),
+        xbe_path.parent.parent / "tools" / "xbe_parser",
     ]
-    for p in candidates:
-        if p.exists():
-            return p
+
+    for directory in search_dirs:
+        for name in ANALYSIS_JSON_NAMES:
+            candidate = directory / name.format(stem=xbe_path.stem)
+            if candidate.exists():
+                return candidate
     return None
+
+
+# Backwards-compatible alias for the previous private name.
+_find_analysis_json = find_analysis_json
 
 
 def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImage:
@@ -150,7 +173,7 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
 
     Args:
         xbe_path: Path to the .xbe file.
-        analysis_json: Optional path to burnout3_analysis.json.
+        analysis_json: Optional path to the stage-1 analysis JSON.
                        If None, auto-detected from standard locations.
 
     Returns:
