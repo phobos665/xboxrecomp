@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""
+Run the whole recompilation pipeline for one title.
+
+The four stages have to run in order and each reads the previous one's output,
+so running them by hand mostly means retyping the same XBE path four times and
+remembering that stage 2 needs the JSON from stage 1.
+
+    python3 scripts/recompile.py game_files/default.xbe
+
+Defaults to --game-only. Lifting CRT and XDK code you intend to HLE away costs
+compile time and debugging attention for code you will not run; switch to --all
+only when you have a reason.
+
+Stages:
+    1. parse    tools.xbe_parser   header, sections, imports -> analysis JSON
+    2. disasm   tools.disasm       .text -> instructions, functions, xrefs
+    3. identify tools.func_id      classify CRT / RenderWare / game functions
+    4. lift     tools.recomp       x86 -> C
+
+Re-run a later stage on its own after changing something:
+
+    python3 scripts/recompile.py game.xbe --from identify
+    python3 scripts/recompile.py game.xbe --only lift --all
+"""
+
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+STAGES = ["parse", "disasm", "identify", "lift"]
+
+
+def build_commands(args, xbe: Path, analysis_json: Path):
+    """Return [(stage, argv)] for the stages that were selected."""
+    parse = [sys.executable, "-m", "tools.xbe_parser", str(xbe),
+             "--json", str(analysis_json)]
+
+    disasm = [sys.executable, "-m", "tools.disasm", str(xbe), "--text-only"]
+    if args.verbose:
+        disasm.append("-v")
+
+    identify = [sys.executable, "-m", "tools.func_id", str(xbe)]
+    if args.verbose:
+        identify.append("-v")
+
+    lift = [sys.executable, "-m", "tools.recomp", str(xbe)]
+    lift.append("--all" if args.all else "--game-only")
+    if args.split:
+        lift += ["--split", str(args.split)]
+    if args.gen_dir:
+        lift += ["--gen-dir", args.gen_dir]
+    if args.verbose:
+        lift.append("-v")
+
+    commands = dict(zip(STAGES, [parse, disasm, identify, lift]))
+
+    if args.only:
+        selected = [args.only]
+    else:
+        selected = STAGES[STAGES.index(args.start):]
+
+    return [(name, commands[name]) for name in selected]
+
+
+def run(name: str, argv, dry_run: bool) -> bool:
+    print(f"\n{'=' * 70}")
+    print(f"  {STAGES.index(name) + 1}/4  {name}")
+    print(f"{'=' * 70}")
+    print("  $ " + " ".join(argv))
+
+    if dry_run:
+        return True
+
+    start = time.time()
+    result = subprocess.run(argv, cwd=REPO)
+    elapsed = time.time() - start
+
+    if result.returncode != 0:
+        print(f"\n  FAILED: stage '{name}' exited {result.returncode} "
+              f"after {elapsed:.1f}s", file=sys.stderr)
+        return False
+
+    print(f"\n  done in {elapsed:.1f}s")
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("xbe", help="Path to the title's default.xbe")
+    ap.add_argument("--all", action="store_true",
+                    help="Lift everything, including CRT and XDK code "
+                         "(default: --game-only)")
+    ap.add_argument("--split", type=int, default=1000, metavar="N",
+                    help="Functions per generated .c file (default: 1000)")
+    ap.add_argument("--gen-dir", metavar="DIR",
+                    help="Output directory for generated sources")
+    ap.add_argument("--json", metavar="FILE",
+                    help="Where to write the stage-1 analysis JSON "
+                         "(default: <xbe stem>_analysis.json beside the XBE)")
+    ap.add_argument("--from", dest="start", choices=STAGES, default="parse",
+                    metavar="STAGE",
+                    help=f"Start from this stage: {', '.join(STAGES)}")
+    ap.add_argument("--only", choices=STAGES, metavar="STAGE",
+                    help="Run only this stage")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Print the commands without running them")
+    ap.add_argument("--verbose", "-v", action="store_true")
+    args = ap.parse_args()
+
+    xbe = Path(args.xbe).resolve()
+    if not args.dry_run and not xbe.is_file():
+        print(f"error: XBE not found: {xbe}", file=sys.stderr)
+        return 1
+
+    # Written next to the XBE, named after it, because tools.disasm looks
+    # there first and several titles may share one directory.
+    analysis_json = (Path(args.json).resolve() if args.json
+                     else xbe.parent / f"{xbe.stem}_analysis.json")
+
+    commands = build_commands(args, xbe, analysis_json)
+
+    print(f"Title    {xbe}")
+    print(f"Analysis {analysis_json}")
+    print(f"Scope    {'all functions' if args.all else 'game functions only'}")
+
+    started = time.time()
+    for name, argv in commands:
+        if not run(name, argv, args.dry_run):
+            print("\nPipeline stopped. Fix the error above and re-run with "
+                  f"--from {name}", file=sys.stderr)
+            return 1
+
+    if args.dry_run:
+        print("\n(dry run: nothing was executed)")
+        return 0
+
+    print(f"\n{'=' * 70}")
+    print(f"  Pipeline complete in {time.time() - started:.1f}s")
+    print(f"{'=' * 70}")
+    print("\nNext: build the generated sources against the runtime libraries.")
+    print("See INSTRUCTIONS.md for the build and first-run loop.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

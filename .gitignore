@@ -24,6 +24,9 @@ game_files/
 Thumbs.db
 .DS_Store
 
+# Generated recompiled sources (regenerated per-game by tools.recomp)
+src/game/
+
 # Build
 build/
 bin/

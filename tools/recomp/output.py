@@ -7,7 +7,13 @@ import os
 
 
 def write_summary(stats, output_dir):
-    """Write a JSON summary of translation results."""
+    """Write a JSON summary of translation results.
+
+    The output directory is gitignored, so it does not exist in a fresh clone.
+    Every other writer in the pipeline creates its own; this one did not, which
+    made the final stage fail after all the work was already done.
+    """
+    os.makedirs(output_dir, exist_ok=True)
     summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
