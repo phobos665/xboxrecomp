@@ -22,6 +22,10 @@ pip install capstone
 **Windows:** Visual Studio 2022 with the C++ workload, CMake 3.20+, Python 3.10+,
 then `pip install capstone`.
 
+`capstone` is the only requirement for the pipeline itself. The optional
+`tools/fusion` analysis also needs `pefile` and `numpy`; without them its tests
+error out and everything else still works.
+
 ---
 
 ## 1. Pick a target
