@@ -13,7 +13,16 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
+**→ [INSTRUCTIONS.md](INSTRUCTIONS.md) — start here.** Picking a target, running
+the pipeline, building, and the debug loop, in seven steps.
+
 ### Recent Changes
+
+- **Per-title generalisation** — The kernel thunk table is now read from each
+  title's own XBE header instead of a hardcoded address; per-game overrides
+  moved out of engine code into `title_overrides.c` with a mandatory reason on
+  every entry; `scripts/` gained a target survey, a pipeline driver, and a
+  kernel-coverage audit.
 
 - **Cross-Platform / Linux Port** — Platform abstraction layer with an **OpenGL D3D8 backend** alongside the Windows D3D11 path, POSIX path handling, and Linux build deps (`tools/linux/install_deps.sh`). Builds with GCC/Clang.
 - **`ghidra_naming` Tool (optional)** — Headless Ghidra FidDb pass recovers real CRT/XDK symbol names from a stripped XBE and merges them into `functions.json`, so generated C uses meaningful names instead of `sub_XXXXXXXX`. The core pipeline still needs no disassembler. See `tools/ghidra_naming/`.
