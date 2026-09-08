@@ -11,8 +11,12 @@ detection and version, .text size, kernel import count, and demand-loaded
 sections.
 
 Usage:
-    python3 scripts/survey_xbe_library.py /path/to/extracted/discs --csv survey.csv
+    python3 scripts/survey_xbe_library.py /path/to/isos --csv survey.csv
+    python3 scripts/survey_xbe_library.py /path/to/isos --xdk 5849
     python3 scripts/survey_xbe_library.py /path/to/one/default.xbe --verbose
+
+Reads default.xbe straight out of .iso/.xiso images, so a library does not have
+to be unpacked just to answer "which XDK built this?".
 
 The ranking is a starting point, not a verdict. It cannot see hand-rolled push
 buffers, threading complexity, or whether you actually want to play the game.
@@ -20,8 +24,10 @@ buffers, threading complexity, or whether you actually want to play the game.
 
 import argparse
 import csv
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 # Import the XBE parser from the toolkit rather than re-deriving header offsets.
@@ -31,6 +37,9 @@ from tools.xbe_parser.xbe_parser import (  # noqa: E402
     XBEParser,
     SECTION_PRELOAD,
 )
+from tools.xiso.xdvdfs import Xiso, XisoError  # noqa: E402
+
+DISC_SUFFIXES = (".iso", ".xiso")
 
 # Sections whose presence signals work the toolkit does not yet cover.
 COSTLY_SECTIONS = {
@@ -52,8 +61,11 @@ RENDERWARE_RE = re.compile(rb"RenderWare(?:\x00|\s)*(?:Version|V)?\s*"
 class Survey:
     """Everything the XBE header can tell us about one title."""
 
-    def __init__(self, path):
+    def __init__(self, path, data=None):
+        # `data` is the XBE image when it came from inside a disc image, where
+        # `path` is only a label. A loose .xbe is read from disk as usual.
         self.path = Path(path)
+        self.data = data
         self.error = None
 
         self.title = ""
@@ -82,9 +94,20 @@ class Survey:
             self.error = f"{type(exc).__name__}: {exc}"
 
     def _parse(self):
-        parser = XBEParser(str(self.path))
-        xbe = parser.parse()
-        raw = self.path.read_bytes()
+        # XBEParser only reads from a path, so an image pulled out of an ISO
+        # goes via a temporary file rather than reaching into its internals.
+        if self.data is None:
+            raw = self.path.read_bytes()
+            xbe = XBEParser(str(self.path)).parse()
+        else:
+            raw = self.data
+            handle, tmp = tempfile.mkstemp(suffix=".xbe")
+            try:
+                with os.fdopen(handle, "wb") as f:
+                    f.write(raw)
+                xbe = XBEParser(tmp).parse()
+            finally:
+                os.unlink(tmp)
 
         self.title = xbe.certificate.title_name
         self.title_id = xbe.certificate.title_id
@@ -183,20 +206,62 @@ class Survey:
         }
 
 
-def find_xbes(root: Path):
-    """Yield every XBE under root, or root itself if it is a file."""
-    if root.is_file():
-        return [root]
-
-    found = sorted(root.rglob("*.xbe")) + sorted(root.rglob("*.XBE"))
-    # rglob is case-sensitive on POSIX; de-duplicate for case-insensitive mounts.
+def _dedup(paths):
+    """rglob is case-sensitive on POSIX; collapse case-insensitive duplicates."""
     seen, unique = set(), []
-    for p in found:
+    for p in paths:
         key = str(p).lower()
         if key not in seen:
             seen.add(key)
             unique.append(p)
     return unique
+
+
+def find_targets(root: Path):
+    """Yield (label, data) for every title under root.
+
+    Accepts loose .xbe files and disc images alike. Reading default.xbe out of
+    an ISO avoids unpacking a whole library just to answer "which XDK?", which
+    is the question you have before you have decided what to extract.
+    """
+    if root.is_file():
+        candidates = [root]
+    else:
+        candidates = _dedup(
+            sorted(root.rglob("*.xbe")) + sorted(root.rglob("*.XBE"))
+            + sorted(root.rglob("*.iso")) + sorted(root.rglob("*.ISO"))
+            + sorted(root.rglob("*.xiso")) + sorted(root.rglob("*.XISO")))
+
+    targets = []
+    for path in candidates:
+        if path.suffix.lower() not in DISC_SUFFIXES:
+            targets.append((path, None))
+            continue
+
+        # A disc image: pull default.xbe out without unpacking the rest.
+        try:
+            image = Xiso(str(path))
+        except (XisoError, OSError) as exc:
+            targets.append((path, _Unreadable(f"not a readable disc image: {exc}")))
+            continue
+        try:
+            entry = image.find("default.xbe")
+            if entry is None:
+                targets.append((path, _Unreadable("no default.xbe in image")))
+            else:
+                targets.append((path, image.read(entry)))
+        except (XisoError, OSError) as exc:
+            targets.append((path, _Unreadable(f"could not read default.xbe: {exc}")))
+        finally:
+            image.close()
+    return targets
+
+
+class _Unreadable:
+    """Marks a target we could not get an XBE out of, with the reason."""
+
+    def __init__(self, reason):
+        self.reason = reason
 
 
 def print_verbose(s: Survey):
@@ -247,12 +312,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("path", help="An XBE, or a directory of extracted discs")
+    ap.add_argument("path",
+                    help="An XBE, a disc image, or a directory containing either")
     ap.add_argument("--csv", metavar="FILE", help="Write full results as CSV")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="Print a full report per title")
     ap.add_argument("--limit", type=int, metavar="N",
                     help="Show only the N best-ranked titles in the table")
+    ap.add_argument("--xdk", type=int, metavar="BUILD",
+                    help="Show only titles built with this XDK build (e.g. 5849). "
+                         "Bringing up a second title on a known-good XDK first "
+                         "means anything that breaks is a generality bug rather "
+                         "than an XDK difference.")
     args = ap.parse_args()
 
     root = Path(args.path)
@@ -260,13 +331,32 @@ def main() -> int:
         print(f"error: not found: {root}", file=sys.stderr)
         return 1
 
-    paths = find_xbes(root)
-    if not paths:
-        print(f"error: no .xbe files under {root}", file=sys.stderr)
+    targets = find_targets(root)
+    if not targets:
+        print(f"error: no .xbe or disc images under {root}", file=sys.stderr)
         return 1
 
-    print(f"Surveying {len(paths)} XBE(s)...", file=sys.stderr)
-    surveys = [Survey(p) for p in paths]
+    print(f"Surveying {len(targets)} title(s)...", file=sys.stderr)
+
+    surveys = []
+    for path, data in targets:
+        if isinstance(data, _Unreadable):
+            survey = Survey(path, data=b"")
+            survey.error = data.reason
+        else:
+            survey = Survey(path, data=data)
+        surveys.append(survey)
+
+    if args.xdk is not None:
+        matched = [s for s in surveys if s.xdk_build == args.xdk]
+        if not matched:
+            builds = sorted({s.xdk_build for s in surveys if s.xdk_build})
+            print(f"\nNo title on XDK {args.xdk}.", file=sys.stderr)
+            print(f"Builds present: {', '.join(str(b) for b in builds) or 'none readable'}",
+                  file=sys.stderr)
+            return 1
+        surveys = matched
+
     surveys.sort(key=Survey.score)
 
     if args.verbose:
@@ -287,6 +377,21 @@ def main() -> int:
                   f"{(s.renderware_version or ('yes' if s.renderware else '-'))[:8]:<8} "
                   f"{s.text_size / 1024:>7.0f}K {s.kernel_imports:>4}  "
                   f"{'; '.join(s.notes)}")
+
+    # Which XDK builds are in this library, and how many titles on each. This
+    # is usually the next question after "what should I port?", because a
+    # second title on an XDK you have already brought up isolates generality
+    # bugs from XDK differences.
+    builds = {}
+    for s in surveys:
+        if not s.error and s.xdk_build:
+            builds[s.xdk_build] = builds.get(s.xdk_build, 0) + 1
+    if len(builds) > 1 or (builds and not args.xdk):
+        print("\nXDK builds present:")
+        for build in sorted(builds):
+            titles = builds[build]
+            print(f"  {build}   {titles} title{'s' if titles != 1 else ''}")
+        print("  (--xdk BUILD narrows the table to one of these)")
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:

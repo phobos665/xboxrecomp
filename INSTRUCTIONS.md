@@ -31,19 +31,35 @@ error out and everything else still works.
 ## 1. Pick a target
 
 Some games are far easier than others, and the two things that matter most —
-which XDK built the disc, and whether it used LTCG — are not on any wiki. They
-are in the XBE header, so read them:
+which XDK built the disc, and whether it used LTCG — **are not on any wiki**.
+The XDK build is a property of that particular disc build, recorded in the
+XBE's library-version table. The only way to know is to read it.
+
+Point the survey at your ISOs. It opens each image and reads `default.xbe`
+without unpacking anything:
 
 ```bash
-python3 scripts/survey_xbe_library.py /path/to/your/extracted/discs
+python3 scripts/survey_xbe_library.py /path/to/your/isos
 ```
 
-You get a ranked table. Lower score is a better first target.
+You get a ranked table — lower score is a better first target — and a summary
+of which XDK builds you actually own:
 
 ```
  SCORE  TITLE                     XDK D3D       RW        .text  IMP  CONCERNS
   -2.0  Small RW Racer           5849 D3D8      3.7.0.0    256K    5
+   0.5  Tiny Puzzler             5849 D3D8      -          128K    5
   17.0  Big Online Shooter       5233 D3D8LTCG  -         1536K    5  XONLINE; WMADEC
+
+XDK builds present:
+  5233   1 title
+  5849   2 titles
+```
+
+To list only the discs on one build:
+
+```bash
+python3 scripts/survey_xbe_library.py /path/to/your/isos --xdk 5849
 ```
 
 **What to look for:** a small `.text`, a documented engine like RenderWare, and
@@ -57,9 +73,15 @@ The ranking reads the header only. It cannot see hand-rolled push buffers or
 threading complexity, so treat it as a shortlist, not a verdict.
 
 > **Strongly recommended for your first title:** pick one built with the same
-> XDK as a title already known to work. Anything that breaks is then, by
-> definition, something the project wrongly treated as universal — which makes
-> it a bug worth fixing rather than a mystery.
+> XDK as a title already known to work — 5849 is the one this toolkit has been
+> proven against. Anything that breaks is then, by definition, something the
+> project wrongly treated as universal, which makes it a bug worth fixing
+> rather than a mystery. Once a second title on that XDK runs, a third on a
+> *different* build tells you what is XDK-specific.
+>
+> If nothing in your library is on 5849, that is fine — just expect the first
+> failures to be a mix of generality bugs and XDK differences, and use the
+> build summary to pick whichever build you own the most of.
 
 ---
 
