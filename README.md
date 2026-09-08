@@ -13,6 +13,10 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
+**→ [INSTRUCTIONS.md](INSTRUCTIONS.md) — start here.** The whole journey in one
+page: picking a target from your ISOs, running the pipeline, building, the boot
+loop, and what "playable" actually means.
+
 **[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
 community hub for sp00nznet's recomp projects, where ps3recomp development
 happens in the open. Good place to ask questions, show a port you are working

@@ -134,7 +134,7 @@ so the answer is reproducible. "Record the binary identity" means an address is
 meaningless without knowing which build produced it — the same title on another
 disc revision has different addresses.
 
-This is now summarised in `INSTRUCTIONS.md` step 7.
+This is now summarised in `INSTRUCTIONS.md`, Part III.
 
 ---
 
