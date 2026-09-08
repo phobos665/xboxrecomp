@@ -318,6 +318,13 @@ yet", which are very different amounts of work.
 | `docs/pipeline/` | Detailed stage-by-stage reference |
 | `docs/technical/` | Memory layout, register model, xemu debugging |
 
+## Going further
+
+`INSTRUCTIONS.md` gets you to generated C and a first run. **[docs/WORKFLOW.md](docs/WORKFLOW.md)**
+is the plan for what comes after: the boot loop, how to seed discovery from a
+run, what order to fix subsystems in, what "playable" actually means, and when
+to start on enhancements.
+
 ## Further reading
 
 - `docs/GETTING_STARTED.md` — a longer tour of the same ground
