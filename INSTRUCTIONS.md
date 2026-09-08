@@ -61,13 +61,16 @@ threading complexity, so treat it as a shortlist, not a verdict.
 
 ## 2. Extract the disc
 
-Use [extract-xiso](https://github.com/XboxDev/extract-xiso):
+The toolkit ships its own extractor — no external tool needed:
 
 ```bash
-extract-xiso -x "Your Game.iso" -d game_files/
+python3 -m tools.xiso ls     "Your Game.iso"          # see what's on the disc
+python3 -m tools.xiso unpack "Your Game.iso" -o game_files/
 ```
 
 You want `game_files/default.xbe` plus the game's data files beside it.
+[extract-xiso](https://github.com/XboxDev/extract-xiso) also works if you
+already use it.
 
 ---
 
@@ -171,29 +174,28 @@ subtly wrongly, stop looking for a crash — compare against xemu instead
 ### When you have to patch a function
 
 Sometimes a function must be replaced by hand. Those go in **one file**:
-`src/title_overrides.c`.
+`src/recomp_manual.c`. It is checked before the generated dispatch table, so an
+override always wins.
 
 ```c
-static void stub_00067890(void) {
+/* 0x00067890 spins on an APU DMA bit the audio HLE never sets.
+ * Remove once apu_vp reports buffer completion. */
+void sub_00067890(void) {
     g_eax = 0;
+    esp += 4; return;   /* consume the pushed return address */
 }
-
-const recomp_override_t g_title_overrides[] = {
-    RECOMP_OVERRIDE(0x00067890, stub_00067890,
-        "Spins on an APU DMA bit the audio HLE never sets; "
-        "remove once apu_vp reports buffer completion"),
-    { 0, 0, 0, 0 }
-};
 ```
 
-The reason is **required** — the code will not compile without it, and will not
-start if it is blank. This is deliberate. An override with no recorded reason
-can never be re-evaluated, because nobody can tell whether the bug it works
-around still exists. Write what the *toolkit* gets wrong and what would let the
-override be deleted, not just the symptom.
+**Write down why, every time.** Nothing enforces it, which is exactly why it
+gets skipped — and an override whose rationale was never recorded can never be
+re-evaluated, because nobody can tell whether the bug it works around still
+exists. Say what the *toolkit* gets wrong and what would let the override be
+deleted, not just the symptom.
 
-Never edit `recomp_manual.c`. That is engine code shared by every title; if a
-fix belongs there, it belongs in the toolkit for everyone.
+Keep them in this file and nowhere else. `tools/recomp/manual_scan.py` reads
+`recomp_manual.c` to decide which functions *not* to generate; a hand-written
+definition it cannot see becomes a duplicate symbol, and one it wrongly thinks
+exists becomes an unresolved external.
 
 ---
 
@@ -266,12 +268,16 @@ An unresolved `[ICALL]` is usually a gap in **function discovery**, not a quirk
 of your game. Re-running discovery fixes it for every title; an override fixes
 it for exactly one. Reach for the override only after discovery has failed you.
 
-Likewise, an unimplemented kernel ordinal is a toolkit gap. To see where the
-coverage currently stands:
+Likewise, an unimplemented kernel ordinal is a toolkit gap. To see how much
+kernel work your title actually needs — and how hard each missing piece is:
 
 ```bash
-python3 scripts/audit_kernel_ordinals.py --list-gaps
+python3 -m tools.kernel_audit.coverage game_files/default_analysis.json --list
 ```
+
+It splits the remainder into "an implementation exists but needs a bridge",
+"this is a data export, it needs a value not a function", and "nothing exists
+yet", which are very different amounts of work.
 
 ---
 

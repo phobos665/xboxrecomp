@@ -27,7 +27,10 @@ from pathlib import Path
 # Import the XBE parser from the toolkit rather than re-deriving header offsets.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools.xbe_parser import XBEParser  # noqa: E402
+from tools.xbe_parser.xbe_parser import (  # noqa: E402
+    XBEParser,
+    SECTION_PRELOAD,
+)
 
 # Sections whose presence signals work the toolkit does not yet cover.
 COSTLY_SECTIONS = {
@@ -41,8 +44,6 @@ COSTLY_LIBRARIES = {
     "XNET": "networking",
     "XVOICE": "voice chat",
 }
-
-SECTION_PRELOAD = 0x00000002
 
 RENDERWARE_RE = re.compile(rb"RenderWare(?:\x00|\s)*(?:Version|V)?\s*"
                            rb"([0-9]+\.[0-9]+(?:\.[0-9]+)*)", re.I)

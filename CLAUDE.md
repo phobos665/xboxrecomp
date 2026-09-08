@@ -40,7 +40,7 @@ Verify against the repo rather than trusting the README. Known discrepancies as 
 | README says | Reality (per `docs/technical/gap-analysis.md`) |
 |---|---|
 | NV2A push-buffer interception is a core feature | Push-buffer parsing is a **stub**, marked "N/A — D3D8 API intercept instead". The project already does D3D8 HLE. |
-| "115 of 366 ordinals resolved, 55 bridged" | Audited. 366 total, **71 reachable** from translated code (55 function bridges + 16 data exports), 153 host-side implementations — so 85 look implemented but have no bridge and silently return 0. The old "147" was Burnout 3's *import count*, not a toolkit capability. Re-run `scripts/audit_kernel_ordinals.py` rather than trusting any number written down. |
+| "115 of 366 ordinals resolved, 55 bridged" | Do not trust any number written down; the useful question is per-title, not global. Run `py -3 -m tools.kernel_audit.coverage <analysis.json> --list`, which splits what is missing into "needs a bridge wrapper", "is a data export", and "does not exist yet". Note an ordinal with an `xbox_*` implementation but no bridge silently returns 0. |
 | Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. Win32-only in practice. |
 | Burnout 3 is the proven target | True, and it is a **D3D8LTCG** build on XDK 5849 — so LTCG is not disqualifying. |
 
@@ -75,15 +75,19 @@ The Xbox is uniprocessor. Guest code raises IRQL as mutual exclusion and spins w
 barriers. Keep the cooperative single-thread model, but inject **yield checks at loop
 back-edges** so a spinning guest thread cannot deadlock.
 
-### 5. Separate engine from per-title data — **DONE**
-Overrides now live in `templates/new-game/src/title_overrides.c` (per-title data);
-`recomp_manual.c` is engine code and is not edited per game. The reason field is enforced
-twice: `RECOMP_OVERRIDE` takes it as a required argument, and `recomp_overrides_init()`
-aborts on a blank reason or a duplicate VA and logs the whole table at boot.
+### 5. Separate engine from per-title data — **upstream owns this now**
+Overrides stay in `recomp_manual.c`. Upstream's `tools/recomp/manual_scan.py` treats that
+file as the single source of truth for which `sub_XXXXXXXX` are hand-defined, and the
+recompiler reads it to decide what *not* to generate — so a second override file causes
+duplicate symbols and unresolved externals. A fork-local split was tried here and reverted.
 
-Related and also done: the kernel thunk table is read from each title's own XBE header
-instead of Burnout 3's hardcoded `0x0036B7C0`/147-ordinal list. `xbox_kernel_set_thunk_address()`
-had been declared and called but never defined, so `xbox_kernel` did not link at all.
+The mandatory-reason-per-override idea is still right and still unenforced. The place to
+land it is upstream, as a convention plus a check over `recomp_manual.c`, not as a
+competing file.
+
+The kernel thunk table is already per-title upstream: `xbox_kernel_init()` reads ordinals
+from the mapped XBE, keeps `g_thunk_ordinals` only as a no-XBE fallback, and adds
+`xbox_kernel_set_ordinal_remap()` on top.
 
 ### 6. Then, in rough order of what they unlock
 - **Texture layer** — table-drive formats, mip levels, P8 palette, texcoord generation.
@@ -94,8 +98,8 @@ had been declared and called but never defined, so `xbox_kernel` did not link at
 - **XDK signature coverage** — an *identification* problem, not a reimplementation one. The
   D3D8 API surface is stable; what changes per build is where functions sit. Much of this is
   porting Cxbx-Reloaded's OOVPA work. LTCG builds are harder but demonstrably tractable.
-- **Kernel ordinal coverage** — 366 total, count disputed, audit it. Driven by what titles
-  call, not by XDK version. Accumulates naturally.
+- **Kernel ordinal coverage** — driven by what titles call, not by XDK version; accumulates
+  naturally. Audit per-title with `tools.kernel_audit.coverage`.
 - **LLE fallback** — for titles that hand-roll push buffers or defeat signature matching.
   Shipping working-but-slow, then converting to the fast path, is what makes this a toolkit
   rather than a collection of per-game hacks.
@@ -152,9 +156,10 @@ lives here.
 | Stack overflow | Wrong ESP at entry, or runaway recursion |
 | **Subtly wrong physics or RNG, no crash** | **x87 precision divergence — suspect this first when behaviour differs from xemu without a fault** |
 
-Overrides live in `title_overrides.c` (never `recomp_manual.c`, which is engine code) and are
-checked before the auto-generated table, so they always win. The reason field is mandatory and
-enforced at compile time and at startup.
+Overrides live in `recomp_manual.c` and are checked before the auto-generated table, so they
+always win. `manual_scan.py` parses that file to decide what not to generate, so keep them
+there and nowhere else. **Log every override with its reason at the moment you add it** —
+nothing enforces this yet, which is why it gets skipped.
 
 **Bring-up order:** CRT startup → hardware init → asset loading → menus → gameplay. Get to a
 black screen with no crashes before caring about rendering.

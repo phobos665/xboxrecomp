@@ -17,20 +17,27 @@ this repository has already changed as a result.
 The port carries `tools/xboxrecomp-patches/fsubp-destination.patch`, which fixes
 `FSUBP` writing `ST(1)` regardless of its explicit destination operand.
 
-Checking that against our fork showed the same bug class was far wider here,
-because our lifter predates the upstream revision the patch applies to. `FADD`
-and friends with a memory operand ignored the operand entirely *and* popped;
-`FSUBR`, `FDIVR` and the `FI*` integer forms had no handler at all and lifted to
-a bare comment; `FXCH` ignored its operand; `FISTP` never popped. See the x87
-commit and `tools/recomp/test_lifter_fpu.py`.
+Chasing that patch is what revealed the real problem: **this fork was 287
+commits behind upstream**, with zero local divergence. It was not a fork with a
+different opinion, just a stale copy. doaxbv-re pins a commit 254 ahead of where
+we sat, which is exactly why its patch referenced lifter helpers we did not
+have.
 
-**The lesson is not "x87 was broken".** It is that a second consumer running
-real code finds correctness bugs that a single working title never will, because
-the reference target simply does not happen to execute those encodings. Every
-one of these produced wrong numbers with no crash and no diagnostic.
+Upstream had already fixed the whole x87 bug class — its own comment reads
+"fsubr/fdivr were all wrong" — along with the kernel thunk table, the
+`xbox_host_char` build break, xbe_parser packaging, and analysis-JSON
+discovery. It also ships `tools/recomp/test_lifter_fpu.py` and
+`tools/kernel_audit/coverage.py`, which do the same jobs better.
 
-**What we do about it:** a downstream patch directory is a bug report. Read it
-against our own tree rather than assuming it applies as written.
+**The lesson is not "x87 was broken".** It is twofold:
+
+1. A second consumer running real code finds correctness bugs a single working
+   title never will, because the reference target simply never executes those
+   encodings. Every x87 bug produced wrong numbers with no crash.
+2. **Check the distance to upstream before fixing anything.** A downstream
+   patch directory is a bug report about a *specific revision*. Read it against
+   the current upstream, not against a stale local tree — otherwise you
+   re-derive fixes that already exist, and worse than they exist.
 
 ---
 
@@ -42,7 +49,9 @@ answer is worth copying wholesale:
 - **Synthetic instructions.** Build `Instruction`/`Operand` objects directly,
   run the lifter, assert on the emitted C. No game files, no compiler, no
   generated program. Their `check_fsubp.py` is 40 lines and catches a bug that
-  silently corrupts physics. Ours is now `tools/recomp/test_lifter_fpu.py`.
+  silently corrupts physics. Upstream uses the same technique throughout —
+  `tools/recomp/test_lifter_fpu.py` and 95 tests besides — so the pattern to
+  copy is already in the tree; add to it rather than inventing a parallel one.
 
 - **A fixture at the dispatch seam.** `runtime_public_fixture.c` is a
   hand-written function that occupies the same seam a generated function would.
@@ -70,10 +79,12 @@ The runtime is 146 files split on a strict rule: 36 `*_model.c`, 28
 Their rule, from `AGENTS.md`: *"Keep models separable from interception and host
 delivery details."*
 
-This is why they can unit-test rendering logic and we cannot. Our
-`src/d3d/d3d8_device.c` is 1291 lines mixing all three concerns, so there is no
-seam at which to assert anything. Worth restructuring behind this split as the
-texture layer gets generalised.
+This is why they can unit-test rendering logic and we largely cannot. Our
+`src/d3d/d3d8_device.c` is 1566 lines mixing all three concerns, so there is no
+seam at which to assert anything. Upstream has since grown a real test suite
+(95 Python tests plus `tests/`), but the D3D layer is still the least testable
+part. Worth restructuring behind this split as the texture layer gets
+generalised.
 
 ---
 
@@ -93,8 +104,16 @@ still depend on fixed guest addresses and layouts, so a structure can only be
 redesigned once every function that touches it has been replaced.
 
 That is a different end state from "lift everything and ship it", and it is
-compatible with our override mechanism: `title_overrides.c` is exactly the seam
+compatible with our override mechanism: `recomp_manual.c` is exactly the seam
 their step 4 uses.
+
+An attempt here to split overrides into a separate per-title data file with a
+mandatory reason field was reverted for the same reason as above: upstream's
+`manual_scan.py` makes `recomp_manual.c` the single source of truth for which
+`sub_XXXXXXXX` are hand-defined, and the recompiler reads it to decide what not
+to generate. A second file breaks that contract. The idea is still worth
+having; it belongs upstream as a convention change, not as a fork-local file
+split that fights their tooling.
 
 ---
 
