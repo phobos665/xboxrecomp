@@ -6,7 +6,7 @@ project(xboxrecomp VERSION 0.1.0 LANGUAGES C)
 # Pattern: extract emulator subsystems (xemu) into reusable static libraries.
 #
 # Libraries:
-#   xbox_kernel    - Xbox kernel replacement layer (147 imports → Win32)
+#   xbox_kernel    - Xbox kernel replacement layer (Xbox kernel ordinals → Win32)
 #   xbox_d3d8      - D3D8 → D3D11 graphics compatibility
 #   xbox_dsound    - DirectSound → software mixer compatibility
 #   xbox_input     - Xbox gamepad → XInput compatibility

@@ -98,7 +98,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 
 | Library | Source | What It Does |
 |---------|--------|-------------|
-| **xbox_kernel** | Custom | Xbox kernel → Win32 (147+ imports: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
+| **xbox_kernel** | Custom | Xbox kernel → Win32 (71 of 366 ordinals reachable from game code: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus). Run `scripts/audit_kernel_ordinals.py` for current coverage. |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
 | **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
@@ -196,7 +196,7 @@ py -3 -m tools.recomp game_files/default.xbe --all --split 1000
 #    Output: src/game/recomp/gen/ (millions of lines of C)
 
 # 7. Set up runtime shims (see docs/runtime/ for templates)
-#    - Xbox kernel replacement (147 imports)
+#    - Xbox kernel replacement (kernel ordinal HLE)
 #    - D3D8 -> D3D11 translation layer
 #    - Memory layout reproduction
 #    - Input system
@@ -281,7 +281,7 @@ xboxrecomp/
 - [Indirect Call Dispatch](docs/technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
 - [D3D8 to D3D11 Translation](docs/technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
 - [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions **(NEW)**
-- [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping 147 kernel imports to Win32
+- [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap

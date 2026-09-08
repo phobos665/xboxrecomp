@@ -105,22 +105,37 @@ The `xbe_parser` tool outputs these values for any XBE.
 
 ## Kernel Thunk Table
 
-The Xbox kernel exposes functions via ordinal numbers. Games import them through a thunk table at a fixed address. We reproduce this:
+The Xbox kernel exposes functions via ordinal numbers. Games import them through
+a thunk table. **Both the address and the length of that table are per-title** —
+they come from the XBE header's `KernelImageThunkAddress`, not from a constant.
+
+`xbox_MemoryLayoutInit()` decodes that field (trying the retail and debug XOR
+keys and keeping whichever lands inside the image), counts the entries, and
+hands both to the kernel layer:
 
 ```c
-// The thunk table lives at the same Xbox VA as the original
-#define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0
-#define XBOX_KERNEL_THUNK_TABLE_SIZE  147
-
-// Each entry maps ordinal → function pointer (as synthetic VA)
-extern ULONG_PTR xbox_kernel_thunk_table[147];
+void     xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
+uint32_t xbox_kernel_get_thunk_address(void);
+uint32_t xbox_kernel_get_thunk_count(void);
 ```
+
+`XBOX_KERNEL_THUNK_TABLE_SIZE` (366) is the capacity bound of the fixed slot
+arrays — the size of the Xbox kernel's ordinal space — **not** an entry count.
+Never iterate it against a title's table: past the real end you are reading
+adjacent `.rdata`, and any word there with bit 31 set looks exactly like an
+unresolved ordinal and would be overwritten.
+
+Entry values in the on-disc XBE are `0x80000000 | ordinal`. The engine reads
+those ordinals out of the loaded image; it does not carry a per-game list.
 
 ### Initialization
 
+Order matters — the thunk address is only known after the XBE is mapped:
+
 ```c
-xbox_kernel_init();         // Populate thunk table with ordinal → function mappings
-xbox_kernel_bridge_init();  // Write thunk entries into Xbox memory, set up kernel data area
+xbox_MemoryLayoutInit(xbe, size);  // Maps the XBE, discovers the thunk table
+xbox_kernel_init();                // Resolves ordinals read from the mapped image
+xbox_kernel_bridge_init();         // Patches thunk entries, sets up kernel data area
 ```
 
 ### Kernel Data Exports

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # Xbox Kernel Replacement Layer
-# Replaces 147 Xbox kernel imports with Win32 equivalents.
+# Replaces Xbox kernel imports with Win32 equivalents.
 # Memory layout, file I/O, threading, synchronization, crypto, HAL.
 
 set(KERNEL_SOURCES

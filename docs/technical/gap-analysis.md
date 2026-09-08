@@ -59,7 +59,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Memory management (147 ordinals) | DONE | Win32 heap backend |
+| Memory management | DONE | Win32 heap backend |
 | File I/O with path translation | DONE | Xbox paths → host filesystem |
 | Threading | DONE | Single-thread cooperative model |
 | Synchronization (events, semaphores, waits) | DONE | Win32 primitives |

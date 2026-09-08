@@ -264,29 +264,51 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /*
      * Parse the kernel thunk table address from the XBE header.
-     * The XBE stores KernelImageThunkAddress at offset 0x0158,
-     * XOR-encrypted with 0x5B6D40B6 for retail builds.
-     * We decrypt it and tell the kernel bridge where to find thunks.
+     *
+     * KernelImageThunkAddress sits at offset 0x0158, XOR-encrypted. The key
+     * differs between retail and debug builds, and the header does not say
+     * which was used — the convention is to try both and keep the one that
+     * decodes to an address inside the image. Assuming retail silently yields
+     * a garbage VA for every debug or homebrew XBE.
      */
     if (xbe_size >= 0x015C) {
-        uint32_t thunk_raw = *(const uint32_t *)(xbe + 0x0158);
-        uint32_t thunk_va = thunk_raw ^ 0x5B6D40B6;  /* retail XOR key */
+        static const uint32_t THUNK_XOR_RETAIL = 0x5B6D40B6u;
+        static const uint32_t THUNK_XOR_DEBUG  = 0xEFB1F152u;
 
-        /* Validate: thunk VA should be within our mapped region */
-        if (thunk_va >= XBOX_BASE_ADDRESS && thunk_va < XBOX_TOTAL_RAM) {
-            /* Count thunk entries by scanning until we hit 0 */
+        uint32_t thunk_raw    = *(const uint32_t *)(xbe + 0x0158);
+        uint32_t thunk_retail = thunk_raw ^ THUNK_XOR_RETAIL;
+        uint32_t thunk_debug  = thunk_raw ^ THUNK_XOR_DEBUG;
+        uint32_t thunk_va     = 0;
+        const char *key_used  = NULL;
+
+        if (thunk_retail >= XBOX_BASE_ADDRESS && thunk_retail < XBOX_TOTAL_RAM) {
+            thunk_va = thunk_retail;
+            key_used = "retail";
+        } else if (thunk_debug >= XBOX_BASE_ADDRESS && thunk_debug < XBOX_TOTAL_RAM) {
+            thunk_va = thunk_debug;
+            key_used = "debug";
+        }
+
+        if (thunk_va) {
+            /*
+             * Count entries. In the on-disc XBE every unresolved import is
+             * stored as (0x80000000 | ordinal) and the table ends with a zero
+             * word. Stopping at the first non-ordinal word means a table that
+             * is not zero-terminated cannot run us off into adjacent .rdata.
+             */
             uint32_t thunk_count = 0;
-            for (uint32_t t = 0; t < 366; t++) {
+            for (uint32_t t = 0; t < XBOX_KERNEL_THUNK_TABLE_SIZE; t++) {
                 uint32_t entry = *(volatile uint32_t *)((uintptr_t)(thunk_va + t * 4) + g_memory_offset);
-                if (entry == 0) break;
+                if ((entry & 0x80000000u) == 0) break;
                 thunk_count++;
             }
             xbox_kernel_set_thunk_address(thunk_va, thunk_count);
-            fprintf(stderr, "  Kernel thunks: %u entries at Xbox VA 0x%08X\n",
-                    thunk_count, thunk_va);
+            fprintf(stderr, "  Kernel thunks: %u entries at Xbox VA 0x%08X (%s key)\n",
+                    thunk_count, thunk_va, key_used);
         } else {
-            fprintf(stderr, "  WARNING: kernel thunk VA 0x%08X out of range (raw=0x%08X)\n",
-                    thunk_va, thunk_raw);
+            fprintf(stderr, "  WARNING: kernel thunk VA out of range with either key "
+                            "(raw=0x%08X, retail=0x%08X, debug=0x%08X)\n",
+                    thunk_raw, thunk_retail, thunk_debug);
         }
     }
 

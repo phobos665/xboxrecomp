@@ -1,15 +1,16 @@
 /*
  * kernel_thunks.c - Xbox Kernel Thunk Table & Initialization
  *
- * Wires the 147-entry kernel thunk table at VA 0x0036B7C0 to our
- * xbox_* function/data implementations.
+ * Wires the current title's kernel thunk table to our xbox_* function/data
+ * implementations. Both the table's VA and its entry count are per-title and
+ * are supplied by xbox_MemoryLayoutInit() via xbox_kernel_set_thunk_address().
  *
  * The Xbox kernel thunk table is an array of function/data pointers that
  * game code calls through via indirect calls: call [thunk_addr].
  * Each entry corresponds to a kernel export ordinal.
  *
  * This file provides:
- *   - xbox_kernel_thunk_table[] - the 147 pointer slots
+ *   - xbox_kernel_thunk_table[] - host-side resolved pointer slots
  *   - xbox_resolve_ordinal() - maps ordinal → function/data pointer
  *   - xbox_kernel_init() - fills the thunk table and initializes subsystems
  *   - xbox_kernel_shutdown() - cleanup
@@ -17,6 +18,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -27,6 +29,40 @@
  * ============================================================================ */
 
 ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE] = {0};
+
+/* ============================================================================
+ * Per-title thunk table location
+ *
+ * Set from the XBE header by xbox_MemoryLayoutInit(). Until then we hold the
+ * historical fallback base and a count of 0, which means "not discovered" —
+ * xbox_kernel_init() treats that as an error rather than guessing a length.
+ * ============================================================================ */
+
+static uint32_t g_thunk_table_va    = XBOX_KERNEL_THUNK_TABLE_BASE;
+static uint32_t g_thunk_table_count = 0;
+
+void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
+{
+    if (count > XBOX_KERNEL_THUNK_TABLE_SIZE) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
+            "Thunk count %u exceeds capacity %u; clamping",
+            count, (unsigned)XBOX_KERNEL_THUNK_TABLE_SIZE);
+        count = XBOX_KERNEL_THUNK_TABLE_SIZE;
+    }
+
+    g_thunk_table_va    = xbox_va;
+    g_thunk_table_count = count;
+}
+
+uint32_t xbox_kernel_get_thunk_address(void)
+{
+    return g_thunk_table_va;
+}
+
+uint32_t xbox_kernel_get_thunk_count(void)
+{
+    return g_thunk_table_count;
+}
 
 /* ============================================================================
  * Logging Implementation
@@ -290,31 +326,6 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
 }
 
 /* ============================================================================
- * Ordinal List
- *
- * The 147 ordinals imported by Burnout 3, in thunk table order.
- * Extracted from the XBE kernel thunk table at VA 0x0036B7C0.
- * ============================================================================ */
-
-static const ULONG g_thunk_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE] = {
-      1,   2,   3,   4,   8,  15,  16,  17,  23,  24,   /* 0-9   */
-     40,  41,  42,  44,  46,  47,  49,  62,  65,  67,   /* 10-19 */
-     69,  71,  74,  81,  83,  84,  85,  86,  87,  95,   /* 20-29 */
-     97,  98,  99, 100, 107, 109, 113, 119, 124, 126,   /* 30-39 */
-    127, 128, 129, 137, 139, 142, 143, 145, 149, 150,   /* 40-49 */
-    151, 153, 156, 158, 159, 160, 161, 164, 165, 166,   /* 50-59 */
-    168, 169, 170, 171, 173, 175, 176, 178, 179, 180,   /* 60-69 */
-    181, 182, 184, 187, 189, 190, 193, 195, 196, 197,   /* 70-79 */
-    198, 199, 200, 202, 203, 207, 210, 211, 215, 217,   /* 80-89 */
-    218, 219, 222, 225, 226, 228, 233, 234, 236, 238,   /* 90-99 */
-    246, 247, 250, 252, 253, 255, 256, 258, 259, 260,   /* 100-109 */
-    269, 277, 279, 289, 291, 294, 301, 302, 304, 305,   /* 110-119 */
-    308, 312, 322, 323, 324, 325, 326, 327, 328, 335,   /* 120-129 */
-    336, 337, 338, 339, 340, 344, 345, 346, 347, 349,   /* 130-139 */
-    353, 354, 355, 356, 357, 358, 359,                   /* 140-146 */
-};
-
-/* ============================================================================
  * Unresolved Thunk Handler
  *
  * Called if game code tries to use a thunk slot that wasn't resolved.
@@ -333,16 +344,19 @@ static void __stdcall xbox_unresolved_thunk(void)
 /* ============================================================================
  * xbox_kernel_init - Initialize the kernel replacement layer
  *
- * Must be called before any game code runs. Sets up:
+ * Must be called before any game code runs, and AFTER xbox_MemoryLayoutInit()
+ * so that (a) the XBE is mapped and (b) the per-title thunk VA and count are
+ * known. Sets up:
  *   1. Logging system
- *   2. Path translation
- *   3. Thunk table (all 147 entries)
+ *   2. Host-side thunk table, from the ordinals in the loaded XBE
  * ============================================================================ */
 
 void xbox_kernel_init(void)
 {
     ULONG resolved = 0;
     ULONG unresolved = 0;
+    uint32_t thunk_count;
+    uint32_t thunk_va;
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
@@ -366,28 +380,56 @@ void xbox_kernel_init(void)
         xbox_KrnlVersion.Major, xbox_KrnlVersion.Minor,
         xbox_KrnlVersion.Build, xbox_KrnlVersion.Qfe);
 
-    /* Fill thunk table */
-    for (ULONG i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        ULONG ordinal = g_thunk_ordinals[i];
-        ULONG_PTR ptr = xbox_resolve_ordinal(ordinal);
+    /*
+     * Fill the host-side thunk table from the ordinals the title actually
+     * imports. The XBE stores each unresolved entry as (0x80000000 | ordinal);
+     * we read them straight out of mapped Xbox memory rather than carrying a
+     * per-game ordinal list in engine code.
+     *
+     * Only the entries the title declares are walked. Iterating a fixed 366
+     * would read whatever .rdata follows a shorter table and report hundreds
+     * of phantom "unresolved ordinal 0" errors.
+     */
+    thunk_count = xbox_kernel_get_thunk_count();
+    thunk_va    = xbox_kernel_get_thunk_address();
 
-        if (ptr) {
-            xbox_kernel_thunk_table[i] = ptr;
-            resolved++;
-        } else {
-            /* Point unresolved thunks to our error handler */
-            xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
-            unresolved++;
+    if (thunk_count == 0) {
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THUNK,
+            "Kernel thunk table not discovered - was xbox_MemoryLayoutInit() "
+            "called first? Skipping thunk resolution.");
+    } else {
+        ptrdiff_t mem_offset = xbox_GetMemoryOffset();
+
+        xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
+            "Kernel thunk table: %u entries at Xbox VA 0x%08X",
+            thunk_count, thunk_va);
+
+        for (ULONG i = 0; i < thunk_count; i++) {
+            uint32_t entry = *(volatile uint32_t *)
+                ((uintptr_t)(thunk_va + i * 4) + mem_offset);
+            ULONG ordinal = (entry & 0x80000000u) ? (entry & 0x7FFFFFFFu) : 0;
+            ULONG_PTR ptr = ordinal ? xbox_resolve_ordinal(ordinal) : 0;
+
+            if (ptr) {
+                xbox_kernel_thunk_table[i] = ptr;
+                resolved++;
+            } else {
+                /* Point unresolved thunks to our error handler */
+                xbox_kernel_thunk_table[i] = (ULONG_PTR)xbox_unresolved_thunk;
+                unresolved++;
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
+                    "Slot %u: no implementation for kernel ordinal %u", i, ordinal);
+            }
         }
-    }
 
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
-        "Thunk table: %u/%u resolved, %u unresolved",
-        resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, unresolved);
+        xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
+            "Thunk table: %u/%u resolved, %u unresolved",
+            resolved, thunk_count, unresolved);
 
-    if (unresolved > 0) {
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
-            "WARNING: %u kernel imports are unresolved - game may crash!", unresolved);
+        if (unresolved > 0) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
+                "WARNING: %u kernel imports are unresolved - game may crash!", unresolved);
+        }
     }
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,

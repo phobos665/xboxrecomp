@@ -430,22 +430,41 @@ typedef VOID (*PIO_APC_ROUTINE)(
 
 /*
  * The kernel thunk table is an array of function pointers at a game-specific VA.
- * The address is parsed from the XBE header at runtime. Game code calls kernel
- * functions via: call [thunk_addr]. We fill this table with our xbox_* implementations.
+ * Game code calls kernel functions via: call [thunk_addr].
  *
- * Legacy define for backward compatibility (Burnout 3 address).
- * New code should use xbox_kernel_set_thunk_address() instead.
+ * BOTH the address and the entry count are per-title. They are parsed from the
+ * XBE header's KernelImageThunkAddress field by xbox_MemoryLayoutInit(), which
+ * calls xbox_kernel_set_thunk_address(). Nothing here may assume a particular
+ * game's layout: reading past the end of a title's real thunk table walks into
+ * unrelated .rdata, and any word there with bit 31 set would be mistaken for an
+ * ordinal and overwritten.
+ *
+ * XBOX_KERNEL_THUNK_TABLE_SIZE is a capacity bound for the fixed slot arrays,
+ * not a count. Use xbox_kernel_get_thunk_count() for the number of live slots.
  */
-#define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0  /* default; overridden at runtime */
 #define XBOX_KERNEL_THUNK_TABLE_SIZE  366  /* max possible Xbox kernel ordinals */
 
+/*
+ * Fallback base used only if the XBE header could not be parsed. This is
+ * Burnout 3's thunk VA and is wrong for every other title; it exists so a
+ * failed parse degrades to the historical behaviour instead of a null deref.
+ */
+#define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0
+
 /**
- * Set the kernel thunk table address for the current game.
- * Call this BEFORE xbox_kernel_bridge_init(). The address is parsed
- * from the XBE header's KernelImageThunkAddress field.
- * If not called, the default (Burnout 3's 0x0036B7C0) is used.
+ * Set the kernel thunk table address and entry count for the current game.
+ * Called by xbox_MemoryLayoutInit() once the XBE header has been parsed, and
+ * therefore BEFORE xbox_kernel_init() and xbox_kernel_bridge_init().
+ *
+ * A count of 0, or one above XBOX_KERNEL_THUNK_TABLE_SIZE, is clamped.
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
+
+/** Xbox VA of the current title's kernel thunk table. */
+uint32_t xbox_kernel_get_thunk_address(void);
+
+/** Number of live entries in the current title's kernel thunk table. */
+uint32_t xbox_kernel_get_thunk_count(void);
 
 extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
@@ -471,7 +490,18 @@ void xbox_path_init(const char* game_dir, const char* save_dir);
  * Returns TRUE on success, FALSE if the path couldn't be translated.
  * win_path_buf must be at least MAX_PATH characters.
  */
-BOOL xbox_translate_path(const char* xbox_path, WCHAR* win_path_buf, DWORD buf_size);
+/*
+ * Host path character type. Win32 file APIs take wide paths; POSIX takes
+ * bytes. kernel_path.c already has a separate implementation per platform —
+ * this is the type they disagree on.
+ */
+#if defined(_WIN32)
+typedef WCHAR xbox_host_char;
+#else
+typedef char  xbox_host_char;
+#endif
+
+BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)

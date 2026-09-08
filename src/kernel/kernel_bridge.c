@@ -3,7 +3,9 @@
  *
  * Problem:
  *   Translated game code calls kernel functions via indirect calls through
- *   the kernel thunk table at VA 0x0036B7C0. In the XBE file, these entries
+ *   the kernel thunk table, whose VA and length are per-title and come from
+ *   the XBE header via xbox_kernel_get_thunk_address/count(). In the XBE file,
+ *   these entries
  *   contain unresolved ordinals (0x80000000 | ordinal). On real Xbox hardware,
  *   the kernel loader replaces these with actual function pointers before the
  *   game runs.
@@ -1661,14 +1663,28 @@ void xbox_kernel_bridge_init(void)
     int unbridged = 0;
     DWORD old_protect;
 
-    fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
-            XBOX_KERNEL_THUNK_TABLE_SIZE, XBOX_KERNEL_THUNK_TABLE_BASE);
+    /*
+     * Both the base and the length are per-title. Walking a fixed count from a
+     * fixed base reads whatever .rdata follows a shorter table, and any word
+     * there with bit 31 set would be mistaken for an ordinal and overwritten.
+     */
+    uint32_t thunk_base  = xbox_kernel_get_thunk_address();
+    uint32_t thunk_count = xbox_kernel_get_thunk_count();
+
+    if (thunk_count == 0) {
+        fprintf(stderr, "  Kernel thunk bridge: table not discovered from the XBE "
+                        "header; nothing to resolve\n");
+        return;
+    }
+
+    fprintf(stderr, "  Kernel thunk bridge: resolving %u entries at 0x%08X\n",
+            thunk_count, thunk_base);
 
     /* The thunk table lives in .rdata which is marked PAGE_READONLY.
      * Temporarily make it writable so we can patch the ordinals. */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)thunk_base + g_xbox_mem_offset),
+        thunk_count * 4,
         PAGE_READWRITE,
         &old_protect
     );
@@ -1676,8 +1692,8 @@ void xbox_kernel_bridge_init(void)
     /* Initialize kernel data export values first */
     kernel_data_init();
 
-    for (i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        uint32_t va = XBOX_KERNEL_THUNK_TABLE_BASE + i * 4;
+    for (i = 0; i < (int)thunk_count; i++) {
+        uint32_t va = thunk_base + i * 4;
         uint32_t current = BRIDGE_MEM32(va);
 
         if (current & 0x80000000) {
@@ -1714,15 +1730,17 @@ void xbox_kernel_bridge_init(void)
 
     /* Restore original protection */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)thunk_base + g_xbox_mem_offset),
+        thunk_count * 4,
         old_protect,
         &old_protect
     );
 
-    fprintf(stderr, "  Kernel thunk bridge: %d/%d resolved (%d bridged, %d stub)\n",
-            resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, bridged, unbridged);
-    fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
-            KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
+    fprintf(stderr, "  Kernel thunk bridge: %d/%u resolved (%d bridged, %d stub)\n",
+            resolved, thunk_count, bridged, unbridged);
+    if (resolved > 0) {
+        fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
+                KERNEL_VA_BASE, KERNEL_VA_BASE + (thunk_count - 1) * 4);
+    }
 
 }
