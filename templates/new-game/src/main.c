@@ -38,6 +38,7 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include "title_overrides.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -191,6 +192,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
     xbox_kernel_init();
+
+    /* Step 3b: Validate and index per-title overrides.
+     * Aborts if any override lacks a reason, and logs the active table so the
+     * boot log records which per-title deviations are in force. */
+    recomp_overrides_init();
 
     /* Step 4: Set game directory for file I/O path translation */
     {

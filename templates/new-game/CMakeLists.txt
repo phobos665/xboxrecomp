@@ -47,7 +47,8 @@ file(GLOB RECOMP_GEN_SOURCES "src/recomp/gen/*.c")
 # Core game sources
 set(GAME_SOURCES
     src/main.c
-    src/recomp_manual.c
+    src/recomp_manual.c      # engine: override dispatch + ICALL diagnostics
+    src/title_overrides.c    # per-title data: the only file game hacks go in
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c

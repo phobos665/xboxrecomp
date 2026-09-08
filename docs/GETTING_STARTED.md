@@ -132,7 +132,8 @@ add_subdirectory(path/to/xboxrecomp)
 # Your game executable
 add_executable(my_game
     src/main.c                          # Entry point, window, game loop
-    src/game/recomp/recomp_manual.c     # Manual function overrides
+    src/game/recomp/recomp_manual.c     # Engine: override dispatch, ICALL diagnostics
+    src/game/recomp/title_overrides.c   # Per-title data: the only file game hacks go in
     src/game/recomp/gen/recomp_0000.c   # Generated code
     src/game/recomp/gen/recomp_0001.c
     # ... all gen files
@@ -238,16 +239,23 @@ This tells you: function at 0x000165F0 tried to call 0x001A3F50, but it's not in
 When a recompiled function doesn't work (crashes, loops forever, reads hardware), replace it:
 
 ```c
-// In recomp_manual.c
-void sub_001A3F50(void) {
-    // The original function reads GPU registers we haven't set up.
-    // For now, just return success.
-    eax = 1;
-    esp += 4; return;  // Clean up fake return address
+// In title_overrides.c -- the per-title data file, never in engine code.
+static void stub_sub_001A3F50(void) {
+    // Reads GPU registers we have not set up yet; report success.
+    g_eax = 1;
 }
+
+const recomp_override_t g_title_overrides[] = {
+    RECOMP_OVERRIDE(0x001A3F50, stub_sub_001A3F50,
+        "Polls NV2A status registers the D3D8 HLE never writes; "
+        "remove once nv2a_core reports idle"),
+    { 0, 0, 0, 0 }
+};
 ```
 
-Register your override in the manual lookup table so ICALLs find it.
+The reason is a required argument. `recomp_overrides_init()` refuses to start
+on an entry without one, and logs the whole table at boot, so per-title
+deviations show up in the log rather than only in the source.
 
 ## Step 9: Get to Menus
 

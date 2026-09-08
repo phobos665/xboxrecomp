@@ -293,7 +293,7 @@ void sub_001CFDD0(void) {  // NtFlushBuffersFile or push buffer wait
 }
 #endif
 ```
-Then add a stub in `recomp_manual.c` that returns immediately.
+Then add a stub to `title_overrides.c` that returns immediately, with a reason saying what state it is faking and what would let it be deleted.
 
 ### Access Violation at 0x00000000
 
