@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config
-from .loader import load_image, find_analysis_json, BinaryImage, SectionInfo
+from .loader import load_image, BinaryImage, SectionInfo, _find_analysis_json
 from .engine import DisasmEngine
 from .functions import FunctionDetector
 from .xrefs import build_xrefs, XRefTracker
@@ -70,7 +70,9 @@ class Disassembler:
         if not self.force:
             json_path = self._find_analysis_json()
             if json_path and cache.is_valid(self.xbe_path, json_path,
-                                             self.text_only):
+                                             self.text_only,
+                                             self.extra_sections,
+                                             self.seed_functions):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -136,6 +138,12 @@ class Disassembler:
         if self.verbose:
             print(f"  Total: {total_insns:,d} instructions")
 
+        # Realign after embedded switch tables before anything reads the
+        # instruction stream. See DisasmEngine.resync_jump_tables().
+        n_tables = self.engine.resync_jump_tables()
+        if self.verbose:
+            print(f"  Resynced past {n_tables:,d} embedded jump table(s)")
+
         # Phase 4: Cross-references
         if self.verbose:
             print("\nPhase 4: Building cross-references...")
@@ -154,8 +162,72 @@ class Disassembler:
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
+            realigned = 0
+            mid_instruction = 0
             for addr in self.seed_functions:
+                # Decode there first if the sweep stepped over it. A seed is an
+                # explicit claim that a function starts at this address, and it
+                # is usually the only evidence available -- seeds exist for
+                # entry points that nothing in the image references. But
+                # _build_functions needs instructions at the address to build a
+                # body from, and where the sweep came out of phase there are
+                # none, so the seed was dropped silently.
+                #
+                # Same treatment _pass_call_targets already gives a call target
+                # it has to realign, and for the same reason.
+                # A seed landing *inside* an instruction the sweep already
+                # decoded is not a stream out of phase -- it is a bad seed.
+                # Accepting it manufactures a boundary mid-instruction, and the
+                # new "function" then clamps the end of the real one it sits
+                # in, which loses that function its epilogue.
+                #
+                # Checked before the realign test, not inside it: an earlier
+                # seed's decode_at can already have laid a chain through this
+                # address, which made the address look like a legitimate
+                # boundary and skipped the guard entirely.
+                #
+                # Half-Life 2 has two such slots out of 12,288, and one
+                # (0x00202C2E, six bytes into a 9-byte mov) cut sub_00202BB9
+                # short at 0x00202C31 instead of 0x00202D4F. That function has
+                # 250 callers, and every one got back an unrestored
+                # ebx/esi/ebp/edi and a leaked frame -- which drifts esp until
+                # some later `pop esi` lifts a float off the stack and it gets
+                # used as a `this` pointer.
+                covering = self.engine.instruction_covering(addr)
+                if covering is not None:
+                    # ...unless the seed decodes as a function prologue, in
+                    # which case the sweep is the one out of phase. It drifts
+                    # whenever it walks zero padding or a data table as
+                    # instructions and runs off the end into real code:
+                    # default.xbe's XPP section decodes 001C950600558D at
+                    # 0x00069533, which swallows the `push ebp` at 0x00069538
+                    # that a tail jump targets. Rejecting that seed left the
+                    # target stubbed, and the stub returned without the
+                    # callee's `ret 8` -- which walked esp off by 4 and moved
+                    # the loader's object pointer out from under its own
+                    # vtable.
+                    #
+                    # A prologue is the evidence that separates the two cases:
+                    # the bad HL2 seed at 0x00202C2E is six bytes into a mov
+                    # and decodes as nothing of the kind.
+                    if self.engine.probes_as_prologue(addr):
+                        if self.engine.decode_at(addr):
+                            realigned += 1
+                            self.func_detector._add_candidate(
+                                addr, 0.95, "seed_vtable_thunk")
+                            continue
+                    mid_instruction += 1
+                    continue
+                if addr not in self.engine.instructions:
+                    if self.engine.decode_at(addr):
+                        realigned += 1
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
+            if realigned:
+                print(f"  Realigned {realigned} seeded address(es) the sweep "
+                      f"stepped over")
+            if mid_instruction:
+                print(f"  Rejected {mid_instruction} seed(s) landing inside an "
+                      f"already-decoded instruction")
             if self.verbose:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 
@@ -202,7 +274,8 @@ class Disassembler:
             # Save cache
             json_path = self._find_analysis_json()
             if json_path:
-                cache.save(self.xbe_path, json_path, self.text_only, elapsed)
+                cache.save(self.xbe_path, json_path, self.text_only, elapsed,
+                           self.extra_sections, self.seed_functions)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")
@@ -245,7 +318,7 @@ class Disassembler:
         if self.analysis_json:
             return self.analysis_json
 
-        found = find_analysis_json(Path(self.xbe_path))
+        found = _find_analysis_json(Path(self.xbe_path))
         return str(found) if found else None
 
     def _load_and_print_cached_stats(self) -> None:

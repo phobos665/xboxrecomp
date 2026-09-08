@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.1.0 LANGUAGES C)
+project(xboxrecomp VERSION 0.8.0 LANGUAGES C)
 
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
@@ -23,7 +23,6 @@ add_compile_definitions(
 )
 
 # Option to build examples
-option(XBOXRECOMP_BUILD_EXAMPLES "Build example programs" OFF)
 
 # ── Runtime Libraries ─────────────────────────────────────────
 
@@ -47,8 +46,15 @@ add_subdirectory(src/apu)
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
 
+# USB: MCPX OHCI host controllers. A title's XAPI is statically linked and
+# drives these registers directly, so a pad only exists if they do.
+add_subdirectory(src/usb)
+
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
+
+# Shared FMV player (Media Foundation -> D3D8 texture)
+add_subdirectory(src/video)
 
 # ── Umbrella target ───────────────────────────────────────────
 
@@ -59,12 +65,9 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_d3d8
     xbox_dsound
     xbox_input
+    xbox_usb
     xbox_apu
     xbox_nv2a
+    xbox_video
 )
 
-# ── Examples ──────────────────────────────────────────────────
-
-if(XBOXRECOMP_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif()

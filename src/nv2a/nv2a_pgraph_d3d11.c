@@ -16,7 +16,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <math.h>
 
 /* D3D8 device — we include the full header for COM vtable access */
@@ -35,7 +34,8 @@ extern IDirect3DTexture8 *txd_find(const TXD_Dict *dict, const char *name);
 static int g_textures_loaded = 0;
 #endif
 
-/* Font atlas DXT5 data - game-specific, only available in burnout3 */
+/* Font atlas DXT5 data - reference-title frontend data. Only compiled in when
+ * GAME_HAS_FONT_ATLAS is defined for a title whose HUD needs this mapping. */
 #ifdef GAME_HAS_FONT_ATLAS
 #include "font_atlas_data.h"
 #endif

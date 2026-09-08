@@ -356,6 +356,24 @@ BOOLEAN __stdcall xbox_KeConnectInterrupt(PXBOX_KINTERRUPT Interrupt)
     return TRUE;
 }
 
+BOOLEAN __stdcall xbox_KeDisconnectInterrupt(PXBOX_KINTERRUPT Interrupt)
+{
+    BOOLEAN was_connected;
+
+    if (!Interrupt)
+        return FALSE;
+
+    /* Returns the PREVIOUS connected state, not success. */
+    was_connected = Interrupt->Connected;
+    Interrupt->Connected = FALSE;
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
+        "KeDisconnectInterrupt: interrupt=%p was_connected=%d",
+        Interrupt, (int)was_connected);
+
+    return was_connected;
+}
+
 /* ============================================================================
  * Miscellaneous Port I/O Stubs
  * ============================================================================ */
@@ -421,8 +439,21 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     switch (Option) {
     case AV_OPTION_QUERY_AVPACK:
-        /* Report HDTV/Component pack - allows games to offer 480p/720p */
-        *Result = AV_PACK_HDTV;
+        /* Pack type, video standard and refresh rate, in one word.
+         *
+         * D3D keys its display-mode table on all three: the row flags carry
+         * the pack in 0x000000FF, the standard in 0x0000FF00 and the refresh
+         * in 0x00C00000 (Half-Life 2's 640x480 60Hz row is 0x00480104).
+         * Returning the pack alone left the standard as 0, which matches no
+         * row, so the mode scan ran off the end of the table and device
+         * creation failed with E_FAIL.
+         *
+         * HDTV pack keeps 480p/720p available to titles that offer them;
+         * NTSC-M and 60Hz are the North American retail default, and match
+         * the region reported by ExQueryNonVolatileSetting. */
+        *Result = AV_PACK_HDTV
+                | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
+                | AV_REFRESH_60Hz;
         break;
 
     case AV_OPTION_QUERY_MODE:
@@ -594,6 +625,68 @@ NTSTATUS __stdcall xbox_HalWriteSMBusValue(
 }
 
 /* ============================================================================
+ * HAL Data Exports
+ *
+ * Ordinals 40, 41 and 42 are variables, not functions. Games read them
+ * directly through the thunk table, so the thunk must hand back the address
+ * of real storage -- pointing these at a function is what produced garbage
+ * disk metadata before.
+ *
+ * The strings are counted (Length/MaximumLength), not NUL-terminated, matching
+ * the kernel's STRING type. Values describe the virtual disk we present; no
+ * real hardware is queried.
+ * ============================================================================ */
+
+ULONG xbox_HalDiskCachePartitionCount = 3;
+
+static char g_disk_model[]  = "XBOXRECOMP VIRTUAL HDD";
+static char g_disk_serial[] = "XR0000000000";
+
+XBOX_ANSI_STRING xbox_HalDiskModelNumber = {
+    sizeof(g_disk_model) - 1,
+    sizeof(g_disk_model) - 1,
+    g_disk_model
+};
+
+XBOX_ANSI_STRING xbox_HalDiskSerialNumber = {
+    sizeof(g_disk_serial) - 1,
+    sizeof(g_disk_serial) - 1,
+    g_disk_serial
+};
+
+/*
+ * Video mode the SMC reported at boot. 0 lets title code fall back to querying
+ * the AV pack, which we answer properly in AvGetSavedDataAddress/SMBus.
+ */
+ULONG xbox_HalBootSMCVideoMode = 0;
+
+/*
+ * IDE channel object. Real kernels export a device object for the ATA channel;
+ * drivers only ever pass it back to us, so identity is all that is required.
+ */
+static ULONG g_idex_channel_data = 0x49444558; /* 'IDEX' */
+PVOID xbox_IdexChannelObject = &g_idex_channel_data;
+
+/* ============================================================================
+ * Shutdown Notification
+ * ============================================================================ */
+
+VOID __stdcall xbox_HalRegisterShutdownNotification(
+    PVOID ShutdownRegistration,
+    BOOLEAN Register)
+{
+    /*
+     * Registers a callback to run on reboot/shutdown. We never initiate an
+     * Xbox-style shutdown -- HalReturnToFirmware terminates the process -- so
+     * the callback would never fire. Recorded in the log so a title relying on
+     * shutdown cleanup is visible rather than silently ignored.
+     */
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
+        "HalRegisterShutdownNotification: %s registration=%p (never invoked)",
+        Register ? "register" : "unregister", ShutdownRegistration);
+}
+
+/* ============================================================================
  * Unknown Ordinal Stubs
  * ============================================================================ */
 
@@ -610,4 +703,76 @@ VOID __stdcall xbox_Unknown_23(void)
 VOID __stdcall xbox_Unknown_42(void)
 {
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL, "Unknown ordinal 42 called (stubbed)");
+}
+
+/* ============================================================================
+ * Debug / Timing
+ * ============================================================================ */
+
+VOID __stdcall xbox_DbgBreakPoint(void)
+{
+    /*
+     * Titles call this from assertion paths. Under a debugger this should
+     * break; without one, raising a breakpoint exception would terminate the
+     * process on a condition the title may well survive. Log loudly and
+     * continue, and only actually break when a debugger is attached to catch it.
+     */
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL, "DbgBreakPoint called by title");
+
+    if (IsDebuggerPresent())
+        DebugBreak();
+}
+
+ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
+{
+    /*
+     * Time since boot in NT 100ns units. GetTickCount64 is milliseconds, so
+     * scale by 10,000. Resolution is coarser than the real kernel's, but it is
+     * monotonic, which is the property callers actually depend on.
+     */
+    return (ULONGLONG)GetTickCount64() * 10000ULL;
+}
+
+/* ============================================================================
+ * Time stamp counter
+ *
+ * Xbox's QueryPerformanceCounter is a bare `rdtsc`, and its
+ * QueryPerformanceFrequency returns the CPU clock as a constant the title
+ * compiles in: Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7.
+ * So a frame timer computes seconds as counter / 733333333.
+ *
+ * Returning the host's own TSC would make that division wrong by the ratio of
+ * the two clocks -- a 3.5 GHz host would have the guest believe nearly five
+ * seconds had passed for every real one. Scaling the host's performance
+ * counter to the console's rate keeps the guest's arithmetic honest.
+ *
+ * Monotonic and shared by every thread, which is what a TSC is. The first
+ * call establishes the origin so the counter starts near zero rather than at
+ * whatever the host had been running for.
+ * ========================================================================= */
+#define XBOX_TSC_HZ 733333333ull
+
+uint64_t xbox_ReadTimeStampCounter(void)
+{
+    static LARGE_INTEGER freq;
+    static LARGE_INTEGER origin;
+    LARGE_INTEGER now;
+
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&origin);
+        if (freq.QuadPart == 0)
+            freq.QuadPart = 1;
+    }
+    QueryPerformanceCounter(&now);
+
+    {
+        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
+        /* Split the scaling so a long run cannot overflow: whole seconds
+         * first, then the remainder. */
+        uint64_t secs = ticks / (uint64_t)freq.QuadPart;
+        uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
+        return secs * XBOX_TSC_HZ
+             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
+    }
 }

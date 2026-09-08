@@ -11,6 +11,17 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Sections that hold data even when the XBE marks them executable. Excluded
+# from disassembly by name; --extra-sections overrides this per title.
+#
+# Only the conventional PE data sections are listed. XDK library sections are
+# NOT excluded even when their name suggests data (DSOUND_RD, D3D_RD, XON_RD):
+# the linker maps class those as CODE, and they are exactly the sections we
+# want disassembled.
+DATA_SECTION_NAMES = frozenset({
+    ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
+})
+
 
 @dataclass
 class SectionInfo:
@@ -119,8 +130,21 @@ class BinaryImage:
         return [s for s in self.sections if s.executable]
 
     def get_code_sections(self) -> List[SectionInfo]:
-        """Return sections suitable for disassembly (executable, have raw data)."""
-        return [s for s in self.sections if s.executable and s.raw_size > 0]
+        """Return sections suitable for disassembly.
+
+        The executable flag alone is not a usable signal: Xbox linkers mark
+        nearly every section executable, including .data. Disassembling those
+        yields phantom functions built out of zero-fill -- runs of 00 00 decode
+        as `add [eax], al`, and the lifter happily emits C for them (one such
+        phantom referenced a nonexistent `cr7` and broke the build).
+
+        So data sections are excluded by name regardless of their flags. A
+        title that genuinely hides code in one of them can put it back with
+        --extra-sections, which is exactly what that flag is for.
+        """
+        return [s for s in self.sections
+                if s.executable and s.raw_size > 0
+                and s.name not in DATA_SECTION_NAMES]
 
 
 def _parse_hex(s: str) -> int:
@@ -128,43 +152,43 @@ def _parse_hex(s: str) -> int:
     return int(s, 16)
 
 
-# Names we will accept for the stage-1 analysis JSON, most specific first.
-# "<xbe stem>_analysis.json" lets several titles share one directory; the
-# others are the conventional names. "burnout3_analysis.json" is kept only so
-# existing working trees do not break.
-ANALYSIS_JSON_NAMES = (
-    "{stem}_analysis.json",
-    "g_analysis.json",
-    "analysis.json",
-    "xbe_analysis.json",
-    "burnout3_analysis.json",
-)
+def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
+    """Auto-detect the analysis JSON for this XBE.
 
+    Written by ``tools.xbe_parser --json``, so the name is per-game rather than
+    hardcoded to one title.
 
-def find_analysis_json(xbe_path: Path) -> Optional[Path]:
-    """Auto-detect the stage-1 analysis JSON produced by tools.xbe_parser.
-
-    Searched next to the XBE first, then in the xbe_parser tool directory.
-    Returns None if nothing matches, in which case the caller should fall back
-    to parsing section headers out of the XBE directly.
+    The exact ``<stem>_analysis.json`` always wins. A bare ``*_analysis.json``
+    glob is only accepted when the directory holds a single XBE: a disc that
+    ships one binary per region keeps them side by side -- Wreckless has seven
+    in one folder -- and taking the first sorted match there hands DSTEAL_JP.xbe
+    the analysis written for default.xbe. Different entry point, different
+    section layout, no warning. Data from the wrong binary is worse than none,
+    because everything downstream still runs.
     """
-    xbe_path = Path(xbe_path)
     search_dirs = [
+        # Same directory as XBE
         xbe_path.parent,
+        # In the xbe_parser tool directory
         Path("tools/xbe_parser"),
+        # Relative to repo root
         xbe_path.parent.parent / "tools" / "xbe_parser",
     ]
-
-    for directory in search_dirs:
-        for name in ANALYSIS_JSON_NAMES:
-            candidate = directory / name.format(stem=xbe_path.stem)
-            if candidate.exists():
-                return candidate
+    for d in search_dirs:
+        exact = d / (xbe_path.stem + "_analysis.json")
+        if exact.exists():
+            return exact
+    for d in search_dirs:
+        try:
+            ambiguous = len(list(d.glob("*.xbe"))) > 1
+        except OSError:
+            continue
+        if ambiguous:
+            continue
+        # sorted() so the pick is deterministic when a dir holds several
+        for p in sorted(d.glob("*_analysis.json")):
+            return p
     return None
-
-
-# Backwards-compatible alias for the previous private name.
-_find_analysis_json = find_analysis_json
 
 
 def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImage:
@@ -173,7 +197,7 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
 
     Args:
         xbe_path: Path to the .xbe file.
-        analysis_json: Optional path to the stage-1 analysis JSON.
+        analysis_json: Optional path to burnout3_analysis.json.
                        If None, auto-detected from standard locations.
 
     Returns:
@@ -193,9 +217,19 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
     # Find and load analysis JSON
     json_path = Path(analysis_json) if analysis_json else _find_analysis_json(xbe_file)
     if json_path is None or not json_path.exists():
+        # Name the file it wants and the command that writes it. The old
+        # message said only "run the XBE parser first", which left the reader
+        # to guess both the filename and where it goes -- one did, passed
+        # `--json JSON`, and then had to pass `--analysis-json JSON` here to
+        # get past it. Auto-detection needs the exact name.
+        wanted = xbe_file.parent / (xbe_file.stem + "_analysis.json")
         raise FileNotFoundError(
-            f"Analysis JSON not found. Run the XBE parser first, or specify "
-            f"--analysis-json path. Searched near: {xbe_file}"
+            f"Analysis JSON not found: {wanted}\n"
+            f"  Write it with:  py -3 -m tools.xbe_parser {xbe_file} "
+            f"--json {wanted}\n"
+            f"  The name matters -- this step looks for "
+            f"<xbe stem>_analysis.json beside the XBE. A file somewhere else, "
+            f"or under another name, needs --analysis-json <path>."
         )
 
     with open(json_path) as f:

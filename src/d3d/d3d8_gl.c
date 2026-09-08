@@ -22,6 +22,7 @@
  */
 
 #include "d3d8_xbox.h"
+#include "d3d8_fvf.h"
 
 #include <SDL.h>
 #include <epoxy/gl.h>
@@ -43,6 +44,15 @@
 /* ======================================================================== */
 
 #define MAX_RS    256
+
+/* Window title for the SDL window, configurable per title via
+ * xbox_D3D8SetWindowTitle(). Default is a generic name. */
+static const char *g_window_title = "Xbox Game";
+
+void xbox_D3D8SetWindowTitle(const char *title)
+{
+    g_window_title = (title && title[0]) ? title : "Xbox Game";
+}
 #define MAX_TSS   33
 #define MAX_TSU   8     /* texture stages */
 
@@ -656,7 +666,7 @@ static HRESULT __stdcall dev_GetIndices(IDirect3DDevice8 *s, IDirect3DIndexBuffe
  * this point: XYZ (or XYZRHW) + DIFFUSE + optional TEX1. */
 static void setup_fvf_attribs(DWORD fvf, UINT stride)
 {
-    GLboolean xyzrhw = (fvf & D3DFVF_XYZRHW) ? GL_TRUE : GL_FALSE;
+    GLboolean xyzrhw = d3d8_fvf_transformed(fvf) ? GL_TRUE : GL_FALSE;
     GLboolean has_diff = (fvf & D3DFVF_DIFFUSE) ? GL_TRUE : GL_FALSE;
     GLboolean has_tex  = ((fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT) > 0;
     UINT off = 0;
@@ -664,7 +674,8 @@ static void setup_fvf_attribs(DWORD fvf, UINT stride)
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, xyzrhw ? 4 : 3, GL_FLOAT, GL_FALSE, stride,
                           (const void *)(uintptr_t)off);
-    off += (xyzrhw ? 4 : 3) * sizeof(float);
+    off = d3d8_fvf_position_bytes(fvf);
+    if (fvf & D3DFVF_NORMAL) off += 12;
     /* Diffuse: D3DCOLOR (BGRA byte order, normalised to 0..1) */
     if (has_diff) {
         glEnableVertexAttribArray(1);
@@ -712,7 +723,7 @@ static void update_mvp(DWORD fvf)
     mat4_mul(&mvp, &wv, &g.m_proj);
     /* GL is column-major; D3D MATRIX is row-major. Tell GL to transpose. */
     glUniformMatrix4fv(g.u_mvp, 1, GL_TRUE, (const GLfloat *)mvp.m);
-    glUniform1i(g.u_use_xform, (fvf & D3DFVF_XYZRHW) ? 0 : 1);
+    glUniform1i(g.u_use_xform, d3d8_fvf_transformed(fvf) ? 0 : 1);
 }
 
 static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *s, D3DPRIMITIVETYPE pt,
@@ -979,7 +990,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    g.window = SDL_CreateWindow("Burnout 3: Takedown",
+    g.window = SDL_CreateWindow(g_window_title,
                                 SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                                 g.backbuf_w, g.backbuf_h,
                                 SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);

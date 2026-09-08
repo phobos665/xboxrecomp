@@ -20,17 +20,27 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    icall_feedback.c
+    recomp_trace.c
+    nv2a_pb_scan.c
+    nv2a_pb_exec.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
+# See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
+# CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
+get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+
 target_include_directories(xbox_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
+    ${XBOXRECOMP_SRC_DIR}
 )
 
 if(WIN32)
-    target_link_libraries(xbox_kernel PUBLIC kernel32 bcrypt)
+    # platform is an INTERFACE target on Windows: it contributes the src/
+    # include path that "platform/xbox_winnt.h" resolves against.
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
