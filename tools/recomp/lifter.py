@@ -14,6 +14,7 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import re
 import struct
 
 from .disasm import Instruction, Operand
@@ -93,6 +94,71 @@ def _mem_accessor(size):
 def _smem_accessor(size):
     """Return the signed MEM macro for a given operand size."""
     return {1: "SMEM8", 2: "SMEM16", 4: "SMEM32"}.get(size, "SMEM32")
+
+
+_FPU_REG_RE = re.compile(r"st\(?([0-7])\)?")
+
+
+def _fpu_stack_index(op):
+    """Return the x87 stack index for a register operand, or None."""
+    if op is None or getattr(op, "type", None) != "reg" or not op.reg:
+        return None
+    match = _FPU_REG_RE.fullmatch(op.reg.strip().lower())
+    return int(match.group(1)) if match else None
+
+
+def _fmt_fpu_stack_register(op):
+    """Format an ST(i) operand. Defaults to ST(1), the implicit destination."""
+    index = _fpu_stack_index(op)
+    if index is None:
+        return "fp_st1()"
+    if index == 0:
+        return "fp_top()"
+    if index == 1:
+        return "fp_st1()"
+    return f"fp_st({index})"
+
+
+def _fmt_fpu_operand(op, integer=False):
+    """Format an x87 source operand: memory (real or integer) or ST(i).
+
+    x87 loads m32fp/m64fp as float/double and m16int/m32int/m64int as signed
+    integers; the FI* instructions are the integer forms.
+    """
+    if getattr(op, "type", None) == "mem":
+        if integer:
+            return f"{_smem_accessor(op.mem_size)}({_fmt_mem(op)})"
+        if op.mem_size == 8:
+            return f"MEMD({_fmt_mem(op)})"
+        return f"MEMF({_fmt_mem(op)})"
+    return _fmt_fpu_stack_register(op)
+
+
+# Arithmetic forms: operator, reversed operands, pops afterwards, integer source.
+#
+# The reversed forms (FSUBR/FDIVR) compute source - destination rather than
+# destination - source, which is the whole reason they exist; emitting them as
+# the non-reversed operation is silently wrong rather than merely imprecise.
+_FPU_ARITH = {
+    "fadd":   ("+", False, False, False),
+    "faddp":  ("+", False, True,  False),
+    "fiadd":  ("+", False, False, True),
+    "fmul":   ("*", False, False, False),
+    "fmulp":  ("*", False, True,  False),
+    "fimul":  ("*", False, False, True),
+    "fsub":   ("-", False, False, False),
+    "fsubp":  ("-", False, True,  False),
+    "fisub":  ("-", False, False, True),
+    "fsubr":  ("-", True,  False, False),
+    "fsubrp": ("-", True,  True,  False),
+    "fisubr": ("-", True,  False, True),
+    "fdiv":   ("/", False, False, False),
+    "fdivp":  ("/", False, True,  False),
+    "fidiv":  ("/", False, False, True),
+    "fdivr":  ("/", True,  False, False),
+    "fdivrp": ("/", True,  True,  False),
+    "fidivr": ("/", True,  False, True),
+}
 
 
 def _fmt_mem(op):
@@ -1426,6 +1492,11 @@ class Lifter:
                     elif ops[0].mem_size == 8:
                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
+                # `fld st(i)` duplicates a stack entry. Read the source before
+                # pushing: the push moves the stack, so fp_st(i) would name a
+                # different slot afterwards.
+                src = _fmt_fpu_stack_register(ops[0])
+                return [f"{{ double _t = {src}; fp_push(_t); }} /* fld {insn.op_str} */"]
             return [f"/* fld {insn.op_str} */"]
 
         if m in ("fst", "fstp"):
@@ -1443,28 +1514,60 @@ class Lifter:
                 return [f"fp_push((double){smem}({_fmt_mem(ops[0])})); /* fild */"]
             return [f"/* fild {insn.op_str} */"]
 
-        if m in ("fist", "fistp"):
+        if m in ("fist", "fistp", "fisttp"):
             if len(ops) >= 1 and ops[0].type == "mem":
-                mem_acc = _mem_accessor(ops[0].mem_size)
-                return [f"{mem_acc}({_fmt_mem(ops[0])}) = (int32_t)fp_top(); /* {m} */"]
+                size = ops[0].mem_size or 4
+                mem_acc = _mem_accessor(size)
+                ctype = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(size, "int32_t")
+                # FIST/FISTP round according to the FPU control word, whose
+                # default is round-to-nearest-even. Truncating instead is a
+                # silent off-by-one on exactly half the inputs. FISTTP is the
+                # SSE3 instruction that genuinely truncates.
+                value = "fp_top()" if m == "fisttp" else "nearbyint(fp_top())"
+                pop = " fp_pop();" if m in ("fistp", "fisttp") else ""
+                return [f"{mem_acc}({_fmt_mem(ops[0])}) = ({ctype}){value};{pop}"
+                        f" /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
-        if m == "fadd":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* fadd */"]
-        if m == "faddp":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* faddp */"]
-        if m == "fsub":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsub */"]
-        if m == "fsubp":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsubp */"]
-        if m == "fmul":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmul */"]
-        if m == "fmulp":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmulp */"]
-        if m == "fdiv":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdiv */"]
-        if m == "fdivp":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdivp */"]
+        if m in _FPU_ARITH:
+            operator, reverse, pops, integer = _FPU_ARITH[m]
+
+            mem_ops = [o for o in ops if getattr(o, "type", None) == "mem"]
+            reg_ops = [o for o in ops if getattr(o, "type", None) == "reg"]
+
+            if mem_ops:
+                # Memory forms operate on ST(0) and never pop.
+                dest = "fp_top()"
+                src = _fmt_fpu_operand(mem_ops[0], integer=integer)
+                pops = False
+            elif len(reg_ops) >= 2:
+                # Intel order: the first operand is the destination.
+                #   fadd  st(0), st(i)  ->  ST(0) = ST(0) + ST(i)
+                #   fadd  st(i), st(0)  ->  ST(i) = ST(i) + ST(0)
+                dest = _fmt_fpu_stack_register(reg_ops[0])
+                src = _fmt_fpu_stack_register(reg_ops[1])
+            elif len(reg_ops) == 1:
+                if pops:
+                    # `fsubp st(i)` is `fsubp st(i), st(0)`.
+                    dest = _fmt_fpu_stack_register(reg_ops[0])
+                    src = "fp_top()"
+                else:
+                    # `fadd st(i)` is the D8 form, `fadd st(0), st(i)`.
+                    dest = "fp_top()"
+                    src = _fmt_fpu_stack_register(reg_ops[0])
+            else:
+                # No operands: the implicit ST(1), ST(0) form.
+                dest = "fp_st1()"
+                src = "fp_top()"
+
+            if reverse:
+                body = f"{dest} = {src} {operator} {dest};"
+            else:
+                body = f"{dest} = {dest} {operator} {src};"
+            if pops:
+                body += " fp_pop();"
+            comment = f"/* {m} {insn.op_str} */" if insn.op_str else f"/* {m} */"
+            return [f"{body} {comment}"]
         if m == "fchs":
             return [f"fp_top() = -fp_top(); /* fchs */"]
         if m == "fabs":
@@ -1472,17 +1575,25 @@ class Lifter:
         if m == "fsqrt":
             return [f"fp_top() = sqrt(fp_top()); /* fsqrt */"]
         if m == "fxch":
-            return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
+            other = _fmt_fpu_stack_register(ops[0]) if ops else "fp_st1()"
+            comment = f"/* fxch {insn.op_str} */" if insn.op_str else "/* fxch */"
+            return [f"{{ double _t = fp_top(); fp_top() = {other}; {other} = _t; }} {comment}"]
         if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
-            # Set _fpu_cmp for the fcomp/fnstsw/sahf pattern
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
-                    f" /* {m} {insn.op_str} */"]
+            # Set _fpu_cmp for the fcomp/fnstsw/sahf pattern. The comparison is
+            # against ST(1) only when no operand is given; FCOMPP pops twice.
+            src = _fmt_fpu_operand(ops[0]) if ops else "fp_st1()"
+            npops = 2 if m.endswith("pp") else (1 if m.endswith("p") else 0)
+            pop_code = " " + " ".join(["fp_pop();"] * npops) if npops else ""
+            comment = f"/* {m} {insn.op_str} */" if insn.op_str else f"/* {m} */"
+            return [f"_fpu_cmp = (fp_top() < {src}) ? -1 : (fp_top() > {src}) ? 1 : 0;"
+                    f"{pop_code} {comment}"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
             # fcompi/fucompi pop st(0) after comparing; fcomi/fucomi do not
             pops = m.endswith("pi") or m.endswith("ip")
+            src = _fmt_fpu_operand(ops[-1]) if ops else "fp_st1()"
             pop_code = " fp_pop();" if pops else ""
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
+            return [f"_fpu_cmp = (fp_top() < {src}) ? -1 : (fp_top() > {src}) ? 1 : 0;"
                     f"{pop_code} /* {m} */"]
         if m == "fnstsw":
             return [f"/* fnstsw {insn.op_str} - store FPU status word */"]

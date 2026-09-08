@@ -141,11 +141,13 @@ void recomp_icall_fail_log(uint32_t va);
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+#define MEM64(addr)  (*(volatile uint64_t *)XBOX_PTR(addr))
 
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
+#define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
 
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))

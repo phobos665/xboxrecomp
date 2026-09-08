@@ -315,7 +315,8 @@ class FunctionTranslator:
             lines.append(f"    #define fp_pop() (_fp_top++)")
             lines.append(f"    #define fp_popp() (fp_pop())")
             lines.append(f"    #define fp_top() _fp_stack[_fp_top & 7]")
-            lines.append(f"    #define fp_st1() _fp_stack[(_fp_top + 1) & 7]")
+            lines.append(f"    #define fp_st(i) _fp_stack[(_fp_top + (i)) & 7]")
+            lines.append(f"    #define fp_st1() fp_st(1)")
 
         # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
         # In x86, these functions inherit EBP from their caller (typically
@@ -410,6 +411,7 @@ class FunctionTranslator:
             lines.append(f"    #undef fp_pop")
             lines.append(f"    #undef fp_popp")
             lines.append(f"    #undef fp_top")
+            lines.append(f"    #undef fp_st")
             lines.append(f"    #undef fp_st1")
 
         lines.append(f"}}")
