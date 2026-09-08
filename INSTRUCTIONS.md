@@ -1,6 +1,6 @@
 # Recompiling a game
 
-A start-to-finish walkthrough. Seven steps, in order.
+A start-to-finish walkthrough. Eight steps, in order.
 
 This turns an Xbox game you own into a native executable. You need the game
 files from your own disc — none ship here, and none ever will.
@@ -197,7 +197,70 @@ fix belongs there, it belongs in the toolkit for everyone.
 
 ---
 
-## 7. Know when it isn't your bug
+## 7. The two tools worth adding
+
+You can get a long way on stderr alone, but two external tools change what is
+possible. Each answers a different question — reach for the right one.
+
+### xemu — "what does the real thing do?"
+
+xemu runs the same game correctly. Launch it with its GDB stub and you have a
+reference to compare against:
+
+```bash
+xemu -s -S      # -s opens GDB on :1234, -S waits for you to attach
+```
+
+Use it for anything about **live** behaviour: what a kernel call actually
+returns, what a struct contains at a given moment, what value a register holds
+when a function is entered.
+
+This is the only practical way to solve the no-crash divergence case. Break at
+the same function in both, dump state, and find the first disagreement. Add a
+state-dump hook to your build early so this is a flag rather than a rebuild.
+
+Details in `docs/technical/xemu-debugging.md`.
+
+### Ghidra — "where is this, statically?"
+
+Ghidra answers questions about the binary at rest: function boundaries, cross
+references, what calls what. It is a second opinion on `tools.func_id`, not a
+view of a running game. Its debugger can attach to xemu's GDB stub, but expect
+to fight it over i386 detection — not worth it as a first step.
+
+The toolkit already ships an automated path that is usually enough:
+
+```bash
+bash tools/ghidra_naming/run_ghidra.sh
+```
+
+That runs Ghidra headless, recovers real CRT and XDK symbol names, and merges
+them into `functions.json`, so generated C reads `RwMatrixMultiply` instead of
+`sub_00123ABC`. See `tools/ghidra_naming/README.md`.
+
+**If you drive Ghidra interactively (including via an MCP server), keep queries
+bounded.** Ask for one specific thing — this function's bounds, this address's
+xrefs — and record which binary you asked about. Open-ended exploration
+produces answers you cannot reproduce later, and an address is meaningless
+without knowing which build it came from.
+
+### Which one
+
+| Question | Tool |
+|---|---|
+| What does this kernel call really return? | xemu |
+| What is in this struct at this moment? | xemu |
+| Why does my build differ from the real game? | xemu |
+| Where does this function start and end? | Ghidra |
+| What calls this address? | Ghidra |
+| What is this function's real name? | `ghidra_naming` |
+| What does this XDK/NV2A register mean? | Public Cxbx-Reloaded or nxdk sources |
+
+Read public sources for semantics, then implement independently.
+
+---
+
+## 8. Know when it isn't your bug
 
 An unresolved `[ICALL]` is usually a gap in **function discovery**, not a quirk
 of your game. Re-running discovery fixes it for every title; an override fixes

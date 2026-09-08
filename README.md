@@ -293,6 +293,7 @@ xboxrecomp/
 - [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
+- [Lessons from a Downstream Port](docs/technical/downstream-lessons.md) — What `doaxbv-re` teaches about testing, architecture and tool routing
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
 
 ### Xbox Formats
