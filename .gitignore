@@ -37,3 +37,6 @@ bin/
 *.obj
 *.exe
 tools/split/output/
+
+# Runtime log written by the kernel layer next to the executable
+xbox_kernel.log
