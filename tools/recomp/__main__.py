@@ -119,8 +119,17 @@ def game_categories(classification_db):
     Take every "game_*" category instead, so a new one is included by default,
     and keep "unknown" because an unclassified function is far more likely to
     be game code than library code.
+
+    "crt" is included too, because nothing replaces it. The CRT is statically
+    linked into the XBE and the runtime provides no native substitute, so an
+    excluded CRT function does not become a fast native call -- it becomes a
+    stub that pops the return address and returns whatever was already in eax.
+    Burnout 2 calls _ftol2 510 times; stubbing it makes every float-to-int
+    conversion in the game produce garbage, which surfaces much later as a
+    corrupt pointer in an unrelated function. Excluding library code is only
+    sound once something actually implements it.
     """
-    categories = {"unknown"}
+    categories = {"unknown", "crt"}
     for entry in classification_db.values():
         category = entry.get("category")
         if category and category.startswith("game_"):
