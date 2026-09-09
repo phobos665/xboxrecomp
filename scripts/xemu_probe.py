@@ -172,6 +172,13 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=1234)
     ap.add_argument("--wait", type=float, default=120.0,
                     help="Seconds to wait for the breakpoint (default 120)")
+    ap.add_argument("--read", action="append", default=[], metavar="VA",
+                    type=lambda s: int(s, 0),
+                    help="Also dump the 4-byte word at this absolute guest "
+                         "address when the breakpoint hits. Repeatable -- use "
+                         "it for the function-pointer slots a call goes "
+                         "through, which is what a runtime-populated table "
+                         "looks like from the outside.")
     ap.add_argument("--peek", action="store_true",
                     help="Do not break: just halt, dump 16 bytes at --addr, "
                          "and resume. Use this first to confirm the game is "
@@ -210,6 +217,16 @@ def main() -> int:
                 return 1
             print("  --hw given: setting a hardware breakpoint anyway.")
 
+        if args.read:
+            print("  absolute reads:")
+            for target in args.read:
+                word = gdb.read_memory(target, 4)
+                if word is None:
+                    print(f"    [0x{target:08X}] NOT READABLE")
+                else:
+                    value = struct.unpack("<I", word)[0]
+                    print(f"    [0x{target:08X}] = 0x{value:08X}   {describe(value)}")
+
         if args.peek:
             print("peek only, not breaking.")
             return 0
@@ -236,6 +253,14 @@ def main() -> int:
                 if value is None:
                     continue
                 print(f"  {name} = 0x{value:08X}   {describe(value)}")
+
+            for target in args.read:
+                word = gdb.read_memory(target, 4)
+                if word is None:
+                    print(f"  [0x{target:08X}] NOT READABLE")
+                else:
+                    value = struct.unpack("<I", word)[0]
+                    print(f"  [0x{target:08X}] = 0x{value:08X}   {describe(value)}")
 
             pointer = regs.get(args.deref)
             if pointer:
