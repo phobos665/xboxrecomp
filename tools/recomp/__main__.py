@@ -106,6 +106,28 @@ def check_data_matches_binary(xbe_path, summary_path):
         sys.exit(1)
 
 
+def game_categories(classification_db):
+    """Every category that is game code, plus the unclassified remainder.
+
+    Naming the three categories game_engine/game_vtable/unknown explicitly
+    silently dropped every subsystem func_id manages to identify: on Burnout 2
+    that excluded game_render, game_audio, game_network, game_vehicle, game_io,
+    game_input, game_ui and game_physics. The symptom is an unresolved indirect
+    call into code that was discovered and classified but never translated --
+    the sharper the classifier gets, the more --game-only leaves out.
+
+    Take every "game_*" category instead, so a new one is included by default,
+    and keep "unknown" because an unclassified function is far more likely to
+    be game code than library code.
+    """
+    categories = {"unknown"}
+    for entry in classification_db.values():
+        category = entry.get("category")
+        if category and category.startswith("game_"):
+            categories.add(category)
+    return categories
+
+
 def list_categories(translator):
     """Print category breakdown."""
     cats = {}
@@ -307,7 +329,7 @@ def main():
 
         if args.game_only:
             funcs = translator.get_functions_by_category(
-                categories={"game_engine", "game_vtable", "unknown"})
+                categories=game_categories(translator.classification_db))
         elif args.category:
             funcs = translator.get_functions_by_category(
                 categories={args.category})
@@ -328,13 +350,13 @@ def main():
         funcs = translator.get_functions_by_category(categories=categories)
     elif args.game_only:
         # Game-specific functions only
-        categories = {"game_engine", "game_vtable", "unknown"}
+        categories = game_categories(translator.classification_db)
         funcs = translator.get_functions_by_category(categories=categories)
     elif args.all:
         funcs = translator.get_functions_by_category()
     else:
         # Default: game functions only
-        categories = {"game_engine", "game_vtable", "unknown"}
+        categories = game_categories(translator.classification_db)
         funcs = translator.get_functions_by_category(categories=categories)
 
     print(f"\nTranslating {len(funcs)} functions...", file=sys.stderr)
