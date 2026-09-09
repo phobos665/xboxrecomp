@@ -2920,6 +2920,165 @@ static void bridge_NtReadFile(void)
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
+
+/* Show text a title writes to a file.
+ *
+ * Titles carry their own diagnostics and write them out -- Burnout 2 pairs
+ * RtlInitAnsiString and RtlEqualString with NtWriteFile all through D3D setup.
+ * On a console that text goes to the debug channel and somebody reads it. Here
+ * it went into a file handle and vanished, so the one source that says what
+ * the title thinks is wrong, in its own words, was being discarded.
+ *
+ * Only writes that are actually text are printed, so this stays quiet for save
+ * games and asset streams. Trailing newlines are trimmed because the title
+ * supplies its own and the log adds one.
+ */
+static void bridge_log_guest_text(uint32_t buffer_va, uint32_t length)
+{
+    const unsigned char *p;
+    uint32_t i, printable = 0, n;
+
+    if (!buffer_va || !length || length > 2048)
+        return;
+    p = (const unsigned char *)XBOX_TO_NATIVE(buffer_va);
+    if (!p)
+        return;
+
+    for (i = 0; i < length; i++) {
+        unsigned char c = p[i];
+        if (c == '\t' || c == '\r' || c == '\n' || (c >= 0x20 && c < 0x7F))
+            printable++;
+    }
+    if (printable * 10 < length * 9) {
+        /* Not text. Say what it was anyway -- a title writing binary during
+         * bring-up is saving state or streaming an asset, and which of those
+         * is the difference between progress and a stuck loop. */
+        if (KERNEL_LOG_ON())
+            fprintf(stderr, "  [GUESTWRITE] %u bytes, %02X %02X %02X %02X ...\n",
+                    length, p[0], length > 1 ? p[1] : 0,
+                    length > 2 ? p[2] : 0, length > 3 ? p[3] : 0);
+        return;
+    }
+
+    n = length;
+    while (n && (p[n - 1] == '\n' || p[n - 1] == '\r'))
+        n--;
+    if (!n)
+        return;
+
+    fprintf(stderr, "  [GUESTLOG] %.*s\n", (int)n, (const char *)p);
+    fflush(stderr);
+}
+
+
+/* -- DbgPrint (ordinal 8, cdecl variadic) -----------------
+ * ULONG DbgPrint(PCSTR Format, ...)
+ *
+ * The title's own diagnostics. On a console this goes to the debug channel
+ * and somebody reads it; unrouted here it was the one import Burnout 2 uses
+ * that had no implementation, so the only source that says what the title
+ * thinks is wrong -- in its own words -- was being dropped.
+ *
+ * Expanded here rather than printed raw because the interesting part is
+ * usually the argument: "surface %dx%d format %d" says nothing without them.
+ * cdecl, so the caller cleans and the bridge only reads.
+ *
+ * Deliberately conservative about %s: the pointer comes from guest memory and
+ * a title mid-failure is exactly where it is garbage, so it is range-checked
+ * against the mapping and length-capped rather than handed to printf.
+ */
+static const char *bridge_guest_string(uint32_t va, uint32_t *out_len)
+{
+    const char *p;
+    uint32_t n = 0;
+
+    *out_len = 0;
+    if (!va || (uint64_t)va >= (uint64_t)xbox_GetMappedSize())
+        return NULL;
+    p = (const char *)XBOX_TO_NATIVE(va);
+    if (!p)
+        return NULL;
+    while (n < 512 && (uint64_t)va + n < (uint64_t)xbox_GetMappedSize()
+           && p[n])
+        n++;
+    *out_len = n;
+    return p;
+}
+
+static void bridge_DbgPrint(void)
+{
+    uint32_t fmt_len;
+    const char *fmt = bridge_guest_string(STACK_ARG(0), &fmt_len);
+    char out[1024];
+    uint32_t i, o = 0, arg = 1;
+
+    g_eax = 0;
+    if (!fmt || !fmt_len)
+        return;
+
+    for (i = 0; i < fmt_len && o + 64 < sizeof out; i++) {
+        if (fmt[i] != '%') {
+            out[o++] = fmt[i];
+            continue;
+        }
+        i++;
+        if (i >= fmt_len)
+            break;
+        /* Skip flags, width and precision -- the value is what matters. */
+        while (i < fmt_len && (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' '
+                               || fmt[i] == '#' || fmt[i] == '0'
+                               || (fmt[i] >= '1' && fmt[i] <= '9')
+                               || fmt[i] == '.' || fmt[i] == 'l'
+                               || fmt[i] == 'h'))
+            i++;
+        if (i >= fmt_len)
+            break;
+        switch (fmt[i]) {
+        case '%':
+            out[o++] = '%';
+            break;
+        case 'd': case 'i':
+            o += (uint32_t)sprintf(out + o, "%d", (int)STACK_ARG(arg++));
+            break;
+        case 'u':
+            o += (uint32_t)sprintf(out + o, "%u", STACK_ARG(arg++));
+            break;
+        case 'x':
+            o += (uint32_t)sprintf(out + o, "%x", STACK_ARG(arg++));
+            break;
+        case 'X': case 'p':
+            o += (uint32_t)sprintf(out + o, "%08X", STACK_ARG(arg++));
+            break;
+        case 'c':
+            out[o++] = (char)(STACK_ARG(arg++) & 0xFF);
+            break;
+        case 's': {
+            uint32_t sl;
+            const char *sv = bridge_guest_string(STACK_ARG(arg++), &sl);
+            if (!sv) {
+                o += (uint32_t)sprintf(out + o, "(bad ptr)");
+            } else {
+                if (sl > sizeof out - o - 64)
+                    sl = (uint32_t)(sizeof out - o - 64);
+                memcpy(out + o, sv, sl);
+                o += sl;
+            }
+            break;
+        }
+        default:
+            out[o++] = '%';
+            out[o++] = fmt[i];
+            break;
+        }
+    }
+    while (o && (out[o - 1] == '\n' || out[o - 1] == '\r'))
+        o--;
+    out[o] = 0;
+
+    fprintf(stderr, "  [DbgPrint] %s\n", out);
+    fflush(stderr);
+}
+
 static void bridge_NtWriteFile(void)
 {
     HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
@@ -2937,6 +3096,7 @@ static void bridge_NtWriteFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    bridge_log_guest_text(buffer_va, length);
     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
@@ -4751,6 +4911,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 328: return bridge_XeUnloadSection;
     case 226: return bridge_NtSetInformationFile;
     case 236: return bridge_NtWriteFile;
+
+    /* Debug output */
+    case 8:   return bridge_DbgPrint;
 
     /* Memory - contiguous */
     case 165: return bridge_MmAllocateContiguousMemory;

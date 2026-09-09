@@ -68,6 +68,7 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None,
     # nothing in the .err records which interval produced it -- so note it here.
     (out_dir / f"{tag}.meta").write_text(
         "\n".join([f"profile_interval={profile or 0}",
+                    f"kernel_budget={kernel_log if kernel_log is not None else 200}",
                     f"seconds={seconds:.0f}",
                     f"exe={exe}", ""]),
         encoding="utf-8")
@@ -96,17 +97,21 @@ def summarise(err_path: Path) -> dict:
 
     meta = err_path.with_suffix(".meta")
     interval = 0
+    budget = 0
     if meta.is_file():
-        m = re.search(r"profile_interval=([0-9]+)",
-                      meta.read_text(encoding="utf-8"))
+        meta_text = meta.read_text(encoding="utf-8")
+        m = re.search(r"profile_interval=([0-9]+)", meta_text)
         if m:
             interval = int(m.group(1))
+        m = re.search(r"kernel_budget=([0-9]+)", meta_text)
+        if m:
+            budget = int(m.group(1))
 
     return {
         "profile_interval": interval,
         "lines": text.count("\n"),
         "kernel_calls": len(re.findall(r"\[KERNEL\] #", text)),
-        "kernel_capped": bool(re.search(r"\[KERNEL\] summary: \d+ total", text)),
+        "kernel_budget": budget,
         "icalls": max(icall_totals) if icall_totals else 0,
         "icall_failures": failed,
         "abi_violations": abi,
@@ -203,9 +208,10 @@ def main() -> int:
                   " evidence on its own -- re-run at the same interval.")
         if now["table_full"]:
             print("      (profiler table filled - the real count is higher)")
-    if now["kernel_capped"]:
-        print("      note: the kernel log hit its budget, so \"kernel calls\" below")
-        print("      is the cap and not a count. Raise RECOMP_KERNEL_LOG_BUDGET.")
+    if now["kernel_budget"] and now["kernel_calls"] >= now["kernel_budget"]:
+        print(f"      note: the kernel log stopped at its budget of "
+              f"{now['kernel_budget']}, so \"kernel calls\" below is that")
+        print("      budget and not a count. Re-run with a larger --kernel-log.")
     for key, label in (("kernel_calls", "kernel calls"),
                        ("icalls", "indirect calls"),
                        ("files_opened", "files opened"),
