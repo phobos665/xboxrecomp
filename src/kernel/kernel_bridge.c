@@ -1591,10 +1591,31 @@ static void bridge_NtYieldExecution(void)
 static void bridge_MmGetPhysicalAddress(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* Xbox uses identity mapping (physical == virtual) for the lower 64MB.
-     * Just return the Xbox VA as-is. Don't call xbox_MmGetPhysicalAddress
-     * which would return a native pointer. */
-    g_eax = addr;
+
+    /* Identity below 64 MB, minus the window base inside it.
+     *
+     * The old comment here was half right: the lower 64 MB is identity
+     * mapped, so returning the VA is correct there. It is wrong for the
+     * contiguous window, which is precisely where anything that asks this
+     * question lives -- a caller wants a physical address because it is
+     * about to hand a buffer to the GPU, and a GPU buffer comes from
+     * MmAllocateContiguousMemory.
+     *
+     * Physical page P is visible at XBOX_CONTIG_BASE + P, so the physical
+     * address of a window VA is the VA minus that base.
+     *
+     * Measured against the real title in xemu, at the same point in its
+     * boot: Burnout 2 stores VA - PA at 0x005A8860 during audio pool setup.
+     * Hardware has 0x83FDE000 - 0x03FDE000 = 0x80000000 there. Returning the
+     * VA unchanged made that delta 0, so every buffer address the title
+     * converted for the GPU stayed virtual. The title submitted two draw
+     * calls and then stopped advancing DMA_PUT at all.
+     */
+    if (addr >= XBOX_CONTIG_BASE
+        && (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        g_eax = addr - XBOX_CONTIG_BASE;
+    else
+        g_eax = addr;
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
