@@ -469,6 +469,7 @@ class DisasmEngine:
         if not data:
             return None
 
+        limit = addr + len(data)
         count = 0
         for decoded in self._cs.disasm(data, addr):
             count += 1
@@ -478,6 +479,28 @@ class DisasmEngine:
             if mnemonic in config.RET_MNEMONICS:
                 return decoded.address + decoded.size
             if mnemonic in config.JMP_MNEMONICS:
+                # A forward jump that stays inside the window being scanned is
+                # ordinary control flow, not the end of anything -- MSVC emits
+                # it constantly to skip an else-branch, and
+                # probes_as_returning_body already says so. Treating every jmp
+                # as a terminator cut Burnout 2's sub_00120307 to 20 bytes at
+                # its own "jmp 0x120321", stranding the epilogue that restores
+                # esi. That function is a global constructor, so _initterm
+                # called it with esi holding the cursor into the initialiser
+                # table, got esi back clobbered, and walked off the table into
+                # whatever followed -- calling the middle of an unrelated
+                # function as if it were the next constructor.
+                #
+                # Only a backward jump, or one leaving the window, is
+                # tail-call shaped and ends the run.
+                try:
+                    operands = decoded.operands
+                except Exception:                    # noqa: BLE001
+                    return decoded.address + decoded.size
+                if operands and operands[0].type == CS_OP_IMM:
+                    target = operands[0].imm & 0xFFFFFFFF
+                    if decoded.address < target < limit:
+                        continue
                 return decoded.address + decoded.size
         return None
 

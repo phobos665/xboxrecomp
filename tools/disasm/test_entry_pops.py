@@ -115,5 +115,39 @@ class Boundaries(unittest.TestCase):
         self.assertEqual(probe(code), [])
 
 
+class BlockExtentEnd(unittest.TestCase):
+    """A forward jump inside the body is control flow, not a terminator.
+
+    Treating every jmp as the end cut a global constructor to 20 bytes at its
+    own else-skip, stranding the epilogue that restored esi -- and _initterm
+    calls that constructor with esi holding its table cursor.
+    """
+
+    def test_forward_jump_does_not_end_the_run(self):
+        # push esi ; jmp +2 ; nop ; nop ; pop esi ; ret
+        code = bytes([0x56, 0xEB, 0x02, 0x90, 0x90, 0x5E, 0xC3])
+        engine = DisasmEngine(_Image(BASE, code))
+        end = engine.block_extent_end(BASE)
+        self.assertEqual(end, BASE + len(code),
+                         "the run should reach the ret past the forward jump")
+
+    def test_backward_jump_still_ends_the_run(self):
+        # nop ; jmp -3  (backwards: tail-call shaped)
+        code = bytes([0x90, 0xEB, 0xFC])
+        engine = DisasmEngine(_Image(BASE, code))
+        self.assertEqual(engine.block_extent_end(BASE), BASE + 3)
+
+    def test_a_ret_still_ends_the_run(self):
+        code = bytes([0x90, 0xC3, 0x90])
+        engine = DisasmEngine(_Image(BASE, code))
+        self.assertEqual(engine.block_extent_end(BASE), BASE + 2)
+
+    def test_jump_leaving_the_window_ends_the_run(self):
+        # jmp far forward, past everything we can see
+        code = bytes([0xE9, 0x00, 0x10, 0x00, 0x00, 0x90])
+        engine = DisasmEngine(_Image(BASE, code))
+        self.assertEqual(engine.block_extent_end(BASE), BASE + 5)
+
+
 if __name__ == "__main__":
     unittest.main()
