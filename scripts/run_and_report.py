@@ -41,6 +41,13 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None):
             # a run that faults or is killed never reaches atexit, and this one
             # always faults.
             env["RECOMP_TRACE_PROFILE"] = str(profile)
+            # The stderr report is a top-40 list. That answers "where do the
+            # calls go" and cannot answer "did this function ever run", which
+            # is what bring-up asks -- an initialiser that should have run and
+            # did not is simply absent from a top-40 of 25,000. Reading absence
+            # out of that list looks like evidence and is not, so take the
+            # whole table too.
+            env["RECOMP_PROFILE_DUMP"] = str((out_dir / f"{tag}.prof").resolve())
         proc = subprocess.Popen([str(exe)], stdout=out, stderr=err,
                                 cwd=str(exe.parent), env=env)
         try:
@@ -162,6 +169,9 @@ def main() -> int:
                                     profile=args.profile)
     print(f"  {status} after {elapsed:.1f}s")
     print(f"  stderr -> {err_path}")
+    prof = err_path.with_suffix(".prof")
+    if prof.is_file():
+        print(f"  every function entered -> {prof}")
 
     now = summarise(err_path)
     before = summarise(args.baseline) if args.baseline and args.baseline.is_file() else None

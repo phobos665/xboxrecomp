@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "xbox_memory_layout.h"
 
@@ -52,6 +53,21 @@ static long trace_budget(void)
  *
  * Enable with RECOMP_TRACE_PROFILE=1. The report goes to stderr at exit,
  * hottest first.
+ *
+ * The stderr report shows the top 40 only, which answers "where do the calls
+ * go" but cannot answer "did this particular function ever run" -- and that
+ * second question is the one bring-up actually asks, because a function that
+ * should have initialised something and did not is invisible in a top-40 list
+ * of 25,000 entered functions. Reading absence out of that list is a mistake
+ * that looks like evidence. Set RECOMP_PROFILE_DUMP to a path to get the
+ * whole table instead, rewritten at every report so a run that faults still
+ * leaves a complete one behind.
+ *
+ * The report only fires every N calls, so the table on disk lags the run by up
+ * to N entries -- which is exactly the window a crash lands in. Reading "this
+ * function is absent, so it never ran" off a lagging table is wrong in the one
+ * case that matters. The crash handler calls this directly so the file covers
+ * the fault itself; absence in a file written that way is real.
  */
 #define PROF_SLOTS 65536                /* open addressing, power of two */
 /* Sized for --trace-all-entries, which hooks every function rather than a
@@ -59,10 +75,43 @@ static long trace_budget(void)
  * counting exactly when the number is most interesting. It reports when it
  * is full, so a short count is never mistaken for a small frontier. */
 
-static struct { uint32_t va; unsigned long long hits; } g_prof[PROF_SLOTS];
+static struct {
+    uint32_t va;
+    unsigned long long hits;
+    unsigned long long first;   /* call ordinal of the first entry */
+} g_prof[PROF_SLOTS];
 static const char *g_prof_name[PROF_SLOTS];
 static int g_prof_used, g_prof_full;
 static unsigned long long g_prof_calls;
+
+/* The complete set of functions entered, for "did X ever run".
+ *
+ * Rewritten from the start each time rather than appended: the file is then
+ * always the current state, and a title that dies mid-run leaves a whole
+ * table rather than a truncated stream. */
+void recomp_profile_dump(void)
+{
+    const char *path = getenv("RECOMP_PROFILE_DUMP");
+    FILE *f;
+    int i;
+
+    if (!path || !*path)
+        return;
+    f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# %d functions entered%s\n", g_prof_used,
+            g_prof_full ? " (table full, some dropped)" : "");
+    fprintf(f, "# va\tname\thits\tfirst_call\n");
+    for (i = 0; i < PROF_SLOTS; i++) {
+        if (!g_prof[i].hits)
+            continue;
+        fprintf(f, "0x%08X\t%s\t%llu\t%llu\n", g_prof[i].va,
+                g_prof_name[i] ? g_prof_name[i] : "?", g_prof[i].hits,
+                g_prof[i].first);
+    }
+    fclose(f);
+}
 
 static void prof_report(void)
 {
@@ -94,6 +143,7 @@ static void prof_report(void)
                 g_prof[best].va);
     }
     fflush(stderr);
+    recomp_profile_dump();
 }
 
 /* RECOMP_TRACE_PROFILE=1 profiles; a larger number is also how often to
@@ -139,6 +189,7 @@ static void prof_count(const char *name, uint32_t va)
         if (!g_prof[k].hits) {
             g_prof[k].va = va;
             g_prof[k].hits = 1;
+            g_prof[k].first = g_prof_calls;
             g_prof_name[k] = name;
             g_prof_used++;
             return;
@@ -147,8 +198,60 @@ static void prof_count(const char *name, uint32_t va)
     g_prof_full = 1;
 }
 
+
+/* Watch one guest word and name whoever changes it.
+ *
+ * "This global is wrong by the time it is read" is the shape of most bring-up
+ * faults, and reading the lifted code to find the writer does not scale: the
+ * value can be written by a rep stos with a computed base, by a memcpy, or by
+ * a function whose own bounds are wrong -- none of which mention the address.
+ *
+ * Sampling at function entry rather than trapping the write means the report
+ * names the first function entered *after* the change, not the instruction
+ * that made it. That is a coarser answer and a cheap one, and it is usually
+ * enough: it narrows a 25,000-function run to a single call boundary.
+ *
+ * Set RECOMP_WATCH_VA to a guest address, e.g. RECOMP_WATCH_VA=0x5A8868.
+ */
+static uint32_t g_watch_va;
+static uint32_t g_watch_last;
+static int g_watch_on = -1, g_watch_primed;
+
+static void watch_check(const char *name)
+{
+    const uint8_t *mem;
+    uint32_t now;
+
+    if (g_watch_on < 0) {
+        const char *v = getenv("RECOMP_WATCH_VA");
+        g_watch_va = v ? (uint32_t)strtoul(v, NULL, 0) : 0;
+        g_watch_on = g_watch_va != 0;
+    }
+    if (!g_watch_on)
+        return;
+    if ((uint64_t)g_watch_va + 4 > (uint64_t)xbox_GetMappedSize())
+        return;
+
+    mem = (const uint8_t *)xbox_GetMemoryOffset();
+    now = *(const uint32_t *)(mem + g_watch_va);
+    if (!g_watch_primed) {
+        g_watch_primed = 1;
+        g_watch_last = now;
+        fprintf(stderr, "[WATCH] 0x%08X starts as 0x%08X (at %s)\n",
+                g_watch_va, now, name);
+        return;
+    }
+    if (now != g_watch_last) {
+        fprintf(stderr, "[WATCH] 0x%08X: 0x%08X -> 0x%08X, "
+                "changed before entering %s (call %llu)\n",
+                g_watch_va, g_watch_last, now, name, g_prof_calls);
+        g_watch_last = now;
+    }
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    watch_check(name);
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at
