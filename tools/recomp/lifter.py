@@ -1905,6 +1905,39 @@ class Lifter:
             if not is_code_address(val):
                 break
             targets.append(val)
+
+        # The displacement names index 0, which is not always the first entry.
+        #
+        # MSVC's memcpy tail dispatch counts remaining bytes *down*, so its
+        # index is negative and the displacement points at the last entry:
+        #
+        #     0011F176  jmp dword ptr [ecx*4 + 0x11F248]
+        #
+        # over a table running 0x0011F22C-0x0011F24C. Reading forward from
+        # 0x0011F248 finds one entry and then the unrolled copy blocks, which
+        # do not read as code addresses -- so the scan stopped at one,
+        # _analyze_switch_table rejected it as too short, and the dispatch
+        # lifted to RECOMP_ITAIL. Its arms are inside memcpy rather than
+        # function starts, so every one of them failed to resolve at runtime
+        # and the path through them skipped the epilogue.
+        #
+        # Only look backwards when the forward scan came up short. A healthy
+        # forward table is followed by whatever the compiler put next, and
+        # extending such a table backwards would swallow the code before it on
+        # the strength of a few words that happen to read as addresses.
+        if len(targets) < 2:
+            back = []
+            for i in range(1, max_entries + 1):
+                o = offset - i * 4
+                if o < 0:
+                    break
+                val = struct.unpack_from('<I', self.xbe_data, o)[0]
+                if not is_code_address(val):
+                    break
+                back.append(val)
+            if back:
+                back.reverse()
+                targets = back + targets
         return targets
 
     def _analyze_switch_table(self, ops):
