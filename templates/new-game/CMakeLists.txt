@@ -33,6 +33,29 @@ add_compile_definitions(
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 
+# ── Bring-up diagnostics ────────────────────────────────────────
+#
+# ebx/esi/edi are callee-saved on x86 and the recompiler keeps them in globals,
+# so a function whose epilogue did not lift correctly corrupts its *caller*.
+# There is no crash and no message where the failure happens: the caller
+# carries on with a wrong loop cursor or a wrong `this` and faults somewhere
+# unrelated, often several frames away.
+#
+# With this on, every call -- direct and indirect -- checks that ebx, esi and
+# edi came back unchanged and that esp came back at least 4 higher, and names
+# the offending function. Off by default because it costs a few compares per
+# call; leave it on until a title boots.
+#
+# Directory scope, and set before add_subdirectory, deliberately: the check is
+# emitted into generated game code but recomp_abi_violation_log() is compiled
+# into xbox_kernel. Defining it on the game target alone builds the calls
+# without the callee and fails to link.
+option(RECOMP_ABI_CHECK "Verify callee-saved registers across every call" OFF)
+if(RECOMP_ABI_CHECK)
+    add_compile_definitions(RECOMP_ABI_CHECK)
+    message(STATUS "ABI check enabled: callee-saved registers verified per call")
+endif()
+
 # Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)

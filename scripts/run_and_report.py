@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+Run a recompiled title and summarise how far it got.
+
+The bring-up loop is run, read stderr, fix, regenerate, run again -- and the
+only question that matters each time is whether the frontier moved. Scrolling a
+few thousand lines of kernel trace to answer that is what makes the loop slow.
+
+    python3 scripts/run_and_report.py build/Debug/your_game_recomp.exe
+
+Writes the full stderr next to the summary so nothing is lost, and prints the
+handful of numbers worth comparing between runs: how many kernel calls ran, how
+many indirect calls were dispatched, which ones failed, any callee-saved ABI
+violations (needs -DRECOMP_ABI_CHECK), and where it stopped.
+
+Compare against a previous run to see whether a change helped:
+
+    python3 scripts/run_and_report.py game.exe --baseline runs/run7.err
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def run(exe: Path, seconds: float, out_dir: Path, tag: str):
+    """Run the executable for a bounded time, capturing stdout and stderr."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{tag}.out"
+    err_path = out_dir / f"{tag}.err"
+
+    with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        started = time.time()
+        proc = subprocess.Popen([str(exe)], stdout=out, stderr=err,
+                                cwd=str(exe.parent))
+        try:
+            proc.wait(timeout=seconds)
+            status = f"exited with code {proc.returncode}"
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            status = f"still running after {seconds:.0f}s (killed)"
+        elapsed = time.time() - started
+
+    return err_path, status, elapsed
+
+
+def summarise(err_path: Path) -> dict:
+    text = err_path.read_text(encoding="utf-8", errors="replace")
+
+    icall_totals = [int(m) for m in re.findall(r"total calls: (\d+)", text)]
+    failed = sorted(set(re.findall(r"Failed to resolve VA (0x[0-9A-Fa-f]+)", text)))
+    abi = re.findall(r"^\[ABI\] (sub_[0-9A-Fa-f]+):(.*)$", text, re.M)
+
+    crash = None
+    m = re.search(r"^\[CRASH\][^\n]*\n(?:[^\n]*\n){0,4}?\s*in (sub_[0-9A-Fa-f]+\+0x[0-9A-Fa-f]+)",
+                  text, re.M)
+    if m:
+        crash = m.group(1)
+    fault = re.search(r"Xbox VA of fault: (0x[0-9A-Fa-f]+)", text)
+
+    return {
+        "lines": text.count("\n"),
+        "kernel_calls": len(re.findall(r"\[KERNEL\] #", text)),
+        "icalls": max(icall_totals) if icall_totals else 0,
+        "icall_failures": failed,
+        "abi_violations": abi,
+        "crash_in": crash,
+        "fault_va": fault.group(1) if fault else None,
+        "exited_cleanly": "HalReturnToFirmware" in text,
+        "files_opened": len(set(re.findall(r"\[PATH\] (\S+)", text))),
+    }
+
+
+def show(label: str, current, baseline=None):
+    if baseline is None:
+        print(f"  {label:<22} {current}")
+        return
+    if isinstance(current, int) and isinstance(baseline, int):
+        delta = current - baseline
+        arrow = "" if delta == 0 else (f"  ({delta:+d})")
+        print(f"  {label:<22} {current}{arrow}   [was {baseline}]")
+    else:
+        same = " (unchanged)" if current == baseline else ""
+        print(f"  {label:<22} {current}{same}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("exe", type=Path, help="The built executable")
+    ap.add_argument("--seconds", type=float, default=40.0,
+                    help="How long to let it run (default 40)")
+    ap.add_argument("--out-dir", type=Path, default=Path("runs"),
+                    help="Where to keep the captured logs (default runs/)")
+    ap.add_argument("--tag", default=None,
+                    help="Name for this run (default: the next free runNN)")
+    ap.add_argument("--baseline", type=Path, default=None,
+                    help="A previous .err to compare against")
+    args = ap.parse_args()
+
+    if not args.exe.is_file():
+        print(f"error: no such executable: {args.exe}", file=sys.stderr)
+        return 1
+
+    tag = args.tag
+    if tag is None:
+        n = 1
+        while (args.out_dir / f"run{n:02d}.err").exists():
+            n += 1
+        tag = f"run{n:02d}"
+
+    print(f"running {args.exe.name} for up to {args.seconds:.0f}s ...")
+    err_path, status, elapsed = run(args.exe, args.seconds, args.out_dir, tag)
+    print(f"  {status} after {elapsed:.1f}s")
+    print(f"  stderr -> {err_path}")
+
+    now = summarise(err_path)
+    before = summarise(args.baseline) if args.baseline and args.baseline.is_file() else None
+
+    print("\nfrontier")
+    for key, label in (("kernel_calls", "kernel calls"),
+                       ("icalls", "indirect calls"),
+                       ("files_opened", "files opened"),
+                       ("lines", "stderr lines")):
+        show(label, now[key], before[key] if before else None)
+
+    show("unresolved icalls", len(now["icall_failures"]),
+         len(before["icall_failures"]) if before else None)
+    show("abi violations", len(now["abi_violations"]),
+         len(before["abi_violations"]) if before else None)
+
+    print("\nstopped")
+    if now["crash_in"]:
+        print(f"  crash in              {now['crash_in']}"
+              + (f"  reading {now['fault_va']}" if now["fault_va"] else ""))
+        if before and before["crash_in"] == now["crash_in"]:
+            print("  SAME SITE as the baseline. Two runs stopping at the same")
+            print("  event means stop varying the run: compare the two logs and")
+            print("  find the earliest divergence instead.")
+    elif now["exited_cleanly"]:
+        print("  exited via HalReturnToFirmware (the title chose to quit)")
+    else:
+        print("  no crash recorded - it was still running when time ran out")
+
+    if now["abi_violations"]:
+        print("\ncallee-saved violations (the caller is corrupted, not the callee)")
+        for name, detail in now["abi_violations"][:10]:
+            print(f"  {name}{detail}")
+
+    if now["icall_failures"]:
+        print("\nunresolved indirect-call targets")
+        print("  " + " ".join(now["icall_failures"][:12]))
+        print("  (tools.seed_from_log turns the ones that are code into functions)")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

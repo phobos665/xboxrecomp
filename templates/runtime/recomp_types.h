@@ -755,12 +755,17 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * call through this macro, which expands to a plain call when the flag is
  * off. That matters because CRT and static-initialiser paths -- where these
  * clobbers actually bite -- are almost entirely direct calls.
- * Generated code emits a direct call as a plain C call to the symbol, with no
- * macro to hook, so a direct callee that clobbers these registers is invisible
- * here. That matters more than it sounds -- CRT and static-initialiser paths
- * are almost entirely direct calls, so this found nothing at all on Half-Life
- * 2's static init, where the clobber demonstrably exists. It is the right tool
- * for vtable-dispatch-heavy code and the wrong one for early boot.
+ * (An earlier note here said direct calls were a plain C call with no macro to
+ * hook, and concluded this was the wrong tool for early boot. That stopped
+ * being true when tools/recomp started routing every direct call through
+ * RECOMP_ABI_CALL. Early boot is now exactly where it earns its keep.)
+ *
+ * Build note: define RECOMP_ABI_CHECK for the runtime libraries too, not only
+ * for the generated game code. The check is emitted into generated code but
+ * recomp_abi_violation_log() is compiled into xbox_kernel, so setting it on the
+ * game target alone produces the calls without the callee and fails to link.
+ * The game template does this with a directory-scope add_compile_definitions()
+ * placed before add_subdirectory().
  */
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
