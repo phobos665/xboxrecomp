@@ -179,6 +179,12 @@ def main() -> int:
                          "it for the function-pointer slots a call goes "
                          "through, which is what a runtime-populated table "
                          "looks like from the outside.")
+    ap.add_argument("--dump", metavar="VA:WORDS", default=None,
+                    help="Dump a run of 32-bit words, e.g. 0x5ADCF8:64. Use it "
+                         "to recover a dispatch table the game builds at "
+                         "runtime -- those live in BSS, so nothing in the "
+                         "image file points at their contents and static "
+                         "analysis cannot find the functions they name.")
     ap.add_argument("--peek", action="store_true",
                     help="Do not break: just halt, dump 16 bytes at --addr, "
                          "and resume. Use this first to confirm the game is "
@@ -226,6 +232,20 @@ def main() -> int:
                 else:
                     value = struct.unpack("<I", word)[0]
                     print(f"    [0x{target:08X}] = 0x{value:08X}   {describe(value)}")
+
+        if args.dump:
+            where, _, count = args.dump.partition(":")
+            base = int(where, 0)
+            words = int(count or "16", 0)
+            blob = gdb.read_memory(base, words * 4)
+            if blob is None:
+                print(f"  [0x{base:08X}] NOT READABLE")
+            else:
+                print(f"  dump of {words} words at 0x{base:08X}:")
+                for n in range(len(blob) // 4):
+                    value = struct.unpack_from("<I", blob, n * 4)[0]
+                    print(f"    [0x{base + n * 4:08X}] = 0x{value:08X}"
+                          f"   {describe(value)}")
 
         if args.peek:
             print("peek only, not breaking.")
