@@ -401,6 +401,55 @@ class DisasmEngine:
                 return ops[0].imm & 0xFFFFFFFF
         return None
 
+    def entry_pops_unsaved(self, addr: int, max_insns: int = 256):
+        """Callee-saved registers this address pops without ever pushing.
+
+        A function entry saves what it restores. An address that pops ebx, esi,
+        edi or ebp having never pushed it is not an entry point: it is the
+        middle of a function whose prologue did the pushing. Calling it as a
+        function runs the epilogue against the caller's stack, so the caller
+        gets back whatever happened to be there -- silent register corruption,
+        surfacing far away.
+
+        Returns the offending register names, or an empty list.
+
+        Scanned linearly to the first ret, which is the same shape
+        probes_as_function_body accepts, so the two agree about what body they
+        are talking about. Deliberately conservative: a register both pushed
+        and popped is fine however unbalanced the counts, because one prologue
+        push commonly answers several epilogue pops.
+
+        __SEH_epilog legitimately has this shape -- unwinding the caller's
+        frame is its whole job -- so it is a real exception rather than a
+        failure of the rule. It is identified by byte pattern elsewhere and
+        never needs seeding.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return []
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return []
+
+        saved = ("ebx", "esi", "edi", "ebp")
+        pushed = set()
+        popped = []
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            if count > max_insns:
+                break
+            mnemonic = decoded.mnemonic.lower()
+            operand = decoded.op_str.strip().lower()
+            if mnemonic == "push" and operand in saved:
+                pushed.add(operand)
+            elif mnemonic == "pop" and operand in saved:
+                if operand not in pushed and operand not in popped:
+                    popped.append(operand)
+            elif mnemonic in config.RET_MNEMONICS:
+                break
+        return popped
+
     def block_extent_end(self, addr: int, max_insns: int = 256):
         """
         Where the straight-line run at `addr` ends: the address just past its

@@ -89,6 +89,9 @@ def main(argv=None):
     ap.add_argument("--analysis-json", type=Path,
                     help="xbe_parser output; only needed when it is not named "
                          "<xbe stem>_analysis.json next to the XBE")
+    ap.add_argument("--prune", action="store_true",
+                    help="re-test seeds already in the file and "
+                         "drop any that fail the gates")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -118,6 +121,22 @@ def main(argv=None):
     starts = [b[0] for b in bounds]
 
     existing = json.loads(args.seeds.read_text()) if args.seeds.exists() else []
+
+    if args.prune:
+        # Seeds accepted before this check existed are still in the file.
+        # Re-test them rather than trusting that they were ever verified.
+        kept, dropped = [], 0
+        for entry in existing:
+            unsaved = engine.entry_pops_unsaved(int(entry["start"], 0))
+            if unsaved:
+                print("  - %s  pruned: restores %s without saving it"
+                      % (entry["start"], "/".join(unsaved)))
+                dropped += 1
+                continue
+            kept.append(entry)
+        print("  pruned %d of %d existing seed(s)" % (dropped, dropped + len(kept)))
+        existing = kept
+
     have = {e["start"].lower() for e in existing if isinstance(e, dict)}
 
     added = 0
@@ -131,6 +150,17 @@ def main(argv=None):
             continue
         if not engine.probes_as_function_body(va):
             print("  - %08X  does not read as a function body" % va)
+            continue
+        unsaved = engine.entry_pops_unsaved(va)
+        if unsaved:
+            # Restoring a register it never saved means this is the middle of
+            # a function, whatever else it looks like. Seeding it makes the
+            # recompiler emit an epilogue that runs against the *caller's*
+            # stack, so the caller resumes with a corrupted register and faults
+            # somewhere unrelated -- worse than the missing target, because a
+            # missing one is reported and this is silent.
+            print("  - %08X  restores %s without saving it: mid-function"
+                  % (va, "/".join(unsaved)))
             continue
         i = bisect.bisect_right(starts, va) - 1
         inside = i >= 0 and bounds[i][0] < va < bounds[i][1]
