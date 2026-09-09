@@ -70,6 +70,15 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None,
         "\n".join([f"profile_interval={profile or 0}",
                     f"kernel_budget={kernel_log if kernel_log is not None else 200}",
                     f"seconds={seconds:.0f}",
+                    # Switches that change what the program does, not just what
+                    # it prints. RECOMP_VBLANK gates the whole frame-delivery
+                    # chain, so a run without it is a different program -- and
+                    # comparing one against a run with it reads as "the change
+                    # did nothing".
+                    "switches=" + ",".join(
+                        k for k in ("RECOMP_VBLANK", "RECOMP_PB_EXEC",
+                                    "RECOMP_PB_SCAN", "RECOMP_NV2A_TRACE")
+                        if os.environ.get(k)) or "switches=none",
                     f"exe={exe}", ""]),
         encoding="utf-8")
 
@@ -98,6 +107,8 @@ def summarise(err_path: Path) -> dict:
     meta = err_path.with_suffix(".meta")
     interval = 0
     budget = 0
+    switches = ""
+
     if meta.is_file():
         meta_text = meta.read_text(encoding="utf-8")
         m = re.search(r"profile_interval=([0-9]+)", meta_text)
@@ -106,12 +117,16 @@ def summarise(err_path: Path) -> dict:
         m = re.search(r"kernel_budget=([0-9]+)", meta_text)
         if m:
             budget = int(m.group(1))
+        m = re.search(r"switches=(\S*)", meta_text)
+        if m:
+            switches = m.group(1)
 
     return {
         "profile_interval": interval,
         "lines": text.count("\n"),
         "kernel_calls": len(re.findall(r"\[KERNEL\] #", text)),
         "kernel_budget": budget,
+        "switches": switches,
         "icalls": max(icall_totals) if icall_totals else 0,
         "icall_failures": failed,
         "abi_violations": abi,
@@ -194,6 +209,11 @@ def main() -> int:
     before = summarise(args.baseline) if args.baseline and args.baseline.is_file() else None
 
     print("\nfrontier")
+    if before and before["switches"] != now["switches"]:
+        print(f"      RUN DIFFERENTLY from the baseline: switches "
+              f"{before['switches'] or 'none'} vs {now['switches'] or 'none'}.")
+        print("      These change what the title does, not just what it logs,")
+        print("      so the differences below are not attributable to a change.")
     if now["functions_reached"] or (before and before["functions_reached"]):
         show("functions reached", now["functions_reached"],
              before["functions_reached"] if before else None)
