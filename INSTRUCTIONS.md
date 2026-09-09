@@ -346,6 +346,40 @@ Raise it before concluding anything about which ordinals a title uses.
 entered *after* the value changed, not the instruction that wrote it. That is
 enough to narrow a 25,000-function run to one call boundary.
 
+## When it runs forever instead of crashing
+
+A title that never faults gives no address to start from, and comparing its
+state against a reference is the slow way in: every structure may match while
+the fault is a function that entered and never returned.
+
+    python3 scripts/stall_report.py runs/runNN.prof <project>/src/recomp/gen
+
+**frontier** is the last functions entered, by call ordinal. **dead ends** are
+functions that were entered, call other functions, and none of them ran. The
+latest dead end is what is holding everything up -- a wait on hardware state
+reads as a loop on a memory read, an early return as a test of a value that
+should not be zero.
+
+Then `RECOMP_WATCH_VA` names whoever writes that value, and xemu says what it
+should be.
+
+## Before you trust a number
+
+Absence has two causes: it did not happen, or the tool could not show it.
+They look identical and only one is a finding.
+
+| Looks like | Check |
+|---|---|
+| a function "never ran" | the stderr profile is the **top 40**; use `RECOMP_PROFILE_DUMP` |
+| `kernel calls: 200` | that is the **budget**, not a count |
+| a run that "changed nothing" | did the build actually succeed, and were the same switches set |
+| an all-zero structure | was it sampled **before** the title built it |
+| a missing capability | grep for it being present and **switched off** |
+
+`run_and_report.py` records the profile interval, the kernel budget and the
+active switches in each run's `.meta`, and refuses to present a comparison
+across different ones as an effect.
+
 ## When you stop making progress
 
 The discipline that ends the longest debugging sessions:
