@@ -34,7 +34,11 @@ from . import image
 # we need a supply of verifiable functions, not all of them.
 _PROLOGUE = bytes((0x55, 0x8B, 0xEC))
 
-_LIFTED_RE = '\\blifted_([0-9A-Fa-f]{8})\\s*\\('
+# Any mention of a lifted symbol, not just a direct call. A body also reaches
+# one through RECOMP_ABI_CALL(va, lifted_XXXXXXXX), where the name is a macro
+# argument with no '(' after it. Requiring one missed those, so the callee was
+# never stubbed and the harness failed to build on an undeclared identifier.
+_LIFTED_RE = r'\blifted_([0-9A-Fa-f]{8})\b'
 
 _MAX_INSNS = 400
 _MIN_BYTES, _MAX_BYTES = 12, 1200
