@@ -95,6 +95,25 @@ def summarise(err_path: Path) -> dict:
     # The profiler reports "[PROFILE] N functions entered" periodically, so a
     # run that is killed or faults still leaves one behind. Take the highest.
     reached = [int(m) for m in re.findall(r"\[PROFILE\] (\d+) functions entered", text)]
+
+    # Still climbing, or settled?
+    #
+    # "Why did it stop" is the wrong question for a title that has not
+    # stopped, and the two look identical in a single number. Burnout 2's
+    # count plateaus for a long stretch, resumes, and was still rising when
+    # every run so far was killed -- so several careful investigations were
+    # measuring a title cut off mid-flight and reading the snapshot as a
+    # final state.
+    #
+    # Compare the last tenth of the samples against the previous tenth: a
+    # title that is still loading gains functions there, one that has settled
+    # does not.
+    growing = None
+    if len(reached) >= 20:
+        tail = max(2, len(reached) // 10)
+        recent = reached[-tail:]
+        earlier = reached[-2 * tail:-tail]
+        growing = max(recent) - max(earlier)
     table_full = "table full" in text
 
     crash = None
@@ -135,6 +154,7 @@ def summarise(err_path: Path) -> dict:
         "exited_cleanly": "HalReturnToFirmware" in text,
         "files_opened": len(set(re.findall(r"\[PATH\] (\S+)", text))),
         "functions_reached": max(reached) if reached else 0,
+        "still_growing": growing,
         "table_full": table_full,
     }
 
@@ -226,6 +246,14 @@ def main() -> int:
                   f"{before['profile_interval'] or '?'} calls vs "
                   f"{now['profile_interval'] or '?'}). The change above is not"
                   " evidence on its own -- re-run at the same interval.")
+        if now["still_growing"] is not None:
+            if now["still_growing"] > 0:
+                print(f"      STILL CLIMBING: +{now['still_growing']} in the last"
+                      f" tenth of the run. It had not finished --")
+                print("      give it longer before asking why it stopped.")
+            else:
+                print("      settled: no new functions in the last tenth of the"
+                      " run.")
         if now["table_full"]:
             print("      (profiler table filled - the real count is higher)")
     if now["kernel_budget"] and now["kernel_calls"] >= now["kernel_budget"]:
