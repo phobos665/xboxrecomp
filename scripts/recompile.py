@@ -40,7 +40,20 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     parse = [sys.executable, "-m", "tools.xbe_parser", str(xbe),
              "--json", str(analysis_json)]
 
-    disasm = [sys.executable, "-m", "tools.disasm", str(xbe), "--text-only"]
+    # Deliberately not --text-only. An XBE statically links its libraries into
+    # their own executable sections -- D3D, DSOUND, XACTENG, XONLINE and the
+    # rest -- and --text-only leaves those unswept. Their functions are still
+    # detected, but their *ends* cannot be measured, because the end-finder
+    # stops at the first address it has no instruction for. Burnout 2's
+    # sub_00218CD0 came out 79 bytes instead of 321: truncated at its own tail
+    # jump, with the pops and the ret stranded past the cut. Every call leaked
+    # the 24-byte frame, and esp eventually walked out of the guest stack.
+    #
+    # The extra sections are a few hundred KB against a 2 MB .text, so the
+    # scan costs little; --text-only trades correctness for a few seconds.
+    disasm = [sys.executable, "-m", "tools.disasm", str(xbe)]
+    if args.text_only:
+        disasm.append("--text-only")
     if args.verbose:
         disasm.append("-v")
 
@@ -94,6 +107,11 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("xbe", help="Path to the title's default.xbe")
+    ap.add_argument("--text-only", action="store_true",
+                    help="Disassemble only .text, skipping the statically "
+                         "linked library sections. Faster, and wrong for any "
+                         "title that calls into them: their functions end up "
+                         "truncated at the first byte the sweep never decoded.")
     ap.add_argument("--all", action="store_true",
                     help="Lift everything, including CRT and XDK code "
                          "(default: --game-only)")

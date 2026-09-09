@@ -632,6 +632,27 @@ class FunctionDetector:
                     added = True
                 continue
 
+            # A target that restores callee-saved registers it never saved
+            # is the *continuation* of the function that jumped to it, not a
+            # function of its own -- the pushes it unwinds were made before the
+            # jump. Registering it as a candidate is actively harmful: the
+            # candidate becomes the upper bound when the jumping function's end
+            # is measured, so that function is truncated at its own tail jump,
+            # and if the candidate is later rejected the continuation is left
+            # undiscovered. The tail jump then lifts as a call to a stub, which
+            # can infer the argument cleanup from the ret but knows nothing
+            # about the frame, so every call leaks it.
+            #
+            # Burnout 2's sub_00218CD0 is exactly this: 79 bytes ending in
+            # "jmp 0x218d23", with the pops and ret living at the target. Its
+            # frame -- sub esp,8 plus four pushes -- leaked on every call, and
+            # esp walked out of the guest stack into .data.
+            #
+            # Skipping it lets the jumping function extend over the target
+            # naturally, since nothing clamps the bound any more.
+            if self.engine.entry_pops_unsaved(target):
+                continue
+
             self._add_candidate(target, config.CONFIDENCE_TAIL_JUMP,
                                 "tail_jump_target")
             added = True
