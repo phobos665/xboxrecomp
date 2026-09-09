@@ -121,7 +121,39 @@ def _fixup_icall_esp_save(lines):
             j -= 1
             continue
 
-        insert_before.add(first_push_idx)
+        # Which convention is this call site? A caller that cleans the
+        # arguments itself is cdecl, and the generated code says so plainly:
+        # an "esp = esp + N" follows the call, usually just past the return
+        # label.
+        #
+        # It decides where the capture belongs, because RECOMP_ICALL_SAFE
+        # rewinds g_esp to it when the lookup fails:
+        #
+        #   stdcall  the callee would have cleaned the arguments, so the
+        #            failure path must clean them -- capture above the pushes.
+        #   cdecl    the caller cleans them a few lines later regardless, so
+        #            capturing above the pushes cleans them twice. Capture
+        #            below them instead and the failure path pops only the
+        #            return address, leaving the caller's own add to do its
+        #            job.
+        #
+        # Burnout 2's sub_000E8C30 makes three cdecl indirect calls with four
+        # arguments each. Two of them failed, and 16 bytes cleaned twice per
+        # call put esp 32 bytes high, which its caller's epilogue then popped
+        # esi from -- handing the caller a corrupt `this` several frames from
+        # anything that looked wrong.
+        caller_cleans = False
+        k = icall_idx + 1
+        while k < len(lines) and k <= icall_idx + 6:
+            probe = lines[k].strip()
+            if not probe or re.match(r'^loc_[0-9A-Fa-f]+:', probe):
+                k += 1
+                continue
+            if re.match(r'^esp = esp \+ (0x[0-9A-Fa-f]+|\d+);$', probe):
+                caller_cleans = True
+            break
+
+        insert_before.add(icall_idx if caller_cleans else first_push_idx)
 
     # Build result with saves inserted
     for i, line in enumerate(lines):
