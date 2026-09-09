@@ -1,0 +1,10 @@
+[
+ {
+  "start": "0x000E24E1",
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00264E5D",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ }
+]

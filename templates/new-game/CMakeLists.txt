@@ -97,6 +97,15 @@ if(MSVC)
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+
+    # Drop MSVC's Debug runtime checks. /RTC1 traps a local read before its
+    # first write, and lifted code does that deliberately: an fpo_leaf function
+    # inherits its caller's frame, so it reads ebp before assigning it and
+    # picks the value up from g_seh_ebp. That is correct by design here, but
+    # /RTC1 cannot know it and aborts through a message box -- which never
+    # reaches stderr, so the run looks like a silent hang at the first lifted
+    # frame. Debug is the configuration bring-up uses, so this cannot stay on.
+    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
 endif()
 
 # ── Game-specific additions ─────────────────────────────────────
