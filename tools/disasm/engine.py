@@ -401,6 +401,37 @@ class DisasmEngine:
                 return ops[0].imm & 0xFFFFFFFF
         return None
 
+    def block_extent_end(self, addr: int, max_insns: int = 256):
+        """
+        Where the straight-line run at `addr` ends: the address just past its
+        terminating ret or direct jmp, or None if it runs longer than the
+        window without reaching either.
+
+        This is the extent that probes_as_returning_body and block_tail_jump
+        actually inspected, so it is the honest end for a body they accepted.
+        Bounding an alias by "the next known function start" instead is only a
+        proxy, and where starts are sparse it produces a body spanning a large
+        part of the section.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return None
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return None
+
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            if count > max_insns:
+                return None
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return decoded.address + decoded.size
+            if mnemonic in config.JMP_MNEMONICS:
+                return decoded.address + decoded.size
+        return None
+
     def probes_as_returning_body(self, addr: int,
                                  max_insns: int = 64) -> bool:
         """

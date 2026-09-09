@@ -761,6 +761,19 @@ class FunctionDetector:
                 sec = self.image.get_section_at_va(target)
                 end = starts[i] if i < len(starts) else section_end.get(
                     sec.name if sec else "", target + 4)
+                # In a gap, "the next known start" is a poor bound: the starts
+                # list predates this pass, so a table of 30,000 entries lands in
+                # a region with almost no known starts and every alias runs to
+                # the next real function or the section end. On Burnout 2 that
+                # gave 30,378 alias bodies with a median size of 115 KB, in a
+                # 2 MB .text whose genuine functions median 84 bytes -- 22,483
+                # of them over 50 KB. Clamp to where the block this pass just
+                # probed actually ends. This only ever shrinks an alias, so it
+                # cannot clamp a neighbouring body the way registering these as
+                # starts would.
+                extent = self.engine.block_extent_end(target, max_insns=64)
+                if extent is not None:
+                    end = min(end, extent)
             if end <= target:
                 continue
             self._alias_entries[target] = end
@@ -840,10 +853,20 @@ class FunctionDetector:
                     or tail is not None):
                 continue
 
-            # Run to the next known function start, or the section end.
+            # Run to the next known function start, or the section end --
+            # then clamp to where the block this pass just probed actually
+            # ends. The next-start bound is only a proxy for the body's
+            # extent, and where starts are sparse it is a wild one: on
+            # Burnout 2 it produced 30,378 alias bodies with a median size of
+            # 115 KB, in a .text of 2 MB whose real functions median 84 bytes.
+            # Translating those is the difference between a working build and
+            # one that never finishes generating.
             k = bisect.bisect_right(starts, target)
             end = starts[k] if k < len(starts) else (section.virtual_addr
                                                     + section.virtual_size)
+            extent = self.engine.block_extent_end(target)
+            if extent is not None:
+                end = min(end, extent)
             self._alias_entries[target] = end
             added = True
 
