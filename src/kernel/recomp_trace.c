@@ -253,9 +253,96 @@ static void watch_check(const char *name)
     }
 }
 
+
+/* Dump a run of guest words once, the first time any function is entered
+ * after the address becomes readable.
+ *
+ * The reference oracle works by comparing structures, not single values: the
+ * question is rarely "what is this word" and usually "does our copy of this
+ * object look like the one xemu has". Reading it a word at a time through
+ * RECOMP_WATCH_VA is too slow to do that, and the crash handler only dumps
+ * when there is a crash.
+ *
+ * RECOMP_DUMP_VA=0x00F81000:16 prints sixteen words at that address.
+ * Repeats are pointless -- the shape of a structure is what is being compared
+ * -- so it fires once.
+ */
+/* Hold the dump until the nth function entry. */
+#define return_if_early(count, spec) \
+    do { if ((count) < strtoull((spec), NULL, 0)) return; } while (0)
+
+static void dump_va_once(void)
+{
+    static int done;
+    const char *spec;
+    const uint8_t *mem;
+    uint32_t va, n, i;
+    char *colon;
+
+    if (done)
+        return;
+    spec = getenv("RECOMP_DUMP_VA");
+    if (!spec || !*spec)
+        return;
+
+    va = (uint32_t)strtoul(spec, &colon, 0);
+    n = (colon && *colon == ':') ? (uint32_t)strtoul(colon + 1, NULL, 0) : 16;
+    if (!n || n > 256)
+        n = 16;
+
+    if ((uint64_t)va + n * 4 > (uint64_t)xbox_GetMappedSize()
+        && !(va >= 0x80000000u && va < 0x84000000u))
+        return;                             /* not readable yet */
+
+    mem = (const uint8_t *)xbox_GetMemoryOffset();
+
+    /* Wait for the structure to exist.
+     *
+     * Firing on the first function entry dumps the address before anything
+     * has written to it, and sixteen zero words then read as "ours is empty"
+     * when the honest answer is "too early". Guest RAM starts zeroed, so a
+     * range that is still entirely zero has not been built yet -- hold until
+     * one word is not.
+     *
+     * A structure whose first bytes are legitimately zero is dumped as soon
+     * as any later word is set, which is close enough; RECOMP_DUMP_AFTER
+     * overrides for the case where the whole range really should be zero.
+     */
+    {
+        static unsigned long long entries;
+        const char *after = getenv("RECOMP_DUMP_AFTER");
+        uint32_t seen = 0;
+
+        entries++;
+
+        /* Comparing a structure against a reference only means anything when
+         * both are read at the same stage. Dumping at first-non-zero catches
+         * ours part-built, and the fields the reference has set look missing
+         * when they are merely later. RECOMP_DUMP_AFTER=<n> waits for the
+         * nth function entry, so a stalled title can be sampled once it has
+         * stopped changing. Its own counter, because g_prof_calls only moves
+         * when profiling is on. */
+        if (after)
+            return_if_early(entries, after);
+
+        for (i = 0; i < n; i++)
+            seen |= *(const uint32_t *)(mem + va + i * 4);
+        if (!seen)
+            return;
+    }
+
+    done = 1;
+    fprintf(stderr, "[DUMP] %u words at 0x%08X:\n", n, va);
+    for (i = 0; i < n; i++)
+        fprintf(stderr, "  [0x%08X] = 0x%08X\n", va + i * 4,
+                *(const uint32_t *)(mem + va + i * 4));
+    fflush(stderr);
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
     watch_check(name);
+    dump_va_once();
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at
