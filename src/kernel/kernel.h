@@ -380,6 +380,27 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
 #define XBOX_CONTIG_BASE 0x80000000u
 #define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
 
+/* Low physical memory the bump allocator must not hand out.
+ *
+ * MmAllocateContiguousMemory returning physical page 0 is not something real
+ * hardware does -- the low pages belong to the kernel, and titles know it well
+ * enough to park fixed structures there. Burnout 2's XPP library owns
+ * 0x80000000-0x80001000 outright: it carves that page with its own bump
+ * allocator (`mov ebx, 0x80001000; sub ebx, [0x28C160]`, counter initialised
+ * to 0xFE0) and poisons each block it hands out with 0xCCCCCCCC.
+ *
+ * Starting our arena at the window base put both allocators on the same page.
+ * The title built a free list there, XPP's next allocation poisoned the link
+ * fields, and the following pop dereferenced 0xCCCCCCCC. Reserving the low
+ * region costs 1.5% of the window and removes the whole class: any title that
+ * assumes it owns a fixed low physical page now gets to.
+ *
+ * Allocations that name an explicit physical address go through
+ * MmAllocateContiguousMemoryEx, which honours the request directly and is not
+ * affected by this.
+ */
+#define XBOX_CONTIG_RESERVED_LOW (1u * 1024u * 1024u)
+
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
 

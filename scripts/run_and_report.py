@@ -27,7 +27,8 @@ import time
 from pathlib import Path
 
 
-def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None):
+def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None,
+        kernel_log=None):
     """Run the executable for a bounded time, capturing stdout and stderr."""
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{tag}.out"
@@ -48,6 +49,8 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None):
             # out of that list looks like evidence and is not, so take the
             # whole table too.
             env["RECOMP_PROFILE_DUMP"] = str((out_dir / f"{tag}.prof").resolve())
+        if kernel_log is not None:
+            env["RECOMP_KERNEL_LOG_BUDGET"] = str(kernel_log)
         proc = subprocess.Popen([str(exe)], stdout=out, stderr=err,
                                 cwd=str(exe.parent), env=env)
         try:
@@ -103,6 +106,7 @@ def summarise(err_path: Path) -> dict:
         "profile_interval": interval,
         "lines": text.count("\n"),
         "kernel_calls": len(re.findall(r"\[KERNEL\] #", text)),
+        "kernel_capped": bool(re.search(r"\[KERNEL\] summary: \d+ total", text)),
         "icalls": max(icall_totals) if icall_totals else 0,
         "icall_failures": failed,
         "abi_violations": abi,
@@ -149,6 +153,13 @@ def main() -> int:
                          "run that faults before the first report leaves none, "
                          "and a crash never reaches atexit. Raise it once the "
                          "title runs long enough to make the lines a nuisance.")
+    ap.add_argument("--kernel-log", type=int, default=None, metavar="N",
+                    help="How many kernel calls to log (RECOMP_KERNEL_LOG_BUDGET). "
+                         "The default of 200 is a budget, not a limit on the "
+                         "title -- a run that reaches it reports 200 whatever "
+                         "it actually did, which reads like a measurement and "
+                         "is not one. Raise it when asking what the title "
+                         "called the kernel for.")
     ap.add_argument("--baseline", type=Path, default=None,
                     help="A previous .err to compare against")
     args = ap.parse_args()
@@ -166,7 +177,8 @@ def main() -> int:
 
     print(f"running {args.exe.name} for up to {args.seconds:.0f}s ...")
     err_path, status, elapsed = run(args.exe, args.seconds, args.out_dir, tag,
-                                    profile=args.profile)
+                                    profile=args.profile,
+                                    kernel_log=args.kernel_log)
     print(f"  {status} after {elapsed:.1f}s")
     print(f"  stderr -> {err_path}")
     prof = err_path.with_suffix(".prof")
@@ -191,6 +203,9 @@ def main() -> int:
                   " evidence on its own -- re-run at the same interval.")
         if now["table_full"]:
             print("      (profiler table filled - the real count is higher)")
+    if now["kernel_capped"]:
+        print("      note: the kernel log hit its budget, so \"kernel calls\" below")
+        print("      is the cap and not a count. Raise RECOMP_KERNEL_LOG_BUDGET.")
     for key, label in (("kernel_calls", "kernel calls"),
                        ("icalls", "indirect calls"),
                        ("files_opened", "files opened"),

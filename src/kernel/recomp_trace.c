@@ -229,7 +229,11 @@ static void watch_check(const char *name)
     }
     if (!g_watch_on)
         return;
-    if ((uint64_t)g_watch_va + 4 > (uint64_t)xbox_GetMappedSize())
+    /* Plain RAM, or the contiguous window. The window sits above the mapped
+     * RAM size, so a bare size check rejects exactly the addresses a DMA pool
+     * lives at -- which is the case worth watching. */
+    if (!((uint64_t)g_watch_va + 4 <= (uint64_t)xbox_GetMappedSize()
+          || (g_watch_va >= 0x80000000u && g_watch_va < 0x84000000u)))
         return;
 
     mem = (const uint8_t *)xbox_GetMemoryOffset();

@@ -320,6 +320,32 @@ bug, and you will fix it twice.
 | Stack overflow | Wrong ESP at entry, or runaway recursion | Check your entry point value |
 | **Wrong physics or RNG, but no crash** | **x87 floating-point divergence** | **Suspect this first when behaviour differs from xemu without any error** |
 
+## Asking the run a direct question
+
+Four switches, each answering one question. All are read from the environment,
+so no rebuild is needed to turn one on.
+
+| Question | Switch | What you get |
+|---|---|---|
+| Where do the calls go? | `RECOMP_TRACE_PROFILE=50` | Top 40 functions by entry count, every 50 calls |
+| Did *this* function ever run? | `RECOMP_PROFILE_DUMP=run.prof` | Every function entered, with hit counts |
+| Did A run before B? | same file, `first_call` column | The call ordinal each function was first entered at |
+| Who changed this word? | `RECOMP_WATCH_VA=0x5A8868` | Every change to that guest word, naming the next function entered |
+| What did it ask the kernel for? | `RECOMP_KERNEL_LOG_BUDGET=1000000` | Every kernel call, not the first 200 |
+
+Two traps worth knowing before you trust a number:
+
+**The stderr profile is a top-40 list.** A function missing from it has not been
+shown to be absent from the run. Use `RECOMP_PROFILE_DUMP` to ask directly.
+
+**`kernel calls: 200` is a budget, not a count.** The log stops at
+`RECOMP_KERNEL_LOG_BUDGET` (default 200) and the summary line then says so.
+Raise it before concluding anything about which ordinals a title uses.
+
+`RECOMP_WATCH_VA` samples at function entry, so it names the first function
+entered *after* the value changed, not the instruction that wrote it. That is
+enough to narrow a 25,000-function run to one call boundary.
+
 ## When you stop making progress
 
 The discipline that ends the longest debugging sessions:

@@ -2068,7 +2068,8 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
  * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+static uint32_t g_contig_next =
+    XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW;
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
