@@ -67,6 +67,8 @@ def build_commands(args, xbe: Path, analysis_json: Path):
         lift += ["--split", str(args.split)]
     if args.gen_dir:
         lift += ["--gen-dir", args.gen_dir]
+    if args.trace_all_entries:
+        lift.append("--trace-all-entries")
     if args.verbose:
         lift.append("-v")
 
@@ -107,6 +109,12 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("xbe", help="Path to the title's default.xbe")
+    ap.add_argument("--trace-all-entries", action="store_true",
+                    help="Hook every function's entry so a profiled run can "
+                         "report how many distinct functions it reached. That "
+                         "is the frontier measure worth comparing between "
+                         "iterations; run the build with RECOMP_TRACE_PROFILE "
+                         "set, or use run_and_report.py --profile.")
     ap.add_argument("--text-only", action="store_true",
                     help="Disassemble only .text, skipping the statically "
                          "linked library sections. Faster, and wrong for any "

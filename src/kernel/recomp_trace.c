@@ -53,7 +53,11 @@ static long trace_budget(void)
  * Enable with RECOMP_TRACE_PROFILE=1. The report goes to stderr at exit,
  * hottest first.
  */
-#define PROF_SLOTS 8192                 /* open addressing, power of two */
+#define PROF_SLOTS 65536                /* open addressing, power of two */
+/* Sized for --trace-all-entries, which hooks every function rather than a
+ * chosen few: a mid-size title lifts ~35,000, and a table that fills stops
+ * counting exactly when the number is most interesting. It reports when it
+ * is full, so a short count is never mistaken for a small frontier. */
 
 static struct { uint32_t va; unsigned long long hits; } g_prof[PROF_SLOTS];
 static const char *g_prof_name[PROF_SLOTS];

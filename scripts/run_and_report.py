@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 
-def run(exe: Path, seconds: float, out_dir: Path, tag: str):
+def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None):
     """Run the executable for a bounded time, capturing stdout and stderr."""
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{tag}.out"
@@ -35,8 +35,14 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str):
 
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
         started = time.time()
+        env = dict(os.environ)
+        if profile:
+            # The interval is in calls. The profiler reports as it goes because
+            # a run that faults or is killed never reaches atexit, and this one
+            # always faults.
+            env["RECOMP_TRACE_PROFILE"] = str(profile)
         proc = subprocess.Popen([str(exe)], stdout=out, stderr=err,
-                                cwd=str(exe.parent))
+                                cwd=str(exe.parent), env=env)
         try:
             proc.wait(timeout=seconds)
             status = f"exited with code {proc.returncode}"
@@ -56,6 +62,11 @@ def summarise(err_path: Path) -> dict:
     failed = sorted(set(re.findall(r"Failed to resolve VA (0x[0-9A-Fa-f]+)", text)))
     abi = re.findall(r"^\[ABI\] (sub_[0-9A-Fa-f]+):(.*)$", text, re.M)
 
+    # The profiler reports "[PROFILE] N functions entered" periodically, so a
+    # run that is killed or faults still leaves one behind. Take the highest.
+    reached = [int(m) for m in re.findall(r"\[PROFILE\] (\d+) functions entered", text)]
+    table_full = "table full" in text
+
     crash = None
     m = re.search(r"^\[CRASH\][^\n]*\n(?:[^\n]*\n){0,4}?\s*in (sub_[0-9A-Fa-f]+\+0x[0-9A-Fa-f]+)",
                   text, re.M)
@@ -73,6 +84,8 @@ def summarise(err_path: Path) -> dict:
         "fault_va": fault.group(1) if fault else None,
         "exited_cleanly": "HalReturnToFirmware" in text,
         "files_opened": len(set(re.findall(r"\[PATH\] (\S+)", text))),
+        "functions_reached": max(reached) if reached else 0,
+        "table_full": table_full,
     }
 
 
@@ -100,6 +113,16 @@ def main() -> int:
                     help="Where to keep the captured logs (default runs/)")
     ap.add_argument("--tag", default=None,
                     help="Name for this run (default: the next free runNN)")
+    ap.add_argument("--profile", type=int, nargs="?", const=100, default=None,
+                    metavar="EVERY",
+                    help="Run with the entry profiler on, reporting every N "
+                         "function calls (default 100). Needs a build lifted "
+                         "with --trace-all-entries. The interval only sets how "
+                         "often a running total is printed; this reads the "
+                         "highest. Keep it small while a title dies early -- a "
+                         "run that faults before the first report leaves none, "
+                         "and a crash never reaches atexit. Raise it once the "
+                         "title runs long enough to make the lines a nuisance.")
     ap.add_argument("--baseline", type=Path, default=None,
                     help="A previous .err to compare against")
     args = ap.parse_args()
@@ -116,7 +139,8 @@ def main() -> int:
         tag = f"run{n:02d}"
 
     print(f"running {args.exe.name} for up to {args.seconds:.0f}s ...")
-    err_path, status, elapsed = run(args.exe, args.seconds, args.out_dir, tag)
+    err_path, status, elapsed = run(args.exe, args.seconds, args.out_dir, tag,
+                                    profile=args.profile)
     print(f"  {status} after {elapsed:.1f}s")
     print(f"  stderr -> {err_path}")
 
@@ -124,6 +148,11 @@ def main() -> int:
     before = summarise(args.baseline) if args.baseline and args.baseline.is_file() else None
 
     print("\nfrontier")
+    if now["functions_reached"] or (before and before["functions_reached"]):
+        show("functions reached", now["functions_reached"],
+             before["functions_reached"] if before else None)
+        if now["table_full"]:
+            print("      (profiler table filled - the real count is higher)")
     for key, label in (("kernel_calls", "kernel calls"),
                        ("icalls", "indirect calls"),
                        ("files_opened", "files opened"),
