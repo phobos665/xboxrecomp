@@ -54,6 +54,14 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     disasm = [sys.executable, "-m", "tools.disasm", str(xbe)]
     if args.text_only:
         disasm.append("--text-only")
+    # Seeds are entry points nothing in the image references -- vtable slots
+    # and indirect-call targets recovered from a run. Discovery cannot find
+    # them by construction, so omitting the file here silently undoes every
+    # seeding pass: the addresses stay undetected, the calls to them stay
+    # unresolved, and the next run reports the very same targets as missing.
+    # Picked up by default so running the pipeline never quietly discards them.
+    for seed_file in args.seeds:
+        disasm += ["--seed-functions", str(seed_file)]
     if args.verbose:
         disasm.append("-v")
 
@@ -109,6 +117,12 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("xbe", help="Path to the title's default.xbe")
+    ap.add_argument("--seeds", action="append", default=None, metavar="FILE",
+                    help="Seed file of extra entry points. Repeatable. "
+                         "Defaults to config/seed_functions.json when it "
+                         "exists; pass --no-seeds to disable.")
+    ap.add_argument("--no-seeds", action="store_true",
+                    help="Ignore the default seed file")
     ap.add_argument("--trace-all-entries", action="store_true",
                     help="Hook every function's entry so a profiled run can "
                          "report how many distinct functions it reached. That "
@@ -139,6 +153,12 @@ def main() -> int:
                     help="Print the commands without running them")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
+
+    if args.no_seeds:
+        args.seeds = []
+    elif args.seeds is None:
+        default_seeds = REPO / "config" / "seed_functions.json"
+        args.seeds = [default_seeds] if default_seeds.is_file() else []
 
     xbe = Path(args.xbe).resolve()
     if not args.dry_run and not xbe.is_file():

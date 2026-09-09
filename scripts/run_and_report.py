@@ -52,6 +52,16 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None):
             status = f"still running after {seconds:.0f}s (killed)"
         elapsed = time.time() - started
 
+    # The profiler only prints a running total every `profile` calls, so the
+    # highest number in the log undershoots the truth by up to one interval.
+    # Two runs sampled at different intervals are therefore not comparable, and
+    # nothing in the .err records which interval produced it -- so note it here.
+    (out_dir / f"{tag}.meta").write_text(
+        "\n".join([f"profile_interval={profile or 0}",
+                    f"seconds={seconds:.0f}",
+                    f"exe={exe}", ""]),
+        encoding="utf-8")
+
     return err_path, status, elapsed
 
 
@@ -74,7 +84,16 @@ def summarise(err_path: Path) -> dict:
         crash = m.group(1)
     fault = re.search(r"Xbox VA of fault: (0x[0-9A-Fa-f]+)", text)
 
+    meta = err_path.with_suffix(".meta")
+    interval = 0
+    if meta.is_file():
+        m = re.search(r"profile_interval=([0-9]+)",
+                      meta.read_text(encoding="utf-8"))
+        if m:
+            interval = int(m.group(1))
+
     return {
+        "profile_interval": interval,
         "lines": text.count("\n"),
         "kernel_calls": len(re.findall(r"\[KERNEL\] #", text)),
         "icalls": max(icall_totals) if icall_totals else 0,
@@ -151,6 +170,15 @@ def main() -> int:
     if now["functions_reached"] or (before and before["functions_reached"]):
         show("functions reached", now["functions_reached"],
              before["functions_reached"] if before else None)
+        if now["profile_interval"]:
+            print(f"      (sampled every {now['profile_interval']} calls, so"
+                  f" the true count is up to {now['profile_interval'] - 1}"
+                  f" higher)")
+        if before and before["profile_interval"] != now["profile_interval"]:
+            print("      MEASURED DIFFERENTLY from the baseline (every "
+                  f"{before['profile_interval'] or '?'} calls vs "
+                  f"{now['profile_interval'] or '?'}). The change above is not"
+                  " evidence on its own -- re-run at the same interval.")
         if now["table_full"]:
             print("      (profiler table filled - the real count is higher)")
     for key, label in (("kernel_calls", "kernel calls"),
