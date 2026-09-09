@@ -273,12 +273,41 @@ class DisasmEngine:
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
-            if entries < min_entries:
+
+            # ...and backwards, because the index can be negative.
+            #
+            # `jmp [reg*4 + disp]` says where index 0 lands, not where the
+            # table starts. MSVC's memcpy tail dispatch counts its remaining
+            # bytes down rather than up, so disp names the *last* entry and the
+            # rest sit below it. Burnout 2's memcpy does exactly that at
+            # 0x0011F176: `jmp dword ptr [ecx*4 + 0x11F248]` over a table that
+            # runs 0x0011F22C-0x0011F24C.
+            #
+            # Scanning forward alone found one entry there, which is under
+            # min_entries, so the table was left as data the sweep had already
+            # hallucinated instructions over. _find_function_end then walked
+            # memcpy into the table, found no instruction at 0x0011F248, and
+            # ended the function -- 165 bytes short, with every unrolled copy
+            # block and the epilogue outside it. memcpy returned without
+            # restoring esi, edi or esp, and every caller paid for it.
+            back = 0
+            while back < max_entries:
+                addr = tbl - (back + 1) * 4
+                if addr < lo:
+                    break
+                target = self.image.read_u32_at_va(addr)
+                if target is None or not (lo <= target < hi):
+                    break
+                back += 1
+
+            if entries + back < min_entries:
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
                 # would delete real instructions.
                 continue
 
+            tbl -= back * 4
+            entries += back
             end = tbl + entries * 4
             for insn in self.get_instructions_in_range(
                     tbl - 16, end):

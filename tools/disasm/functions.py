@@ -995,8 +995,29 @@ class FunctionDetector:
         Determines function boundaries by finding the extent of each
         function (up to the next function start or unreachable point).
         """
-        # Sort candidates by address
-        sorted_starts = sorted(self._candidates.keys())
+        # Sort candidates by address.
+        #
+        # A candidate with no instruction decoded at its own address is not a
+        # function, and must not be allowed to bound the one before it. The
+        # loop below takes sorted_starts[idx + 1] as the previous function's
+        # upper bound *before* discovering the candidate is empty, then drops
+        # it with `continue` -- so the clamp stands and nothing is emitted to
+        # fill what it cut off.
+        #
+        # Burnout 2's memcpy (sub_0011EFB0) is the case that matters. Its
+        # tail-copy jump table sits inline at 0x0011F230, and a candidate
+        # landed at 0x0011F248, four bytes inside that table. resync_jump_tables
+        # had already deleted the instructions the sweep hallucinated over the
+        # table, so the candidate decoded to nothing -- but it had already
+        # clamped memcpy to 0x0011F248, cutting off every unrolled copy block
+        # and the epilogue behind them. The result is a 165-byte hole covered
+        # by no function, memcpy returning without restoring esi/edi/esp, and
+        # the table's own entries lifted as unresolvable indirect calls.
+        #
+        # Filtering here rather than skipping later is what makes the bound
+        # honest: the list this loop walks is the list of real starts.
+        sorted_starts = [a for a in sorted(self._candidates.keys())
+                         if self.engine.get_instruction(a) is not None]
         if not sorted_starts:
             return
 
