@@ -567,9 +567,35 @@ class FunctionDetector:
             if not (self.engine.probes_as_returning_body(target)
                     or self.engine.probes_as_vcall_thunk(target)):
                 continue
+
+            # The same two guards _pass_data_ptr_targets carries, and for the
+            # same reason: an immediate is weak evidence, so the filter has to
+            # do the work.
+            #
+            # Requiring the address to already be a start the linear sweep
+            # produced rejects one that sits *inside* an instruction. Calling
+            # decode_at here instead manufactured a second, out-of-phase stream
+            # over real code and registered a start in the middle of it.
+            #
+            # Rejecting a first instruction of int3 or nop rejects alignment
+            # padding. An entry point never begins with padding, and a run of
+            # nops before a function is exactly where a stray immediate lands.
+            #
+            # Burnout 2 at 0x00160000 shows both. The real leaf is 19 bytes --
+            #     fld [0x2943E4]; fsub [0x2B0BF4]; fstp [0x4D29E4]; ret
+            # -- preceded by five nops. Without these guards the pass created
+            # starts at 0x0015FFFD, 0x0015FFFE and 0x0015FFFF (all nops) and at
+            # 0x00160002 (inside the fld), and the real entry inherited a
+            # 6-byte body from them. sub_00160000 therefore executed the fld
+            # and returned: the store never happened and the x87 stack leaked a
+            # slot on every call, which is the "wrong numbers, no crash" class
+            # of failure rather than anything that announces itself.
             if target not in self.engine.instructions:
-                if not self.engine.decode_at(target):
-                    continue
+                continue
+            first = self.engine.instructions[target]
+            if first.mnemonic.lower() in ("int3", "nop"):
+                continue
+
             self._add_candidate(target, config.CONFIDENCE_IMM_REF,
                                 "imm_ref_target")
             found += 1
