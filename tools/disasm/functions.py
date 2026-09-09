@@ -694,10 +694,35 @@ class FunctionDetector:
             data = self.image.get_section_data(sec)
             if not data:
                 continue
+            # Require a neighbour. A real function table is a run of code
+            # addresses; a lone one surrounded by unrelated bytes is a
+            # coincidence, and 14% of the candidates on Burnout 2 were exactly
+            # that -- 5,595 isolated words against a single genuine run of
+            # 28,826. One of them, 0x000B9087, sat in the middle of DSOUND's
+            # audio data and happened to name a branch target inside
+            # sub_000B9030, 87 bytes past the prologue that loads esi from ecx.
+            #
+            # Accepting it is worse than missing it. The entry goes in the
+            # dispatch table, so an indirect call to that address stops being
+            # an unresolved ICALL -- which is reported, and which
+            # tools.seed_from_log can recover from a run log -- and becomes a
+            # silent jump into the middle of a function with whatever the
+            # previous one left in the registers. Burnout 2 faulted reading
+            # esi+0x6B948 with a stale esi, four frames and no diagnostic away
+            # from the cause.
+            hits = []
             for off in range(0, len(data) - 3, 4):
                 value = int.from_bytes(data[off:off + 4], "little")
                 if in_code_section(value):
-                    targets.add(value)
+                    hits.append(off)
+            neighbours = set()
+            for i, off in enumerate(hits):
+                prev_adjacent = i > 0 and hits[i - 1] == off - 4
+                next_adjacent = i + 1 < len(hits) and hits[i + 1] == off + 4
+                if prev_adjacent or next_adjacent:
+                    neighbours.add(off)
+            for off in neighbours:
+                targets.add(int.from_bytes(data[off:off + 4], "little"))
 
         # Alias entries, not candidates.
         #
