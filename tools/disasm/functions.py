@@ -923,9 +923,21 @@ class FunctionDetector:
             k = bisect.bisect_right(starts, target)
             end = starts[k] if k < len(starts) else (section.virtual_addr
                                                     + section.virtual_size)
-            extent = self.engine.block_extent_end(target)
-            if extent is not None:
-                end = min(end, extent)
+            # Measured the same way as _pass_data_ptr_targets, and for the
+            # same reason: block_extent_end stops at the first terminator, so
+            # it cuts a function with several return paths at its first ret
+            # (0x00120307: 0x00120357 rather than 0x001203B0) and a switch
+            # dispatcher at its indirect jmp (0x000EC640: 30 bytes of 320,
+            # stranding every case body and all four epilogues).
+            # _find_function_end tracks internal branch targets instead, so it
+            # stops only once it has decoded past all of them.
+            measured = self._find_function_end(
+                target, end,
+                section.virtual_addr + section.virtual_size)
+            if measured and target < measured < end:
+                end = measured
+            if end <= target:
+                continue
             self._alias_entries[target] = end
             added = True
 

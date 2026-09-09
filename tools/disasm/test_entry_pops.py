@@ -149,5 +149,40 @@ class BlockExtentEnd(unittest.TestCase):
         self.assertEqual(engine.block_extent_end(BASE), BASE + 5)
 
 
+class BlockTailJump(unittest.TestCase):
+    """The three block probes have to agree about where a block ends.
+
+    block_extent_end learned that a forward jump inside the window is an
+    else-skip rather than a terminator; block_tail_jump did not, so it named
+    sub_00120307's own internal jump as that block's tail. A caller then both
+    believed the block ended in a tail call and registered an alias entry at
+    an address in the middle of the function.
+    """
+
+    def test_an_internal_forward_jump_is_not_the_tail(self):
+        # push esi ; jmp +2 ; nop ; nop ; pop esi ; ret
+        code = bytes([0x56, 0xEB, 0x02, 0x90, 0x90, 0x5E, 0xC3])
+        engine = DisasmEngine(_Image(BASE, code))
+        self.assertIsNone(engine.block_tail_jump(BASE),
+                          "this block rets; the jmp only skips two nops")
+
+    def test_a_jump_out_of_the_block_is_still_the_tail(self):
+        # nop ; jmp far forward, past everything in the window
+        code = bytes([0x90, 0xE9, 0x00, 0x10, 0x00, 0x00])
+        engine = DisasmEngine(_Image(BASE, code))
+        self.assertEqual(engine.block_tail_jump(BASE), BASE + 0x1006)
+
+    def test_a_backward_jump_is_still_the_tail(self):
+        # nop ; jmp -3  (rel8 is measured from the end of the jump)
+        code = bytes([0x90, 0xEB, 0xFD])
+        engine = DisasmEngine(_Image(BASE, code))
+        self.assertEqual(engine.block_tail_jump(BASE), BASE)
+
+    def test_a_ret_before_the_jump_still_means_not_this_shape(self):
+        code = bytes([0xC3, 0xEB, 0xFC])
+        engine = DisasmEngine(_Image(BASE, code))
+        self.assertIsNone(engine.block_tail_jump(BASE))
+
+
 if __name__ == "__main__":
     unittest.main()

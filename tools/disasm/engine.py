@@ -383,6 +383,7 @@ class DisasmEngine:
         if not data:
             return None
 
+        limit = addr + len(data)
         count = 0
         for decoded in self._cs.disasm(data, addr):
             count += 1
@@ -394,11 +395,21 @@ class DisasmEngine:
             if mnemonic in config.JMP_MNEMONICS:
                 try:
                     ops = decoded.operands
-                except Exception:
+                except Exception:                    # noqa: BLE001
                     return None
                 if not ops or ops[0].type != CS_OP_IMM:
                     return None             # indirect: nothing to name
-                return ops[0].imm & 0xFFFFFFFF
+                target = ops[0].imm & 0xFFFFFFFF
+                # Same rule as block_extent_end: a forward jump landing inside
+                # the window is MSVC skipping an else-branch, not the block's
+                # tail. Without this the two probes disagree about where a
+                # block ends -- block_tail_jump(0x00120307) answered 0x00120321,
+                # that function's own internal else-skip, so the caller both
+                # believed the block ended in a tail jump and registered an
+                # alias at an address in the middle of the function.
+                if decoded.address < target < limit:
+                    continue
+                return target
         return None
 
     def entry_pops_unsaved(self, addr: int, max_insns: int = 256):
