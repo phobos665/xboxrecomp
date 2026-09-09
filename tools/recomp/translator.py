@@ -43,23 +43,28 @@ def _fixup_icall_esp_save(lines):
     caller corruption. Leaving an argument behind is the mirror image, and
     shifts the epilogue the other way.
 
-    Push and pop counts separate them. A register popped at least as often as
-    it is pushed is restored on every path out, so a push of it is a save and
-    the argument run ends there -- "at least", not "exactly", because a
-    function with several epilogues pops once per return path. A register
-    pushed more often than it is popped has a push nobody restores -- an
-    argument -- and the run absorbs it as before.
+    A register the function pops anywhere is one it restores, so a push of it
+    ends the argument run.
 
-    Where that is still ambiguous, stopping early is the safer error: it
-    under-rewinds, which surfaces as the detectable "epilogue never ran" leak,
-    rather than as a caller silently carrying a wrong register.
+    Comparing push and pop *counts* instead does not work, because a register
+    can serve both roles in one function. Burnout 2's sub_000EC240 saves esi
+    once, passes it as an argument twice more, and pops it in each of its two
+    epilogues: three pushes against two pops. The count rule read that as "more
+    pushes than pops, therefore an argument", swallowed the save into the
+    argument run, and put the _icall_esp capture above it -- so a failed lookup
+    rewound g_esp past the saved esi and the epilogue popped the wrong slot.
+    The caller got back a corrupt `this` and faulted several frames later,
+    which is precisely the silent corruption this is meant to prevent.
+
+    Erring toward "save" is the safe direction, as the note below already
+    argued: stopping early under-rewinds, which surfaces as the detectable
+    "epilogue never ran" leak, where stopping late corrupts a caller silently.
     """
     import re
     saves = tuple(
         "PUSH32(esp, %s)" % reg
         for reg in ("ebx", "esi", "edi", "ebp")
-        if 0 < sum("PUSH32(esp, %s)" % reg in line for line in lines)
-        <= sum("POP32(esp, %s)" % reg in line for line in lines)
+        if any("POP32(esp, %s)" % reg in line for line in lines)
     )
     result = []
     # Find indices of all ICALL_SAFE lines
