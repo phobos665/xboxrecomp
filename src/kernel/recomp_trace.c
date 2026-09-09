@@ -213,6 +213,21 @@ static void prof_count(const char *name, uint32_t va)
  *
  * Set RECOMP_WATCH_VA to a guest address, e.g. RECOMP_WATCH_VA=0x5A8868.
  */
+/* Readable through the guest mapping: plain RAM, the contiguous window, or a
+ * device aperture. The apertures matter -- an interrupt-status register is
+ * often the thing a stalled title is really waiting on, and rejecting it as
+ * "out of range" hides that. */
+static int guest_readable(uint32_t va, uint32_t bytes)
+{
+    if ((uint64_t)va + bytes <= (uint64_t)xbox_GetMappedSize())
+        return 1;
+    if (va >= 0x80000000u && (uint64_t)va + bytes <= 0x84000000ull)
+        return 1;                            /* contiguous window */
+    if (va >= 0xFD000000u && (uint64_t)va + bytes <= 0xFE000000ull)
+        return 1;                            /* NV2A registers */
+    return 0;
+}
+
 static uint32_t g_watch_va;
 static uint32_t g_watch_last;
 static int g_watch_on = -1, g_watch_primed;
@@ -229,11 +244,7 @@ static void watch_check(const char *name)
     }
     if (!g_watch_on)
         return;
-    /* Plain RAM, or the contiguous window. The window sits above the mapped
-     * RAM size, so a bare size check rejects exactly the addresses a DMA pool
-     * lives at -- which is the case worth watching. */
-    if (!((uint64_t)g_watch_va + 4 <= (uint64_t)xbox_GetMappedSize()
-          || (g_watch_va >= 0x80000000u && g_watch_va < 0x84000000u)))
+    if (!guest_readable(g_watch_va, 4))
         return;
 
     mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -290,9 +301,8 @@ static void dump_va_once(void)
     if (!n || n > 256)
         n = 16;
 
-    if ((uint64_t)va + n * 4 > (uint64_t)xbox_GetMappedSize()
-        && !(va >= 0x80000000u && va < 0x84000000u))
-        return;                             /* not readable yet */
+    if (!guest_readable(va, n * 4))
+        return;                             /* not readable */
 
     mem = (const uint8_t *)xbox_GetMemoryOffset();
 

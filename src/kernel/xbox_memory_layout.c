@@ -157,6 +157,23 @@ static volatile LONG g_nv2a_ack_stop = 0;
  * that is not listed still hangs -- run the title and the watchdog sample will
  * name the register.
  */
+/* The interrupt-status registers, as opposed to the busy bits that share the
+ * same table. Only these are the title's to clear. */
+static int intr_status_reg(uint32_t offset)
+{
+    return offset == 0x000100u      /* PMC_INTR_0   */
+        || offset == 0x600100u;     /* PCRTC_INTR_0 */
+}
+
+/* Set when the vblank tick is delivering interrupts, so the acknowledgement
+ * thread knows a real ISR is servicing them. */
+static int s_vblank_owns_intr = 0;
+
+void xbox_NV2A_VblankOwnsInterrupts(int owns)
+{
+    s_vblank_owns_intr = owns;
+}
+
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
 
@@ -529,6 +546,28 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+
+            /* Leave the interrupt status alone once something actually
+             * raises interrupts.
+             *
+             * Holding these at zero was correct while nothing here ever
+             * raised a GPU interrupt -- "none pending" was the truth, and a
+             * title's ISR re-entering on a bit that never cleared is how
+             * Halo reached a native stack overflow.
+             *
+             * With RECOMP_VBLANK the vblank tick raises one and the title's
+             * own ISR services it, so the premise is gone. Burnout 2's
+             * deferred routine reads PMC_INTR_0 through the context the
+             * kernel handed it (0x00226EB8 holds 0xFD000000, so the flags it
+             * tests are at 0xFD000100) and decides from those bits what work
+             * to do. Clearing them from here meant the routine ran 4,818
+             * times and found nothing pending every time.
+             *
+             * The ISR clears them itself, which is what write-1-to-clear is
+             * for; this thread stops competing with it. */
+            if (s_vblank_owns_intr && intr_status_reg(NV2A_ACK[i].offset))
+                continue;
+
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }

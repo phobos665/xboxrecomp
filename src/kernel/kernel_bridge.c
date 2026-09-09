@@ -1785,6 +1785,28 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         return 0;
     }
 
+    /* Name the routine the first few times it runs.
+     *
+     * "4,818 DPCs dispatched" says the plumbing works and nothing about what
+     * ran. A deferred routine that returns immediately and one that drives the
+     * title's frame are indistinguishable from the count, and the count is all
+     * there was. */
+    {
+        static uint32_t said[8];
+        static unsigned n;
+        unsigned i;
+
+        for (i = 0; i < n; i++)
+            if (said[i] == routine)
+                break;
+        if (i == n && n < 8) {
+            said[n++] = routine;
+            fprintf(stderr, "  [DPC] routine 0x%08X (dpc 0x%08X context "
+                            "0x%08X)\n", routine, dpc_va, context);
+            fflush(stderr);
+        }
+    }
+
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
@@ -1974,6 +1996,17 @@ static void kernel_vblank_tick(void)
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
+
+    /* Tell the acknowledgement thread to stop clearing the interrupt status:
+     * from here the title's own ISR services it. */
+    {
+        extern void xbox_NV2A_VblankOwnsInterrupts(int);
+        static int claimed;
+        if (!claimed) {
+            claimed = 1;
+            xbox_NV2A_VblankOwnsInterrupts(1);
+        }
+    }
 
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
