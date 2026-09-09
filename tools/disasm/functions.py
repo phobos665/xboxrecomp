@@ -807,19 +807,32 @@ class FunctionDetector:
                 sec = self.image.get_section_at_va(target)
                 end = starts[i] if i < len(starts) else section_end.get(
                     sec.name if sec else "", target + 4)
-                # In a gap, "the next known start" is a poor bound: the starts
-                # list predates this pass, so a table of 30,000 entries lands in
-                # a region with almost no known starts and every alias runs to
-                # the next real function or the section end. On Burnout 2 that
-                # gave 30,378 alias bodies with a median size of 115 KB, in a
-                # 2 MB .text whose genuine functions median 84 bytes -- 22,483
-                # of them over 50 KB. Clamp to where the block this pass just
-                # probed actually ends. This only ever shrinks an alias, so it
-                # cannot clamp a neighbouring body the way registering these as
-                # starts would.
-                extent = self.engine.block_extent_end(target, max_insns=64)
-                if extent is not None:
-                    end = min(end, extent)
+                # In a gap, "the next known start" is a poor bound on its
+                # own: the starts list predates this pass, so a table of 30,000
+                # entries lands in a region with almost no known starts and
+                # every alias runs to the next real function or the section
+                # end. On Burnout 2 that gave 30,378 alias bodies with a median
+                # size of 115 KB, in a 2 MB .text whose genuine functions
+                # median 84 bytes -- 22,483 of them over 50 KB.
+                #
+                # Measure the body properly instead. _find_function_end walks
+                # forward tracking every internal branch target, so it stops
+                # only once it has decoded past all of them -- which is what a
+                # function with several return paths needs.
+                #
+                # Stopping at the first terminator instead, as this did, cuts
+                # any such function at its first ret. Burnout 2's global
+                # constructor sub_00120307 was cut that way: two later branches
+                # target the byte after that ret, so they lifted as tail calls
+                # to a stub and the function returned without popping either the
+                # saved esi or its own return address. _initterm calls that
+                # constructor with esi holding its table cursor, and got it back
+                # as 0x14.
+                measured = self._find_function_end(
+                    target, end,
+                    section_end.get(sec.name if sec else "", None))
+                if measured and target < measured < end:
+                    end = measured
             if end <= target:
                 continue
             self._alias_entries[target] = end
