@@ -193,15 +193,22 @@ def main() -> int:
         gdb.halt()
 
         code = gdb.read_memory(args.addr, 16)
-        if code is None:
-            print(f"  0x{args.addr:08X} is NOT readable in the guest.")
-            print("  The game is not loaded there yet - xemu is still in")
-            print("  the BIOS or dashboard. Let it boot, then run again.")
-            return 1
-        print(f"  bytes at 0x{args.addr:08X}: {code.hex(chr(32))}")
-        if set(code) in ({0}, {0xFF}):
-            print("  ...that is blank. The game is not loaded there yet.")
-            return 1
+        loaded = code is not None and set(code) not in ({0}, {0xFF})
+        if loaded:
+            print(f"  bytes at 0x{args.addr:08X}: {code.hex(chr(32))}")
+        else:
+            # With xemu -S the guest has not executed yet, so the image is
+            # not in memory. That is expected and is exactly when a
+            # hardware breakpoint is the right tool: it watches the address
+            # rather than patching the code, so it survives the loader
+            # writing the section in later.
+            print(f"  0x{args.addr:08X} is not loaded yet")
+            if not args.hw:
+                print("  xemu is still in the BIOS or dashboard. Either let")
+                print("  the game boot and retry, or start xemu with -S and")
+                print("  pass --hw to break before the image is loaded.")
+                return 1
+            print("  --hw given: setting a hardware breakpoint anyway.")
 
         if args.peek:
             print("peek only, not breaking.")
