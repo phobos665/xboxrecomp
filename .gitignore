@@ -9,7 +9,10 @@ tools/func_id/output/
 tools/recomp/output/
 tools/abi_analysis/output/
 
+
+#xbox-specific
 /games
+/xemu*
 
 # Game files (user provides their own)
 game_files/
