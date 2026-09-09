@@ -83,24 +83,25 @@ class Gdb:
         except GdbError:
             return ""       # already stopped
 
-    def set_breakpoint(self, addr: int) -> None:
-        reply = self.command(f"Z0,{addr:x},1")
+    def set_breakpoint(self, addr: int, hardware: bool = False) -> None:
+        kind = "Z1" if hardware else "Z0"
+        reply = self.command(f"{kind},{addr:x},1")
         if reply != "OK":
             raise GdbError(f"stub refused a breakpoint at 0x{addr:08X}: "
                            f"{reply!r} (is the address mapped yet?)")
-        self.breakpoints.add(addr)
+        self.breakpoints.add((addr, hardware))
 
-    def clear_breakpoint(self, addr: int) -> None:
-        self.command(f"z0,{addr:x},1")
-        self.breakpoints.discard(addr)
+    def clear_breakpoint(self, addr: int, hardware: bool = False) -> None:
+        self.command(f"{'z1' if hardware else 'z0'},{addr:x},1")
+        self.breakpoints.discard((addr, hardware))
 
     def clear_all(self) -> None:
-        for addr in list(self.breakpoints):
+        for addr, hardware in list(self.breakpoints):
             try:
-                self.clear_breakpoint(addr)
+                self.clear_breakpoint(addr, hardware)
             except Exception:                       # noqa: BLE001
                 print(f"  WARNING: could not remove the breakpoint at "
-                      f"0x{addr:08X}; it is an int3 in the guest now",
+                      f"0x{addr:08X}; it may still be set in the guest",
                       file=sys.stderr)
 
     def continue_until_stop(self, timeout: float) -> str:
@@ -171,6 +172,12 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=1234)
     ap.add_argument("--wait", type=float, default=120.0,
                     help="Seconds to wait for the breakpoint (default 120)")
+    ap.add_argument("--peek", action="store_true",
+                    help="Do not break: just halt, dump 16 bytes at --addr, "
+                         "and resume. Use this first to confirm the game is "
+                         "actually loaded there.")
+    ap.add_argument("--hw", action="store_true",
+                    help="Use a hardware breakpoint (Z1) instead of Z0")
     args = ap.parse_args()
 
     print(f"connecting to {args.host}:{args.port} ...")
@@ -185,8 +192,24 @@ def main() -> int:
         print("halting the guest ...")
         gdb.halt()
 
-        print(f"setting a breakpoint at 0x{args.addr:08X} ...")
-        gdb.set_breakpoint(args.addr)
+        code = gdb.read_memory(args.addr, 16)
+        if code is None:
+            print(f"  0x{args.addr:08X} is NOT readable in the guest.")
+            print("  The game is not loaded there yet - xemu is still in")
+            print("  the BIOS or dashboard. Let it boot, then run again.")
+            return 1
+        print(f"  bytes at 0x{args.addr:08X}: {code.hex(chr(32))}")
+        if set(code) in ({0}, {0xFF}):
+            print("  ...that is blank. The game is not loaded there yet.")
+            return 1
+
+        if args.peek:
+            print("peek only, not breaking.")
+            return 0
+
+        print(f"setting a {'hardware' if args.hw else 'software'} breakpoint "
+              f"at 0x{args.addr:08X} ...")
+        gdb.set_breakpoint(args.addr, hardware=args.hw)
 
         for hit in range(1, args.hits + 1):
             print(f"\nrunning (waiting up to {args.wait:.0f}s for hit "
