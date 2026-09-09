@@ -57,6 +57,13 @@ COSTLY_LIBRARIES = {
 RENDERWARE_RE = re.compile(rb"RenderWare(?:\x00|\s)*(?:Version|V)?\s*"
                            rb"([0-9]+\.[0-9]+(?:\.[0-9]+)*)", re.I)
 
+# RenderWare builds leave Perforce $Id: strings from the SDK sources, e.g.
+#   @@(#)$Id: //RenderWare/RW34Active/rwsdk/src/bacamera.c#3 $
+# "RW34" is the SDK branch, i.e. RenderWare 3.4. Retail builds rarely carry a
+# printed version string, so in practice this is the pattern that identifies
+# the engine version.
+RENDERWARE_SDK_RE = re.compile(rb"//RenderWare/RW(\d)(\d)")
+
 
 class Survey:
     """Everything the XBE header can tell us about one title."""
@@ -145,9 +152,14 @@ class Survey:
                 self.notes.append(f"{sec.name} section ({COSTLY_SECTIONS[bare]})")
 
         match = RENDERWARE_RE.search(raw)
+        sdk = RENDERWARE_SDK_RE.search(raw)
         if match:
             self.renderware = True
             self.renderware_version = match.group(1).decode("ascii", "replace")
+        elif sdk:
+            self.renderware = True
+            self.renderware_version = (sdk.group(1).decode() + "."
+                                       + sdk.group(2).decode())
         elif b"RenderWare" in raw or b"RwEngine" in raw:
             self.renderware = True
 

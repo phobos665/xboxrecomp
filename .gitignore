@@ -9,6 +9,8 @@ tools/func_id/output/
 tools/recomp/output/
 tools/abi_analysis/output/
 
+/games
+
 # Game files (user provides their own)
 game_files/
 *.xbe
