@@ -183,11 +183,13 @@ static int intr_status_reg(uint32_t offset)
 
 /* Set when the vblank tick is delivering interrupts, so the acknowledgement
  * thread knows a real ISR is servicing them. */
-static int s_vblank_owns_intr = 0;
+/* Written by the timer thread, read by the acknowledgement thread, so it is
+ * shared state and gets the same interlocked treatment as g_nv2a_ack_stop. */
+static volatile LONG s_vblank_owns_intr = 0;
 
 void xbox_NV2A_VblankOwnsInterrupts(int owns)
 {
-    s_vblank_owns_intr = owns;
+    InterlockedExchange(&s_vblank_owns_intr, owns ? 1 : 0);
 }
 
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
@@ -581,7 +583,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              *
              * The ISR clears them itself, which is what write-1-to-clear is
              * for; this thread stops competing with it. */
-            if (s_vblank_owns_intr && intr_status_reg(NV2A_ACK[i].offset))
+            if (InterlockedCompareExchange(&s_vblank_owns_intr, 0, 0)
+                && intr_status_reg(NV2A_ACK[i].offset))
                 continue;
 
             if (*r & NV2A_ACK[i].busy_mask) {
