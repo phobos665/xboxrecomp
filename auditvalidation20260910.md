@@ -110,7 +110,19 @@ Prefer the second form; it is the actual invariant.
   `[PROFILE] N functions entered`, unresolved ICALL count. Record all three in the
   commit body. If a Burnout 3 build exists, do the same there.
 
-**Status.** _______
+**Status.** `CONFIRMED` as a defect, `PARTIAL` on severity. Fixed in `03c636f`.
+
+The repro reproduced exactly: table start moved to `0x11023`, dispatch jump
+deleted. Fixed by flooring the backward scan at the dispatch instruction's
+`end_address`, looked up by `insn.jump_table` — testing `target == tbl` only
+catches the index-0 layout, which is how a first attempt passed one new test
+and failed the other. Two tests added in the inline layout; 129 pass.
+
+The severity claim does not hold for this title. Across the whole image there
+are 190 `jmp [reg*4+disp32]` sites (.text 177, D3D 9, XNET 3, XONLINE 1) and
+**none** place the table immediately after the jump, so Burnout 2 regenerated
+byte-identically: 35,598 functions, 2,157,398 bytes covered, before and after.
+Nothing measured on this branch is invalidated. The bug was latent here.
 
 ---
 
@@ -148,7 +160,13 @@ Move the existing 214 entries to the Burnout 2 file.
 Burnout 2 shows its file. A seed file with the wrong title ID makes the driver exit
 non-zero with a message naming both IDs. Add a unit test for the refusal.
 
-**Status.** _______
+**Status.** `CONFIRMED`. Fixed in `069ecd1`.
+
+Seeds are now `config/seeds/<TITLEID>.json` and the driver loads only the
+matching file; Burnout 2's 214 moved to `41430019.json`. Measured on five
+discs: Burnout 2 gets its file, Dead to Rights, Def Jam, Time Splitters 2 and
+Outrun 2 each get none. `seed_from_log` defaults to the same path and warns on
+a mismatch. Five tests added.
 
 ---
 
@@ -221,7 +239,25 @@ interlocked pattern as `g_nv2a_ack_stop`.
 **Acceptance.** The watch shows `0 -> 0x01000000 -> 0` once per frame. A Halo build,
 if available, with `RECOMP_VBLANK` set does not overflow the native stack.
 
-**Status.** _______
+**Status.** `CONFIRMED`. Fixed in `9f5931b`, and it exposed the next blocker.
+
+Before: the watch on `0xFD000100` showed one transition, `0 -> 0x01000000`,
+and never a return to zero — one vblank in a 45-second run. After: 1,752
+transitions cycling `0 -> 0x01000000 -> 0`, the vblank ISR from 1 entry to
+2,774 and its DPC from 1 to 2,773. `s_vblank_owns_intr` is `volatile LONG`
+behind the same interlocked pattern as `g_nv2a_ack_stop`.
+
+The ack runs as soon as the ISR returns, which is where hardware clears it.
+Acking after `kernel_drain_dpcs()` was tried first and is wrong: it leaves the
+status set while the DPC runs, a state hardware never presents.
+
+**Still blocked, separately.** D3D8's vblank DPC reads a pending-event mask at
+`[[context]+0x100]`, tests it against `0xFFFFEFFF`, finds nothing, and takes
+its early exit on all 2,773 entries. So `sub_000B86C0` — the vertical-blank
+callback the title hands D3D8 at `0x000B8D3D` — still never runs, the counter
+at `0x005518FC` it feeds is still zero, and the loader still spins in
+`sub_000CC5A0`. The ISR claims the interrupt without recording what it was,
+most likely reading status registers beyond the two this tick sets.
 
 ---
 
@@ -271,7 +307,12 @@ give that directory a `CMakeLists.txt` so it is actually built.
 **Acceptance.** `grep -rn DSP src/apu/apu_mmio_hook.c` returns only genuine DSP
 references. `tests/mmio_decode` builds and passes.
 
-**Status.** _______
+**Status.** `CONFIRMED`. Already fixed in `0e255d4`, before this document
+arrived — an independent audit of the same commits reached the same
+conclusion. Renamed to `MCPX_AC97_BM0_CR` / `MCPX_AC97_BM1_CR` /
+`MCPX_AC97_CR_RR`, comment rewritten around the NABM block and RR's
+self-clearing behaviour, behaviour unchanged. `tests/mmio_decode` still has no
+`CMakeLists.txt`; not addressed.
 
 ---
 
@@ -300,7 +341,12 @@ fault-routing switch (NV2A, APU, AC'97 ranges) into the runtime behind one
 **Acceptance.** A fresh copy of the template, built against a title that touches
 APU MMIO, reaches `[APU]` log lines instead of an access violation at 0xFE8xxxxx.
 
-**Status.** _______
+**Status.** `PARTIAL`, not yet fixed. `g_ac97_page_trapped` was already
+removed in `0e255d4`, and the duplicate `XBOX_MCPX_AC97_PAGE` in `apu.h` with
+it. The template still has none of the APU wiring, and `g_contig_blocks[512]`
+still has no overflow log — both open. The suggested `xbox_handle_fault(ctx)`
+in the runtime looks right: three ranges are already routed by hand in one
+project's `main.c`.
 
 ---
 
@@ -388,7 +434,9 @@ Each is small; check with the command, fix if confirmed.
 | V10i | Commit 083dd6f's body says the stale `STACK_ARG(0)` was the return address; the dispatcher pops it first (`kernel_bridge.c:5395–5396`) so it was the caller's frame slot | read the dispatcher | note only; fix is correct |
 | V10j | `block_extent_end` (`engine.py:493`) is dead after 4fb34f4 but keeps tests | grep callers | delete or mark |
 
-**Status.** _______
+**Status.** Not worked, except V10i, which is noted: the commit body for
+`083dd6f` says `STACK_ARG(0)` was the return address. The value read was
+garbage either way and the fix is right, but the description is wrong.
 
 ---
 
@@ -426,4 +474,5 @@ valuable as the fixes.
 
 | ID | Result | Evidence |
 |---|---|---|
-| | | |
+| V1 (severity) | `PARTIAL` — the defect is real, the blast radius is not | 190 `jmp [reg*4+disp32]` sites in the image, 0 with the table immediately after the jump. Burnout 2 regenerates byte-identically across the fix: 35,598 functions, 2,157,398 bytes. "Every function with an inline switch, on every title" is true of the mechanism and false of this title; the claim that it invalidates the branch's measurements does not hold. |
+| V4 (sufficiency) | `PARTIAL` — fixing the latch does not deliver a vblank callback | The chain now cycles 1,752 times, and D3D8's DPC still early-exits on every one because the pending mask at `[[context]+0x100]` is empty. A second defect sits behind this one. |
