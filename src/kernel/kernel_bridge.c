@@ -1204,17 +1204,29 @@ static void bridge_ExAllocatePoolWithTag(void)
     g_eax = xbox_va;
 }
 
-/* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+/* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ──────
+ *
+ * Both are __fastcall, so the level arrives in ecx and never reaches the
+ * stack -- their arg-size entries below are 0 for exactly that reason. These
+ * two read STACK_ARG(0) anyway, which at bridge entry is the guest return
+ * address (see g_xbox_kernel_caller), so every raise and lower was handed the
+ * low byte of its own caller's return address as an IRQL. Burnout 2 asked to
+ * lower to 8, 172, 192, 19, 248, 100 and 88 in seven consecutive calls; the
+ * legal range is 0-31.
+ *
+ * IRQL is how guest code on a uniprocessor console gets mutual exclusion, and
+ * it gates DPC delivery, so a wrong level is not a cosmetic warning: a title
+ * that believes it is at DISPATCH_LEVEL when it is not, or that never comes
+ * back down, waits for work that is never dispatched.
+ */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
+    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)g_ecx);
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    xbox_KfLowerIrql((UCHAR)new_irql);
+    xbox_KfLowerIrql((UCHAR)g_ecx);
     g_eax = 0;
 }
 
