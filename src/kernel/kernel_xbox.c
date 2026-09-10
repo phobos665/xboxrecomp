@@ -125,6 +125,60 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
 
+/* Game region the running title's certificate allows.
+ *
+ * Set from the mapped XBE during layout init. Zero means there was no XBE to
+ * read -- a synthetic test image, or the static fallback path -- and the
+ * factory answers below then pick North America rather than refusing.
+ */
+static uint32_t s_xbe_game_region;
+
+void xbox_kernel_set_xbe_game_region(uint32_t region)
+{
+    s_xbe_game_region = region;
+}
+
+uint32_t xbox_kernel_get_xbe_game_region(void)
+{
+    return s_xbe_game_region;
+}
+
+/* The console region to report, as the narrowest one this disc allows.
+ *
+ * A title's check is `cert_region & console_region`, so any single bit the
+ * certificate sets will pass. Preferring NA keeps NTSC-M as the video
+ * standard for the region-free discs that set all three, which is what a
+ * North American console would report; RECOMP_XBOX_REGION overrides it for a
+ * PAL or Japanese disc whose title also keys language or timing off the
+ * region it sees.
+ */
+static uint32_t console_game_region(void)
+{
+    const char *env = getenv("RECOMP_XBOX_REGION");
+    uint32_t allowed = s_xbe_game_region;
+
+    if (env) {
+        if (env[0] == 'j' || env[0] == 'J') return XC_GAME_REGION_JAPAN;
+        if (env[0] == 'r' || env[0] == 'R'
+         || env[0] == 'p' || env[0] == 'P') return XC_GAME_REGION_RESTOFWORLD;
+        return XC_GAME_REGION_NA;
+    }
+
+    if (allowed & XC_GAME_REGION_NA)          return XC_GAME_REGION_NA;
+    if (allowed & XC_GAME_REGION_RESTOFWORLD) return XC_GAME_REGION_RESTOFWORLD;
+    if (allowed & XC_GAME_REGION_JAPAN)       return XC_GAME_REGION_JAPAN;
+    return XC_GAME_REGION_NA;
+}
+
+static uint32_t console_av_region(void)
+{
+    switch (console_game_region()) {
+    case XC_GAME_REGION_JAPAN:       return XC_AV_STANDARD_NTSC_J;
+    case XC_GAME_REGION_RESTOFWORLD: return XC_AV_STANDARD_PAL_I;
+    default:                         return XC_AV_STANDARD_NTSC_M;
+    }
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -198,6 +252,61 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
             *(PLONG)Value = -300;
             if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(LONG);
+        }
+        break;
+
+    /* ---- the factory block ----
+     *
+     * Burnout 2 asks for both region entries during init and got zeroed
+     * memory from the default arm below, because the switch stopped at the
+     * user settings. Zero is the one answer a region check can never accept.
+     */
+    case XC_FACTORY_GAME_REGION:
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = console_game_region();
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_FACTORY_AV_REGION:
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = console_av_region();
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_FACTORY_SERIAL_NUMBER:
+        /* Twelve ASCII digits, no terminator. Real consoles encode the plant
+         * and week here; nothing reads it but the dashboard. */
+        if (ValueLength >= 12) {
+            memcpy(Value, "100000000000", 12);
+            if (Type) *Type = 3;              /* REG_BINARY */
+            if (ResultLength) *ResultLength = 12;
+        }
+        break;
+
+    case XC_FACTORY_ETHERNET_ADDR: {
+        /* Six bytes, in Microsoft's Xbox OUI so a title that sanity-checks
+         * the prefix is satisfied. System Link keys off this being stable
+         * rather than being any particular value. */
+        static const unsigned char mac[6] = { 0x00, 0x50, 0xF2, 0x00, 0x00, 0x01 };
+        if (ValueLength >= sizeof mac) {
+            memcpy(Value, mac, sizeof mac);
+            if (Type) *Type = 3;
+            if (ResultLength) *ResultLength = (ULONG)sizeof mac;
+        }
+        break;
+    }
+
+    case XC_FACTORY_ONLINE_KEY:
+        /* Sixteen bytes, per-console, and only Xbox Live uses it. Zeroed
+         * deliberately: there is nothing to authenticate against. */
+        if (ValueLength >= 16) {
+            memset(Value, 0, 16);
+            if (Type) *Type = 3;
+            if (ResultLength) *ResultLength = 16;
         }
         break;
 

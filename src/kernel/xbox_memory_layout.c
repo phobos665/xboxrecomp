@@ -1314,6 +1314,30 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    /* The certificate, for the region a title is allowed to run in.
+     *
+     * dwCertificateAddr sits at header+0x0118 and is a plain VA -- unlike the
+     * thunk pointer above it is not XOR-obfuscated. dwGameRegion is at
+     * certificate+0xA0. A title reads XC_FACTORY_GAME_REGION and ANDs it
+     * against this, so reporting a console region the disc does not allow is
+     * indistinguishable to the title from a region-locked-out console.
+     */
+    if (xbe_size >= 0x011C) {
+        uint32_t cert_va = *(const uint32_t *)(xbe + 0x0118);
+        uint32_t base_va = *(const uint32_t *)(xbe + 0x0104);
+
+        /* The headers map 1:1 from file offset 0, so VA minus base is the
+         * file offset -- true for the certificate, which always lives in
+         * them. */
+        uint32_t cert_off = cert_va - base_va;
+
+        if (cert_va >= base_va && (uint64_t)cert_off + 0xA4 <= (uint64_t)xbe_size) {
+            uint32_t region = *(const uint32_t *)(xbe + cert_off + 0xA0);
+            xbox_kernel_set_xbe_game_region(region);
+            fprintf(stderr, "  XBE certificate: game region 0x%08X\n", region);
+        }
+    }
+
     /*
      * NOTE: .rdata is NOT set read-only.
      * VirtualProtect rounds to page boundaries, and the .rdata end (0x003B2454)

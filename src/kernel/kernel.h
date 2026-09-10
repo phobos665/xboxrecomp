@@ -1027,6 +1027,38 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
 
+/* The factory block. Written at manufacture, read-only to a title, and
+ * numbered separately from the user settings above -- so a switch that only
+ * covers 0x00-0x12 answers every one of these from its default arm. Zeroed
+ * defaults are not harmless here: a title ANDs its own certificate region
+ * against XC_FACTORY_GAME_REGION and refuses to run when the result is empty,
+ * which zero always is. */
+#define XC_FACTORY_START_INDEX    0x100
+#define XC_FACTORY_SERIAL_NUMBER  0x100
+#define XC_FACTORY_ETHERNET_ADDR  0x101
+#define XC_FACTORY_ONLINE_KEY     0x102
+#define XC_FACTORY_AV_REGION      0x103
+#define XC_FACTORY_GAME_REGION    0x104
+#define XC_FACTORY_MAX_INDEX      0x104
+
+/* XC_FACTORY_GAME_REGION, and the same bits the XBE certificate uses at
+ * certificate+0xA0 -- the comparison is a bitwise AND, so the two enums are
+ * deliberately identical. */
+#define XC_GAME_REGION_NA            0x00000001
+#define XC_GAME_REGION_JAPAN         0x00000002
+#define XC_GAME_REGION_RESTOFWORLD   0x00000004
+#define XC_GAME_REGION_MANUFACTURING 0x80000000
+
+/* XC_FACTORY_AV_REGION, the EEPROM VideoStandard field. */
+#define XC_AV_STANDARD_NTSC_M     0x00400100
+#define XC_AV_STANDARD_NTSC_J     0x00400200
+#define XC_AV_STANDARD_PAL_I      0x00800300
+
+/* Game region the XBE certificate allows, as parsed during layout init, or 0
+ * if there was no mapped XBE to read it from. */
+uint32_t xbox_kernel_get_xbe_game_region(void);
+void     xbox_kernel_set_xbe_game_region(uint32_t region);
+
 /* Older spellings kept so existing call sites still build. */
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
 #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
