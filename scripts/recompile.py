@@ -32,6 +32,29 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+def xbe_title_id(xbe):
+    """The title ID from an XBE certificate, as eight uppercase hex digits.
+
+    Read here rather than imported so the driver keeps working when the XBE is
+    missing (--dry-run) and so stage one is not a prerequisite for choosing
+    seeds. The certificate address is at header+0x0118 and is a plain VA, the
+    image base at +0x0104, and the ID at certificate+0x08.
+    """
+    try:
+        data = Path(xbe).read_bytes()
+    except OSError:
+        return None
+    if len(data) < 0x011C or data[:4] != b"XBEH":
+        return None
+    base = int.from_bytes(data[0x0104:0x0108], "little")
+    cert = int.from_bytes(data[0x0118:0x011C], "little")
+    off = cert - base
+    if off < 0 or off + 12 > len(data):
+        return None
+    return "%08X" % int.from_bytes(data[off + 8:off + 12], "little")
+
+
+
 STAGES = ["parse", "disasm", "identify", "lift"]
 
 
@@ -154,13 +177,35 @@ def main() -> int:
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 
+    xbe = Path(args.xbe).resolve()
+
+    # Seeds belong to a title, not to the toolkit.
+    #
+    # This used to load config/seed_functions.json for every XBE. A seed is an
+    # unconditional claim that a function starts at an address, and tools.disasm
+    # only refuses one that lands mid-instruction -- so Burnout 2's 214
+    # addresses were applied to any other title, and each one that happened to
+    # fall on an instruction boundary became a fake function start, splitting
+    # the real function around it. Silently, and on a "make this work for any
+    # game" branch.
     if args.no_seeds:
         args.seeds = []
     elif args.seeds is None:
-        default_seeds = REPO / "config" / "seed_functions.json"
-        args.seeds = [default_seeds] if default_seeds.is_file() else []
+        args.seeds = []
+        title = xbe_title_id(xbe)
+        if title:
+            per_title = REPO / "config" / "seeds" / (title + ".json")
+            if per_title.is_file():
+                args.seeds = [per_title]
+                if args.verbose:
+                    print(f"seeds: {per_title.name} (title {title})")
+            elif args.verbose:
+                print(f"seeds: none for title {title}")
+        legacy = REPO / "config" / "seed_functions.json"
+        if legacy.is_file():
+            print(f"warning: {legacy} is ignored; seeds are per-title now, "
+                  f"in config/seeds/<TITLEID>.json", file=sys.stderr)
 
-    xbe = Path(args.xbe).resolve()
     if not args.dry_run and not xbe.is_file():
         print(f"error: XBE not found: {xbe}", file=sys.stderr)
         return 1
