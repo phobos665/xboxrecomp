@@ -165,6 +165,43 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
 
+/* Whether the vertices in a batch have been transformed yet.
+ *
+ * The rasteriser can only draw screen-space geometry, and it decided which
+ * was which by guessing at scale: a bounding box wider than a few model units
+ * was called pixels. That works for a menu and fails for a world. Burnout 2's
+ * track geometry spans hundreds of model units, so every batch of it passed
+ * the test and was drawn as if those units were pixels -- 110,000 triangles a
+ * frame smeared into a white band, with the executor reporting "0 batches
+ * skipped as not screen-space" the whole time.
+ *
+ * The unambiguous answer is in the push buffer. SET_TRANSFORM_EXECUTION_MODE
+ * says whether a vertex program is running, and if one is then attribute 0 is
+ * object space by definition, whatever its scale looks like.
+ */
+#define NV097_SET_TRANSFORM_EXECUTION_MODE 0x1E94
+#define NV097_SET_TRANSFORM_PROGRAM        0x0B00
+#define NV097_SET_VIEWPORT_OFFSET          0x0A20   /* +4 each, x y z w */
+#define NV097_SET_VIEWPORT_SCALE           0x0AF0   /* +4 each, x y z w */
+#define NV097_SET_TRANSFORM_PROGRAM_LOAD   0x1E9C
+#define NV097_SET_TRANSFORM_CONSTANT_LOAD  0x1EA4
+#define NV097_SET_TRANSFORM_CONSTANT       0x0B80   /* +4, 32 dwords a batch */
+
+/* The program and its constants, as the title uploads them.
+ *
+ * 136 instructions is the hardware limit and each is four dwords; constants
+ * are 192 vec4s. Held so the program can be executed, and dumpable with
+ * RECOMP_VP_DUMP=<path> so the instruction set it actually uses can be read
+ * off rather than guessed at.
+ */
+#define NV_VP_MAX_INSNS      136
+#define NV_VP_MAX_CONSTANTS  192
+
+#define NV_XFORM_MODE_MASK      0x00000003u
+#define NV_XFORM_MODE_FIXED     0u
+#define NV_XFORM_MODE_PROGRAM   2u
+
+
 /* The GPU-side fence.
  *
  * D3D8 hands work to the GPU and then has to know how much of it is done --
@@ -241,6 +278,15 @@ static struct {
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t sem_offset, sem_value, sem_releases;
+    uint32_t xform_mode, xform_prog_words;
+    uint32_t vp_prog[NV_VP_MAX_INSNS * 4];
+    uint32_t vp_prog_load;          /* next instruction slot to fill */
+    uint32_t vp_prog_len;           /* highest slot written, in dwords */
+    float    vp_const[NV_VP_MAX_CONSTANTS][4];
+    uint32_t vp_const_load;         /* next constant slot, in vec4s */
+    uint32_t vp_const_hi;
+    float    vp_offset[4], vp_scale[4];
+    uint32_t batches_program_mode;
     uint32_t sem_ctx_dma, sem_refused;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -1232,6 +1278,52 @@ static uint32_t vertex_color(uint32_t index)
  */
 #define OBJECT_SPACE_SPAN 8.0f
 
+/* Write the uploaded program and its constants out once.
+ *
+ * RECOMP_VP_DUMP=<path>. The NV2A's vertex program is four dwords per
+ * instruction and the encoding is dense; reading which opcodes a title
+ * actually uses off a dump is quicker and more honest than implementing the
+ * whole instruction set on the assumption it needs all of it.
+ */
+static void vp_dump_once(void)
+{
+    static int done;
+    const char *path;
+    FILE *f;
+    uint32_t i;
+
+    if (done)
+        return;
+    path = getenv("RECOMP_VP_DUMP");
+    if (!path || !*path || !s_gpu.vp_prog_len)
+        return;
+    done = 1;
+
+    f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# vertex program: %u dwords (%u instructions)\n",
+            s_gpu.vp_prog_len, s_gpu.vp_prog_len / 4);
+    fprintf(f, "# viewport offset %.3f %.3f %.3f %.3f\n",
+            s_gpu.vp_offset[0], s_gpu.vp_offset[1],
+            s_gpu.vp_offset[2], s_gpu.vp_offset[3]);
+    fprintf(f, "# viewport scale  %.3f %.3f %.3f %.3f\n",
+            s_gpu.vp_scale[0], s_gpu.vp_scale[1],
+            s_gpu.vp_scale[2], s_gpu.vp_scale[3]);
+    for (i = 0; i + 3 < s_gpu.vp_prog_len; i += 4)
+        fprintf(f, "insn %3u %08X %08X %08X %08X\n", i / 4,
+                s_gpu.vp_prog[i], s_gpu.vp_prog[i + 1],
+                s_gpu.vp_prog[i + 2], s_gpu.vp_prog[i + 3]);
+    fprintf(f, "# constants in use: %u\n", s_gpu.vp_const_hi);
+    for (i = 0; i < s_gpu.vp_const_hi; i++)
+        fprintf(f, "c[%3u] %12.5f %12.5f %12.5f %12.5f\n", i,
+                s_gpu.vp_const[i][0], s_gpu.vp_const[i][1],
+                s_gpu.vp_const[i][2], s_gpu.vp_const[i][3]);
+    fclose(f);
+    fprintf(stderr, "  [GPU] vertex program written to %s\n", path);
+    fflush(stderr);
+}
+
 static int batch_is_screen_space(void)
 {
     float p[4], lo_x, hi_x, lo_y, hi_y;
@@ -1239,6 +1331,16 @@ static int batch_is_screen_space(void)
 
     if (!s_gpu.clip_w || !s_gpu.clip_h || !s_gpu.idx_count)
         return 0;
+
+    /* A vertex program is running, so attribute 0 is object space and no
+     * amount of looking at its scale will say otherwise. Drawing it anyway is
+     * what put a white smear across the frame. */
+    if (s_gpu.xform_mode == NV_XFORM_MODE_PROGRAM) {
+        s_gpu.batches_program_mode++;
+        vp_dump_once();
+        return 0;
+    }
+
     if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p))
         return 0;
     lo_x = hi_x = p[0];
@@ -1583,7 +1685,54 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method);
         return;
     }
+
+    /* Program and constant uploads are method *blocks*, not single methods.
+     *
+     * SET_TRANSFORM_PROGRAM is 0x0B00..0x0B7C and SET_TRANSFORM_CONSTANT
+     * 0x0B80..0x0BFC -- thirty-two consecutive dword slots each, written in
+     * whatever order the push buffer's increments land. Handling only the
+     * base method captured one word in thirty-two: 324 words went past and 2
+     * arrived, which read as "the title uploads almost no program" when it
+     * had uploaded all of it.
+     *
+     * Ranges rather than thirty-two case labels apiece, and before the switch
+     * so the switch stays about methods that mean one thing.
+     */
+    if (method >= NV097_SET_TRANSFORM_PROGRAM
+     && method < NV097_SET_TRANSFORM_PROGRAM + 0x80) {
+        if (s_gpu.vp_prog_load < NV_VP_MAX_INSNS * 4) {
+            s_gpu.vp_prog[s_gpu.vp_prog_load++] = param;
+            if (s_gpu.vp_prog_load > s_gpu.vp_prog_len)
+                s_gpu.vp_prog_len = s_gpu.vp_prog_load;
+        }
+        s_gpu.xform_prog_words++;
+        return;
+    }
+
+    if (method >= NV097_SET_TRANSFORM_CONSTANT
+     && method < NV097_SET_TRANSFORM_CONSTANT + 0x80) {
+        uint32_t slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
+        uint32_t idx  = s_gpu.vp_const_load + slot / 4;
+        if (idx < NV_VP_MAX_CONSTANTS) {
+            s_gpu.vp_const[idx][slot % 4] = *(const float *)&param;
+            if (idx + 1 > s_gpu.vp_const_hi)
+                s_gpu.vp_const_hi = idx + 1;
+        }
+        return;
+    }
+
     switch (method) {
+    case NV097_SET_TRANSFORM_PROGRAM_LOAD:
+        /* An instruction index, so four dwords per step. */
+        s_gpu.vp_prog_load = param * 4;
+        if (s_gpu.vp_prog_load > NV_VP_MAX_INSNS * 4)
+            s_gpu.vp_prog_load = NV_VP_MAX_INSNS * 4;
+        break;
+
+    case NV097_SET_TRANSFORM_CONSTANT_LOAD:
+        s_gpu.vp_const_load = param;
+        break;
+
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;
@@ -1658,6 +1807,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
         semaphore_release(param);
         break;
+
+    case NV097_SET_TRANSFORM_EXECUTION_MODE: {
+        uint32_t mode = param & NV_XFORM_MODE_MASK;
+        if (mode != s_gpu.xform_mode) {
+            fprintf(stderr, "  [GPU] transform mode -> %s (0x%08X)\n",
+                    mode == NV_XFORM_MODE_PROGRAM ? "vertex program" :
+                    mode == NV_XFORM_MODE_FIXED   ? "fixed function" : "?",
+                    param);
+            fflush(stderr);
+        }
+        s_gpu.xform_mode = mode;
+        break;
+    }
 
     case NV097_SET_FLIP_READ:
         s_gpu.flip_read = param;
@@ -1950,6 +2112,13 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    if (s_gpu.batches_program_mode || s_gpu.xform_prog_words)
+        fprintf(stderr, "[GPU] transform: %u batches needed a vertex program "
+                "(%u program words uploaded), viewport offset %.1f,%.1f "
+                "scale %.1f,%.1f\n",
+                s_gpu.batches_program_mode, s_gpu.xform_prog_words,
+                s_gpu.vp_offset[0], s_gpu.vp_offset[1],
+                s_gpu.vp_scale[0], s_gpu.vp_scale[1]);
     if (s_gpu.sem_releases || s_gpu.sem_refused)
         fprintf(stderr, "[GPU] semaphore: %u released (last value %u), "
                 "%u refused\n",
