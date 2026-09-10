@@ -206,6 +206,46 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
 };
 
+/* DSP command acknowledgement, in the MCPX aperture rather than the NV2A one.
+ *
+ * DirectSound starts a DSP by writing 2 to a control byte and then spinning
+ * until the DSP clears it:
+ *
+ *     byte [dsp - 0x13ffef5] = 2
+ *   loop:
+ *     cl = byte [dsp - 0x13ffef5];  cl &= 2;  test cl, cl;  jne loop
+ *
+ * The two DSPs are indexed through a table at 0x0024A5E8 holding 0x10 and
+ * 0x70, and the subtraction wraps, so the bytes land at 0xFEC0011B and
+ * 0xFEC0017B -- above the 512 KB of APU registers that are trapped for MMIO,
+ * so they are plain memory that nothing was ever going to change.
+ *
+ * Clearing the bit is the same answer the hardware gives: a real DSP takes the
+ * command and drops the busy flag. There is no DSP here, so the command is
+ * dropped too -- which is honest about audio and wrong about nothing else,
+ * since the title only reads this byte to find out whether it may proceed.
+ *
+ * This is necessary and not yet sufficient, and the measurement says why. The
+ * clear fires -- three times in a run, at both addresses -- and the title
+ * still waits, because the wait does not re-read memory:
+ *
+ *     mov cl, byte [dsp]      <- read once
+ *     and cl, 2
+ *   loop:
+ *     test cl, cl;  jne loop  <- spins on the register copy
+ *
+ * The read happens four instructions after the write, so the bit has to be
+ * clear by then; on hardware it is, because the write latches a command and
+ * the flag drops with it. A thread clearing the byte from outside cannot win
+ * that race. Making it deterministic means catching the write itself --
+ * PAGE_READONLY on this page traps writes while leaving reads plain and fast,
+ * and the write handler masks the bit out. That is the next piece of work.
+ */
+static const uint32_t MCPX_DSP_ACK[] = {
+    0x0040011Bu,   /* 0xFEC0011B -- GP DSP */
+    0x0040017Bu,   /* 0xFEC0017B -- EP DSP */
+};
+
 /*
  * Bits that must always read as SET. The mirror image of the table above:
  * where an interrupt-pending bit is false because nothing raises interrupts,
@@ -687,6 +727,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
                 *c += 1;
+            }
+        }
+
+        /* Take the DSP command and report it done.
+         *
+         * Not guarded on g_apu_mmio_trapped: these bytes sit above the trapped
+         * APU registers, in the part of the aperture that stays plain memory,
+         * so they are reachable either way -- and with the APU trapped is
+         * exactly when a title gets far enough to write them.
+         */
+        if (g_mcpx_regs) {
+            for (size_t i = 0; i < sizeof(MCPX_DSP_ACK) / sizeof(MCPX_DSP_ACK[0]); i++) {
+                volatile uint8_t *b =
+                    (volatile uint8_t *)((char *)g_mcpx_regs + MCPX_DSP_ACK[i]);
+                if (*b & 2)
+                    *b = (uint8_t)(*b & ~2u);
             }
         }
 
@@ -2146,6 +2202,20 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 static uint32_t g_contig_next =
     XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW;
 
+/* What each contiguous block is, so its size can be answered later.
+ *
+ * The arena is a bump allocator and blocks are never freed, so this only ever
+ * grows and needs no free list -- but MmQueryAllocationSize has to be able to
+ * answer for these addresses, and without a record the only honest answer is
+ * zero. DirectSound allocates its DSP buffers here and then asks how big they
+ * are; a zero told it the block was not real, and it retried, which is why a
+ * run spent 103 of its last 400 kernel calls back in
+ * MmAllocateContiguousMemoryEx.
+ */
+#define XBOX_CONTIG_MAX_BLOCKS 512
+static struct { uint32_t addr, size; } g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+static int g_contig_block_count;
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -2165,6 +2235,13 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     }
 
     g_contig_next = result + size;
+
+    if (g_contig_block_count < XBOX_CONTIG_MAX_BLOCKS) {
+        g_contig_blocks[g_contig_block_count].addr = result;
+        g_contig_blocks[g_contig_block_count].size = size;
+        g_contig_block_count++;
+    }
+
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
@@ -2302,6 +2379,15 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
             xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
             return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
     }
+
+    /* Contiguous memory is a separate arena, and a caller asking about a
+     * block from MmAllocateContiguousMemory is asking the same question. */
+    for (i = 0; i < g_contig_block_count; i++) {
+        if (xbox_va >= g_contig_blocks[i].addr &&
+            xbox_va <  g_contig_blocks[i].addr + g_contig_blocks[i].size)
+            return g_contig_blocks[i].size - (xbox_va - g_contig_blocks[i].addr);
+    }
+
     return 0;
 }
 

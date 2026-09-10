@@ -71,6 +71,39 @@ void apu_mixer_get_state(int slot, uint32_t *byte_offset, int *active, int *loop
 void apu_mixer_play(int slot, int looping);
 void apu_mixer_stop(int slot);
 
+
+/* ---- APU register aperture, and the fault handler that serves it ----
+ *
+ * The APU's 512 KB of registers are mapped PAGE_NOACCESS so that a guest
+ * access traps, and apu_hook_handle_mmio() decodes the faulting instruction,
+ * performs the read or write against the emulated APU, advances RIP past it
+ * and reports true. A host program installs a vectored exception handler and
+ * calls this for a fault inside the aperture; returning false means the
+ * instruction was not one the decoder knows, and the fault should be treated
+ * as a real crash.
+ *
+ * Declared here because it is the boundary between the runtime and a
+ * project's own main(): without a declaration the caller gets C89's implicit
+ * int and the bool comes back truncated.
+ */
+#define XBOX_APU_MMIO_BASE  0xFE800000u
+#define XBOX_APU_MMIO_SIZE  0x00080000u
+
+/* The emulated APU the fault handler serves from.
+ *
+ * NULL until mcpx_apu_init_standalone() runs, and apu_hook_handle_mmio()
+ * declines every access while it is -- silently, which is why trapping the
+ * aperture without creating the device turns each APU access into a crash
+ * with no APU log line to explain it.
+ */
+extern MCPXAPUState *g_apu_state;
+
+#ifdef _WIN32
+struct _CONTEXT;
+int apu_hook_handle_mmio(struct _CONTEXT *ctx, uintptr_t fault_addr,
+                         uint32_t fault_xbox_va, int is_write);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

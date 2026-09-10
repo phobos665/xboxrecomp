@@ -255,11 +255,11 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * Public API (called from VEH in main.c)
  * ============================================================ */
 
-bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
-                          uint32_t fault_xbox_va, int is_write)
+int apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                         uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    int ok = apu_decode_and_handle(ctx, mmio_offset, is_write) ? 1 : 0;
 
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out
