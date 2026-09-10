@@ -2273,6 +2273,25 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     return result;
 }
 
+/* Walk the contiguous blocks this runtime handed out.
+ *
+ * Exposed because the DirectSound DSP doorbell lives inside one of them and
+ * its address is not derivable from any APU register: GPSADDR and friends
+ * point at the DSP's own scratch, while the command block is an ordinary
+ * contiguous allocation. Rather than have each title name the address, the
+ * APU can look for it.
+ *
+ * Returns 0 when `index` is past the end, so a caller can just count up.
+ */
+int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size)
+{
+    if (index < 0 || index >= g_contig_block_count)
+        return 0;
+    if (addr) *addr = g_contig_blocks[index].addr;
+    if (size) *size = g_contig_blocks[index].size;
+    return 1;
+}
+
 /* How much of the window has been handed out.
  *
  * Lets a caller holding a physical address decide whether it names contiguous

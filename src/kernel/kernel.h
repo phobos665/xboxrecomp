@@ -1057,6 +1057,9 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 /* Game region the XBE certificate allows, as parsed during layout init, or 0
  * if there was no mapped XBE to read it from. */
 uint32_t xbox_kernel_get_xbe_game_region(void);
+
+/* Walk the contiguous allocations, oldest first. Returns 0 past the end. */
+int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size);
 void     xbox_kernel_set_xbe_game_region(uint32_t region);
 
 /* Older spellings kept so existing call sites still build. */

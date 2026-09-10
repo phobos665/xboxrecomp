@@ -79,6 +79,111 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
+/* Find the doorbell rather than being told it.
+ *
+ * RECOMP_APU_DSP_ACK exists because the address is not derivable from the APU
+ * registers, and naming it per title is the one genuinely per-game knob left
+ * in the audio path. It does not have to be: the command block is a
+ * contiguous allocation, the runtime now records every one it hands out, and
+ * the doorbell sits at a fixed offset inside it -- Burnout 2's two are at
+ * 0x80BB0810 and 0x80C18810, both `base + 0x810`.
+ *
+ * Scanning for a non-zero word at that offset is not enough on its own: a
+ * framebuffer is a contiguous allocation too, and some pixel will hold a
+ * small number. What separates a doorbell from data is that a stuck doorbell
+ * does not change. The guest writes a command and spins, so the value stays
+ * put; a pixel, a vertex buffer, an audio ring all move. So a candidate has
+ * to hold the *same* non-zero value across several APU frames before it is
+ * believed, and every address adopted is logged.
+ *
+ * Conservative on purpose. Writing four bytes into the wrong guest structure
+ * is the kind of fault that surfaces somewhere else entirely, hours later.
+ */
+/* From the kernel's memory layout. Declared here rather than by including
+ * kernel.h: the APU library does not depend on the kernel's headers, and this
+ * is the whole of the interface it needs. */
+int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size);
+
+#define APU_DSP_DOORBELL_OFFSET  0x810u
+#define APU_DSP_DOORBELL_STABLE  8        /* frames a value must persist */
+#define APU_DSP_MAX_CANDIDATES   16
+
+typedef struct {
+    uint32_t addr;
+    uint32_t value;
+    uint32_t stable;
+    int      adopted;
+} DspDoorbell;
+
+static DspDoorbell s_doorbell[APU_DSP_MAX_CANDIDATES];
+static int s_doorbell_count;
+
+static DspDoorbell *doorbell_slot(uint32_t addr)
+{
+    int i;
+
+    for (i = 0; i < s_doorbell_count; i++)
+        if (s_doorbell[i].addr == addr)
+            return &s_doorbell[i];
+    if (s_doorbell_count >= APU_DSP_MAX_CANDIDATES)
+        return NULL;
+    s_doorbell[s_doorbell_count].addr = addr;
+    return &s_doorbell[s_doorbell_count++];
+}
+
+static void dsp_ack_discovered(MCPXAPUState *d)
+{
+    uint32_t addr, size;
+    int index;
+
+    for (index = 0; xbox_ContiguousBlock(index, &addr, &size); index++) {
+        uint32_t slot_va = addr + APU_DSP_DOORBELL_OFFSET;
+        volatile uint32_t *slot;
+        DspDoorbell *cand;
+        uint32_t v;
+
+        if (size < APU_DSP_DOORBELL_OFFSET + 4)
+            continue;
+
+        slot = (volatile uint32_t *)(d->ram_ptr + slot_va);
+        v = *slot;
+
+        cand = doorbell_slot(slot_va);
+        if (!cand)
+            continue;
+
+        if (cand->adopted) {
+            if (v) {
+                *slot = 0;
+                cand->stable++;
+            }
+            continue;
+        }
+
+        /* A command is a small code -- Burnout 2 posts 2 and 3 -- and it has
+         * to sit still. Anything large or moving is data. */
+        if (!v || v > 0xFF) {
+            cand->value = v;
+            cand->stable = 0;
+            continue;
+        }
+        if (v != cand->value) {
+            cand->value = v;
+            cand->stable = 1;
+            continue;
+        }
+        if (++cand->stable < APU_DSP_DOORBELL_STABLE)
+            continue;
+
+        cand->adopted = 1;
+        *slot = 0;
+        fprintf(stderr, "[APU] DSP doorbell found at 0x%08X: command 0x%02X "
+                        "held for %d frames, acknowledged\n",
+                slot_va, v, APU_DSP_DOORBELL_STABLE);
+        fflush(stderr);
+    }
+}
+
 static void dsp_ack_frame(MCPXAPUState *d)
 {
     int i;
@@ -87,16 +192,41 @@ static void dsp_ack_frame(MCPXAPUState *d)
         dsp_ack_init();
     if (!d->ram_ptr)
         return;
-    for (i = 0; i < s_dsp_ack_count; i++) {
-        uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
-        if (*slot) {
-            static int shown[APU_DSP_ACK_MAX];
-            if (shown[i]++ < 3)
-                fprintf(stderr, "[APU] DSP doorbell 0x%08X: command 0x%08X"
-                                " acknowledged\n", s_dsp_ack[i], *slot);
-            *slot = 0;
+
+    /* An explicit list short-circuits the search: if a title has been
+     * measured, there is no reason to re-derive it every frame. */
+    if (s_dsp_ack_count) {
+        for (i = 0; i < s_dsp_ack_count; i++) {
+            uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+            if (*slot) {
+                static int shown[APU_DSP_ACK_MAX];
+                if (shown[i]++ < 3)
+                    fprintf(stderr, "[APU] DSP doorbell 0x%08X: command 0x%08X"
+                                    " acknowledged\n", s_dsp_ack[i], *slot);
+                *slot = 0;
+            }
         }
+        return;
     }
+
+    /* Opt-in, because it does not work yet.
+     *
+     * The idea is sound and the mechanism is here: the command block is a
+     * contiguous allocation, the runtime records every one, and a stuck
+     * doorbell is the one word in such a block that holds a small value and
+     * does not change. Measured on Burnout 2 it finds nothing -- the two
+     * known doorbells at 0x80BB0810 and 0x80C18810 are not turning up at
+     * `base + 0x810` of any tracked block, so either those blocks are not
+     * allocated through xbox_ContiguousAlloc or the offset is not fixed.
+     *
+     * Left behind RECOMP_APU_DSP_SCAN rather than deleted: the next step is to
+     * log the tracked blocks against the known addresses and see which
+     * assumption is wrong. Enabled by default it would be a regression, since
+     * with the explicit list the title reaches 1,345,011 guest calls and
+     * without it 109,999.
+     */
+    if (getenv("RECOMP_APU_DSP_SCAN"))
+        dsp_ack_discovered(d);
 }
 
 void mcpx_apu_dsp_init(MCPXAPUState *d)

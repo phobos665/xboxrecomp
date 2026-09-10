@@ -1399,21 +1399,43 @@ static int fetch_position(uint32_t index, float out[4])
  */
 static void vp_dump_once(void)
 {
-    static int done;
+    /* Every distinct program, not just the first.
+     *
+     * One program does not constrain the encoding. Burnout 2's frontend
+     * shader is twelve instructions and uses source B exactly once, so a
+     * search for B's field position leaves sixteen candidates -- and fitting
+     * a bit offset to one data point is how a plausible wrong answer gets
+     * adopted. Each new program adds instructions that use B and C in known
+     * roles, and a DP4 chain pins both at once.
+     */
+    #define VP_DUMP_MAX 32
+    static uint32_t seen[VP_DUMP_MAX];
+    static int seen_count;
+    static int appended;
     const char *path;
     FILE *f;
-    uint32_t i;
+    uint32_t i, sig = 0;
+    int k;
 
-    if (done)
-        return;
     path = getenv("RECOMP_VP_DUMP");
     if (!path || !*path || !s_gpu.vp_prog_len)
         return;
-    done = 1;
 
-    f = fopen(path, "w");
+    for (i = 0; i < s_gpu.vp_prog_len; i++)
+        sig = sig * 31u + s_gpu.vp_prog[i];
+    sig = sig * 31u + s_gpu.vp_prog_len;
+
+    for (k = 0; k < seen_count; k++)
+        if (seen[k] == sig)
+            return;
+    if (seen_count >= VP_DUMP_MAX)
+        return;
+    seen[seen_count++] = sig;
+
+    f = fopen(path, appended++ ? "a" : "w");
     if (!f)
         return;
+    fprintf(f, "\n### program %d, signature %08X\n", seen_count - 1, sig);
     fprintf(f, "# vertex program: %u dwords (%u instructions)\n",
             s_gpu.vp_prog_len, s_gpu.vp_prog_len / 4);
     fprintf(f, "# viewport offset %.3f %.3f %.3f %.3f\n",
@@ -1449,7 +1471,7 @@ static int batch_is_screen_space(void)
      * object space. Counted separately so a frame's mix is visible. */
     if (s_gpu.xform_mode == NV_XFORM_MODE_PROGRAM) {
         s_gpu.batches_program_mode++;
-        vp_dump_once();
+        vp_dump_once();                    /* records each distinct program */
     }
 
     if (!fetch_position(s_gpu.idx[0], p))
