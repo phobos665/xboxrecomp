@@ -1074,6 +1074,8 @@ static void dump_texture_bmp(uint32_t seq)
     fflush(stderr);
 }
 
+static uint32_t g_dbg_tex_px, g_dbg_texfail_px, g_dbg_flat_px, g_dbg_tris;
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
@@ -1155,12 +1157,24 @@ static void raster_triangle(const float a[2], const float b[2],
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
+                    g_dbg_tex_px++;
                     put_pixel(mem, bpp, x, y, texel);
                     continue;
                 }
+                g_dbg_texfail_px++;
             }
+            if (!textured) g_dbg_flat_px++;
             put_pixel(mem, bpp, x, y, argb);
         }
+    }
+    if (++g_dbg_tris % 4000u == 0u) {
+        fprintf(stderr, "  [PX] tris %u  tex %u  texfail %u  flat %u"
+                "  fmt%02X %ux%u valid %d  surf %08X pitch %u bpp %u\n",
+                g_dbg_tris, g_dbg_tex_px, g_dbg_texfail_px, g_dbg_flat_px,
+                s_gpu.tex.color, s_gpu.tex.width, s_gpu.tex.height,
+                s_gpu.tex.valid, dma_resolve(s_gpu.color_offset),
+                s_gpu.pitch, bpp);
+        fflush(stderr);
     }
     s_gpu.tris_drawn++;
 }
@@ -1575,11 +1589,43 @@ static void raster_batch(void)
             raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
                            vertex_color(s_gpu.idx[i]));
         break;
-    case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_QUADS:
+        /* Independent quads: 0-3, 4-7, 8-11. Each is its own two triangles
+         * and shares nothing with its neighbours.
+         *
+         * These used to go through the fan case below, on the reasoning that
+         * a single quad fanned around vertex 0 is exactly its two triangles.
+         * True of one quad, and wrong for every quad after it: fanning the
+         * whole batch joins each later quad back to the *first* quad's corner.
+         *
+         * Burnout 2 draws its text as one QUADS batch of glyph quads, so every
+         * glyph got a triangle stretched back to the first glyph -- forty-five
+         * thousand long thin triangles a frame, smearing font texels across
+         * the whole row. That is the white band that made the frame look like
+         * nothing was working, while the logo two triangles earlier was
+         * pixel-perfect.
+         */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+            uint32_t c0 = vertex_color(s_gpu.idx[i]);
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2], c0);
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3], c0);
+        }
+        break;
+
     case NV_PRIM_QUAD_STRIP:
-        /* A fan and a quad both rasterise as a triangle fan around index 0;
-         * for a quad that is exactly its two triangles. */
+        /* Vertices in pairs, each new pair closing another quad against the
+         * previous one: quad n is (2n, 2n+1, 2n+3, 2n+2). Note the last two
+         * are swapped relative to index order, which is what keeps the
+         * winding consistent along the strip. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+            uint32_t c0 = vertex_color(s_gpu.idx[i]);
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3], c0);
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2], c0);
+        }
+        break;
+
+    case NV_PRIM_TRIANGLE_FAN:
+        /* A genuine fan: every triangle shares index 0. */
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
             raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
                            vertex_color(s_gpu.idx[0]));

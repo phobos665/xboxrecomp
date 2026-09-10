@@ -854,5 +854,17 @@
  {
   "start": "0x0021CE30",
   "note": "NV2A vblank ISR. KeConnectInterrupt vector 3 names it at runtime; nothing references it statically, so discovery never found it and recomp_lookup could not call it -- the frame-complete interrupt was raised and declined every time."
+ },
+ {
+  "start": "0x00107FA0",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00109470",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0010A2F0",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
  }
 ]
