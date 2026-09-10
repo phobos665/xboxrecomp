@@ -210,9 +210,22 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_AUDIO:
-        /* Stereo + Dolby Digital enabled (0x00000001 = stereo, 0x00010000 = AC3) */
+        /* Two-channel, no encoders.
+         *
+         * This used to answer 0x00010001, described as "stereo + Dolby
+         * Digital". Stereo is 0 in this field and 1 is mono, so it actually
+         * said mono -- and then advertised an AC3 encoder on top, which is a
+         * combination no console reports.
+         *
+         * The encoder bits are the part that matters. Advertising AC3 tells a
+         * title the digital output can carry an encoded stream, so it
+         * configures its mixer for one; Burnout 2 goes on to load
+         * data/b2distfx.bin, an effects image for the APU's DSP, and this
+         * runtime has no DSP to download it to. Claiming a capability that is
+         * not implemented is worse than claiming none.
+         */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00010001;
+            *(PULONG)Value = XC_AUDIO_FLAGS_STEREO;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

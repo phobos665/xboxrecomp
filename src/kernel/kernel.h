@@ -1063,6 +1063,19 @@ void     xbox_kernel_set_xbe_game_region(uint32_t region);
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
 #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
 
+/* Channel configuration and encoder flags in XC_AUDIO.
+ *
+ * The channel count is a small enum in the low bits, and stereo is zero --
+ * so 1 is mono, not stereo. The encoder bits advertise what the console can
+ * send down the digital output, and a title that sees them will ask its
+ * mixer for an encoded stream.
+ */
+#define XC_AUDIO_FLAGS_STEREO       0x00000000
+#define XC_AUDIO_FLAGS_MONO         0x00000001
+#define XC_AUDIO_FLAGS_SURROUND     0x00000002
+#define XC_AUDIO_FLAGS_ENABLE_AC3   0x00010000
+#define XC_AUDIO_FLAGS_ENABLE_DTS   0x00020000
+
 /* Video standard flags in XC_VIDEO */
 #define XC_VIDEO_FLAGS_WIDESCREEN   0x01
 #define XC_VIDEO_FLAGS_HDTV         0x02
