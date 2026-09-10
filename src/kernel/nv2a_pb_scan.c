@@ -97,7 +97,10 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1D8C, "SET_CLEAR_DEPTH" },
     { 0x1D90, "SET_COLOR_CLEAR_VALUE" },
     { 0x1D94, "CLEAR_SURFACE" },
-    { 0x1D6C, "SET_ZSTENCIL_CLEAR" },
+    { 0x1D6C, "SET_SEMAPHORE_OFFSET" },   /* not SET_ZSTENCIL_CLEAR, which
+                                        * is 0x1D8C -- and this label is
+                                        * how the fence went unnoticed */
+    { 0x1D70, "BACK_END_WRITE_SEMAPHORE_RELEASE" },
     { 0x0B80, "SET_TRANSFORM_PROGRAM" },
     { 0x0B00, "SET_TRANSFORM_CONSTANT" },
     { 0x1720, "SET_VERTEX_DATA_ARRAY_OFFSET" },

@@ -164,6 +164,32 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+
+/* The GPU-side fence.
+ *
+ * D3D8 hands work to the GPU and then has to know how much of it is done --
+ * to reuse a push-buffer segment, or to let go of a vertex buffer. It does
+ * that with a semaphore: SET_SEMAPHORE_OFFSET names a dword in the semaphore
+ * DMA object, and BACK_END_WRITE_SEMAPHORE_RELEASE writes its parameter there
+ * once the GPU has drained everything queued ahead of it. The value is a
+ * monotonic count, and D3D8 spins reading that dword until it passes what it
+ * needs.
+ *
+ * Ignoring these does not lose a frame, it stops the title. Burnout 2 reaches
+ * its main init, submits eleven segments, and then sits in
+ *   loc_0021B180:  ecx = *GET;  edi = PUT - ecx;  cmp eax, edi;  jb loc_0021B180
+ * with PUT = 11 and *GET stuck at 3, waiting for 9 -- forever, making no
+ * kernel calls, drawing its title screen every frame. It is a hang with no
+ * fault, no log line, and nothing on the frontier.
+ *
+ * ponytail: the release happens the moment it is parsed, because this
+ * executor runs the push buffer synchronously and there is nothing still in
+ * flight behind it. That is the same shortcut FLIP_STALL takes above.
+ */
+#define NV097_SET_CONTEXT_DMA_SEMAPHORE   0x01A4
+#define NV097_SET_SEMAPHORE_OFFSET        0x1D6C
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
+
 #define NV097_INLINE_ARRAY                0x1818
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
@@ -214,6 +240,8 @@ static struct {
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
+    uint32_t sem_offset, sem_value, sem_releases;
+    uint32_t sem_ctx_dma, sem_refused;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
@@ -461,6 +489,141 @@ static void dump_surface_bmp(void)
 static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
+
+/* Resolve a DMA context handle to the physical address it names.
+ *
+ * A method like SET_CONTEXT_DMA_SEMAPHORE carries a handle, not an address.
+ * The guest turns handles into objects through two structures the GPU reads
+ * out of instance memory, and this runtime backs the whole NV2A aperture with
+ * ordinary committed pages -- so PRAMIN is just memory, and both structures
+ * can be read back exactly as the hardware would see them.
+ *
+ *   RAMHT   8-byte entries: [handle, context]. The context's low 16 bits are
+ *           the object's instance address in units of 16 bytes.
+ *   object  4 dwords: [class|flags, limit, frame|access, frame|access].
+ *           The frame is page-aligned, so the low 12 bits are access flags.
+ *
+ * The hash table is searched rather than hashed. The NV2A's hash folds the
+ * handle with the channel id and the table size, and getting it subtly wrong
+ * returns a plausible wrong object; a linear pass over 128 KB happens once
+ * per handle and cannot. Both the entry and the object it points at are
+ * validated before the frame is believed.
+ *
+ * Returns 0 when the handle is not found or the object does not look like
+ * memory, which every caller must treat as "do not write".
+ */
+/* The aperture base is private to xbox_memory_layout.c; this is the same
+ * constant, and the address is fixed by the hardware. */
+#define NV_APERTURE_BASE   0xFD000000u
+#define NV_PRAMIN_OFFSET   0x00700000u
+#define NV_PRAMIN_BYTES    0x00020000u        /* 128 KB, the whole of RAMIN */
+#define NV_CLASS_DMA_IN_MEMORY  0x3Du
+#define NV_CLASS_DMA_TO_MEMORY  0x3Eu
+
+static uint32_t dma_object_frame(uint32_t handle, uint32_t *limit_out)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint32_t *pramin =
+        (const uint32_t *)(mem + NV_APERTURE_BASE + NV_PRAMIN_OFFSET);
+    uint32_t words = NV_PRAMIN_BYTES / 4;
+    uint32_t i;
+
+    if (!handle)
+        return 0;
+
+    for (i = 0; i + 1 < words; i += 2) {
+        uint32_t inst, cls, frame;
+
+        if (pramin[i] != handle)
+            continue;
+
+        inst = (pramin[i + 1] & 0xFFFFu) << 4;
+        if (inst + 16 > NV_PRAMIN_BYTES)
+            continue;
+
+        cls   = pramin[inst / 4] & 0xFFFu;
+        frame = pramin[inst / 4 + 2] & 0xFFFFF000u;
+
+        if (cls != NV_CLASS_DMA_IN_MEMORY && cls != NV_CLASS_DMA_TO_MEMORY)
+            continue;
+        if (frame >= XBOX_CONTIG_SIZE)
+            continue;                      /* not memory this runtime backs */
+
+        if (limit_out)
+            *limit_out = pramin[inst / 4 + 1];
+        return frame;
+    }
+    return 0;
+}
+
+/* Write the semaphore value where the title is watching for it. */
+static void semaphore_release(uint32_t value)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t limit = 0;
+    uint32_t frame = dma_object_frame(s_gpu.sem_ctx_dma, &limit);
+    uint32_t va;
+
+    /* No object, no write. Guessing an address here corrupts four bytes of
+     * whatever is actually there, silently. */
+    if (!frame) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr,
+                    "  [GPU] semaphore release ignored: DMA context 0x%X did "
+                    "not resolve to memory in PRAMIN.\n",
+                    s_gpu.sem_ctx_dma);
+            fflush(stderr);
+        }
+        s_gpu.sem_refused++;
+        return;
+    }
+    if (limit && s_gpu.sem_offset + 4 > limit + 1) {
+        s_gpu.sem_refused++;
+        return;                            /* past the end of the object */
+    }
+
+    va = dma_resolve(frame + s_gpu.sem_offset);
+
+    /* Same reasoning as a surface: the offset is a DMA-object offset, so it
+     * is physical, and contiguous memory is reachable only through the
+     * window. Refusing a write into the loaded image matters more here than
+     * for a surface -- this one is four bytes and would corrupt silently. */
+    if (surface_write_refused(va, 4, "release a semaphore into"))
+        return;
+
+    /* The low contiguous page belongs to XPP, which hardcodes it and poisons
+     * it with 0xCCCCCCCC -- XBOX_CONTIG_RESERVED_LOW exists because two
+     * allocators sharing it ended twenty-one runs in a row. An offset of 0
+     * means the address came from the DMA object, which is not resolved yet,
+     * so this would be a four-byte write into someone else's structure. */
+    if (va < XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr,
+                    "  [GPU] semaphore release to 0x%08X refused: that is the "
+                    "reserved low contiguous page.\n"
+                    "  [GPU]   DMA object 0x%X resolved to frame 0x%08X + "
+                    "offset 0x%X.\n", va, s_gpu.sem_ctx_dma, frame,
+                    s_gpu.sem_offset);
+            fflush(stderr);
+        }
+        s_gpu.sem_refused++;
+        return;
+    }
+
+    *(volatile uint32_t *)(mem + va) = value;
+    s_gpu.sem_value = value;
+    s_gpu.sem_releases++;
+
+    if (s_gpu.sem_releases <= 4 || (s_gpu.sem_releases % 500) == 0)
+        fprintf(stderr, "  [GPU] semaphore release #%u: [0x%08X] = %u "
+                "(dma 0x%X frame 0x%08X + 0x%X)\n",
+                s_gpu.sem_releases, va, value, s_gpu.sem_ctx_dma,
+                frame, s_gpu.sem_offset);
+}
 
 static void clear_surface(uint32_t param)
 {
@@ -1445,6 +1608,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * contiguous window when it names contiguous memory. */
         s_gpu.tex.offset = dma_resolve(param);
         record_tex_reg(method, param);
+        break;
+
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        s_gpu.sem_ctx_dma = param;
+        /* Which DMA object the offset below is relative to. Recorded rather
+         * than used: dma_resolve() decides physical-versus-VA from where the
+         * runtime handed the memory out, which is the same answer for every
+         * object this executor can see. */
+        break;
+
+    case NV097_SET_SEMAPHORE_OFFSET:
+        s_gpu.sem_offset = param;
+        break;
+
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        semaphore_release(param);
         break;
 
     case NV097_SET_FLIP_READ:
