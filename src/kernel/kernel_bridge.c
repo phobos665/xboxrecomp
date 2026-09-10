@@ -1996,35 +1996,6 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
-/* Take the interrupt back down, the way the ISR's acknowledgement would.
- *
- * These registers are write-1-to-clear on hardware, so the ISR acknowledges
- * by writing the pending bit back. The aperture is plain memory, so that
- * write *sets* it instead -- and since the ack thread was told to stop
- * touching them, nothing else ever cleared them either. Both bits stayed set
- * after the first frame, and the tick's own guard then saw a still-pending
- * interrupt: one vblank delivered, and never another.
- *
- * The symptom was nowhere near the cause. Burnout 2's D3D8 registers a
- * vertical-blank callback and the game's loader spins until the counter that
- * callback feeds advances, so one vblank means asset loading waits for ever.
- *
- * Called as soon as the ISR returns, because that is when hardware clears it:
- * the ISR runs at high IRQL, acknowledges, and only queues a DPC. The DPC
- * runs later at DISPATCH_LEVEL and reads driver state the ISR saved, not the
- * register. Acking after the drain instead was tried, and it leaves the
- * status set while the DPC runs -- a state hardware never presents.
- *
- * Unconditional rather than only when the ISR claimed it: an interrupt left
- * pending is the re-entry storm the ack table was written for after Halo's
- * native stack overflow.
- */
-static void kernel_vblank_ack(void)
-{
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   &= ~NV2A_PMC_INTR_PCRTC;
-}
-
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2055,6 +2026,17 @@ static void kernel_vblank_tick(void)
         }
     }
 
+    /* Raise it, and leave the clearing to the guest.
+     *
+     * Both registers are write-1-to-clear, and the CRTC page is write-trapped
+     * so the guest's acknowledgement now does what it says: the ISR checks
+     * PMC_INTR_0 bit 24, the DPC writes PCRTC_INTR_0 and spins until the
+     * summary drops, and it drops because nv2a_intr_handle_write() maintains
+     * it. Clearing them from here instead was tried twice -- after the ISR,
+     * which left the DPC reading a status that was already gone, and after the
+     * DPC drain, which is a state hardware never presents -- and both were
+     * guesses at a protocol the guest was perfectly capable of running.
+     */
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
@@ -2068,7 +2050,6 @@ static void kernel_vblank_tick(void)
         fflush(stderr);
     }
 
-    kernel_vblank_ack();
 }
 
 /* Run whatever is queued. Called from the timer thread, which has the guest

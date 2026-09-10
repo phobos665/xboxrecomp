@@ -367,6 +367,139 @@ static int ac97_store(void *dst, uint64_t value, int size)
     return ok;
 }
 
+/* ============================================================
+ * NV2A interrupt status: write-1-to-clear
+ * ============================================================ */
+
+/* Defined below, next to the AC'97 handler it is shared with. */
+static int mmio_decode_write_value(PCONTEXT ctx, uint64_t *out, int *out_size);
+static int ac97_store(void *dst, uint64_t value, int size);
+
+/* The registers a guest ISR acknowledges through, and the summary bit.
+ *
+ * PMC_INTR_0 bit 24 is not storage: it reports that the CRTC has something
+ * pending, and it goes away when PCRTC_INTR_0 does. A driver acknowledges by
+ * writing the bits it handled to PCRTC_INTR_0 -- write-1-to-clear -- and then
+ * waits for the summary to drop.
+ *
+ * Burnout 2's D3D8 does exactly that, and against plain memory it cannot ever
+ * finish:
+ *
+ *     0x0021D0D0:  mov  [edi + 0x600100], ecx      ; ecx = 1, the vblank bit
+ *     0x0021D0D6:  test [edi + 0x100], 0x1000000
+ *     0x0021D0DC:  jne  0x21d0d0                   ; spin
+ *
+ * The store put 1 into PCRTC_INTR_0 rather than clearing bit 0, PMC_INTR_0
+ * kept its summary bit, and the loop never exited. That loop runs on the DPC,
+ * which this runtime dispatches from the timer thread -- the same thread that
+ * raises the next vblank. So one frame was delivered, the thread died inside
+ * the acknowledgement, and nothing ever ticked again. The title's registered
+ * vertical-blank callback never ran, and its asset loader waits on a counter
+ * that callback feeds.
+ *
+ * Implementing the real semantics is what fixes it, and it is less code than
+ * the workarounds: clear the written bits, then recompute the summary.
+ */
+#define NV2A_PMC_INTR_0_OFF      0x000100u
+#define NV2A_PMC_INTR_PCRTC_BIT  0x01000000u
+#define NV2A_PCRTC_INTR_0_OFF    0x600100u
+
+int nv2a_intr_handle_write(PCONTEXT ctx, uintptr_t host_addr,
+                           uint32_t nv2a_offset, uintptr_t aperture)
+{
+    volatile uint32_t *pmc =
+        (volatile uint32_t *)(aperture + NV2A_PMC_INTR_0_OFF);
+    volatile uint32_t *pcrtc =
+        (volatile uint32_t *)(aperture + NV2A_PCRTC_INTR_0_OFF);
+    uint64_t written;
+    int size;
+
+    if (!mmio_decode_write_value(ctx, &written, &size))
+        return 0;
+
+    if (nv2a_offset == NV2A_PCRTC_INTR_0_OFF) {
+        uint32_t remaining = *pcrtc & ~(uint32_t)written;
+        if (!ac97_store((void *)host_addr, remaining, 4))
+            return 0;
+        /* The summary follows the unit, and nothing else owns that bit. */
+        if (remaining)
+            *pmc |= NV2A_PMC_INTR_PCRTC_BIT;
+        else
+            *pmc &= ~NV2A_PMC_INTR_PCRTC_BIT;
+        return 1;
+    }
+
+    if (nv2a_offset == NV2A_PMC_INTR_0_OFF) {
+        /* PMC_INTR_0 is read-only status on hardware. A driver that writes it
+         * is acknowledging, so drop the written bits rather than storing
+         * them. */
+        uint32_t remaining = *pmc & ~(uint32_t)written;
+        return ac97_store((void *)host_addr, remaining, 4);
+    }
+
+    /* Any other register on the page: a plain store, so the page behaves as
+     * memory for everything this does not model. */
+    return ac97_store((void *)host_addr, written, size);
+}
+
+/* Decode the value and width a faulting store was going to write.
+ *
+ * Shared by the AC'97 and NV2A handlers, which differ only in what they do
+ * with the value. Returns 0 for a form the decoder does not know, and the
+ * caller must then let the fault through -- silently skipping an instruction
+ * whose width is a guess is how a wrong RIP happens.
+ */
+static int mmio_decode_write_value(PCONTEXT ctx, uint64_t *out, int *out_size)
+{
+    const uint8_t *ip = (const uint8_t *)ctx->Rip;
+    int prefix_len = 0, has_66 = 0, rex = 0, has_rex = 0;
+    int rex_w, rex_r, rex_b, size;
+    const uint8_t *opcode;
+
+    while (1) {
+        uint8_t b = ip[prefix_len];
+        if (b == 0x66) { has_66 = 1; prefix_len++; }
+        else if (b == 0xF2 || b == 0xF3) { prefix_len++; }
+        else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix_len++; }
+        else break;
+    }
+    rex_w = has_rex && (rex & 0x08);
+    rex_r = has_rex && (rex & 0x04);
+    rex_b = has_rex && (rex & 0x01);
+
+    opcode = ip + prefix_len;
+    size = 4;
+    if (has_66) size = 2;
+    if (rex_w)  size = 8;
+
+    if (opcode[0] == 0x89 || opcode[0] == 0x88) {
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        if (opcode[0] == 0x88) size = 1;
+        *out = *ctx_reg64(ctx, reg);
+        *out_size = size;
+        ctx->Rip += prefix_len + 1 + modrm_len;
+        return 1;
+    }
+    if (opcode[0] == 0xC7) {
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        int imm_len = has_66 ? 2 : 4;
+        *out = has_66 ? *(const uint16_t *)(opcode + 1 + modrm_len)
+                      : *(const uint32_t *)(opcode + 1 + modrm_len);
+        *out_size = size;
+        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+        return 1;
+    }
+    if (opcode[0] == 0xC6) {
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        *out = *(opcode + 1 + modrm_len);
+        *out_size = 1;
+        ctx->Rip += prefix_len + 1 + modrm_len + 1;
+        return 1;
+    }
+    return 0;
+}
+
 int mcpx_ac97_handle_write(PCONTEXT ctx, uintptr_t host_addr, uint32_t mcpx_offset)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;

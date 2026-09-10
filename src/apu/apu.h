@@ -113,6 +113,22 @@ int apu_hook_handle_mmio(struct _CONTEXT *ctx, uintptr_t fault_addr,
  */
 int mcpx_ac97_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
                            uint32_t mcpx_offset);
+
+/* Apply a guest write to an NV2A interrupt register with the semantics the
+ * hardware has: PCRTC_INTR_0 is write-1-to-clear and PMC_INTR_0 bit 24 is a
+ * summary of it, not storage. A driver acknowledging a vblank writes the one
+ * and spins on the other, so against plain memory it spins for ever.
+ *
+ * `aperture` is the host address the NV2A register window starts at; the
+ * handler needs both registers and only the faulting one's address is known.
+ *
+ * It lives beside the APU handler because that is where the x86-64 store
+ * decoder is, not because it has anything to do with audio.
+ */
+#define XBOX_NV2A_PCRTC_PAGE  0x00600000u   /* 0xFD600000, one 4 KB page */
+
+int nv2a_intr_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
+                           uint32_t nv2a_offset, uintptr_t aperture);
 #endif
 
 #ifdef __cplusplus

@@ -95,6 +95,8 @@ static void *g_nv2a_memory = NULL;
  * kernel does not link the APU library, so it is repeated rather than
  * shared. */
 #define XBOX_MCPX_AC97_PAGE 0x00400000u
+/* The CRTC page, offset from the NV2A base. Same constant as apu.h. */
+#define XBOX_NV2A_PCRTC_PAGE 0x00600000u
 static void *g_mcpx_memory = NULL;
 
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
@@ -1578,6 +1580,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
+        /* Trap writes to the CRTC interrupt page when the vblank chain runs.
+         *
+         * PCRTC_INTR_0 is write-1-to-clear and PMC_INTR_0 bit 24 is a summary
+         * of it. A guest ISR acknowledges by writing the one and spinning on
+         * the other, and against plain memory that spin never ends: Burnout
+         * 2's D3D8 does it on the DPC, which this runtime dispatches from the
+         * timer thread -- the same thread that raises the next vblank. One
+         * frame was delivered and the clock stopped.
+         *
+         * PAGE_READONLY, not PAGE_NOACCESS: the status registers are read far
+         * more than written, and only the write needs different semantics.
+         * Only when RECOMP_VBLANK is set, because that is the only thing that
+         * raises an interrupt for anyone to acknowledge.
+         */
+        if (g_nv2a_memory && getenv("RECOMP_VBLANK")) {
+            DWORD old_nv;
+            if (VirtualProtect((char *)g_nv2a_memory + XBOX_NV2A_PCRTC_PAGE,
+                               4096, PAGE_READONLY, &old_nv))
+                fprintf(stderr, "  NV2A: 0x%08X..0x%08X write-trapped "
+                        "(PCRTC interrupt status)\n",
+                        XBOX_NV2A_BASE + XBOX_NV2A_PCRTC_PAGE,
+                        XBOX_NV2A_BASE + XBOX_NV2A_PCRTC_PAGE + 4096);
+            else
+                fprintf(stderr, "  WARNING: NV2A PCRTC page protect failed "
+                        "(error %lu); the vblank ack will spin\n",
+                        GetLastError());
+        }
+
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
