@@ -91,6 +91,10 @@ static void *g_nv2a_memory = NULL;
 /* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
+/* The AC97 page, offset from the MCPX base. Same constant as apu.h; the
+ * kernel does not link the APU library, so it is repeated rather than
+ * shared. */
+#define XBOX_MCPX_AC97_PAGE 0x00400000u
 static void *g_mcpx_memory = NULL;
 
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
@@ -206,46 +210,6 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
 };
 
-/* DSP command acknowledgement, in the MCPX aperture rather than the NV2A one.
- *
- * DirectSound starts a DSP by writing 2 to a control byte and then spinning
- * until the DSP clears it:
- *
- *     byte [dsp - 0x13ffef5] = 2
- *   loop:
- *     cl = byte [dsp - 0x13ffef5];  cl &= 2;  test cl, cl;  jne loop
- *
- * The two DSPs are indexed through a table at 0x0024A5E8 holding 0x10 and
- * 0x70, and the subtraction wraps, so the bytes land at 0xFEC0011B and
- * 0xFEC0017B -- above the 512 KB of APU registers that are trapped for MMIO,
- * so they are plain memory that nothing was ever going to change.
- *
- * Clearing the bit is the same answer the hardware gives: a real DSP takes the
- * command and drops the busy flag. There is no DSP here, so the command is
- * dropped too -- which is honest about audio and wrong about nothing else,
- * since the title only reads this byte to find out whether it may proceed.
- *
- * This is necessary and not yet sufficient, and the measurement says why. The
- * clear fires -- three times in a run, at both addresses -- and the title
- * still waits, because the wait does not re-read memory:
- *
- *     mov cl, byte [dsp]      <- read once
- *     and cl, 2
- *   loop:
- *     test cl, cl;  jne loop  <- spins on the register copy
- *
- * The read happens four instructions after the write, so the bit has to be
- * clear by then; on hardware it is, because the write latches a command and
- * the flag drops with it. A thread clearing the byte from outside cannot win
- * that race. Making it deterministic means catching the write itself --
- * PAGE_READONLY on this page traps writes while leaving reads plain and fast,
- * and the write handler masks the bit out. That is the next piece of work.
- */
-static const uint32_t MCPX_DSP_ACK[] = {
-    0x0040011Bu,   /* 0xFEC0011B -- GP DSP */
-    0x0040017Bu,   /* 0xFEC0017B -- EP DSP */
-};
-
 /*
  * Bits that must always read as SET. The mirror image of the table above:
  * where an interrupt-pending bit is false because nothing raises interrupts,
@@ -315,6 +279,7 @@ static void *g_mcpx_regs = NULL;
  * counter ticking below must leave them alone -- writing through the pointer
  * faults, and the emulated APU owns those registers anyway. */
 static int g_apu_mmio_trapped = 0;
+static int g_ac97_page_trapped = 0;
 
 /*
  * GPU completion fences the title waits on in guest memory rather than in the
@@ -727,22 +692,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
                 *c += 1;
-            }
-        }
-
-        /* Take the DSP command and report it done.
-         *
-         * Not guarded on g_apu_mmio_trapped: these bytes sit above the trapped
-         * APU registers, in the part of the aperture that stays plain memory,
-         * so they are reachable either way -- and with the APU trapped is
-         * exactly when a title gets far enough to write them.
-         */
-        if (g_mcpx_regs) {
-            for (size_t i = 0; i < sizeof(MCPX_DSP_ACK) / sizeof(MCPX_DSP_ACK[0]); i++) {
-                volatile uint8_t *b =
-                    (volatile uint8_t *)((char *)g_mcpx_regs + MCPX_DSP_ACK[i]);
-                if (*b & 2)
-                    *b = (uint8_t)(*b & ~2u);
             }
         }
 
@@ -1723,6 +1672,32 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
+
+                /* Writes to this page trap; reads do not.
+                 *
+                 * PAGE_READONLY rather than PAGE_NOACCESS, because the two
+                 * things on it want opposite treatment. The codec status is
+                 * read and has to stay plain memory -- it is polled a
+                 * thousand times in a row. The DSP command bytes have to be
+                 * caught at the instant they are written, because the wait
+                 * that follows reads the byte once and then spins on the
+                 * register copy, so anything that changes memory afterwards
+                 * arrives too late to be seen.
+                 *
+                 * Set the codec bit before protecting: afterwards this is not
+                 * writable from here either.
+                 */
+                if (VirtualProtect((char *)g_mcpx_memory + XBOX_MCPX_AC97_PAGE,
+                                   4096, PAGE_READONLY, &old_protect)) {
+                    g_ac97_page_trapped = 1;
+                    fprintf(stderr, "  AC97: 0x%08X..0x%08X write-trapped\n",
+                            XBOX_MCPX_BASE + XBOX_MCPX_AC97_PAGE,
+                            XBOX_MCPX_BASE + XBOX_MCPX_AC97_PAGE + 4096);
+                } else {
+                    fprintf(stderr, "  WARNING: AC97 page protect failed "
+                            "(error %lu); the DSP wait will not clear\n",
+                            GetLastError());
+                }
             }
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",

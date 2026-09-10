@@ -102,6 +102,19 @@ extern MCPXAPUState *g_apu_state;
 struct _CONTEXT;
 int apu_hook_handle_mmio(struct _CONTEXT *ctx, uintptr_t fault_addr,
                          uint32_t fault_xbox_va, int is_write);
+
+/* Apply a guest write to the AC'97 page, dropping the DSP busy bit.
+ *
+ * That page is mapped PAGE_READONLY rather than PAGE_NOACCESS: the codec
+ * status is read constantly and must stay plain memory, while the DSP command
+ * bytes have to be caught at the moment they are written. So only writes
+ * fault, and only writes come here. mcpx_offset is measured from the MCPX
+ * aperture base, host_addr is where the page actually lives.
+ */
+#define XBOX_MCPX_AC97_PAGE  0x00400000u   /* 0xFEC00000, one 4 KB page */
+
+int mcpx_ac97_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
+                           uint32_t mcpx_offset);
 #endif
 
 #ifdef __cplusplus

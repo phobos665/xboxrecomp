@@ -252,6 +252,128 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
 }
 
 /* ============================================================
+ * AC'97 page: writes trap, reads do not
+ * ============================================================ */
+
+/* The DSP command bytes, as offsets from the MCPX aperture base.
+ *
+ * DirectSound starts a DSP by writing 2 here and then reads the byte back
+ * four instructions later, expecting the flag to have dropped -- the wait
+ * loads it once and spins on the register copy, so it never sees a later
+ * change:
+ *
+ *     mov cl, byte [dsp];  and cl, 2
+ *   loop:
+ *     test cl, cl;  jne loop
+ *
+ * On hardware the write latches a command and the flag drops with it, so the
+ * read already sees zero. A thread clearing the byte from outside cannot win
+ * that race, and measurably does not. Catching the write is what makes it
+ * deterministic: the page is mapped PAGE_READONLY, so a write faults here and
+ * a read stays plain memory at full speed.
+ *
+ * Dropping the bit is the whole model. There is no DSP to run the command,
+ * and the title reads this byte only to find out whether it may proceed.
+ */
+#define MCPX_DSP_GP_CONTROL  0x0040011Bu   /* 0xFEC0011B */
+#define MCPX_DSP_EP_CONTROL  0x0040017Bu   /* 0xFEC0017B */
+#define MCPX_DSP_BUSY_BIT    0x02u
+
+static uint64_t ac97_apply_mask(uint32_t mcpx_offset, uint64_t value)
+{
+    if (mcpx_offset == MCPX_DSP_GP_CONTROL || mcpx_offset == MCPX_DSP_EP_CONTROL)
+        return value & ~(uint64_t)MCPX_DSP_BUSY_BIT;
+    return value;
+}
+
+/* Put the value in the page, which is read-only to everyone including us. */
+static int ac97_store(void *dst, uint64_t value, int size)
+{
+    DWORD old;
+    if (!VirtualProtect(dst, (SIZE_T)size, PAGE_READWRITE, &old))
+        return 0;
+    switch (size) {
+    case 1: *(volatile uint8_t  *)dst = (uint8_t)value;  break;
+    case 2: *(volatile uint16_t *)dst = (uint16_t)value; break;
+    case 8: *(volatile uint64_t *)dst = value;           break;
+    default: *(volatile uint32_t *)dst = (uint32_t)value; break;
+    }
+    VirtualProtect(dst, (SIZE_T)size, old, &old);
+    return 1;
+}
+
+int mcpx_ac97_handle_write(PCONTEXT ctx, uintptr_t host_addr, uint32_t mcpx_offset)
+{
+    const uint8_t *ip = (const uint8_t *)ctx->Rip;
+    int prefix_len = 0, has_66 = 0, rex = 0, has_rex = 0;
+    int rex_w, rex_r, rex_b, access_size;
+    const uint8_t *opcode;
+
+    while (1) {
+        uint8_t b = ip[prefix_len];
+        if (b == 0x66) { has_66 = 1; prefix_len++; }
+        else if (b == 0xF2 || b == 0xF3) { prefix_len++; }
+        else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix_len++; }
+        else break;
+    }
+    rex_w = has_rex && (rex & 0x08);
+    rex_r = has_rex && (rex & 0x04);
+    rex_b = has_rex && (rex & 0x01);
+
+    opcode = ip + prefix_len;
+    access_size = 4;
+    if (has_66) access_size = 2;
+    if (rex_w)  access_size = 8;
+
+    /* MOV r/m, r */
+    if (opcode[0] == 0x89 || opcode[0] == 0x88) {
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        uint64_t val = *ctx_reg64(ctx, reg);
+        if (opcode[0] == 0x88) access_size = 1;
+        if (!ac97_store((void *)host_addr,
+                        ac97_apply_mask(mcpx_offset, val), access_size))
+            return 0;
+        ctx->Rip += prefix_len + 1 + modrm_len;
+        return 1;
+    }
+
+    /* MOV r/m32, imm32 */
+    if (opcode[0] == 0xC7) {
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        uint32_t imm = *(const uint32_t *)(opcode + 1 + modrm_len);
+        if (!ac97_store((void *)host_addr,
+                        ac97_apply_mask(mcpx_offset, imm), access_size))
+            return 0;
+        ctx->Rip += prefix_len + 1 + modrm_len + 4;
+        return 1;
+    }
+
+    /* MOV r/m8, imm8 -- the one the DSP kick actually uses */
+    if (opcode[0] == 0xC6) {
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        uint8_t imm = *(opcode + 1 + modrm_len);
+        if (!ac97_store((void *)host_addr,
+                        ac97_apply_mask(mcpx_offset, imm), 1))
+            return 0;
+        ctx->Rip += prefix_len + 1 + modrm_len + 1;
+        return 1;
+    }
+
+    {
+        static unsigned said;
+        if (said++ < 20) {
+            fprintf(stderr, "[AC97] write decode fail at RIP=%p offset=0x%X: "
+                    "%02X %02X %02X %02X %02X %02X\n",
+                    (void *)ctx->Rip, mcpx_offset,
+                    ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
+/* ============================================================
  * Public API (called from VEH in main.c)
  * ============================================================ */
 
