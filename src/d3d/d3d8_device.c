@@ -18,6 +18,8 @@
 #include "d3d8_internal.h"
 #include <stdio.h>
 #include <string.h>
+/* malloc: without <stdlib.h> its pointer is truncated to int. */
+#include <stdlib.h>
 
 /* ================================================================
  * Internal device state

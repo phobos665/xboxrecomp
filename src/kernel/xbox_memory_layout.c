@@ -17,6 +17,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
+/* <stdlib.h> is load-bearing, not tidiness.
+ *
+ * Without it MSVC applies the implicit-declaration rule and assumes
+ * `int getenv()`, so the returned pointer is truncated to 32 bits and sign
+ * extended. RECOMP_WATCHDOG_SECS was the visible symptom: `if (!secs ||
+ * !*secs)` dereferenced 0xFFFFFFFFA94859D5 and faulted about one run in
+ * three, and when the truncated byte happened to read zero it returned
+ * early instead -- so the watchdog was either a crash or silently inert,
+ * and never once fired. The `getenv(...) != NULL` tests elsewhere in this
+ * file survived only because a truncated non-zero value is still non-zero.
+ */
+#include <stdlib.h>
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000

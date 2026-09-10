@@ -22,6 +22,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+/* malloc: without <stdlib.h> its pointer is truncated to int. */
+#include <stdlib.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
 

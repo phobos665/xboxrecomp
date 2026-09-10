@@ -11,6 +11,8 @@
 
 #include "kernel.h"
 #include <string.h>
+/* getenv: without <stdlib.h> its pointer is truncated to int. */
+#include <stdlib.h>
 
 /* ============================================================================
  * Exported Data Objects

@@ -19,6 +19,8 @@ MCPXAPUState *g_apu_state = NULL;
  * now the whole body is Windows-only so apu_emu links on Debian. */
 #if defined(_WIN32)
 #include <windows.h>
+/* getenv: without <stdlib.h> its pointer is truncated to int. */
+#include <stdlib.h>
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u

@@ -23,6 +23,8 @@
 #include <mferror.h>
 #include <stdio.h>
 #include <math.h>
+/* malloc/calloc: without <stdlib.h> the pointer is truncated to int. */
+#include <stdlib.h>
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")

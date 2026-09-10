@@ -330,6 +330,12 @@ static long kernel_log_budget(void)
  * arg0 is at g_esp+0, arg1 at g_esp+4, etc. */
 #define STACK_ARG(n) ((uint32_t)BRIDGE_MEM32(g_esp + (n) * 4))
 
+/* Defined further down this file, and called from two bridges above it.
+ * Without this it is implicitly declared; the return type happens to match on
+ * this target, so unlike the getenv case nothing was corrupted -- but the
+ * build now rejects implicit declarations, so it has to be said. */
+uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+
 /* Guest return address of the call currently in a bridge. */
 RECOMP_TLS uint32_t g_xbox_kernel_caller;
 

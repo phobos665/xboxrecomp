@@ -22,6 +22,24 @@ add_compile_definitions(
     NOMINMAX
 )
 
+# An implicit declaration is an error, everywhere, in every configuration.
+#
+# C89's rule is that an undeclared function returns int, and on this target
+# that silently truncates a 64-bit return value to 32 bits and sign extends
+# it. Seven files used getenv, malloc or calloc without <stdlib.h> and so
+# received corrupted pointers: RECOMP_WATCHDOG_SECS faulted on
+# 0xFFFFFFFFA94859D5 about one run in three and was inert the rest of the
+# time, and two D3D8 draw paths were allocating through a truncated malloc.
+#
+# It was a warning the whole time (C4013, alongside C4047 for the assignment).
+# A warning among hundreds in a build this size is not a signal, so it is an
+# error now. C4047 stays a warning: it fires on legitimate casts elsewhere.
+if(MSVC)
+    add_compile_options(/we4013)
+else()
+    add_compile_options(-Werror=implicit-function-declaration)
+endif()
+
 # Option to build examples
 
 # ── Runtime Libraries ─────────────────────────────────────────
