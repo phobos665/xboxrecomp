@@ -104,6 +104,74 @@ class BackwardIndexedTables(unittest.TestCase):
         self.assertEqual(engine.jump_table_entries(table_va), targets)
 
 
+def build_inline(table_entries, disp_index):
+    """The same, but with the table immediately after the dispatch.
+
+    This is where MSVC actually puts it, and the distance is what matters:
+    `build()` above leaves 0xE0 bytes between the jump and the table, so the
+    backward scan runs out of plausible pointers long before it reaches the
+    jump. Inline, the four bytes below the table *are* the jump's
+    displacement, and its value is the table address -- a perfectly good code
+    address for the scan to accept.
+    """
+    size = 0x400
+    img = _Image(BASE, bytes(size))
+
+    jmp_off = 0x20
+    table_va = BASE + jmp_off + 7          # straight after ff 24 8d <disp32>
+    for i, target in enumerate(table_entries):
+        off = (table_va - BASE) + i * 4
+        img.code[off:off + 4] = struct.pack("<I", target)
+
+    disp = table_va + disp_index * 4
+    img.code[jmp_off:jmp_off + 3] = b"\xff\x24\x8d"
+    img.code[jmp_off + 3:jmp_off + 7] = struct.pack("<I", disp)
+    for target in table_entries:
+        img.code[target - BASE] = 0xC3     # ret, so the arms decode
+    return img, table_va, BASE + jmp_off
+
+
+class InlineTables(unittest.TestCase):
+    """A table placed immediately after its dispatch, which is the usual case.
+
+    Both of these failed before the backward scan learned to stop at the
+    instruction that owns the bytes: the scan read the jump's own displacement
+    as entry -1, moved the table start back a slot, and the cleanup loop then
+    deleted the jump -- so _find_function_end saw neither a table nor an
+    instruction at the dispatch and ended the function there. Every function
+    with an inline switch was truncated, on every title.
+    """
+
+    def test_a_table_directly_after_its_dispatch_is_not_extended_backwards(self):
+        targets = [BASE + 0x200 + i * 0x10 for i in range(4)]
+        img, table_va, jmp_va = build_inline(targets, disp_index=0)
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.resync_jump_tables()
+
+        self.assertIn(table_va, engine.jump_tables,
+                      "the table starts where the jump ends, not four bytes below")
+        self.assertEqual(engine.jump_tables[table_va], table_va + len(targets) * 4)
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+        self.assertIsNotNone(engine.instructions.get(jmp_va),
+                             "the dispatch jump must survive the resync")
+
+    def test_an_inline_table_addressed_from_its_last_entry_still_resolves(self):
+        # The negative-index case the backward scan exists for, in the layout
+        # it will actually meet: scanning down from the displacement has to
+        # reach the table start and stop exactly at the end of the jump.
+        targets = [BASE + 0x200 + i * 0x10 for i in range(4)]
+        img, table_va, jmp_va = build_inline(targets, disp_index=len(targets) - 1)
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.resync_jump_tables()
+
+        self.assertIn(table_va, engine.jump_tables)
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+        self.assertIsNotNone(engine.instructions.get(jmp_va),
+                             "the dispatch jump must survive the resync")
+
+
 class StillRejectsNonTables(unittest.TestCase):
     """Scanning both ways must not make a coincidence into a table."""
 

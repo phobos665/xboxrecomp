@@ -1926,13 +1926,32 @@ class Lifter:
         # extending such a table backwards would swallow the code before it on
         # the strength of a few words that happen to read as addresses.
         if len(targets) < 2:
+            # ...and never over the dispatch instruction's own displacement.
+            #
+            # MSVC usually puts the table immediately after the jump, and
+            # `jmp dword ptr [reg*4 + disp32]` is FF 24 8D <disp32> (or
+            # FF 24 85 for a base-less scale-4 form) -- so the four bytes just
+            # below the table are the displacement, and its value is the table
+            # address itself, which reads as a perfectly good code address.
+            # Accepting it prepends a bogus leading entry, and
+            # _analyze_switch_table below stops at the first entry outside the
+            # function, so one bogus word discards the whole switch.
+            #
+            # The engine has instruction bounds and uses those; here there is
+            # only the image, so test for the opcode directly and keep the
+            # value check as a backstop for encodings this does not name.
+            floor = 0
+            if offset >= 7 and self.xbe_data[offset - 7:offset - 4] in (
+                    b"\xff\x24\x8d", b"\xff\x24\x85"):
+                floor = offset - 4       # the disp belongs to the jump
+
             back = []
             for i in range(1, max_entries + 1):
                 o = offset - i * 4
-                if o < 0:
+                if o < 0 or o >= floor > 0:
                     break
                 val = struct.unpack_from('<I', self.xbe_data, o)[0]
-                if not is_code_address(val):
+                if not is_code_address(val) or val == table_va:
                     break
                 back.append(val)
             if back:

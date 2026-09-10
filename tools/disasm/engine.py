@@ -256,6 +256,31 @@ class DisasmEngine:
         Returns the number of tables resynced.
         """
         resynced = 0
+
+        # Where each dispatch instruction ends, keyed by the table it names.
+        #
+        # A table cannot start before the instruction that addresses it: the
+        # candidate came from that instruction's displacement, and MSVC puts
+        # the table straight after the jump, so the four bytes below the table
+        # *are* the displacement -- and its value is the table address, which
+        # the backward scan happily reads as entry -1. It then moved the start
+        # back a slot and the cleanup below deleted the jump, so
+        # _find_function_end saw neither a table nor an instruction at the
+        # dispatch and ended the function there. Every function with an inline
+        # switch was truncated, on every title.
+        #
+        # Keyed on insn.jump_table rather than on "an instruction ends here",
+        # because with a negative index the candidate is in the middle of the
+        # table and nothing ends at it. Built once: scanning the instruction
+        # map per candidate is quadratic on a real image.
+        dispatch_end = {}
+        for insn in self.instructions.values():
+            jt = getattr(insn, "jump_table", None)
+            if jt is None:
+                continue
+            if insn.end_address > dispatch_end.get(jt, 0):
+                dispatch_end[jt] = insn.end_address
+
         for tbl in sorted(self._jt_candidates):
             # XBEs mark .rdata and .data executable, so "points at an
             # executable section" alone would let an array of data pointers
@@ -290,10 +315,30 @@ class DisasmEngine:
             # ended the function -- 165 bytes short, with every unrolled copy
             # block and the epilogue outside it. memcpy returned without
             # restoring esi, edi or esp, and every caller paid for it.
+            # ...but not over the dispatch instruction itself.
+            #
+            # MSVC usually puts the table immediately after the jump, and
+            # `jmp dword ptr [reg*4 + disp32]` is FF 24 8D <disp32> -- so the
+            # four bytes at tbl-4 are the jump's own displacement, and its
+            # value *is* tbl, which is inside the section. The scan accepted
+            # it, moved the table start back a slot, and the cleanup below
+            # deleted the jump. _find_function_end then found neither a table
+            # nor an instruction at the dispatch and ended the function there,
+            # truncating every function with an inline switch on every title.
+            #
+            # The invariant is ownership, not the value: the table cannot
+            # begin before the instruction that addresses it has ended.
+            # Testing the value instead (target == tbl) would only catch the
+            # index-0 layout and would miss it whenever the compiler picked a
+            # different entry to name.
+            floor = dispatch_end.get(tbl, lo)
+            if floor < lo:
+                floor = lo
+
             back = 0
             while back < max_entries:
                 addr = tbl - (back + 1) * 4
-                if addr < lo:
+                if addr < floor:
                     break
                 target = self.image.read_u32_at_va(addr)
                 if target is None or not (lo <= target < hi):
