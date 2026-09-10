@@ -279,7 +279,6 @@ static void *g_mcpx_regs = NULL;
  * counter ticking below must leave them alone -- writing through the pointer
  * faults, and the emulated APU owns those registers anyway. */
 static int g_apu_mmio_trapped = 0;
-static int g_ac97_page_trapped = 0;
 
 /*
  * GPU completion fences the title waits on in guest memory rather than in the
@@ -1659,13 +1658,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
+                /* Registers only, not the DSP's memory.
+                 *
+                 * The aperture's first 512 KB holds two different kinds of
+                 * thing. Up to 0x30000 are registers the emulated APU models:
+                 * the PAPU block below 0x20000 and the voice processor from
+                 * 0x20000. From 0x30000 up are the GP and EP DSPs' own program
+                 * and data memory, which apu_core.c ignores -- so trapping
+                 * them buys nothing and costs correctness.
+                 *
+                 * It cost a crash, not just cycles. A title loads DSP firmware
+                 * by copying it into that window, and MSVC compiles the lifted
+                 * copy into AVX: the fault at offset 0x30314 was C5 FE 6F 02,
+                 * `vmovdqu ymm0, [rdx]`, which the MMIO decoder does not
+                 * handle and never should -- a 32-byte vector load is not a
+                 * register access. Left as plain memory the copy just lands,
+                 * which is what the hardware does and what a stubbed DSP
+                 * needs.
+                 */
                 DWORD old_protect;
-                if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
+                #define XBOX_APU_REG_BYTES 0x00030000u
+                if (VirtualProtect((char *)g_mcpx_memory, XBOX_APU_REG_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
-                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
-                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
+                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
+                            " (registers; DSP memory above stays plain)\n",
+                            XBOX_MCPX_BASE,
+                            XBOX_MCPX_BASE + XBOX_APU_REG_BYTES);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
@@ -1689,7 +1709,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  */
                 if (VirtualProtect((char *)g_mcpx_memory + XBOX_MCPX_AC97_PAGE,
                                    4096, PAGE_READONLY, &old_protect)) {
-                    g_ac97_page_trapped = 1;
                     fprintf(stderr, "  AC97: 0x%08X..0x%08X write-trapped\n",
                             XBOX_MCPX_BASE + XBOX_MCPX_AC97_PAGE,
                             XBOX_MCPX_BASE + XBOX_MCPX_AC97_PAGE + 4096);

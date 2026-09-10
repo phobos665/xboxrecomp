@@ -516,9 +516,25 @@ static void raster_triangle(const float a[2], const float b[2],
  * constant, and the address is fixed by the hardware. */
 #define NV_APERTURE_BASE   0xFD000000u
 #define NV_PRAMIN_OFFSET   0x00700000u
-#define NV_PRAMIN_BYTES    0x00020000u        /* 128 KB, the whole of RAMIN */
-#define NV_CLASS_DMA_IN_MEMORY  0x3Du
-#define NV_CLASS_DMA_TO_MEMORY  0x3Eu
+#define NV_PRAMIN_BYTES    0x00100000u        /* 1 MB; RAMIN is not 128 KB */
+
+/* The real DMA object classes, from nv2a_regs.h rather than recollection.
+ * 0x3E was invented: it is not a class, and using it both accepted something
+ * that cannot exist and rejected the two that do. */
+#define NV_CLASS_DMA_FROM_MEMORY  0x02u
+#define NV_CLASS_DMA_TO_MEMORY    0x03u
+#define NV_CLASS_DMA_IN_MEMORY    0x3Du
+
+/* Field masks, same as nv2a_regs.h. The adjust is the byte offset of the
+ * object inside its frame, and dropping it reads up to 4095 bytes low for any
+ * object that is not page aligned -- nv2a_core.c:76 has always got this
+ * right. */
+#define NV_DMA_ADDRESS_MASK       0xFFFFF000u
+#define NV_DMA_ADJUST_MASK        0xFFF00000u
+#define NV_DMA_ADJUST_SHIFT       20
+#define NV_DMA_CLASS_MASK         0x00000FFFu
+#define NV_RAMHT_INSTANCE_MASK    0x0000FFFFu
+#define NV_RAMHT_STATUS_VALID     0x80000000u
 
 static uint32_t dma_object_frame(uint32_t handle, uint32_t *limit_out)
 {
@@ -532,26 +548,41 @@ static uint32_t dma_object_frame(uint32_t handle, uint32_t *limit_out)
         return 0;
 
     for (i = 0; i + 1 < words; i += 2) {
-        uint32_t inst, cls, frame;
+        uint32_t ctx, inst, flags, cls, frame, address;
 
         if (pramin[i] != handle)
             continue;
 
-        inst = (pramin[i + 1] & 0xFFFFu) << 4;
+        /* The entry has to be live. Without this the scan accepts any pair of
+         * dwords whose first happens to equal the handle, and the handles are
+         * small integers -- Burnout 2's semaphore context is 0x8, so the
+         * literal 8 appears all over instance memory. This one bit is most of
+         * the discrimination a real hash would have given. */
+        ctx = pramin[i + 1];
+        if (!(ctx & NV_RAMHT_STATUS_VALID))
+            continue;
+
+        inst = (ctx & NV_RAMHT_INSTANCE_MASK) << 4;
         if (inst + 16 > NV_PRAMIN_BYTES)
             continue;
 
-        cls   = pramin[inst / 4] & 0xFFFu;
-        frame = pramin[inst / 4 + 2] & 0xFFFFF000u;
+        flags = pramin[inst / 4];
+        cls   = flags & NV_DMA_CLASS_MASK;
+        frame = pramin[inst / 4 + 2] & NV_DMA_ADDRESS_MASK;
 
-        if (cls != NV_CLASS_DMA_IN_MEMORY && cls != NV_CLASS_DMA_TO_MEMORY)
+        if (cls != NV_CLASS_DMA_IN_MEMORY
+         && cls != NV_CLASS_DMA_TO_MEMORY
+         && cls != NV_CLASS_DMA_FROM_MEMORY)
             continue;
-        if (frame >= XBOX_CONTIG_SIZE)
+        if (!frame || frame >= XBOX_CONTIG_SIZE)
             continue;                      /* not memory this runtime backs */
+
+        address = frame
+                | ((flags & NV_DMA_ADJUST_MASK) >> NV_DMA_ADJUST_SHIFT);
 
         if (limit_out)
             *limit_out = pramin[inst / 4 + 1];
-        return frame;
+        return address;
     }
     return 0;
 }
@@ -579,8 +610,12 @@ static void semaphore_release(uint32_t value)
         s_gpu.sem_refused++;
         return;
     }
-    if (limit && s_gpu.sem_offset + 4 > limit + 1) {
+    if (limit && (uint64_t)s_gpu.sem_offset + 4 > (uint64_t)limit + 1) {
         s_gpu.sem_refused++;
+        if (s_gpu.sem_refused == 1)
+            fprintf(stderr, "  [GPU] semaphore release refused: offset 0x%X is "
+                    "past the end of DMA object 0x%X (limit 0x%X)\n",
+                    s_gpu.sem_offset, s_gpu.sem_ctx_dma, limit);
         return;                            /* past the end of the object */
     }
 
@@ -1611,11 +1646,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        /* Which object the offset below is relative to. Resolved for real by
+         * dma_object_frame() at release time. */
         s_gpu.sem_ctx_dma = param;
-        /* Which DMA object the offset below is relative to. Recorded rather
-         * than used: dma_resolve() decides physical-versus-VA from where the
-         * runtime handed the memory out, which is the same answer for every
-         * object this executor can see. */
         break;
 
     case NV097_SET_SEMAPHORE_OFFSET:
@@ -1917,6 +1950,10 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    if (s_gpu.sem_releases || s_gpu.sem_refused)
+        fprintf(stderr, "[GPU] semaphore: %u released (last value %u), "
+                "%u refused\n",
+                s_gpu.sem_releases, s_gpu.sem_value, s_gpu.sem_refused);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,

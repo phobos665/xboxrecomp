@@ -111,8 +111,6 @@ int apu_hook_handle_mmio(struct _CONTEXT *ctx, uintptr_t fault_addr,
  * fault, and only writes come here. mcpx_offset is measured from the MCPX
  * aperture base, host_addr is where the page actually lives.
  */
-#define XBOX_MCPX_AC97_PAGE  0x00400000u   /* 0xFEC00000, one 4 KB page */
-
 int mcpx_ac97_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
                            uint32_t mcpx_offset);
 #endif

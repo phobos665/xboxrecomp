@@ -94,8 +94,15 @@ def main():
         run_name, run_len = None, 0
         for t in icalls:
             name = describe(t, table, starts) or "0x%08X" % t
-            if 0xFE000000 <= t < 0xFF000000:
-                name = "0x%08X (runtime thunk range)" % t
+            # The synthetic thunk range is KERNEL_VA_BASE plus ordinal*4 over
+            # roughly 366 ordinals, so it ends well below 0xFE001000. Labelling
+            # the whole 16 MB window swallowed the MCPX aperture at 0xFE800000
+            # and reported the APU as a kernel thunk -- the exact confusion the
+            # label exists to prevent.
+            if 0xFE000000 <= t < 0xFE001000:
+                name = "0x%08X (kernel thunk, ordinal %d)" % (t, (t - 0xFE000000) // 4)
+            elif 0xFE800000 <= t < 0xFF000000:
+                name = "0x%08X (MCPX aperture: APU/AC97/USB)" % t
             if name == run_name:
                 run_len += 1
                 continue
