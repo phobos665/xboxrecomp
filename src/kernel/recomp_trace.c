@@ -320,10 +320,40 @@ static void dump_va_once(void)
      */
     {
         static unsigned long long entries;
+        static unsigned shown;
         const char *after = getenv("RECOMP_DUMP_AFTER");
+        const char *every = getenv("RECOMP_DUMP_EVERY");
         uint32_t seen = 0;
 
         entries++;
+
+        /* Sample repeatedly rather than once.
+         *
+         * A single sample has to be placed, and placing it means guessing the
+         * entry rate: too early catches the structure half built, too late
+         * never fires at all. Both happened here within one sitting.
+         *
+         * RECOMP_DUMP_EVERY=<n> prints every n entries instead, up to six
+         * times. A field that is zero in all six, on a title that has stopped
+         * changing, is genuinely never written -- which is the claim that
+         * needed evidence. */
+        if (every) {
+            unsigned long long period = strtoull(every, NULL, 0);
+
+            if (!period)
+                period = 50000;
+            if (entries % period || shown >= 6)
+                return;
+            shown++;
+            mem = (const uint8_t *)xbox_GetMemoryOffset();
+            fprintf(stderr, "[DUMP] %u words at 0x%08X (entry %llu):\n",
+                    n, va, entries);
+            for (i = 0; i < n; i++)
+                fprintf(stderr, "  [0x%08X] = 0x%08X\n", va + i * 4,
+                        *(const uint32_t *)(mem + va + i * 4));
+            fflush(stderr);
+            return;
+        }
 
         /* Comparing a structure against a reference only means anything when
          * both are read at the same stage. Dumping at first-non-zero catches
