@@ -18,6 +18,7 @@
  */
 
 #include "d3d8_internal.h"
+#include <float.h>
 #include "d3d8_vsh.h"
 #include <d3dcompiler.h>
 #include <string.h>
@@ -1487,4 +1488,269 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     ID3D11DeviceContext_VSSetConstantBuffers(ctx, 1, 1, &g_vsh_cb);
 
     return TRUE;
+}
+
+/* ================================================================
+ * CPU execution of a parsed vertex program
+ * ================================================================
+ *
+ * The parser above turns microcode into NV2AVshProgram; generate_hlsl turns
+ * that into a shader for the D3D11 path. This runs it directly, because the
+ * software rasteriser in nv2a_pb_exec.c has no shader stage and every batch
+ * Burnout 2 draws needs one: with a program bound, attribute 0 is object
+ * space, so without executing the program there is nothing sensible to
+ * rasterise. Measured on Burnout 2's frontend: 322 batches a frame, all of
+ * them in program mode, none pre-transformed.
+ *
+ * Two things about the encoding matter for correctness and are easy to get
+ * backwards:
+ *
+ *   MAC ADD reads A and C, not A and B. So does MAD's addend.
+ *   The two units are parallel. Both read the register file as it was at the
+ *   start of the slot, so sources are gathered before either writes.
+ *
+ * R12 is not a temp that happens to hold the position -- it *is* oPos, the
+ * same register under two names. Storing it once and aliasing the output
+ * avoids a program that writes R12 and reads oPos (or the reverse) seeing two
+ * different values.
+ */
+
+#define VSH_TEMP_OPOS 12
+
+static float vsh_src_component(const NV2AVshSrcOperand *src,
+                               const NV2AVshState *st,
+                               const float inputs[][4],
+                               const float (*consts)[4], int const_count,
+                               int sel)
+{
+    const float *v;
+    float f;
+    int idx = src->reg_index;
+
+    switch (src->reg_type) {
+    case NV2A_VSH_REG_INPUT:
+        v = inputs[idx & 15];
+        break;
+    case NV2A_VSH_REG_CONST:
+        if (src->rel_addr)
+            idx += (int)st->addr;
+        if (idx < 0 || idx >= const_count)
+            return 0.0f;
+        v = consts[idx];
+        break;
+    case NV2A_VSH_REG_TEMP:
+    default:
+        v = st->temp[idx < 0 ? 0 : (idx > VSH_TEMP_OPOS ? VSH_TEMP_OPOS : idx)];
+        break;
+    }
+
+    f = v[sel & 3];
+    return src->negate ? -f : f;
+}
+
+static void vsh_read_src(const NV2AVshSrcOperand *src,
+                         const NV2AVshState *st,
+                         const float inputs[][4],
+                         const float (*consts)[4], int const_count,
+                         float out[4])
+{
+    out[0] = vsh_src_component(src, st, inputs, consts, const_count,
+                               src->swizzle.x);
+    out[1] = vsh_src_component(src, st, inputs, consts, const_count,
+                               src->swizzle.y);
+    out[2] = vsh_src_component(src, st, inputs, consts, const_count,
+                               src->swizzle.z);
+    out[3] = vsh_src_component(src, st, inputs, consts, const_count,
+                               src->swizzle.w);
+}
+
+/* write_mask is bit3=x .. bit0=w, per the header. */
+static void vsh_write_dst(const NV2AVshDstOperand *dst, NV2AVshState *st,
+                          const float val[4])
+{
+    int c;
+
+    if (!dst->write_mask)
+        return;
+
+    for (c = 0; c < 4; c++) {
+        if (!(dst->write_mask & (8 >> c)))
+            continue;
+        if (dst->temp_reg >= 0 && dst->temp_reg <= VSH_TEMP_OPOS)
+            st->temp[dst->temp_reg][c] = val[c];
+        if (dst->output_reg != NV2A_VSH_OUT_NONE
+            && dst->output_reg < NV2A_VSH_OUT_COUNT) {
+            if (dst->output_reg == NV2A_VSH_OUT_POS)
+                st->temp[VSH_TEMP_OPOS][c] = val[c];   /* oPos *is* R12 */
+            else
+                st->out[dst->output_reg][c] = val[c];
+        }
+    }
+    if (dst->output_reg != NV2A_VSH_OUT_NONE
+        && dst->output_reg < NV2A_VSH_OUT_COUNT)
+        st->out_written |= (uint16_t)(1u << dst->output_reg);
+    if (dst->temp_reg == VSH_TEMP_OPOS)
+        st->out_written |= (uint16_t)(1u << NV2A_VSH_OUT_POS);
+}
+
+static void vsh_splat(float out[4], float f)
+{
+    out[0] = out[1] = out[2] = out[3] = f;
+}
+
+static void vsh_do_mac(NV2AVshMacOp op, const float a[4], const float b[4],
+                       const float c[4], float r[4])
+{
+    switch (op) {
+    case NV2A_VSH_MAC_MOV:
+        r[0] = a[0]; r[1] = a[1]; r[2] = a[2]; r[3] = a[3];
+        break;
+    case NV2A_VSH_MAC_MUL:
+        r[0] = a[0]*b[0]; r[1] = a[1]*b[1];
+        r[2] = a[2]*b[2]; r[3] = a[3]*b[3];
+        break;
+    case NV2A_VSH_MAC_ADD:                 /* A + C, not A + B */
+        r[0] = a[0]+c[0]; r[1] = a[1]+c[1];
+        r[2] = a[2]+c[2]; r[3] = a[3]+c[3];
+        break;
+    case NV2A_VSH_MAC_MAD:
+        r[0] = a[0]*b[0]+c[0]; r[1] = a[1]*b[1]+c[1];
+        r[2] = a[2]*b[2]+c[2]; r[3] = a[3]*b[3]+c[3];
+        break;
+    case NV2A_VSH_MAC_DP3:
+        vsh_splat(r, a[0]*b[0] + a[1]*b[1] + a[2]*b[2]);
+        break;
+    case NV2A_VSH_MAC_DPH:
+        vsh_splat(r, a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + b[3]);
+        break;
+    case NV2A_VSH_MAC_DP4:
+        vsh_splat(r, a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]);
+        break;
+    case NV2A_VSH_MAC_DST:
+        r[0] = 1.0f; r[1] = a[1]*b[1]; r[2] = a[2]; r[3] = b[3];
+        break;
+    case NV2A_VSH_MAC_MIN:
+        r[0] = a[0]<b[0]?a[0]:b[0]; r[1] = a[1]<b[1]?a[1]:b[1];
+        r[2] = a[2]<b[2]?a[2]:b[2]; r[3] = a[3]<b[3]?a[3]:b[3];
+        break;
+    case NV2A_VSH_MAC_MAX:
+        r[0] = a[0]>b[0]?a[0]:b[0]; r[1] = a[1]>b[1]?a[1]:b[1];
+        r[2] = a[2]>b[2]?a[2]:b[2]; r[3] = a[3]>b[3]?a[3]:b[3];
+        break;
+    case NV2A_VSH_MAC_SLT:
+        r[0] = a[0]<b[0]?1.0f:0.0f; r[1] = a[1]<b[1]?1.0f:0.0f;
+        r[2] = a[2]<b[2]?1.0f:0.0f; r[3] = a[3]<b[3]?1.0f:0.0f;
+        break;
+    case NV2A_VSH_MAC_SGE:
+        r[0] = a[0]>=b[0]?1.0f:0.0f; r[1] = a[1]>=b[1]?1.0f:0.0f;
+        r[2] = a[2]>=b[2]?1.0f:0.0f; r[3] = a[3]>=b[3]?1.0f:0.0f;
+        break;
+    case NV2A_VSH_MAC_ARL:
+    case NV2A_VSH_MAC_NOP:
+    default:
+        r[0] = r[1] = r[2] = r[3] = 0.0f;
+        break;
+    }
+}
+
+static void vsh_do_ilu(NV2AVshIluOp op, const float c[4], float r[4])
+{
+    float x = c[0];
+
+    switch (op) {
+    case NV2A_VSH_ILU_MOV:
+        r[0] = c[0]; r[1] = c[1]; r[2] = c[2]; r[3] = c[3];
+        break;
+    case NV2A_VSH_ILU_RCP:
+        vsh_splat(r, x == 0.0f ? FLT_MAX : 1.0f / x);
+        break;
+    case NV2A_VSH_ILU_RCC: {
+        float v = x == 0.0f ? FLT_MAX : 1.0f / x;
+        /* The odd clamp is the hardware's, and it is asymmetric. */
+        if (v >= 0.0f)
+            v = v < 5.42101e-20f ? 5.42101e-20f
+              : (v > 1.884467e+19f ? 1.884467e+19f : v);
+        else
+            v = v > -5.42101e-20f ? -5.42101e-20f
+              : (v < -1.884467e+19f ? -1.884467e+19f : v);
+        vsh_splat(r, v);
+        break;
+    }
+    case NV2A_VSH_ILU_RSQ: {
+        float m = x < 0.0f ? -x : x;
+        vsh_splat(r, m == 0.0f ? FLT_MAX : 1.0f / sqrtf(m));
+        break;
+    }
+    case NV2A_VSH_ILU_EXP:
+        vsh_splat(r, powf(2.0f, x));
+        break;
+    case NV2A_VSH_ILU_LOG: {
+        float m = x < 0.0f ? -x : x;
+        vsh_splat(r, m == 0.0f ? -FLT_MAX : log2f(m));
+        break;
+    }
+    case NV2A_VSH_ILU_LIT: {
+        float diffuse = c[0] > 0.0f ? c[0] : 0.0f;
+        float spec_in = c[1] > 0.0f ? c[1] : 0.0f;
+        float power   = c[3] < -128.0f ? -128.0f : (c[3] > 128.0f ? 128.0f : c[3]);
+        r[0] = 1.0f;
+        r[1] = diffuse;
+        r[2] = c[0] > 0.0f ? powf(spec_in, power) : 0.0f;
+        r[3] = 1.0f;
+        break;
+    }
+    case NV2A_VSH_ILU_NOP:
+    default:
+        r[0] = r[1] = r[2] = r[3] = 0.0f;
+        break;
+    }
+}
+
+void d3d8_vsh_execute(const NV2AVshProgram *program,
+                      const float inputs[][4],
+                      const float (*consts)[4], int const_count,
+                      NV2AVshState *st)
+{
+    int i;
+
+    memset(st, 0, sizeof *st);
+
+    for (i = 0; i < program->length && i < NV2A_VS_MAX_INSTRUCTIONS; i++) {
+        const NV2AVshInstruction *in = &program->insns[i];
+        float a[4], b[4], c[4], ilu_c[4], mac_r[4], ilu_r[4];
+        int did_mac = in->mac_op != NV2A_VSH_MAC_NOP;
+        int did_ilu = in->ilu_op != NV2A_VSH_ILU_NOP;
+
+        /* Both units see the register file as it was at the start of the
+         * slot, so every source is read before either result is stored. */
+        if (did_mac) {
+            vsh_read_src(&in->mac_src[0], st, inputs, consts, const_count, a);
+            vsh_read_src(&in->mac_src[1], st, inputs, consts, const_count, b);
+            vsh_read_src(&in->mac_src[2], st, inputs, consts, const_count, c);
+        }
+        if (did_ilu)
+            vsh_read_src(&in->ilu_src, st, inputs, consts, const_count, ilu_c);
+
+        if (did_mac) {
+            if (in->mac_op == NV2A_VSH_MAC_ARL) {
+                st->addr = floorf(a[0]);
+            } else {
+                vsh_do_mac(in->mac_op, a, b, c, mac_r);
+                vsh_write_dst(&in->mac_dst, st, mac_r);
+            }
+        }
+        if (did_ilu) {
+            vsh_do_ilu(in->ilu_op, ilu_c, ilu_r);
+            vsh_write_dst(&in->ilu_dst, st, ilu_r);
+        }
+
+        if (in->is_final)
+            break;
+    }
+
+    /* oPos is R12; hand it back under the name the caller asked for. */
+    st->out[NV2A_VSH_OUT_POS][0] = st->temp[VSH_TEMP_OPOS][0];
+    st->out[NV2A_VSH_OUT_POS][1] = st->temp[VSH_TEMP_OPOS][1];
+    st->out[NV2A_VSH_OUT_POS][2] = st->temp[VSH_TEMP_OPOS][2];
+    st->out[NV2A_VSH_OUT_POS][3] = st->temp[VSH_TEMP_OPOS][3];
 }

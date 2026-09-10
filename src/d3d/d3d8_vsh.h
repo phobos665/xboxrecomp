@@ -395,4 +395,35 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
 }
 #endif
 
+/** One past the highest real output selector, for sizing arrays. */
+#define NV2A_VSH_OUT_COUNT 13
+
+/**
+ * The register file after a program has run.
+ *
+ * temp[12] is oPos: R12 and oPos are the same register on this hardware, not
+ * two that happen to agree, so it is stored once and mirrored into out[] on
+ * the way out. out_written says which outputs the program actually wrote,
+ * which is how a caller tells "black" from "never assigned".
+ */
+typedef struct NV2AVshState {
+    float    temp[13][4];
+    float    out[NV2A_VSH_OUT_COUNT][4];
+    float    addr;              /* a0.x, from ARL */
+    uint16_t out_written;       /* bit N = out[N] was written */
+} NV2AVshState;
+
+/**
+ * Run a parsed program over one vertex.
+ *
+ * inputs is v0-v15, consts is c0-c(const_count-1). The software rasteriser
+ * needs this because it has no shader stage of its own and, with a program
+ * bound, attribute 0 is object space -- so there is nothing meaningful to
+ * draw without executing the program first.
+ */
+void d3d8_vsh_execute(const NV2AVshProgram *program,
+                      const float inputs[][4],
+                      const float (*consts)[4], int const_count,
+                      NV2AVshState *st);
+
 #endif /* XBOXRECOMP_D3D8_VSH_H */

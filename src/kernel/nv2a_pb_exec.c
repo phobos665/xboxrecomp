@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+#include "../d3d/d3d8_vsh.h"   /* the vertex program, parsed and run */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -286,7 +287,7 @@ static struct {
     uint32_t vp_const_load;         /* next constant slot, in vec4s */
     uint32_t vp_const_hi;
     float    vp_offset[4], vp_scale[4];
-    uint32_t batches_program_mode;
+    uint32_t batches_program_mode, vp_declined;
     uint32_t sem_ctx_dma, sem_refused;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -1278,6 +1279,106 @@ static uint32_t vertex_color(uint32_t index)
  */
 #define OBJECT_SPACE_SPAN 8.0f
 
+/* Run the bound vertex program over one vertex and return window coordinates.
+ *
+ * Every batch Burnout 2 draws has a program bound, so without this there is
+ * nothing to rasterise: attribute 0 is object space and drawing it as pixels
+ * put a white smear across the frame. The parser and the interpreter live in
+ * src/d3d/d3d8_vsh.c -- the parser was already there for the D3D11 path.
+ *
+ * The pipeline after the program is the hardware's: oPos is clip space, so
+ * divide by w and then apply SET_VIEWPORT_SCALE and SET_VIEWPORT_OFFSET,
+ * which for a 640x480 target read 320,-240 and 320.5,240.5 -- half the extent
+ * either way, y flipped, and the half-pixel centre.
+ */
+static const NV2AVshProgram *vp_program(void)
+{
+    static NV2AVshProgram prog;
+    static uint32_t parsed_len;
+    static uint32_t parsed_sig;
+    uint32_t sig = 0, i;
+
+    if (!s_gpu.vp_prog_len)
+        return NULL;
+
+    /* Reparse only when the microcode changes. A cheap signature is enough:
+     * the alternative is parsing 12 instructions per vertex. */
+    for (i = 0; i < s_gpu.vp_prog_len; i++)
+        sig = sig * 31u + s_gpu.vp_prog[i];
+
+    if (sig != parsed_sig || s_gpu.vp_prog_len != parsed_len) {
+        int insns = (int)(s_gpu.vp_prog_len / 4);
+        memset(&prog, 0, sizeof prog);
+        d3d8_vsh_parse((const DWORD *)s_gpu.vp_prog, insns, &prog);
+        parsed_sig = sig;
+        parsed_len = s_gpu.vp_prog_len;
+        fprintf(stderr, "  [GPU] vertex program parsed: %d instructions, "
+                "inputs 0x%04X\n", prog.length, prog.inputs_read);
+        fflush(stderr);
+    }
+    return prog.length ? &prog : NULL;
+}
+
+static int transform_vertex(uint32_t index, float out[4])
+{
+    const NV2AVshProgram *prog = vp_program();
+    float in[NV_VERTEX_ATTRS][4];
+    NV2AVshState st;
+    const float *pos;
+    float w, inv;
+    uint32_t a;
+
+    if (!prog)
+        return 0;
+
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        in[a][0] = in[a][1] = in[a][2] = 0.0f;
+        in[a][3] = 1.0f;
+        if (!(prog->inputs_read & (1u << a)))
+            continue;                      /* the program never reads it */
+        if (!s_gpu.attr[a].stride)
+            continue;                      /* not supplied */
+        fetch_attr(&s_gpu.attr[a], index, in[a]);
+    }
+
+    d3d8_vsh_execute(prog, in, s_gpu.vp_const, (int)s_gpu.vp_const_hi, &st);
+
+    pos = st.out[NV2A_VSH_OUT_POS];
+    w = pos[3];
+    if (w == 0.0f || w != w)               /* w==0 or NaN: nothing to place */
+        return 0;
+    inv = 1.0f / w;
+
+    out[0] = pos[0] * inv * s_gpu.vp_scale[0] + s_gpu.vp_offset[0];
+    out[1] = pos[1] * inv * s_gpu.vp_scale[1] + s_gpu.vp_offset[1];
+    out[2] = pos[2] * inv;
+    out[3] = w;
+    return 1;
+}
+
+/* Position of a vertex in window coordinates, whichever pipeline applies.
+ *
+ * The fallback is not politeness, it is what the evidence says. Some batches
+ * arrive with attribute 0 already in pixels even with a program bound --
+ * Burnout 2's frontend hands over v0 = (202, 100, 0, 1) on a 640x480 target
+ * -- so for those the program is a pass-through and the raw attribute is the
+ * right answer. Requiring the program unconditionally turned a frame that
+ * drew its logo into one that drew nothing.
+ *
+ * So: use the program's position when it produces one, and the attribute when
+ * it does not. Counted, because "the program declined" is a fact worth having
+ * rather than a silent substitution.
+ */
+static int fetch_position(uint32_t index, float out[4])
+{
+    if (s_gpu.xform_mode == NV_XFORM_MODE_PROGRAM) {
+        if (transform_vertex(index, out))
+            return 1;
+        s_gpu.vp_declined++;
+    }
+    return fetch_attr(&s_gpu.attr[0], index, out);
+}
+
 /* Write the uploaded program and its constants out once.
  *
  * RECOMP_VP_DUMP=<path>. The NV2A's vertex program is four dwords per
@@ -1332,21 +1433,20 @@ static int batch_is_screen_space(void)
     if (!s_gpu.clip_w || !s_gpu.clip_h || !s_gpu.idx_count)
         return 0;
 
-    /* A vertex program is running, so attribute 0 is object space and no
-     * amount of looking at its scale will say otherwise. Drawing it anyway is
-     * what put a white smear across the frame. */
+    /* With a program bound the positions below are its output, already in
+     * window coordinates, so the scale test applies to those rather than to
+     * object space. Counted separately so a frame's mix is visible. */
     if (s_gpu.xform_mode == NV_XFORM_MODE_PROGRAM) {
         s_gpu.batches_program_mode++;
         vp_dump_once();
-        return 0;
     }
 
-    if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p))
+    if (!fetch_position(s_gpu.idx[0], p))
         return 0;
     lo_x = hi_x = p[0];
     lo_y = hi_y = p[1];
     for (i = 1; i < s_gpu.idx_count; i++) {
-        if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p))
+        if (!fetch_position(s_gpu.idx[i], p))
             return 0;
         if (p[0] < lo_x) lo_x = p[0];
         if (p[0] > hi_x) hi_x = p[0];
@@ -1392,9 +1492,9 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
     float p[3][4], uv[3][2];
     int textured;
 
-    if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
-     || !fetch_attr(&s_gpu.attr[0], i1, p[1])
-     || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
+    if (!fetch_position(i0, p[0])
+     || !fetch_position(i1, p[1])
+     || !fetch_position(i2, p[2]))
         return;
 
     textured = fetch_texcoord(i0, uv[0])
@@ -1731,6 +1831,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_TRANSFORM_CONSTANT_LOAD:
         s_gpu.vp_const_load = param;
+        break;
+
+    /* The viewport transform the hardware applies after the program.
+     *
+     * These were lost when the program and constant uploads became ranges,
+     * and the failure was quiet in the worst way: a zero scale collapses
+     * every transformed vertex onto the offset, so the frame went from a
+     * white smear to nothing at all while the executor reported batches
+     * skipped as "not screen-space". They were, because the transform made
+     * them that way.
+     */
+    case NV097_SET_VIEWPORT_OFFSET + 0x0:
+    case NV097_SET_VIEWPORT_OFFSET + 0x4:
+    case NV097_SET_VIEWPORT_OFFSET + 0x8:
+    case NV097_SET_VIEWPORT_OFFSET + 0xC:
+        s_gpu.vp_offset[(method - NV097_SET_VIEWPORT_OFFSET) / 4] =
+            *(const float *)&param;
+        break;
+
+    case NV097_SET_VIEWPORT_SCALE + 0x0:
+    case NV097_SET_VIEWPORT_SCALE + 0x4:
+    case NV097_SET_VIEWPORT_SCALE + 0x8:
+    case NV097_SET_VIEWPORT_SCALE + 0xC:
+        s_gpu.vp_scale[(method - NV097_SET_VIEWPORT_SCALE) / 4] =
+            *(const float *)&param;
         break;
 
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
@@ -2119,6 +2244,10 @@ void nv2a_pb_exec_report(void)
                 s_gpu.batches_program_mode, s_gpu.xform_prog_words,
                 s_gpu.vp_offset[0], s_gpu.vp_offset[1],
                 s_gpu.vp_scale[0], s_gpu.vp_scale[1]);
+    if (s_gpu.vp_declined)
+        fprintf(stderr, "[GPU] transform: %u vertices fell back to the raw "
+                "attribute because the program wrote no position\n",
+                s_gpu.vp_declined);
     if (s_gpu.sem_releases || s_gpu.sem_refused)
         fprintf(stderr, "[GPU] semaphore: %u released (last value %u), "
                 "%u refused\n",
