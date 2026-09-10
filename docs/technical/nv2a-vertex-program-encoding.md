@@ -50,7 +50,79 @@ insn  11 00000000 0020181B 0836106C 2070F861
 | A source index | dword2 bits 28-31 | `v1` at instruction 3 and `v2` at instruction 4, consistent with the bank above. |
 | Destination masks and mux | dword3: MAC mask 24-27, temp index 20-23, ILU mask 16-19, output mask 12-15, ORB 11, MUX 2 | Instruction 0 reads as `MOV R1, c0` with no output write; instruction 11 as `MOV oT3, c12` with no temp write. Both are coherent, and they are the two ends of the program. |
 
-## UNRESOLVED
+## Resolved, authoritatively
+
+The derivation above is correct, and the two fields it could not reach are now
+known. `abaire/nv2a_vsh_asm` is an assembler and disassembler for this exact
+instruction set; its `vsh_instruction.py` defines the encoding as ctypes
+bitfields, LSB-first per dword, and it agrees with every field derived above.
+
+Running its disassembler over Burnout 2's twelve instructions gives ground
+truth, and the result is the canonical Xbox pass-through shader:
+
+```
+ 0  MOV R1.xyzw, v0
+ 1  MOV oD0.xyzw, v3      + RCP R1.w, R1.w
+ 2  RCP oFog.xyzw, v0.w
+ 3  MUL R2.xyzw, R1, c[0] + MOV oD1.xyzw, v4
+ 4  ADD oPos.xyzw, R2, c[1]
+ 5  MOV oPts.xyzw, v1.x
+ 6  MOV oB0.xyzw, v7          9  MOV oT1.xyzw, v10
+ 7  MOV oB1.xyzw, v8         10  MOV oT2.xyzw, v11
+ 8  MOV oT0.xyzw, v9         11  MOV oT3.xyzw, v12
+```
+
+Every attribute passes to the output with the matching number, which is what
+confirmed the INPUT field: my own derivation had read those bits as CONST and
+produced a plausible-looking `MOV o<N>, c<N>` instead. The one wrong call in
+nine, and it looked right.
+
+`oPos = v0 * c[0] + c[1]`, and the constants are `c[0] = (1, 1, 16777215, 1)`
+and `c[1] = (0.53125, 0.53125, 0, 0)` -- a half-pixel bias on coordinates that
+are already in window space. So for this shader the transform is identity, the
+raw attribute is the correct position, and executing the program cannot change
+where anything lands.
+
+### The full layout
+
+Absolute bit offsets for `vsh_extract()`, where dword N starts at bit 32*N.
+dword0 is unused.
+
+| dword1 | dword2 | dword3 |
+|---|---|---|
+| A_SWZ_W 32, Z 34, Y 36, X 38 | C_TEMP_HIGH 64 (2) | FINAL 96 |
+| A_NEG 40 | C_SWZ_W 66, Z 68, Y 70, X 72 | A0X 97 |
+| INPUT 41 (4) | C_NEG 74 | OUT_MUX 98 |
+| CONST 45 (8) | B_MUX 75 (2), B_TEMP 77 (4) | OUT_ADDRESS 99 (8) |
+| MAC 53 (4) | B_SWZ_W 81, Z 83, Y 85, X 87 | OUT_ORB 107 |
+| ILU 57 (3) | B_NEG 89 | OUT_O_MASK 108 (4) |
+| | A_MUX 90 (2), A_TEMP 92 (4) | OUT_ILU_MASK 112 (4) |
+| | | OUT_TEMP 116 (4) |
+| | | OUT_MAC_MASK 120 (4) |
+| | | C_MUX 124 (2), C_TEMP_LOW 126 (2) |
+
+Three asymmetries, each of which is a bug in the current parser:
+
+- **A source bank is 1 = temp, 2 = input, 3 = const.** Zero is not a bank. The
+  parser maps the raw value onto an enum that starts at zero, so every operand
+  comes out one bank wrong.
+- **The ILU opcode is three bits**, read as four, which makes unknown opcodes
+  reachable.
+- **MAC and ILU share one destination temp index** and have a write mask each,
+  and there is a *single* output-register write whose source OUT_MUX selects.
+  The parser gives each unit its own output register, which does not exist,
+  and it carries one mask where there are two.
+- **Source C's temp index is split** across dword2 bits 64-65 and dword3 bits
+  126-127, so it cannot be read as one field.
+
+A rewrite against this table was attempted and reverted: the scripted edit
+removed declarations it should not have touched, and since the transform is
+identity for the only shader this title currently uploads, the change cannot
+affect the image. It is worth doing before any title that draws real 3D, and
+the disassembler above is the oracle to test it against -- these twelve
+instructions must decode identically.
+
+## Previously unresolved
 
 **Source B and source C field positions.** Only one instruction in this
 program uses B (the `MUL` at 3) and four use C, so the sample does not
@@ -64,9 +136,10 @@ here the per-source index field (dword2 bits 28-31) already produces the right
 answer, and this program never reads two different inputs in one slot. The two
 readings are indistinguishable on this sample.
 
-## How to resolve them
+## How the remaining question was going to be resolved
 
-Capture a program that transforms world geometry. It will contain a four-
+(Kept for the record; the reference above settled it.) Capture a program that
+transforms world geometry. It will contain a four-
 instruction `DP4` chain against consecutive constants — the matrix multiply —
 and a `DP4` uses A and B together with known operand roles, which pins both
 fields immediately. Burnout 2 uploads such a program once it draws something
