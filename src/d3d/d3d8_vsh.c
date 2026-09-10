@@ -1532,15 +1532,26 @@ static float vsh_src_component(const NV2AVshSrcOperand *src,
         v = inputs[idx & 15];
         break;
     case NV2A_VSH_REG_CONST:
-        if (src->rel_addr)
-            idx += (int)st->addr;
+        if (src->rel_addr) {
+            /* Bound before converting: a0 is float, and (int) of a NaN or of
+             * 1e30 is undefined rather than merely wrong. */
+            float a0 = st->addr;
+            if (!(a0 > -1024.0f && a0 < 1024.0f))
+                return 0.0f;
+            idx += (int)a0;
+        }
         if (idx < 0 || idx >= const_count)
             return 0.0f;
         v = consts[idx];
         break;
     case NV2A_VSH_REG_TEMP:
     default:
-        v = st->temp[idx < 0 ? 0 : (idx > VSH_TEMP_OPOS ? VSH_TEMP_OPOS : idx)];
+        /* R13-R15 do not exist. Reading used to alias them onto oPos while
+         * writing discarded them, so a garbage index could pick up the
+         * position; both now agree that they are zero. */
+        if (idx < 0 || idx > VSH_TEMP_OPOS)
+            return 0.0f;
+        v = st->temp[idx];
         break;
     }
 
@@ -1598,8 +1609,12 @@ static void vsh_splat(float out[4], float f)
     out[0] = out[1] = out[2] = out[3] = f;
 }
 
-static void vsh_do_mac(NV2AVshMacOp op, const float a[4], const float b[4],
-                       const float c[4], float r[4])
+/* Returns 0 when the opcode computes nothing, so the caller can leave the
+ * destination alone. Zeroing it instead turns an opcode this does not know
+ * into a positive assertion that the register is zero -- and the MAC field
+ * is four bits, so 14 and 15 reach here. */
+static int vsh_do_mac(NV2AVshMacOp op, const float a[4], const float b[4],
+                      const float c[4], float r[4])
 {
     switch (op) {
     case NV2A_VSH_MAC_MOV:
@@ -1648,12 +1663,12 @@ static void vsh_do_mac(NV2AVshMacOp op, const float a[4], const float b[4],
     case NV2A_VSH_MAC_ARL:
     case NV2A_VSH_MAC_NOP:
     default:
-        r[0] = r[1] = r[2] = r[3] = 0.0f;
-        break;
+        return 0;                          /* nothing computed, nothing stored */
     }
+    return 1;
 }
 
-static void vsh_do_ilu(NV2AVshIluOp op, const float c[4], float r[4])
+static int vsh_do_ilu(NV2AVshIluOp op, const float c[4], float r[4])
 {
     float x = c[0];
 
@@ -1662,17 +1677,22 @@ static void vsh_do_ilu(NV2AVshIluOp op, const float c[4], float r[4])
         r[0] = c[0]; r[1] = c[1]; r[2] = c[2]; r[3] = c[3];
         break;
     case NV2A_VSH_ILU_RCP:
-        vsh_splat(r, x == 0.0f ? FLT_MAX : 1.0f / x);
+        /* Signed, because -0.0 == 0.0 compares true and the sign is the whole
+         * difference between +inf and -inf. FLT_MAX stands in for infinity
+         * here, as it does for RSQ and LOG. */
+        vsh_splat(r, x == 0.0f
+                     ? (signbit(x) ? -FLT_MAX : FLT_MAX)
+                     : 1.0f / x);
         break;
     case NV2A_VSH_ILU_RCC: {
-        float v = x == 0.0f ? FLT_MAX : 1.0f / x;
+        float v = x == 0.0f ? (signbit(x) ? -FLT_MAX : FLT_MAX) : 1.0f / x;
         /* The odd clamp is the hardware's, and it is asymmetric. */
         if (v >= 0.0f)
             v = v < 5.42101e-20f ? 5.42101e-20f
-              : (v > 1.884467e+19f ? 1.884467e+19f : v);
+              : (v > 1.8446744e+19f ? 1.8446744e+19f : v);
         else
             v = v > -5.42101e-20f ? -5.42101e-20f
-              : (v < -1.884467e+19f ? -1.884467e+19f : v);
+              : (v < -1.8446744e+19f ? -1.8446744e+19f : v);
         vsh_splat(r, v);
         break;
     }
@@ -1701,9 +1721,9 @@ static void vsh_do_ilu(NV2AVshIluOp op, const float c[4], float r[4])
     }
     case NV2A_VSH_ILU_NOP:
     default:
-        r[0] = r[1] = r[2] = r[3] = 0.0f;
-        break;
+        return 0;
     }
+    return 1;
 }
 
 void d3d8_vsh_execute(const NV2AVshProgram *program,
@@ -1714,6 +1734,14 @@ void d3d8_vsh_execute(const NV2AVshProgram *program,
     int i;
 
     memset(st, 0, sizeof *st);
+
+    /* oPos starts as (0,0,0,1), which is what this file's own HLSL generator
+     * emits and what the hardware presents. Leaving w at zero means a program
+     * that writes only oPos.xyz -- or one whose destination decode is wrong --
+     * produces w == 0 for every vertex, and the caller drops the whole batch
+     * on a perspective divide by zero. An invisible frame with no error is the
+     * worst failure available here. */
+    st->temp[VSH_TEMP_OPOS][3] = 1.0f;
 
     for (i = 0; i < program->length && i < NV2A_VS_MAX_INSTRUCTIONS; i++) {
         const NV2AVshInstruction *in = &program->insns[i];
@@ -1734,15 +1762,12 @@ void d3d8_vsh_execute(const NV2AVshProgram *program,
         if (did_mac) {
             if (in->mac_op == NV2A_VSH_MAC_ARL) {
                 st->addr = floorf(a[0]);
-            } else {
-                vsh_do_mac(in->mac_op, a, b, c, mac_r);
+            } else if (vsh_do_mac(in->mac_op, a, b, c, mac_r)) {
                 vsh_write_dst(&in->mac_dst, st, mac_r);
             }
         }
-        if (did_ilu) {
-            vsh_do_ilu(in->ilu_op, ilu_c, ilu_r);
+        if (did_ilu && vsh_do_ilu(in->ilu_op, ilu_c, ilu_r))
             vsh_write_dst(&in->ilu_dst, st, ilu_r);
-        }
 
         if (in->is_final)
             break;

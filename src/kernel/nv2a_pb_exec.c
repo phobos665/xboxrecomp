@@ -1343,6 +1343,17 @@ static int transform_vertex(uint32_t index, float out[4])
 
     d3d8_vsh_execute(prog, in, s_gpu.vp_const, (int)s_gpu.vp_const_hi, &st);
 
+    /* Did the program actually produce a position?
+     *
+     * Asking "is w zero" stopped being the right question once oPos was
+     * initialised to (0,0,0,1) the way the hardware presents it: a program
+     * whose destinations decode wrongly then writes nothing, w reads 1, and
+     * every vertex lands confidently on the viewport centre instead of
+     * failing in a way anyone can see. out_written is the direct answer.
+     */
+    if (!(st.out_written & (1u << NV2A_VSH_OUT_POS)))
+        return 0;
+
     pos = st.out[NV2A_VSH_OUT_POS];
     w = pos[3];
     if (w == 0.0f || w != w)               /* w==0 or NaN: nothing to place */

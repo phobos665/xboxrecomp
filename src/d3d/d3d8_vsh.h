@@ -154,7 +154,7 @@ typedef enum NV2AVshIluOp {
     NV2A_VSH_ILU_NOP = 0,   /* No operation */
     NV2A_VSH_ILU_MOV = 1,   /* dst = C */
     NV2A_VSH_ILU_RCP = 2,   /* dst = 1.0 / C.x (scalar, replicated) */
-    NV2A_VSH_ILU_RCC = 3,   /* dst = clamp(1.0/C.x, 5.42e-36, 1.884e+19) */
+    NV2A_VSH_ILU_RCC = 3,   /* dst = clamp(1.0/C.x, 5.42101e-20, 1.8446744e+19) */
     NV2A_VSH_ILU_RSQ = 4,   /* dst = 1.0 / sqrt(abs(C.x)) */
     NV2A_VSH_ILU_EXP = 5,   /* dst = exp2(C.x) */
     NV2A_VSH_ILU_LOG = 6,   /* dst = log2(abs(C.x)) */
