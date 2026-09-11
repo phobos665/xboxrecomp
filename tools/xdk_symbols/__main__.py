@@ -98,10 +98,16 @@ def find_cli(explicit=None):
         return explicit
     if os.environ.get("XBSDB_CLI"):
         return os.environ["XBSDB_CLI"]
+    # The exact executable name, not a prefix. A Visual Studio build tree has
+    # five other files starting XbSymbolDatabaseCLI (.slnx, .vcxproj,
+    # .vcxproj.filters, .exe.recipe, a .dir folder), and the prefix match
+    # picked the .slnx: WinError 193, "not a valid Win32 application".
+    exe = "XbSymbolDatabaseCLI" + (".exe" if os.name == "nt" else "")
     pattern = os.path.join(REPO, "third_party", "XbSymbolDatabase", "build",
-                           "**", "XbSymbolDatabaseCLI*")
-    hits = [p for p in glob.glob(pattern, recursive=True)
-            if os.path.isfile(p) and not p.endswith((".pdb", ".ilk"))]
+                           "**", exe)
+    hits = [p for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
+    # A multi-config generator can leave Debug and Release side by side.
+    hits.sort(key=lambda p: "release" not in p.lower())
     return hits[0] if hits else None
 
 

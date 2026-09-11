@@ -5,8 +5,12 @@ Synthetic lines in the tool's own formats; no game files or CLI needed.
 Run: py -3 -m unittest tools.xdk_symbols.test_xdk_symbols
 """
 
+import os
+import tempfile
 import unittest
+from unittest import mock
 
+import tools.xdk_symbols.__main__ as xdk
 from tools.xdk_symbols.__main__ import parse_line, parse_output
 
 
@@ -55,6 +59,34 @@ class ParseLine(unittest.TestCase):
         ])
         symbols = parse_output(text)
         self.assertEqual([s["name"] for s in symbols], ["D3DDevice_Swap"])
+
+
+class FindCli(unittest.TestCase):
+    """A real Visual Studio build tree has several files that start with the
+    CLI's name. The finder must return the executable, and prefer Release."""
+
+    def test_the_executable_is_found_among_build_files(self):
+        exe = "XbSymbolDatabaseCLI" + (".exe" if os.name == "nt" else "")
+        with tempfile.TemporaryDirectory() as repo:
+            cli = os.path.join(repo, "third_party", "XbSymbolDatabase",
+                               "build", "projects", "cli")
+            os.makedirs(os.path.join(cli, "Debug"))
+            os.makedirs(os.path.join(cli, "Release"))
+            os.makedirs(os.path.join(cli, "XbSymbolDatabaseCLI.dir"))
+            for name in ("XbSymbolDatabaseCLI.slnx",
+                         "XbSymbolDatabaseCLI.vcxproj",
+                         "XbSymbolDatabaseCLI.vcxproj.filters",
+                         os.path.join("Debug", exe),
+                         os.path.join("Release", exe)):
+                open(os.path.join(cli, name), "w").close()
+            with mock.patch.object(xdk, "REPO", repo), \
+                    mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("XBSDB_CLI", None)
+                self.assertEqual(xdk.find_cli(),
+                                 os.path.join(cli, "Release", exe))
+
+    def test_an_explicit_path_wins(self):
+        self.assertEqual(xdk.find_cli("C:/tools/cli.exe"), "C:/tools/cli.exe")
 
 
 if __name__ == "__main__":

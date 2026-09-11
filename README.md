@@ -172,6 +172,9 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
 - **CMake 3.20+**
+- **XbSymbolDatabase** (MIT), as the submodule `third_party/XbSymbolDatabase`,
+  pinned to a known commit. `tools.xdk_symbols` uses its CLI to name the XDK
+  functions (D3D8, DirectSound, ...) linked into a title; step 1 builds it.
 - An original Xbox game disc image (you must own the game)
 
 ### Step-by-Step
@@ -182,9 +185,14 @@ explains *why* each flag is there, which is what you need when your title
 behaves differently from the example.
 
 ```bash
-# 1. Clone this repo
-git clone https://github.com/sp00nznet/xboxrecomp.git
+# 1. Clone this repo, with its submodule, and build the XDK symbol tool once.
+#    tools.xdk_symbols finds the CLI in third_party/XbSymbolDatabase/build by
+#    itself (or pass --cli, or set XBSDB_CLI). The build folder is ignored.
+git clone --recurse-submodules https://github.com/sp00nznet/xboxrecomp.git
 cd xboxrecomp
+#    Already cloned without it:  git submodule update --init
+cmake -S third_party/XbSymbolDatabase -B third_party/XbSymbolDatabase/build
+cmake --build third_party/XbSymbolDatabase/build --config Release
 
 # 2. Extract default.xbe from your Xbox disc image
 #    (Use xdvdfs, extract-xiso, or similar tool)
