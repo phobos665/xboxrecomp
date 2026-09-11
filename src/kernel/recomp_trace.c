@@ -379,10 +379,80 @@ static void dump_va_once(void)
     fflush(stderr);
 }
 
+/* RECOMP_TRACE_ONLY=<name>[,<name>...] -- print only these functions.
+ *
+ * The full trace prints every entry, which is millions of lines by the time a
+ * title reaches anything interesting, and the budget that stops it filling a
+ * disk runs out long before. This prints the named functions whatever the
+ * budget, and dumps 24 words at ecx: for a thiscall method that is the object
+ * itself, which is usually the state the question is about. Each name prints
+ * at most RECOMP_TRACE_ONLY_MAX times (default 8).
+ */
+static int trace_only_match(const char *name)
+{
+    static int init;
+    static char list[512];
+    static int max_hits = 8;
+    static int hits[16];
+    const char *p;
+    int idx = 0;
+    size_t n = strlen(name);
+
+    if (!init) {
+        const char *v = getenv("RECOMP_TRACE_ONLY");
+        const char *m = getenv("RECOMP_TRACE_ONLY_MAX");
+        init = 1;
+        if (v) {
+            strncpy(list, v, sizeof list - 1);
+            list[sizeof list - 1] = 0;
+        }
+        if (m)
+            max_hits = atoi(m);
+    }
+    if (!list[0])
+        return 0;
+    for (p = list; *p; idx++) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) {
+            if (idx < 16 && hits[idx] < max_hits) {
+                hits[idx]++;
+                return 1;
+            }
+            return 0;
+        }
+        if (!end)
+            break;
+        p = end + 1;
+    }
+    return 0;
+}
+
+static void trace_only_print(const char *name, uint32_t va)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t ret = guest_readable(g_esp, 4) ? *(const uint32_t *)(mem + g_esp) : 0;
+    int i;
+
+    fprintf(stderr, "[ONLY] -> %s (0x%08X) from=%08X esp=%08X eax=%08X "
+            "ecx=%08X edx=%08X esi=%08X edi=%08X ebx=%08X\n",
+            name, va, ret, g_esp, g_eax, g_ecx, g_edx, g_esi, g_edi, g_ebx);
+    if (guest_readable(g_ecx, 96)) {
+        for (i = 0; i < 24; i += 4) {
+            const uint32_t *w = (const uint32_t *)(mem + g_ecx + i * 4);
+            fprintf(stderr, "[ONLY]    [ecx+0x%02X] %08X %08X %08X %08X\n",
+                    i * 4, w[0], w[1], w[2], w[3]);
+        }
+    }
+    fflush(stderr);
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
     watch_check(name);
     dump_va_once();
+    if (trace_only_match(name))
+        trace_only_print(name, va);
     if (prof_enabled()) { prof_count(name, va); return; }
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at

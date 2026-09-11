@@ -208,14 +208,41 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          *   fprintf(stderr, "  Game state: %u\n", state);
          */
 
-        /* Print native stack return addresses for debugging */
+        /* Print native stack return addresses for debugging, named.
+         *
+         * The window is this module's own range. It used to be the preferred
+         * base, 0x140000000-0x150000000, which ASLR moves: the image loads
+         * near 0x7FF7..., so the loop matched nothing and every crash printed
+         * an empty list under this header. The header and the leading
+         * "[i] 0x..." are kept as they were for anything that parses them. */
         {
             uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
+            HMODULE mod = GetModuleHandleW(NULL);
+            const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)
+                ((const BYTE *)mod + ((const IMAGE_DOS_HEADER *)mod)->e_lfanew);
+            uintptr_t lo = (uintptr_t)mod;
+            uintptr_t hi = lo + nt->OptionalHeader.SizeOfImage;
+            int shown = 0;
             fprintf(stderr, "  Native stack (first 8 return addrs):\n");
-            for (int i = 0; i < 64 && sp[i]; i++) {
-                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
-                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
-                }
+            for (int i = 0; i < 256 && shown < 12; i++) {
+                char buf[sizeof(SYMBOL_INFO) + 256];
+                SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+                DWORD64 disp = 0;
+
+                if (sp[i] < lo || sp[i] >= hi)
+                    continue;
+                memset(buf, 0, sizeof(buf));
+                sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                sym->MaxNameLen = 255;
+                if (SymFromAddr(GetCurrentProcess(), (DWORD64)sp[i], &disp, sym))
+                    fprintf(stderr, "    [%d] 0x%llX %s+0x%llX\n", i,
+                            (unsigned long long)sp[i], sym->Name,
+                            (unsigned long long)disp);
+                else
+                    fprintf(stderr, "    [%d] 0x%llX (module+0x%llX)\n", i,
+                            (unsigned long long)sp[i],
+                            (unsigned long long)(sp[i] - lo));
+                shown++;
             }
         }
         fflush(stderr);

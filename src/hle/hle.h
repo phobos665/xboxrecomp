@@ -1,0 +1,49 @@
+/*
+ * hle.h -- replacing XDK library functions by name.
+ *
+ * An implementation is a plain C function marked with HLE_EXPORT(Name), where
+ * Name is the XDK function's own name exactly as tools.xdk_symbols reports it
+ * (D3DDevice_SetTexture, not SetTexture). tools.recomp scans for the marker,
+ * looks the name up in the title's XDK symbols, and generates a thunk from
+ * that address's sub_XXXXXXXX to hle_<Name>. See tools/recomp/hle.py.
+ *
+ * The generated thunk owns the stack. It is reached exactly like a lifted
+ * function -- the caller has pushed the guest return address, so at entry
+ * [esp] is that address and the first stack argument is at esp+4 -- and after
+ * the implementation returns it pops the return address plus the argument
+ * bytes the original function's own `ret N` pops. That count is read from the
+ * binary, not from the signature database, which gets a few of them wrong;
+ * a wrong count leaves esp off in every caller.
+ *
+ * So an implementation reads its arguments with HLE_ARG (register arguments
+ * of a fastcall or thiscall function are g_ecx and g_edx), sets its result
+ * with HLE_RETURN, and never moves esp.
+ */
+#ifndef XBOXRECOMP_HLE_H
+#define XBOXRECOMP_HLE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "../kernel/xbox_memory_layout.h"   /* RECOMP_TLS */
+
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern ptrdiff_t g_xbox_mem_offset;
+
+/* Marks an implementation, and names it hle_<name>. */
+#define HLE_EXPORT(name) void hle_##name(void)
+
+/* Guest memory at a guest address. */
+#define HLE_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
+#define HLE_PTR(va)   ((void *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
+
+/* Stack argument i, counting from 0. */
+#define HLE_ARG(i) HLE_MEM32(g_esp + 4u + 4u * (uint32_t)(i))
+
+/* Set the guest's return value and leave. The thunk pops the stack. */
+#define HLE_RETURN(value)                                                      \
+    do {                                                                       \
+        g_eax = (uint32_t)(value);                                             \
+        return;                                                                \
+    } while (0)
+
+#endif /* XBOXRECOMP_HLE_H */

@@ -565,11 +565,25 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
         case STATUS_NOT_SUPPORTED:              return ERROR_NOT_SUPPORTED;
         case STATUS_CANCELLED:                  return ERROR_CANCELLED;
         case STATUS_ALREADY_COMMITTED:          return ERROR_COMMITMENT_LIMIT;
-        default:
-            /* Fall back to RtlNtStatusToDosError from ntdll if available */
+        default: {
+            /* The Xbox kernel's table is NT's, so the host's ntdll holds the
+             * right answer for any code not listed above. The comment here
+             * used to promise this fallback without doing it. */
+            typedef ULONG (__stdcall *NtToDos)(NTSTATUS);
+            static NtToDos host_map;
+            static int looked_up;
+            if (!looked_up) {
+                HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+                looked_up = 1;
+                if (ntdll)
+                    host_map = (NtToDos)(void *)GetProcAddress(ntdll, "RtlNtStatusToDosError");
+            }
+            if (host_map)
+                return host_map(Status);
             xbox_log(XBOX_LOG_WARN, XBOX_LOG_RTL,
                 "RtlNtStatusToDosError: unmapped status 0x%08X", Status);
             return ERROR_MR_MID_NOT_FOUND;
+        }
     }
 }
 

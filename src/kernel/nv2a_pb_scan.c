@@ -91,9 +91,13 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x030C, "SET_DEPTH_TEST_ENABLE" },
     { 0x0310, "SET_DITHER_ENABLE" },
     { 0x0314, "SET_LIGHTING_ENABLE" },
-    { 0x033C, "SET_CULL_FACE_ENABLE" },
-    { 0x0340, "SET_DEPTH_MASK" },
-    { 0x0350, "SET_CLEAR_DEPTH_VALUE" },
+    { 0x0308, "SET_CULL_FACE_ENABLE" },
+    { 0x033C, "SET_ALPHA_FUNC" },           /* per nv2a_regs.h; these three */
+    { 0x0340, "SET_ALPHA_REF" },            /* were once labelled cull, depth */
+    { 0x0344, "SET_BLEND_FUNC_SFACTOR" },   /* mask and clear depth, which */
+    { 0x0348, "SET_BLEND_FUNC_DFACTOR" },   /* hid that the title was setting */
+    { 0x034C, "SET_BLEND_COLOR" },          /* up alpha blending */
+    { 0x0350, "SET_BLEND_EQUATION" },
     { 0x1D8C, "SET_CLEAR_DEPTH" },
     { 0x1D90, "SET_COLOR_CLEAR_VALUE" },
     { 0x1D94, "CLEAR_SURFACE" },

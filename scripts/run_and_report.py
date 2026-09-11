@@ -77,7 +77,11 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None,
                     # did nothing".
                     "switches=" + ",".join(
                         k for k in ("RECOMP_VBLANK", "RECOMP_PB_EXEC",
-                                    "RECOMP_PB_SCAN", "RECOMP_NV2A_TRACE")
+                                    "RECOMP_PB_SCAN", "RECOMP_NV2A_TRACE",
+                                    # Without these DirectSoundCreate fails,
+                                    # and the title crashes much later in
+                                    # DownloadEffectsImage on a null object.
+                                    "RECOMP_AC97_READY", "RECOMP_APU_DSP_ACK")
                         if os.environ.get(k)) or "switches=none",
                     f"exe={exe}", ""]),
         encoding="utf-8")

@@ -138,6 +138,14 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_SURFACE_FORMAT          0x0208
 #define NV097_SET_SURFACE_PITCH           0x020C
 #define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
+#define NV097_SET_ALPHA_TEST_ENABLE       0x0300
+#define NV097_SET_BLEND_ENABLE            0x0304
+#define NV097_SET_ALPHA_FUNC              0x033C
+#define NV097_SET_ALPHA_REF               0x0340
+#define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
+#define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
+#define NV097_SET_BLEND_COLOR             0x034C
+#define NV097_SET_BLEND_EQUATION          0x0350
 #define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
 #define NV097_CLEAR_SURFACE               0x1D94
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
@@ -276,6 +284,14 @@ static struct {
     uint32_t color_offset, color_base, pitch, format;
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
+    /* Fragment state. The values are GL enums: compare functions 0x0200
+     * (NEVER) to 0x0207 (ALWAYS), blend factors 0x0000, 0x0001, 0x0300-0x0308
+     * and 0x8001-0x8004, equations 0x8006-0x800B. Zero is not the reset value
+     * of the source factor, the equation or the compare function, so the
+     * initialiser below sets those. */
+    uint32_t alpha_test, alpha_func, alpha_ref;
+    uint32_t blend, blend_src, blend_dst, blend_eq, blend_color;
+    unsigned long long px_alpha_rejected;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t sem_offset, sem_value, sem_releases;
@@ -290,12 +306,21 @@ static struct {
     uint32_t batches_program_mode, vp_declined;
     uint32_t sem_ctx_dma, sem_refused;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
+    /* Which path each rasterised pixel took, since start. A frame of one flat
+     * colour is either every pixel falling back to the vertex colour or the
+     * sampler returning that colour, and only these counts tell them apart. */
+    unsigned long long px_textured, px_sample_failed, px_flat;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     Texture  tex;
-} s_gpu;
+} s_gpu = {
+    .alpha_func = 0x0207,       /* ALWAYS */
+    .blend_src  = 0x0001,       /* ONE */
+    .blend_dst  = 0x0000,       /* ZERO */
+    .blend_eq   = 0x8006,       /* FUNC_ADD */
+};
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -1074,7 +1099,88 @@ static void dump_texture_bmp(uint32_t seq)
     fflush(stderr);
 }
 
-static uint32_t g_dbg_tex_px, g_dbg_texfail_px, g_dbg_flat_px, g_dbg_tris;
+/* Alpha test: GL compare functions 0x0200 NEVER .. 0x0207 ALWAYS, so the
+ * low nibble is the operation. */
+static int alpha_passes(uint32_t a)
+{
+    uint32_t ref = s_gpu.alpha_ref;
+
+    switch (s_gpu.alpha_func & 0xF) {
+    case 0:  return 0;              /* NEVER */
+    case 1:  return a <  ref;       /* LESS */
+    case 2:  return a == ref;       /* EQUAL */
+    case 3:  return a <= ref;       /* LEQUAL */
+    case 4:  return a >  ref;       /* GREATER */
+    case 5:  return a != ref;       /* NOTEQUAL */
+    case 6:  return a >= ref;       /* GEQUAL */
+    default: return 1;              /* ALWAYS */
+    }
+}
+
+/* One blend factor for one channel, 0..255. Channels are indexed
+ * 0 = alpha, 1 = red, 2 = green, 3 = blue. */
+static uint32_t blend_factor(uint32_t f, const uint32_t *src,
+                             const uint32_t *dst, const uint32_t *k, int ch)
+{
+    switch (f) {
+    case 0x0000: return 0;                              /* ZERO */
+    case 0x0001: return 255;                            /* ONE */
+    case 0x0300: return src[ch];                        /* SRC_COLOR */
+    case 0x0301: return 255 - src[ch];                  /* ONE_MINUS_SRC_COLOR */
+    case 0x0302: return src[0];                         /* SRC_ALPHA */
+    case 0x0303: return 255 - src[0];                   /* ONE_MINUS_SRC_ALPHA */
+    case 0x0304: return dst[0];                         /* DST_ALPHA */
+    case 0x0305: return 255 - dst[0];                   /* ONE_MINUS_DST_ALPHA */
+    case 0x0306: return dst[ch];                        /* DST_COLOR */
+    case 0x0307: return 255 - dst[ch];                  /* ONE_MINUS_DST_COLOR */
+    case 0x0308:                                        /* SRC_ALPHA_SATURATE */
+        if (ch == 0)
+            return 255;
+        return src[0] < 255 - dst[0] ? src[0] : 255 - dst[0];
+    case 0x8001: return k[ch];                          /* CONSTANT_COLOR */
+    case 0x8002: return 255 - k[ch];                    /* ONE_MINUS_CONSTANT_COLOR */
+    case 0x8003: return k[0];                           /* CONSTANT_ALPHA */
+    case 0x8004: return 255 - k[0];                     /* ONE_MINUS_CONSTANT_ALPHA */
+    default:     return 255;
+    }
+}
+
+static void split_argb(uint32_t v, uint32_t *c)
+{
+    c[0] = v >> 24;
+    c[1] = (v >> 16) & 0xFF;
+    c[2] = (v >> 8) & 0xFF;
+    c[3] = v & 0xFF;
+}
+
+/* Blend a fragment against what the surface already holds. */
+static uint32_t blend_pixel(uint32_t src_argb, uint32_t dst_argb)
+{
+    uint32_t src[4], dst[4], k[4], out = 0;
+    int ch;
+
+    split_argb(src_argb, src);
+    split_argb(dst_argb, dst);
+    split_argb(s_gpu.blend_color, k);
+    for (ch = 0; ch < 4; ch++) {
+        int32_t s_term = (int32_t)(src[ch] * blend_factor(s_gpu.blend_src, src, dst, k, ch));
+        int32_t d_term = (int32_t)(dst[ch] * blend_factor(s_gpu.blend_dst, src, dst, k, ch));
+        int32_t v;
+
+        switch (s_gpu.blend_eq) {
+        case 0x800A: v = s_term - d_term;                      break;  /* SUBTRACT */
+        case 0x800B: v = d_term - s_term;                      break;  /* REVERSE_SUBTRACT */
+        case 0x8007: v = (int32_t)(src[ch] < dst[ch] ? src[ch] : dst[ch]) * 255; break; /* MIN */
+        case 0x8008: v = (int32_t)(src[ch] > dst[ch] ? src[ch] : dst[ch]) * 255; break; /* MAX */
+        default:     v = s_term + d_term;                      break;  /* FUNC_ADD */
+        }
+        v = (v + 127) / 255;
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        out |= (uint32_t)v << (24 - 8 * ch);
+    }
+    return out;
+}
 
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
@@ -1091,6 +1197,24 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
                            (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return;
     row = mem + dma_resolve(s_gpu.color_offset) + (size_t)y * s_gpu.pitch;
+
+    if (s_gpu.alpha_test && !alpha_passes(argb >> 24)) {
+        s_gpu.px_alpha_rejected++;
+        return;
+    }
+    if (s_gpu.blend) {
+        uint32_t dst;
+        if (bpp == 4) {
+            dst = ((const uint32_t *)row)[x];
+        } else {
+            uint32_t v = ((const uint16_t *)row)[x];
+            uint32_t r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, b = v & 0x1F;
+            /* R5G6B5 has no alpha: a destination-alpha factor sees opaque. */
+            dst = 0xFF000000u | (((r << 3) | (r >> 2)) << 16)
+                | (((g << 2) | (g >> 4)) << 8) | ((b << 3) | (b >> 2));
+        }
+        argb = blend_pixel(argb, dst);
+    }
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -1157,24 +1281,15 @@ static void raster_triangle(const float a[2], const float b[2],
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
-                    g_dbg_tex_px++;
+                    s_gpu.px_textured++;
                     put_pixel(mem, bpp, x, y, texel);
                     continue;
                 }
-                g_dbg_texfail_px++;
+                s_gpu.px_sample_failed++;
             }
-            if (!textured) g_dbg_flat_px++;
+            if (!textured) s_gpu.px_flat++;
             put_pixel(mem, bpp, x, y, argb);
         }
-    }
-    if (++g_dbg_tris % 4000u == 0u) {
-        fprintf(stderr, "  [PX] tris %u  tex %u  texfail %u  flat %u"
-                "  fmt%02X %ux%u valid %d  surf %08X pitch %u bpp %u\n",
-                g_dbg_tris, g_dbg_tex_px, g_dbg_texfail_px, g_dbg_flat_px,
-                s_gpu.tex.color, s_gpu.tex.width, s_gpu.tex.height,
-                s_gpu.tex.valid, dma_resolve(s_gpu.color_offset),
-                s_gpu.pitch, bpp);
-        fflush(stderr);
     }
     s_gpu.tris_drawn++;
 }
@@ -1515,12 +1630,22 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types that are triangles under some winding. */
-#define NV_PRIM_TRIANGLES      4
-#define NV_PRIM_TRIANGLE_STRIP 5
-#define NV_PRIM_TRIANGLE_FAN   6
-#define NV_PRIM_QUADS          7
-#define NV_PRIM_QUAD_STRIP     8
+/* NV097 SET_BEGIN_END operations that are triangles under some winding.
+ *
+ * The hardware's values, from NV097_SET_BEGIN_END_OP_* in src/nv2a/nv2a_regs.h:
+ * TRIANGLES is 5. Method 0x17FC carries the hardware value by definition.
+ *
+ * These once followed the PC Direct3D primitive enum, which is one lower
+ * across the board, so every batch was assembled as its neighbour: triangles
+ * as strips, strips as fans, fans as quads, quads as quad strips, and quad
+ * strips not at all. The DOAXBV port documents the same trap on the D3D8 side.
+ */
+#define NV_PRIM_TRIANGLES      5
+#define NV_PRIM_TRIANGLE_STRIP 6
+#define NV_PRIM_TRIANGLE_FAN   7
+#define NV_PRIM_QUADS          8
+#define NV_PRIM_QUAD_STRIP     9
+#define NV_PRIM_POLYGON       10   /* convex, so a fan around vertex 0 */
 
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
@@ -1597,13 +1722,6 @@ static void raster_batch(void)
          * a single quad fanned around vertex 0 is exactly its two triangles.
          * True of one quad, and wrong for every quad after it: fanning the
          * whole batch joins each later quad back to the *first* quad's corner.
-         *
-         * Burnout 2 draws its text as one QUADS batch of glyph quads, so every
-         * glyph got a triangle stretched back to the first glyph -- forty-five
-         * thousand long thin triangles a frame, smearing font texels across
-         * the whole row. That is the white band that made the frame look like
-         * nothing was working, while the logo two triangles earlier was
-         * pixel-perfect.
          */
         for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
             uint32_t c0 = vertex_color(s_gpu.idx[i]);
@@ -1625,7 +1743,8 @@ static void raster_batch(void)
         break;
 
     case NV_PRIM_TRIANGLE_FAN:
-        /* A genuine fan: every triangle shares index 0. */
+    case NV_PRIM_POLYGON:
+        /* A fan, or a convex polygon: every triangle shares index 0. */
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
             raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
                            vertex_color(s_gpu.idx[0]));
@@ -1960,6 +2079,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_CLEAR_SURFACE:
         clear_surface(param);
         break;
+
+    /* Alpha test and blending. Without them every fragment is opaque, so a
+     * quad the title draws with alpha 0 -- a fade, or the transparent part of
+     * a glyph -- paints over whatever is beneath it. */
+    case NV097_SET_ALPHA_TEST_ENABLE:  s_gpu.alpha_test = param;        break;
+    case NV097_SET_ALPHA_FUNC:         s_gpu.alpha_func = param;        break;
+    case NV097_SET_ALPHA_REF:          s_gpu.alpha_ref = param & 0xFF;  break;
+    case NV097_SET_BLEND_ENABLE:       s_gpu.blend = param;             break;
+    case NV097_SET_BLEND_FUNC_SFACTOR: s_gpu.blend_src = param;         break;
+    case NV097_SET_BLEND_FUNC_DFACTOR: s_gpu.blend_dst = param;         break;
+    case NV097_SET_BLEND_COLOR:        s_gpu.blend_color = param;       break;
+    case NV097_SET_BLEND_EQUATION:     s_gpu.blend_eq = param;          break;
 
     case NV097_SET_BEGIN_END:
         if (param) {
@@ -2308,6 +2439,14 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+    fprintf(stderr, "[GPU] pixels: %llu from a texture, %llu where sampling"
+                    " failed, %llu from untextured batches\n",
+            s_gpu.px_textured, s_gpu.px_sample_failed, s_gpu.px_flat);
+    fprintf(stderr, "[GPU] fragment: alpha test %s (func 0x%04X ref %u, %llu"
+                    " pixels rejected); blend %s (0x%04X, 0x%04X, eq 0x%04X)\n",
+            s_gpu.alpha_test ? "on" : "off", s_gpu.alpha_func, s_gpu.alpha_ref,
+            s_gpu.px_alpha_rejected, s_gpu.blend ? "on" : "off",
+            s_gpu.blend_src, s_gpu.blend_dst, s_gpu.blend_eq);
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another

@@ -117,6 +117,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE
         /LARGEADDRESSAWARE
+        # A PDB in every configuration, so the crash handler's SymFromAddr can
+        # name the generated function a host RIP is in. Linker-only: without
+        # /Zi it holds public symbols -- every sub_XXXXXXXX -- and costs no
+        # recompile of the large generated files.
+        /DEBUG
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)

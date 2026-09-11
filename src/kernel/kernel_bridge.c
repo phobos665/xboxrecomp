@@ -1322,12 +1322,99 @@ static void bridge_NtCreateEvent(void)
 }
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
+/* Guest dispatcher objects.
+ *
+ * KeSetEvent and KeWaitForSingleObject take a pointer to a dispatcher object
+ * -- a KEVENT the title owns, in guest memory -- and never a handle. These
+ * bridges used to rebase that address to the host and hand it to SetEvent and
+ * WaitForSingleObjectEx as though it were a HANDLE, so every set did nothing
+ * and every wait failed at once with STATUS_UNSUCCESSFUL. Burnout 2's
+ * D3DDevice_BlockUntilVerticalBlank waits exactly this way, on the device's
+ * vertical-blank event, so it never blocked and the title was never paced.
+ *
+ * An event begins with a DISPATCHER_HEADER: UCHAR Type, Absolute, Size,
+ * Inserted; LONG SignalState; LIST_ENTRY WaitListHead. Type 0 is a
+ * notification event, which stays signalled until reset; type 1 is a
+ * synchronisation event, which a satisfied wait clears (kernel.h names both).
+ * Only those two are handled here, and only in guest RAM below 64 MB; every
+ * other object keeps the host path it had before.
+ */
+#define GUEST_EVENT_NOTIFICATION     0u
+#define GUEST_EVENT_SYNCHRONIZATION  1u
+#define GUEST_RAM_END                0x04000000u
+
+static volatile LONG *bridge_guest_event(uint32_t va, int *sync)
+{
+    uint8_t type;
+
+    if (va < 0x00010000u || va >= GUEST_RAM_END - 8u)
+        return NULL;
+    type = *(volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
+    if (type != GUEST_EVENT_NOTIFICATION && type != GUEST_EVENT_SYNCHRONIZATION)
+        return NULL;
+    if (sync)
+        *sync = (type == GUEST_EVENT_SYNCHRONIZATION);
+    return (volatile LONG *)((uintptr_t)va + 4u + g_xbox_mem_offset);
+}
+
+/* Wait for a guest event by watching its SignalState. The Xbox timeout is a
+ * LARGE_INTEGER in 100 ns units: absent means forever, zero means poll,
+ * negative is relative and positive is an absolute system time. */
+static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
+                                        uint32_t timeout_va)
+{
+    ULONGLONG deadline = 0;
+    int poll_only = 0;
+    unsigned spins = 0;
+
+    if (timeout_va) {
+        int64_t t = (int64_t)(((uint64_t)BRIDGE_MEM32(timeout_va + 4) << 32)
+                              | BRIDGE_MEM32(timeout_va));
+        if (t < 0) {
+            deadline = GetTickCount64() + (ULONGLONG)((-t) / 10000);
+        } else if (t > 0) {
+            FILETIME ft;
+            int64_t now, rest;
+            GetSystemTimeAsFileTime(&ft);
+            now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+            rest = t - now;
+            if (rest <= 0)
+                poll_only = 1;
+            else
+                deadline = GetTickCount64() + (ULONGLONG)(rest / 10000);
+        } else {
+            poll_only = 1;
+        }
+    }
+
+    for (;;) {
+        LONG cur = *state;
+        if (cur > 0) {
+            if (!sync || InterlockedCompareExchange(state, 0, cur) == cur)
+                return 0;                       /* STATUS_SUCCESS */
+            continue;                           /* another waiter took it */
+        }
+        if (poll_only || (deadline && GetTickCount64() >= deadline))
+            return 0x00000102u;                 /* STATUS_TIMEOUT */
+        if (++spins < 64)
+            SwitchToThread();
+        else
+            Sleep(1);
+    }
+}
+
 static void bridge_KeSetEvent(void)
 {
     uint32_t event_ptr = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
+    volatile LONG *state = bridge_guest_event(event_ptr, NULL);
 
+    if (state) {
+        /* KeSetEvent returns the event's previous state. */
+        g_eax = (uint32_t)InterlockedExchange(state, 1);
+        return;
+    }
     g_eax = (uint32_t)xbox_KeSetEvent(XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
 }
 
@@ -1339,6 +1426,20 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t wait_mode = STACK_ARG(2);
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
+    int sync = 0;
+    volatile LONG *state = bridge_guest_event(object, &sync);
+
+    if (state) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "  [KERNEL] KeWaitForSingleObject: guest %s event "
+                    "at 0x%08X, waited on its SignalState\n",
+                    sync ? "synchronisation" : "notification", object);
+        }
+        g_eax = bridge_wait_guest_event(state, sync, timeout_ptr);
+        return;
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         XBOX_TO_NATIVE(object), wait_reason, wait_mode,
@@ -2398,19 +2499,17 @@ static void bridge_ExQueryPoolBlockSize(void)
  */
 static void bridge_RtlNtStatusToDosError(void)
 {
-    uint32_t status = STACK_ARG(0);
-
-    /* Simple mapping of common status codes */
-    switch (status) {
-    case 0x00000000: g_eax = 0; break;          /* STATUS_SUCCESS → ERROR_SUCCESS */
-    case 0xC0000034: g_eax = 2; break;          /* STATUS_OBJECT_NAME_NOT_FOUND → ERROR_FILE_NOT_FOUND */
-    case 0xC000003A: g_eax = 3; break;          /* STATUS_OBJECT_PATH_NOT_FOUND → ERROR_PATH_NOT_FOUND */
-    case 0xC0000022: g_eax = 5; break;          /* STATUS_ACCESS_DENIED → ERROR_ACCESS_DENIED */
-    case 0xC0000008: g_eax = 6; break;          /* STATUS_INVALID_HANDLE → ERROR_INVALID_HANDLE */
-    case 0xC0000017: g_eax = 8; break;          /* STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY */
-    case 0xC000000D: g_eax = 87; break;         /* STATUS_INVALID_PARAMETER → ERROR_INVALID_PARAMETER */
-    default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
-    }
+    /* The full mapping in kernel_rtl.c, which falls back to the host's own
+     * NT table for anything it does not list.
+     *
+     * This bridge used to carry its own seven-entry switch and answer
+     * ERROR_MR_MID_NOT_FOUND (317) for everything else -- including
+     * STATUS_PENDING, which must become ERROR_IO_PENDING (997). XAPI's
+     * ReadFile turns a pending NtReadFile into its last error through here,
+     * and Burnout 2's sound-bank loader proceeds only on 997: on 317 it freed
+     * the buffer and gave up. The complete table was already written; nothing
+     * called it. */
+    g_eax = (uint32_t)xbox_RtlNtStatusToDosError((NTSTATUS)STACK_ARG(0));
 }
 
 /* ── File I/O bridge helpers ─────────────────────────────── */
@@ -2470,6 +2569,9 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
 #define BRIDGE_HANDLE_MAX  16384
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+/* Whether each token's file was opened for asynchronous I/O: CreateOptions
+ * without FILE_SYNCHRONOUS_IO_ALERT or _NONALERT. See bridge_NtReadFile. */
+static unsigned char s_handle_async[BRIDGE_HANDLE_MAX];
 
 static uint32_t bridge_handle_token(HANDLE h)
 {
@@ -2535,6 +2637,7 @@ static HANDLE bridge_take_handle(uint32_t token)
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
             HANDLE h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            s_handle_async[i] = 0;
             return h;
         }
     }
@@ -2661,6 +2764,32 @@ static void bridge_RtlInitAnsiString(void)
 }
 
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
+/* Record whether a newly opened file is asynchronous, keyed by its token. */
+static void bridge_mark_async(uint32_t handle_va, uint32_t options)
+{
+    uint32_t token, i;
+
+    if (!handle_va)
+        return;
+    token = BRIDGE_MEM32(handle_va);
+    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG)
+        return;
+    i = token & BRIDGE_HANDLE_MASK;
+    if (i > 0 && i < BRIDGE_HANDLE_MAX)
+        s_handle_async[i] = (options & (XBOX_FILE_SYNCHRONOUS_IO_ALERT |
+                                        XBOX_FILE_SYNCHRONOUS_IO_NONALERT)) == 0;
+}
+
+static int bridge_handle_is_async(uint32_t token)
+{
+    uint32_t i;
+
+    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG)
+        return 0;
+    i = token & BRIDGE_HANDLE_MASK;
+    return i > 0 && i < BRIDGE_HANDLE_MAX && s_handle_async[i];
+}
+
 static void bridge_NtCreateFile(void)
 {
     uint32_t handle_va   = STACK_ARG(0);  /* PHANDLE */
@@ -2680,6 +2809,8 @@ static void bridge_NtCreateFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
+    if (g_eax == 0)
+        bridge_mark_async(handle_va, options);
 
     /* An FMV the host can decode itself.
      *
@@ -2748,6 +2879,8 @@ static void bridge_NtOpenFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         0, share, 1 /* FILE_OPEN */, options);
+    if (g_eax == 0)
+        bridge_mark_async(handle_va, options);
 }
 
 /*
@@ -2971,8 +3104,31 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    /* An asynchronous file has no file pointer a read moves.
+     *
+     * On the Xbox a read on a file opened for overlapped I/O takes its offset
+     * from the request and leaves the file object's position alone, so a
+     * title streaming a file advances the position itself. Burnout 2's reader
+     * does exactly that: after each 128 KB chunk completes it calls
+     * SetFilePointer(+bytes, FILE_CURRENT). The host handle is synchronous,
+     * and Windows moves its pointer to offset + bytes on every read, so the
+     * two advances added up and traffic.tra was read at 0, 256 KB, 512 KB...
+     * -- every other chunk skipped, and the parser crashed on a pointer taken
+     * from the half never read. Keeping the host pointer where it was makes
+     * the read leave the position exactly as the Xbox kernel would. */
+    int async_file = bridge_handle_is_async(STACK_ARG(0));
+    LARGE_INTEGER saved_pos;
+    saved_pos.QuadPart = 0;
+    if (async_file) {
+        LARGE_INTEGER zero;
+        zero.QuadPart = 0;
+        if (!SetFilePointerEx(handle, zero, &saved_pos, FILE_CURRENT))
+            async_file = 0;
+    }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    if (async_file)
+        SetFilePointerEx(handle, saved_pos, NULL, FILE_BEGIN);
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
@@ -3001,6 +3157,34 @@ static void bridge_NtReadFile(void)
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
+
+    /* A read on an asynchronous handle pends.
+     *
+     * On the Xbox a file opened for overlapped I/O -- no FILE_SYNCHRONOUS_IO
+     * option -- never finishes a DVD read inside NtReadFile: the driver queues
+     * it, NtReadFile returns STATUS_PENDING, and the result arrives through
+     * the status block and the event. The read above has already finished and
+     * both are already written, so reporting STATUS_PENDING changes nothing a
+     * title can observe except which of its own paths runs.
+     *
+     * And titles depend on that. Burnout 2's stream reader treats an immediate
+     * success as the whole request arriving and demands bytes == requested;
+     * only its pending path accepts the short count a read at a file's end
+     * returns. It asked for 96,256 bytes of the 96,068-byte special.rws, got
+     * an immediate success, and showed its dirty-disc screen. */
+    if (g_eax == 0 && bridge_handle_is_async(STACK_ARG(0))) {
+        /* Except a request that carried a completion routine: that one keeps
+         * completing inline. bridge_complete_file_io has already run the
+         * routine, so a caller that marks itself waiting after issuing the
+         * read, then sleeps until the routine fires, would wait forever if it
+         * were told the read was still pending. XAPI's ReadFile passes no
+         * routine, which is the path Burnout 2's stream reader uses. */
+        fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> %s\n",
+                STACK_ARG(1), STACK_ARG(2),
+                STACK_ARG(2) ? "completed now" : "pending");
+        if (!STACK_ARG(2))
+            g_eax = 0x00000103u;           /* STATUS_PENDING */
+    }
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
@@ -3380,6 +3564,8 @@ static void bridge_IoCreateFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
+    if (g_eax == 0)
+        bridge_mark_async(handle_va, options);
 }
 
 /* -- NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) ----
@@ -3465,6 +3651,16 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+    /* FSCTL_DISMOUNT_VOLUME, CTL_CODE(9, 8, 0, 0). XAPI dismounts the cache
+     * partition while it mounts the utility drive at start-up. The real
+     * kernel answers success, and a host-backed partition has nothing to
+     * flush or detach, so success is the correct answer here too. */
+    if (fsctl == 0x00090020u) {
+        bridge_write_iostatus(ios_va, 0, 0);
+        g_eax = 0;
+        return;
+    }
+
     fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;

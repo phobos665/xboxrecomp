@@ -233,6 +233,14 @@ def main():
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
                              "hand-written definition links instead")
+    parser.add_argument("--hle-symbols", metavar="FILE",
+                        help="tools.xdk_symbols JSON for this XBE. XDK functions "
+                             "with an HLE_EXPORT(Name) implementation are "
+                             "replaced by name instead of lifted "
+                             "(see tools/recomp/hle.py)")
+    parser.add_argument("--hle-impl", metavar="PATH", action="append",
+                        help="C file or directory to scan for HLE_EXPORT(Name) "
+                             "markers (repeatable; default: src/hle)")
     parser.add_argument("--exclude-manual", metavar="FILE",
                         nargs="?", const="src/game/recomp/recomp_manual.c",
                         help="Scan a C file (default recomp_manual.c) for the "
@@ -463,6 +471,42 @@ def main():
                   + (f"; {len(wrap & known)} wrapped as sub_X_gen" if wrap else ""),
                   file=sys.stderr)
 
+        # XDK functions replaced by name (tools/recomp/hle.py). Planned after
+        # the hand-written set is complete, so title code keeps winning, and
+        # before translation, so the replaced bodies are not lifted.
+        hle_replace = {}
+        if args.hle_symbols:
+            from .config import va_to_file_offset
+            from .hle import implemented_names, load_symbols, plan, stack_cleanup
+            xbe_bytes = translator.translator.xbe_data
+
+            def _cleanup(addr):
+                # Argument bytes the function's own `ret N` pops, read from the
+                # binary: the thunk pops exactly what the lifted body would.
+                info = translator.func_db.get(addr) or {}
+                end = info.get("end")
+                if isinstance(end, str):
+                    end = int(end, 16)
+                off = va_to_file_offset(addr)
+                if not end or end <= addr or off is None or not xbe_bytes:
+                    return None
+                return stack_cleanup(xbe_bytes[off:off + (end - addr)], addr)
+            impl_paths = args.hle_impl or [os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)))), "src", "hle")]
+            implemented = implemented_names(
+                [p for p in impl_paths if os.path.exists(p)])
+            hle_replace, hle_notes = plan(load_symbols(args.hle_symbols),
+                                          implemented, set(translator.func_db),
+                                          manual, _cleanup)
+            for addr in hle_replace:
+                translator.func_db[addr]["name"] = f"sub_{addr:08X}"
+            manual |= set(hle_replace)
+            print(f"XDK functions replaced by name: {len(hle_replace)} of "
+                  f"{len(implemented)} implemented", file=sys.stderr)
+            for note in hle_notes:
+                print(f"  hle: {note}", file=sys.stderr)
+
         stats = translator.translate_batch_split(
             funcs,
             output_dir=gen_dir,
@@ -470,6 +514,14 @@ def main():
             verbose=args.verbose,
             manual=manual,
         )
+
+        # Written after translation, which clears stale files from gen_dir, and
+        # written even when empty, so a stale thunk file from an earlier lift
+        # can never define a function this lift generated.
+        from .hle import render_thunks
+        with open(os.path.join(gen_dir, "recomp_hle.c"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(render_thunks(hle_replace))
 
         t_translate = time.time() - t0
         print(f"\n=== Split Translation Complete ({t_translate:.1f}s) ===",

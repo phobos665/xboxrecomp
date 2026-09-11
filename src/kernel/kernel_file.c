@@ -153,8 +153,19 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* XBOX_FILE_NO_INTERMEDIATE_BUFFERING is deliberately not passed on.
+         *
+         * On the Xbox it is a performance hint for DVD reads. On the host,
+         * FILE_FLAG_NO_BUFFERING imposes rules the guest never agreed to:
+         * buffer addresses and lengths must be sector-aligned, and so must
+         * the file pointer. A read that ends at a file's end leaves the
+         * pointer mid-sector, after which SetFilePointerEx(0, FILE_CURRENT)
+         * fails with ERROR_INVALID_PARAMETER. XAPI's SetFilePointer asks
+         * exactly that after each read, got STATUS_UNSUCCESSFUL back, and
+         * Burnout 2 showed its dirty-disc screen after special.rws -- a
+         * 96,068-byte file read as 96,256. Buffered, the host pointer lands
+         * where the Xbox kernel's CurrentByteOffset would. */
+        (void)XBOX_FILE_NO_INTERMEDIATE_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),

@@ -100,6 +100,11 @@ def build_commands(args, xbe: Path, analysis_json: Path):
         lift += ["--gen-dir", args.gen_dir]
     if args.trace_all_entries:
         lift.append("--trace-all-entries")
+    # XDK functions with a name-keyed replacement (tools/recomp/hle.py), used
+    # whenever tools.xdk_symbols has been run for this XBE.
+    hle_symbols = xbe.with_name(xbe.stem + "_xdk_symbols.json")
+    if hle_symbols.exists():
+        lift += ["--hle-symbols", str(hle_symbols)]
     if args.verbose:
         lift.append("-v")
 

@@ -74,6 +74,9 @@ add_subdirectory(src/input)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# XDK functions replaced by name (tools/recomp/hle.py)
+add_subdirectory(src/hle)
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
@@ -87,5 +90,6 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_hle
 )
 
