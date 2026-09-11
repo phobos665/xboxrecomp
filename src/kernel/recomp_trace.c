@@ -447,6 +447,29 @@ static void trace_only_print(const char *name, uint32_t va)
     fflush(stderr);
 }
 
+/* See recomp_types.h. A small open-addressed set keeps it to one line per
+ * address; past that many distinct addresses it just keeps printing. */
+void recomp_stub_missing(uint32_t va)
+{
+    static uint32_t seen[512];
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t ret = guest_readable(g_esp, 4) ? *(const uint32_t *)(mem + g_esp) : 0;
+    uint32_t h = (va * 2654435761u) >> 23;
+    int i;
+
+    for (i = 0; i < 512; i++, h = (h + 1) & 511) {
+        if (seen[h] == va)
+            return;
+        if (seen[h] == 0) {
+            seen[h] = va;
+            break;
+        }
+    }
+    fprintf(stderr, "[STUB] 0x%08X was never recompiled (from=%08X) -- "
+            "its code is skipped; seed it or fix discovery\n", va, ret);
+    fflush(stderr);
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
     watch_check(name);

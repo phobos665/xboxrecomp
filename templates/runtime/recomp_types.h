@@ -282,6 +282,18 @@ void recomp_icall_fail_log(uint32_t va);
  * vtable call into an unexplained hang. */
 void recomp_icall_not_code_log(uint32_t va);
 
+/* Report a direct call or jump into an address that was never recompiled --
+ * the generated stub in recomp_stubs_unresolved.c. The stub keeps esp
+ * balanced and does nothing else, so whatever the guest code there would have
+ * done is skipped. Once per address, from the runtime, so every title gets it
+ * without touching its recomp_manual.c.
+ *
+ * Burnout 2's sound manager constructor was one of these: reached only by a
+ * static initialiser's tail jump, never discovered, and so never run. A field
+ * it should have set stayed null, and the game crashed a minute later in an
+ * unrelated-looking Pause. */
+void recomp_stub_missing(uint32_t va);
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen

@@ -160,6 +160,10 @@ class FunctionDetector:
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
+        # Tail jumps out of the alias entries. Must come after every pass that
+        # adds aliases, and before they are built.
+        self._pass_alias_tail_jumps(sections)
+
         self._build_alias_entries()
 
         # Populate call graph
@@ -564,8 +568,22 @@ class FunctionDetector:
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
+            # ...or an adjustor thunk: a few instructions that end in a direct
+            # jmp onto a *known function start*. A tail jump alone is weak
+            # evidence, but landing exactly on a start is not something data
+            # does by accident. Burnout 2's stream object installs three
+            # callbacks side by side (sub_001104F0: +0x0C, +0x10, +0x14); the
+            # middle one is `mov eax,[esp+4]; mov ecx,[eax+0x4c];
+            # mov [esp+4],ecx; jmp sub_00110320`. The other two were found and
+            # it was not, so every call through it was an unresolved ICALL that
+            # popped the wrong amount, and the attract movie's path string
+            # ended up written over saved registers.
+            thunk_to = self.engine.block_tail_jump(target, max_insns=16)
+            is_thunk = (thunk_to in self.functions
+                        and not self.engine.entry_pops_unsaved(target))
             if not (self.engine.probes_as_returning_body(target)
-                    or self.engine.probes_as_vcall_thunk(target)):
+                    or self.engine.probes_as_vcall_thunk(target)
+                    or is_thunk):
                 continue
 
             # The same two guards _pass_data_ptr_targets carries, and for the
@@ -735,6 +753,9 @@ class FunctionDetector:
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
         targets = set()
+        # target -> the values stored beside it in the same table. Used below
+        # as the extra evidence a long body needs.
+        table_mates: Dict[int, Set[int]] = {}
         for sec in self.image.sections:
             if sec.name in code_names:
                 continue                    # scan data, not code
@@ -768,8 +789,14 @@ class FunctionDetector:
                 next_adjacent = i + 1 < len(hits) and hits[i + 1] == off + 4
                 if prev_adjacent or next_adjacent:
                     neighbours.add(off)
+            hit_set = set(hits)
             for off in neighbours:
-                targets.add(int.from_bytes(data[off:off + 4], "little"))
+                value = int.from_bytes(data[off:off + 4], "little")
+                targets.add(value)
+                mates = table_mates.setdefault(value, set())
+                for adj in (off - 4, off + 4):
+                    if adj in hit_set:
+                        mates.add(int.from_bytes(data[adj:adj + 4], "little"))
 
         # Alias entries, not candidates.
         #
@@ -826,9 +853,28 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
+                # A short probe first. The cap is doing precision work here,
+                # not just bounding cost: with the probe's full 8192, runs of
+                # data that merely decode (WMADEC's `add [eax],eax` tables,
+                # XON_RD's strings) eventually hit some ret and got through.
+                #
+                # But 64 alone rejects real vtable methods whose first ret is
+                # further in -- Burnout 2's 0x000419C0 and 0x0004B7B0 (71 and
+                # 178 instructions), each the first of four entries whose
+                # other three were already known. Both became unresolved
+                # ICALLs, their objects were never initialised, and the title
+                # rebooted itself during the attract movie.
+                #
+                # So a longer body needs better evidence than length: a
+                # neighbour in the same table that is already a known function
+                # start. That is exactly what a vtable looks like, and what a
+                # run of numbers that happen to fall in .text does not.
                 if not self.engine.probes_as_function_body(target,
                                                            max_insns=64):
-                    continue
+                    mates = table_mates.get(target, ())
+                    if not (any(m in self.functions for m in mates)
+                            and self.engine.probes_as_function_body(target)):
+                        continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
                 end = starts[i] if i < len(starts) else section_end.get(
@@ -979,6 +1025,97 @@ class FunctionDetector:
         if added:
             print("  conditional-branch orphans recovered as alias entries")
         return added
+
+    def _pass_alias_tail_jumps(self, sections: List[SectionInfo]) -> int:
+        """
+        Follow the tail jumps out of alias entries.
+
+        _pass_tail_jump_targets only sees a jmp that sits inside a function
+        body, and alias entries are not bodies yet when it runs -- most of them
+        come from _pass_data_ptr_targets, after its last round. So a function
+        reached only by a tail jump *from an alias* was never discovered, and
+        the jump lifted as a call to a stub that pops the return address and
+        does nothing else.
+
+        That is the usual shape of a C++ static initialiser: an entry in the
+        CRT's initialiser table, `mov ecx, <object>; jmp <constructor>`.
+        Burnout 2 had 40 such targets. One was the sound manager's constructor
+        (sub_000CA4E0, via sub_00139360), which never ran; the object kept a
+        null mixer pointer, and the title screen crashed a minute later in the
+        sound Pause, with nothing in the log pointing back here.
+
+        New entries are aliases, for the reason _pass_data_ptr_targets gives:
+        built after every boundary is fixed, they cannot clamp a neighbour.
+        Each new alias is scanned in turn, since it can tail-jump onward.
+
+        Returns the number of entries added.
+        """
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+        section_end = {sec.name: sec.virtual_addr + sec.virtual_size
+                       for sec in sections}
+
+        found = 0
+        pending = sorted(self._alias_entries.items())
+        scanned = set()
+        while pending:
+            a_start, a_end = pending.pop()
+            if a_start in scanned:
+                continue
+            scanned.add(a_start)
+            for insn in self.engine.get_instructions_in_range(a_start, a_end):
+                if not insn.is_jump or insn.is_cond_jump:
+                    continue
+                target = insn.jump_target
+                if target is None or a_start <= target < a_end:
+                    continue            # an ordinary branch within the alias
+                if (target in self.functions or target in self._alias_entries
+                        or target in self._candidates):
+                    continue
+                sec = self.image.get_section_at_va(target)
+                if sec is None or not sec.executable \
+                        or sec.name not in section_end:
+                    continue
+
+                j = bisect.bisect_right(starts, target) - 1
+                if j >= 0 and bounds[j][0] < target < bounds[j][1]:
+                    # Inside a function: share its end, as the other alias
+                    # passes do. An instruction boundary is all that is needed.
+                    if target not in self.engine.instructions:
+                        continue
+                    end = bounds[j][1]
+                else:
+                    # In a gap: the same evidence _pass_call_targets asks of a
+                    # target it has to realign, plus the checks that keep
+                    # padding and function interiors out.
+                    if target not in self.engine.instructions:
+                        if not self.engine.probes_as_function_body(target):
+                            continue
+                        if not self.engine.decode_at(target):
+                            continue
+                    if self.engine.instructions[target].mnemonic.lower() \
+                            in ("int3", "nop"):
+                        continue
+                    if self.engine.entry_pops_unsaved(target):
+                        continue        # a continuation, not an entry
+                    # Default cap, as in _pass_data_ptr_targets.
+                    if not self.engine.probes_as_function_body(target):
+                        continue
+                    k = bisect.bisect_right(starts, target)
+                    end = starts[k] if k < len(starts) else section_end[sec.name]
+                    measured = self._find_function_end(
+                        target, end, section_end[sec.name])
+                    if measured and target < measured < end:
+                        end = measured
+                if end <= target:
+                    continue
+                self._alias_entries[target] = end
+                pending.append((target, end))
+                found += 1
+
+        if found:
+            print(f"  {found} tail-jump target(s) reached from alias entries")
+        return found
 
     def _build_alias_entries(self) -> None:
         """

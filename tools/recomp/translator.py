@@ -1584,9 +1584,12 @@ class BatchTranslator:
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
+                # recomp_stub_missing runs first, while [esp] is still the
+                # return address, so the report names the caller.
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"recomp_stub_missing(0x{addr:08X}u); "
+                    f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
 
