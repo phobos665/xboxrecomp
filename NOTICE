@@ -1,9 +1,36 @@
 xboxrecomp — third-party attribution
 ====================================
 
-xboxrecomp is MIT licensed (see LICENSE). The components listed below are
-not, and are included here under their original licences with their original
-copyright intact. They are other people's work and are credited as such.
+This fork of xboxrecomp is distributed under GPL-3.0 (see LICENSE). The
+upstream xboxrecomp code it builds on was released under MIT and keeps that
+notice (LICENSE.upstream-MIT). The components listed below are included under
+their original licences with their original copyright intact. They are other
+people's work and are credited as such.
+
+
+GPL-3.0 — adapted from doaxbv-re
+--------------------------------
+
+  https://github.com/NoRain211/doaxbv-re
+
+  Files, from its recomp-runtime/ directory:
+
+    src/hle/xbox_adpcm.c, xbox_adpcm.h
+                          Xbox ADPCM block decoder. Unchanged.
+    src/hle/dsound_buffer_model.c, dsound_buffer_model.h
+                          The buffer half of dsound_service_model: a
+                          DirectSound buffer's play state on the host clock.
+                          Unchanged apart from the dropped device functions.
+    src/hle/audio_output.h, audio_output_xaudio2.cpp
+                          XAudio2 output. Changed: an unset RECOMP_AUDIO_GAIN
+                          means full gain rather than muted.
+    src/hle/hle_dsound.c  Adapted from dsound_service_adapter.c: keyed by XDK
+                          function name instead of one title's addresses,
+                          voice fields read from the voice settings object,
+                          a clock for every buffer, and a lock.
+
+  Licensed under the GNU General Public License, version 3. The full text is
+  in LICENSE.
 
 
 LGPL-2.1-or-later — extracted from xemu

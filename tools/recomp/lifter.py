@@ -954,6 +954,8 @@ class Lifter:
         # The translator reports this at the end of a run, so the next one
         # costs a line of output instead of an afternoon.
         self.unimplemented = {}
+        # callee address -> the argument bytes its own `ret N` pops, or None.
+        self._pop_cache = {}
 
         # Detect if either is missing, so overriding one does not silently
         # leave the other unset -- that is the bug this whole path fixes.
@@ -1745,6 +1747,33 @@ class Lifter:
     SETJMP_FN = None
     LONGJMP_FN = None
 
+    def callee_pop(self, target):
+        """Argument bytes `target` pops with its own `ret N`, or None.
+
+        Read from the callee's bytes, and only when every ret in its body
+        agrees (hle.stack_cleanup) -- the binary cannot be wrong about what it
+        pops. Feeds RECOMP_ABI_CALL_POP, a diagnostic: an unknown or wrong
+        value only changes what -DRECOMP_ABI_CHECK reports, never what runs.
+        """
+        if target in self._pop_cache:
+            return self._pop_cache[target]
+        pop = None
+        info = self.func_db.get(target)
+        if info is not None and self.xbe_data:
+            end = info.get("end")
+            if isinstance(end, str):
+                try:
+                    end = int(end, 16)
+                except ValueError:
+                    end = None
+            offset = va_to_file_offset(target)
+            if isinstance(end, int) and end > target and offset is not None:
+                from .hle import stack_cleanup
+                pop = stack_cleanup(
+                    self.xbe_data[offset:offset + (end - target)], target)
+        self._pop_cache[target] = pop
+        return pop
+
     def _lift_call(self, insn, ops):
         # x86 'call' pushes the address of the following instruction, then jumps.
         # Push that real guest address, not a placeholder: the value is visible
@@ -1815,11 +1844,20 @@ class Lifter:
                 # direct calls too. Without it the check sees only indirect
                 # ones, and CRT and static-init paths -- where callee-saved
                 # clobbers actually bite -- are almost entirely direct. Expands
-                # to a plain call when the flag is off.
-                lines.append(
-                    f"PUSH32(esp, 0x{ret_va:08X}u); "
-                    f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
-                    f"/* call 0x{insn.call_target:08X} */")
+                # to a plain call when the flag is off. When the callee's own
+                # `ret N` is known, the exact form checks esp both ways.
+                pop = self.callee_pop(insn.call_target)
+                if pop is None:
+                    lines.append(
+                        f"PUSH32(esp, 0x{ret_va:08X}u); "
+                        f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
+                        f"/* call 0x{insn.call_target:08X} */")
+                else:
+                    lines.append(
+                        f"PUSH32(esp, 0x{ret_va:08X}u); "
+                        f"RECOMP_ABI_CALL_POP(0x{insn.call_target:08X}u, "
+                        f"{name}, {pop}u); "
+                        f"/* call 0x{insn.call_target:08X} */")
             # esp immediately after the callee returns. A per-call delta is the
             # only way to attribute a leak to one callee rather than to the
             # function containing them all.

@@ -544,6 +544,19 @@ class FunctionTranslator:
 
         backward = scan(-1, 1)
         forward = scan(1, 0)
+        # An index that never takes the low values: MSVC's memcpy trail
+        # dispatch `jmp [eax*4 + tbl]` has eax 1..3, and slot 0 holds the next
+        # instruction's bytes. Same rule as DisasmEngine.resync_jump_tables --
+        # without it the dispatch lifts as a runtime jump and its first case
+        # (Burnout 2's 0x0011F1AC) fails to resolve. The switch matches by
+        # value, so a missing slot costs nothing.
+        if not backward and not forward:
+            for skip in (1, 2, 3):
+                forward = scan(1, skip)
+                if len(forward) >= 2:
+                    break
+            else:
+                forward = []
         if len(backward) + len(forward) < 2:
             return []
         backward.reverse()

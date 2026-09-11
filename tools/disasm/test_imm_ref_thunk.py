@@ -36,6 +36,10 @@ def _detector(jump_to):
     code[0x10:0x17] = b"\xc7\x46\x10" + (BASE + 0x30).to_bytes(4, "little")
     code[0x17] = 0xc3
     body = b"\x8b\x44\x24\x04\x8b\x48\x4c\x89\x4c\x24\x04"
+    # A ret right before the thunk, not padding, so these tests exercise the
+    # thunk rule alone: _is_padded_entry would accept an aligned target that
+    # follows int3 padding whatever it jumps to.
+    code[0x2F] = 0xC3
     code[0x30:0x30 + len(body)] = body
     end = BASE + 0x30 + len(body) + 5
     code[0x30 + len(body):0x30 + len(body) + 5] = b"\xe9" + _rel32(end, jump_to)

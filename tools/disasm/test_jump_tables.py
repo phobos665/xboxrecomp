@@ -172,6 +172,84 @@ class InlineTables(unittest.TestCase):
                              "the dispatch jump must survive the resync")
 
 
+class EpilogueBeforeTheTable(unittest.TestCase):
+    """The dispatch is early in the function; the table sits after its
+    epilogue. Burnout 2's sub_00092AE0: `jmp [eax*4+0x92D8C]` at 0x92C25, and
+    `add esp,0x218; ret 4` immediately below the table.
+
+    The epilogue's small immediates read as .text addresses -- C4 18 02 00 is
+    0x000218C4 and 00 C2 04 00 is 0x0004C200 -- so the backward scan took them
+    as entries -1 and -2 and the cleanup deleted the epilogue. The function
+    then never freed its frame, and the title booted to the dashboard."""
+
+    def test_the_epilogue_is_not_read_as_table_entries(self):
+        size = 0x40000                     # big enough that both values are in .text
+        img = _Image(BASE, bytes(size))
+        jmp_off = 0x20
+        table_va = BASE + 0x100
+        epilogue = b"\x81\xc4\x18\x02\x00\x00\xc2\x04\x00"
+        img.code[0x100 - len(epilogue):0x100] = epilogue
+        targets = [BASE + 0x200 + i * 0x10 for i in range(4)]
+        for i, target in enumerate(targets):
+            img.code[0x100 + i * 4:0x100 + i * 4 + 4] = struct.pack("<I", target)
+            img.code[target - BASE] = 0xC3
+        img.code[jmp_off:jmp_off + 3] = b"\xff\x24\x8d"
+        img.code[jmp_off + 3:jmp_off + 7] = struct.pack("<I", table_va)
+        self.assertEqual(struct.unpack_from("<I", img.code, 0xFC)[0], 0x0004C200)
+        self.assertEqual(struct.unpack_from("<I", img.code, 0xF8)[0], 0x000218C4)
+
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.decode_at(table_va - len(epilogue))
+        engine.resync_jump_tables()
+
+        self.assertIn(table_va, engine.jump_tables,
+                      "the table starts where the ret ends")
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+        add = engine.instructions.get(table_va - 9)
+        ret = engine.instructions.get(table_va - 3)
+        self.assertIsNotNone(add, "add esp, 0x218 must survive the resync")
+        self.assertIsNotNone(ret, "ret 4 must survive the resync")
+        self.assertTrue(ret.is_ret)
+
+
+class CodeBelowTheTableThatLooksNearby(unittest.TestCase):
+    """Burnout 2's sub_0003EB80: a table at 0x0003EC28 preceded by
+    `pop ebp; ret 4` (the target of a jne). Those bytes read as 0x0004C25D --
+    inside .text and only 55 KB from the dispatch, so a coarse "near the
+    dispatch" test accepts it. Case labels cluster; this one is nowhere near
+    the table's other targets."""
+
+    def test_an_epilogue_that_reads_as_a_nearby_address_is_not_an_entry(self):
+        size = 0x40000
+        img = _Image(BASE, bytes(size))
+        disp_off = 0x2F000                 # dispatch 0x40000: 0x4C25D is 49 KB away
+        table_off = disp_off + 0x100
+        table_va = BASE + table_off
+        epilogue = b"\x5d\xc2\x04\x00"     # pop ebp; ret 4  ->  0x0004C25D
+        img.code[table_off - 4:table_off] = epilogue
+        targets = [BASE + disp_off + 0x10 + i * 0xC for i in range(3)]
+        for i, target in enumerate(targets):
+            img.code[table_off + i * 4:table_off + i * 4 + 4] = struct.pack("<I", target)
+            img.code[target - BASE] = 0xC3
+        img.code[disp_off:disp_off + 3] = b"\xff\x24\x8d"
+        img.code[disp_off + 3:disp_off + 7] = struct.pack("<I", table_va)
+        self.assertEqual(struct.unpack_from("<I", img.code, table_off - 4)[0],
+                         0x0004C25D)
+        self.assertLess(0x0004C25D - (BASE + disp_off), 0x10000)
+
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.decode_at(table_va - 4)
+        engine.resync_jump_tables()
+
+        self.assertIn(table_va, engine.jump_tables)
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+        ret = engine.instructions.get(table_va - 3)
+        self.assertIsNotNone(ret, "ret 4 must survive the resync")
+        self.assertTrue(ret.is_ret)
+
+
 class StillRejectsNonTables(unittest.TestCase):
     """Scanning both ways must not make a coincidence into a table."""
 

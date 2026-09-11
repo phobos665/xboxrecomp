@@ -32,6 +32,12 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* Marks an implementation, and names it hle_<name>. */
 #define HLE_EXPORT(name) void hle_##name(void)
 
+/* Imports an XDK variable's guest address by name, as hle_var_<name>. Must
+ * start a line, like HLE_EXPORT: tools.recomp scans for the marker and writes
+ * the definition into recomp_hle.c from the title's XDK symbols. 0 means the
+ * symbols could not name it, so check before use. */
+#define HLE_IMPORT_VAR(name) extern const uint32_t hle_var_##name
+
 /* Guest memory at a guest address. */
 #define HLE_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define HLE_PTR(va)   ((void *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))

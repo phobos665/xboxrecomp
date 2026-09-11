@@ -299,6 +299,31 @@ class DisasmEngine:
                     break
                 entries += 1
 
+            # An index that never takes the low values. MSVC's memcpy trail
+            # dispatch is `jmp [eax*4 + tbl]` with eax 1..3, so slot 0 is never
+            # read and the compiler lets the next instruction's bytes sit there:
+            # Burnout 2's 0x0011F191 names 0x0011F19C, whose first word is the
+            # tail of the `jmp [ecx*4 + 0x11F298]` at 0x0011F198 and a nop, and
+            # the three real entries follow. Scanning from the base found no
+            # table, the dispatch lifted as a runtime jump, and its first case
+            # (0x0011F1AC) failed to resolve. Skip up to three unused leading
+            # slots when real entries follow them; the table then starts at the
+            # first real one, so the cleanup below leaves the shared bytes to
+            # the instruction that owns them.
+            if entries == 0:
+                for skip in (1, 2, 3):
+                    run = 0
+                    while run < max_entries:
+                        target = self.image.read_u32_at_va(
+                            tbl + (skip + run) * 4)
+                        if target is None or not (lo <= target < hi):
+                            break
+                        run += 1
+                    if run >= min_entries:
+                        tbl += skip * 4
+                        entries = run
+                        break
+
             # ...and backwards, because the index can be negative.
             #
             # `jmp [reg*4 + disp]` says where index 0 lands, not where the
@@ -335,6 +360,33 @@ class DisasmEngine:
             if floor < lo:
                 floor = lo
 
+            # A backward entry must also point near the dispatch, as a case
+            # label does. "Inside the section" alone is a weak test for bytes
+            # that are code: when the table is not straight after the jump --
+            # the epilogue sits between them -- the words below the table are
+            # that epilogue, and its small immediates read as .text addresses.
+            # Burnout 2's sub_00092AE0 dispatches at 0x00092C25 through a
+            # table at 0x00092D8C, preceded by `add esp,0x218; ret 4`: the
+            # bytes C4 18 02 00 and 00 C2 04 00 read as 0x000218C4 and
+            # 0x0004C200, the start moved back 8 bytes, and the cleanup below
+            # deleted the epilogue. The function then returned without freeing
+            # its 0x218-byte frame; the attract movie's path string was popped
+            # into its callers' registers, main returned, and the title booted
+            # to the dashboard. memcpy's backward entries, which this scan
+            # exists for, point a few hundred bytes away.
+            #
+            # "Near" has to be close, not merely in the same neighbourhood of
+            # the image: sub_0003EB80's table at 0x0003EC28 is preceded by
+            # `pop ebp; ret 4` -- the target of a jne -- whose bytes read as
+            # 0x0004C25D, 55 KB from the dispatch. Case labels cluster, so the
+            # test is the cluster: within 4 KB of the dispatch, or of the
+            # span the forward entries already cover.
+            near = dispatch_end.get(tbl, tbl)
+            forward = [self.image.read_u32_at_va(tbl + k * 4)
+                       for k in range(entries)] + [near]
+            cluster_lo = min(forward) - 0x1000
+            cluster_hi = max(forward) + 0x1000
+
             back = 0
             while back < max_entries:
                 addr = tbl - (back + 1) * 4
@@ -342,6 +394,8 @@ class DisasmEngine:
                     break
                 target = self.image.read_u32_at_va(addr)
                 if target is None or not (lo <= target < hi):
+                    break
+                if not (cluster_lo <= target <= cluster_hi):
                     break
                 back += 1
 

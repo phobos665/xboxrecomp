@@ -465,14 +465,19 @@ A: C is portable, debuggable, and the compiler optimizes it for you. You can rea
 
 ## License
 
-**MIT** — see [LICENSE](LICENSE). Third-party components keep their original
-licence:
+**GPL-3.0** — see [LICENSE](LICENSE). This fork became GPL-3.0 so it can
+reuse code from [doaxbv-re](https://github.com/NoRain211/doaxbv-re), which is
+GPL-3.0. The upstream code it builds on was released under MIT and keeps that
+notice ([LICENSE.upstream-MIT](LICENSE.upstream-MIT)); MIT and LGPL-2.1-or-later
+are both compatible with GPL-3.0, so the combined work is distributed under
+GPL-3.0. Third-party components keep their original licence:
 
 | Component | Licence | Copyright |
 |---|---|---|
+| the DirectSound replacement in `src/hle/` (`hle_dsound.c`, `dsound_buffer_model.*`, `xbox_adpcm.*`, `audio_output*`) | GPL-3.0 | adapted from doaxbv-re (NoRain211 and contributors) |
 | the MCPX APU sources in `src/apu/` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
 | `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel |
-| everything else | MIT | sp00nz and contributors |
+| upstream xboxrecomp code | MIT | sp00nz and contributors |
 
 The APU and the NV2A register definitions were extracted from
 [xemu](https://github.com/xemu-project/xemu) and are that project's work, not

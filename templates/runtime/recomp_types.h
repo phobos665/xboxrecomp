@@ -782,14 +782,31 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
+void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                                  uint32_t edi0, uint32_t esp0, uint32_t pop);
 #define RECOMP_ABI_CALL(va, fn) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
     (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
+/* A direct call whose callee's own `ret N` is known (tools/recomp reads it
+ * from the callee's bytes). Then esp has exactly one right value afterwards,
+ * so a stack that comes back too HIGH -- invisible to the one-sided check
+ * above -- is caught at the call that did it rather than frames later.
+ * Burnout 2's CDirectSoundBuffer_GetStatus came back 8 high once in 4.5
+ * million calls, rotated its caller's saved registers, and the title crashed
+ * three frames up with a code address used as an object. */
+#define RECOMP_ABI_CALL_POP(va, fn, pop) do { \
+    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
+    (fn)(); \
+    if (g_ebx != _ab || g_esi != _as || g_edi != _ad || \
+        g_esp != _ap + 4 + (pop)) \
+        recomp_abi_pop_violation_log((va), _ab, _as, _ad, _ap, (pop)); \
+} while(0)
 #else
 #define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_POP(va, fn, pop) (fn)()
 #endif
 
 /**

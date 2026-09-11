@@ -1155,6 +1155,16 @@ static void bridge_HalReturnToFirmware(void)
      * RECOMP_ICALL_FEEDBACK is on. */
     RECOMP_ICALL_FEEDBACK_DUMP();
 
+    /* The function profile too, for the same reason: ExitProcess skips the
+     * atexit report, and the periodic one fires only every 20 million calls.
+     * Burnout 2 boots to the dashboard after about 3.5 million, so a profiled
+     * run of it left no table at all -- exactly when "what ran just before it
+     * gave up" was the question. No-op unless RECOMP_PROFILE_DUMP is set. */
+    {
+        extern void recomp_profile_dump(void);
+        recomp_profile_dump();
+    }
+
     /* Let a host-played FMV finish before the process goes away.
      *
      * The title is not the one presenting it, so it has no reason to wait --
@@ -2153,6 +2163,48 @@ static void kernel_vblank_tick(void)
 
 }
 
+/* The APU's interrupt, delivered.
+ *
+ * The emulated APU works out its interrupt line correctly and then drops it:
+ * its pci_irq_assert() is a stub. DirectSound connects its ISR on vector 6 and
+ * reads voice notifiers only from there (and the DPC it queues), so without
+ * this a stopped buffer keeps reporting PLAYING. Burnout 2 stops its front-end
+ * sound before the attract movie and waits for exactly that, forever.
+ *
+ * Level-triggered, like the hardware: raised on every tick while the line is
+ * asserted, until the ISR acknowledges by writing ISTS (the APU register trap
+ * already clears the bits and recomputes the line). The DPC it queues runs in
+ * the drain straight after, on the same tick.
+ *
+ * The line comes from a callback the host program registers -- the APU is a
+ * separate library, and the kernel must not need it to link. */
+#define APU_VECTOR 6u
+
+static int (*s_apu_irq_pending)(void);
+
+void xbox_SetApuInterruptSource(int (*pending)(void))
+{
+    s_apu_irq_pending = pending;
+}
+
+static void kernel_apu_tick(void)
+{
+    static unsigned n;
+    int claimed;
+
+    if (!s_apu_irq_pending || !xbox_GetConnectedInterrupt(APU_VECTOR))
+        return;
+    if (!s_apu_irq_pending())
+        return;
+    claimed = kernel_raise_interrupt(APU_VECTOR);
+    if (n++ < 3) {
+        fprintf(stderr, "  [APU] interrupt -> ISR %s\n",
+                claimed < 0 ? "not callable" :
+                claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
@@ -2391,6 +2443,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
         Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_apu_tick();     /* the APU's interrupt line */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
@@ -5634,7 +5687,26 @@ static void kernel_thunk_dispatch(void)
     }
 
     if (bridge) {
+        /* A bridge reads its arguments with STACK_ARG and leaves the cleanup
+         * to the line below, so it should never move g_esp itself. The few
+         * that run guest code -- an APC, a synchronize routine -- must come
+         * back balanced too. Say so once per ordinal when one does not: a
+         * stack that comes back a few bytes high is invisible to
+         * RECOMP_ABI_CALL (it only sees esp too low), and surfaces far away as
+         * callee-saved registers restored from the wrong slots. */
+        uint32_t _esp_before = g_esp;
         bridge();
+        if (g_esp != _esp_before) {
+            static uint8_t said[XBOX_KERNEL_THUNK_TABLE_SIZE];
+            if (!said[slot]) {
+                said[slot] = 1;
+                fprintf(stderr, "  [KESP] ordinal %u (slot %d) moved esp by %+d "
+                        "(0x%08X -> 0x%08X), caller 0x%08X\n", ordinal, slot,
+                        (int)(g_esp - _esp_before), _esp_before, g_esp,
+                        g_xbox_kernel_caller);
+                fflush(stderr);
+            }
+        }
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than
          * gating on g_kernel_call_count: a missing bridge is rare and is

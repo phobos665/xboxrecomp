@@ -820,6 +820,37 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     }
     hits[i]++;
 }
+
+/* The exact form, for a direct call whose callee's `ret N` is known: esp must
+ * come back exactly 4 + N higher. Reports once per callee, and says which way
+ * esp is off, since "too high" is the case the one-sided check above misses. */
+void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                                  uint32_t edi0, uint32_t esp0, uint32_t pop)
+{
+    enum { SLOTS = 64 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    int i;
+    int want = 4 + (int)pop, got = (int)(g_esp - esp0);
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            return;
+    if (count == SLOTS)
+        return;
+    seen[count++] = va;
+    fprintf(stderr, "[ABI] sub_%08X:%s%s%s%s\n"
+                    "      esp %+d, expected %+d (ret %u); ebx %08X->%08X"
+                    " esi %08X->%08X edi %08X->%08X esp %08X->%08X\n",
+            va,
+            g_ebx != ebx0 ? " ebx" : "",
+            g_esi != esi0 ? " esi" : "",
+            g_edi != edi0 ? " edi" : "",
+            got > want ? " esp-too-high" : got < want ? " esp-too-low" : "",
+            got, want, pop, ebx0, g_ebx, esi0, g_esi, edi0, g_edi,
+            esp0, g_esp);
+    fflush(stderr);
+}
 #endif
 
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */

@@ -475,6 +475,25 @@ def main():
         # the hand-written set is complete, so title code keeps winning, and
         # before translation, so the replaced bodies are not lifted.
         hle_replace = {}
+        # XDK variables the replacements import by name. Scanned whether or not
+        # there is a symbols file: the implementations declare them either
+        # way, so the generated file has to define them either way (as 0 when
+        # they cannot be named) or the build does not link.
+        from .hle import imported_variables, load_variables, resolve_variables
+        hle_impl_paths = args.hle_impl or [os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "src", "hle")]
+        hle_var_names = imported_variables(
+            [p for p in hle_impl_paths if os.path.exists(p)])
+        hle_variables = {name: 0 for name in hle_var_names}
+        if args.hle_symbols and hle_var_names:
+            hle_variables, var_notes = resolve_variables(
+                hle_var_names, load_variables(args.hle_symbols))
+            print(f"XDK variables imported by name: "
+                  f"{sum(1 for v in hle_variables.values() if v)} of "
+                  f"{len(hle_var_names)}", file=sys.stderr)
+            for note in var_notes:
+                print(f"  hle: {note}", file=sys.stderr)
         if args.hle_symbols:
             from .config import va_to_file_offset
             from .hle import implemented_names, load_symbols, plan, stack_cleanup
@@ -521,7 +540,7 @@ def main():
         from .hle import render_thunks
         with open(os.path.join(gen_dir, "recomp_hle.c"), "w",
                   encoding="utf-8") as fh:
-            fh.write(render_thunks(hle_replace))
+            fh.write(render_thunks(hle_replace, hle_variables))
 
         t_translate = time.time() - t0
         print(f"\n=== Split Translation Complete ({t_translate:.1f}s) ===",

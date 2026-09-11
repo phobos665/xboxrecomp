@@ -98,18 +98,35 @@ def test_a_jump_into_a_function_shares_its_end():
     assert det._alias_entries.get(BASE + 0x01) == BASE + 5
 
 
-def test_a_loop_back_inside_the_host_is_not_a_tail_jump():
-    # An alias inside the first function whose body later jumps back to a
-    # label before the alias -- a loop head. Still an internal branch of the
-    # host, so no new entry.
+def test_a_loop_back_from_an_alias_gets_an_entry():
+    # An alias inside the first function whose body jumps back to a label
+    # before the alias -- a loop head. The host lifts that as a goto, but the
+    # alias is lifted as its own copy, where the label is outside the body and
+    # the jump becomes a tail call. So the label needs an entry of its own,
+    # sharing the host's end.
     #   BASE+0x00  push esi; mov esi, ecx; [alias at +3] jmp BASE+1
     code = bytearray(_layout(b"\xc3"))
     code[0x00:0x08] = b"\x56\x8b\xf1\xe9" + _rel32(BASE + 0x08, BASE + 0x01)
     det, sec = _detector(bytes(code))
     det.functions[BASE] = SimpleNamespace(start=BASE, end=BASE + 8)
     det._alias_entries = {BASE + 3: BASE + 8}
-    assert det._pass_alias_tail_jumps([sec]) == 0, det._alias_entries
-    assert BASE + 1 not in det._alias_entries
+    assert det._pass_alias_tail_jumps([sec]) == 1, det._alias_entries
+    assert det._alias_entries.get(BASE + 1) == BASE + 8
+
+
+def test_a_real_function_jumping_into_another_gets_an_entry():
+    # No aliases at all: a function found late (by immediate) jumps into the
+    # middle of another function. The tail-jump rounds ran before it existed,
+    # so this pass is the one that has to follow the jump.
+    #   BASE+0x00  host:   push esi; mov esi, ecx; pop esi; ret
+    #   BASE+0x50  jumper: jmp BASE+3
+    code = bytearray(_layout(b"\xc3"))
+    code[0x50:0x55] = b"\xe9" + _rel32(BASE + 0x55, BASE + 0x03)
+    det, sec = _detector(bytes(code))
+    det._alias_entries = {}
+    det.functions[BASE + 0x50] = SimpleNamespace(start=BASE + 0x50, end=BASE + 0x55)
+    assert det._pass_alias_tail_jumps([sec]) >= 1, det._alias_entries
+    assert det._alias_entries.get(BASE + 3) == BASE + 5
 
 
 if __name__ == "__main__":
