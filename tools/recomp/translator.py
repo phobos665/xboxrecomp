@@ -1585,7 +1585,9 @@ class BatchTranslator:
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 # recomp_stub_missing runs first, while [esp] is still the
-                # return address, so the report names the caller.
+                # return address, so the report names the caller. For a tail
+                # jump nothing was pushed, so it names the jumper's caller --
+                # one frame further up.
                 stub_lines.append(
                     f"void {unresolved[addr]}(void) {{ "
                     f"recomp_stub_missing(0x{addr:08X}u); "

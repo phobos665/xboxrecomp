@@ -1063,12 +1063,20 @@ class FunctionDetector:
             if a_start in scanned:
                 continue
             scanned.add(a_start)
+            # An alias inside a function shares that function's body, so a
+            # jump back to a label before a_start -- a loop head -- is still an
+            # internal branch of the host, not a tail jump. Treating it as one
+            # registered 8 loop heads on Burnout 2 as entry points.
+            h = bisect.bisect_right(starts, a_start) - 1
+            host = bounds[h] if h >= 0 and a_start < bounds[h][1] else None
             for insn in self.engine.get_instructions_in_range(a_start, a_end):
                 if not insn.is_jump or insn.is_cond_jump:
                     continue
                 target = insn.jump_target
                 if target is None or a_start <= target < a_end:
                     continue            # an ordinary branch within the alias
+                if host is not None and host[0] <= target < host[1]:
+                    continue            # an ordinary branch within the host
                 if (target in self.functions or target in self._alias_entries
                         or target in self._candidates):
                     continue
@@ -1087,19 +1095,20 @@ class FunctionDetector:
                 else:
                     # In a gap: the same evidence _pass_call_targets asks of a
                     # target it has to realign, plus the checks that keep
-                    # padding and function interiors out.
-                    if target not in self.engine.instructions:
-                        if not self.engine.probes_as_function_body(target):
-                            continue
-                        if not self.engine.decode_at(target):
-                            continue
-                    if self.engine.instructions[target].mnemonic.lower() \
-                            in ("int3", "nop"):
-                        continue
+                    # padding and function interiors out. All of them are
+                    # read-only and run first, so a target that is rejected
+                    # leaves no decoded stream behind; decode_at only once it
+                    # has passed. A direct jmp from code is good evidence, so
+                    # the probe gets its full default reach.
+                    if self.image.read_bytes_at_va(target, 1) in (b"\xcc",
+                                                                  b"\x90"):
+                        continue        # padding: int3 or nop
                     if self.engine.entry_pops_unsaved(target):
                         continue        # a continuation, not an entry
-                    # Default cap, as in _pass_data_ptr_targets.
                     if not self.engine.probes_as_function_body(target):
+                        continue
+                    if target not in self.engine.instructions \
+                            and not self.engine.decode_at(target):
                         continue
                     k = bisect.bisect_right(starts, target)
                     end = starts[k] if k < len(starts) else section_end[sec.name]

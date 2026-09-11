@@ -98,6 +98,20 @@ def test_a_jump_into_a_function_shares_its_end():
     assert det._alias_entries.get(BASE + 0x01) == BASE + 5
 
 
+def test_a_loop_back_inside_the_host_is_not_a_tail_jump():
+    # An alias inside the first function whose body later jumps back to a
+    # label before the alias -- a loop head. Still an internal branch of the
+    # host, so no new entry.
+    #   BASE+0x00  push esi; mov esi, ecx; [alias at +3] jmp BASE+1
+    code = bytearray(_layout(b"\xc3"))
+    code[0x00:0x08] = b"\x56\x8b\xf1\xe9" + _rel32(BASE + 0x08, BASE + 0x01)
+    det, sec = _detector(bytes(code))
+    det.functions[BASE] = SimpleNamespace(start=BASE, end=BASE + 8)
+    det._alias_entries = {BASE + 3: BASE + 8}
+    assert det._pass_alias_tail_jumps([sec]) == 0, det._alias_entries
+    assert BASE + 1 not in det._alias_entries
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
