@@ -64,29 +64,50 @@ def _fixup_icall_esp_save(lines):
     caller corruption. Leaving an argument behind is the mirror image, and
     shifts the epilogue the other way.
 
-    A register the function pops anywhere is one it restores, so a push of it
-    ends the argument run.
+    A register the function never pops is never restored, so every push of it
+    is an argument. For one it does pop, position decides: **the first push of
+    that register is the save, and any later push of it is an argument.** A
+    prologue saves before it does anything else, so the earliest push is the
+    one the epilogue answers; a second push of the same register is the
+    function passing its value along.
 
-    Comparing push and pop *counts* instead does not work, because a register
-    can serve both roles in one function. Burnout 2's sub_000EC240 saves esi
-    once, passes it as an argument twice more, and pops it in each of its two
-    epilogues: three pushes against two pops. The count rule read that as "more
-    pushes than pops, therefore an argument", swallowed the save into the
-    argument run, and put the _icall_esp capture above it -- so a failed lookup
-    rewound g_esp past the saved esi and the epilogue popped the wrong slot.
-    The caller got back a corrupt `this` and faulted several frames later,
-    which is precisely the silent corruption this is meant to prevent.
+    Two shapes from real titles pin this down, and each defeats one of the
+    simpler rules tried before:
 
-    Erring toward "save" is the safe direction, as the note below already
-    argued: stopping early under-rewinds, which surfaces as the detectable
-    "epilogue never ran" leak, where stopping late corrupts a caller silently.
+      sub_00135265  edi saved in the prologue, pushed again as an argument to
+                    a virtual call, popped once. "A register the function pops
+                    anywhere ends the run" stops at the *argument* push and
+                    leaves it outside the rewind window, which shifts the
+                    epilogue and returns esi and edi swapped.
+
+      sub_000EC240  esi saved once, passed as an argument twice more, popped in
+                    each of two epilogues: three pushes against two pops.
+                    Comparing push and pop *counts* reads that as "more pushes
+                    than pops, therefore an argument", swallows the save into
+                    the argument run, and a failed lookup rewinds g_esp past
+                    the saved esi so the epilogue pops the wrong slot. The
+                    caller gets back a corrupt `this` and faults several frames
+                    later -- the silent corruption this exists to prevent.
+
+    First-push-is-the-save satisfies both, because in both the save is simply
+    the earliest one.
+
+    Where it is still ambiguous, erring toward "save" is the safe direction:
+    stopping early under-rewinds, which surfaces as the detectable "epilogue
+    never ran" leak, where stopping late corrupts a caller silently.
     """
     import re
-    saves = tuple(
-        "PUSH32(esp, %s)" % reg
-        for reg in ("ebx", "esi", "edi", "ebp")
-        if any("POP32(esp, %s)" % reg in line for line in lines)
-    )
+    # For each callee-saved register the function actually pops, the index of
+    # its earliest push -- that push, and only that push, is the frame save.
+    save_push_idx = {}
+    for reg in ("ebx", "esi", "edi", "ebp"):
+        if not any("POP32(esp, %s)" % reg in line for line in lines):
+            continue                      # never restored: all pushes are args
+        token = "PUSH32(esp, %s)" % reg
+        for i, line in enumerate(lines):
+            if line.strip().startswith(token):
+                save_push_idx[i] = reg
+                break
     result = []
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
@@ -118,9 +139,11 @@ def _fixup_icall_esp_save(lines):
             # g_esp over a call that had already returned.
             if '/* call 0x' in stripped:
                 break
-            # A saved callee-saved register belongs to this function's frame,
-            # not to the call's arguments; the run ends here.
-            if any(stripped.startswith(save) for save in saves):
+            # The frame save of a callee-saved register belongs to this
+            # function, not to the call's arguments, so the run ends there.
+            # A *later* push of the same register is an argument and is
+            # absorbed like any other.
+            if j in save_push_idx:
                 break
             # Check if this is a PUSH32 line (arg push)
             if stripped.startswith('PUSH32(esp,'):
