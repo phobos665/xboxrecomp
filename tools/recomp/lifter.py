@@ -14,11 +14,82 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import os
 import re
 import struct
 
 from .disasm import Instruction, Operand
 from .config import is_code_address, is_data_address, va_to_file_offset
+
+# Function export names of the Windows libraries the host exe links
+# (kernel32/user32/gdi32/advapi32/winmm/ws2_32/ole32/dbghelp/...). A guest
+# function that shares one of these names collides with the import at link
+# time (LNK2005) -- every Xbox-era game re-exports shims named like Win32
+# APIs (CreateThread, GetLastError, QueryPerformanceCounter, SetEvent, ...).
+# Generated from the x64 import libs of the Windows SDK with:
+#   Get-ChildItem "$env:WINSDK/Lib/*/um/x64" -Filter *.lib | ForEach-Object {
+#     & dumpbin /exports $_ }  # then keep the indent-only identifier lines
+_WIN32_EXPORTS = set()
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_WIN32_EXPORTS_FILE = os.path.join(_DATA_DIR, "win32_api_names.txt")
+if os.path.exists(_WIN32_EXPORTS_FILE):
+    with open(_WIN32_EXPORTS_FILE, encoding="ascii") as _f:
+        _WIN32_EXPORTS.update(line.strip() for line in _f if line.strip())
+
+
+# C identifiers a recompiled function name must not be: the generated TUs
+# include the C standard headers (math.h/string.h through recomp_types.h,
+# stdlib.h in the dispatch TU), and a recompiled image carries its own copies
+# of the CRT helpers -- Black has a function literally named `onexit`.
+# Emitting `void onexit(void);` next to UCRT's `onexit_t __cdecl onexit(
+# onexit_t)` is a redefinition with different type modifiers and cl fails with
+# C2373. The host Win32 export names are folded in too: the host exe links
+# kernel32.lib et al., and Xbox games re-export shims named exactly like the
+# APIs they wrap, so the same clash happens there for the linker. Mangle with
+# the address, the same suffixed-<addr> scheme func_id already uses for
+# duplicate names.
+_FUNC_RESERVED_IDENT = frozenset({
+    # C and C++ keywords
+    "asm", "auto", "break", "case", "char", "const", "continue",
+    "default", "do", "double", "else", "enum", "extern", "float",
+    "for", "goto", "if", "inline", "int", "long", "register",
+    "restrict", "return", "short", "signed", "sizeof", "static",
+    "struct", "switch", "typedef", "union", "unsigned", "void",
+    "volatile", "while",
+    # <string.h>
+    "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat",
+    "strchr", "strcmp", "strcoll", "strcpy", "strcspn", "strerror",
+    "strlen", "strncat", "strncmp", "strncpy", "strpbrk", "strrchr",
+    "strspn", "strstr", "strtok", "strxfrm",
+    # <math.h>
+    "acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp",
+    "fabs", "floor", "fmod", "frexp", "ldexp", "log", "log10", "modf",
+    "pow", "sin", "sinh", "sqrt", "tan", "tanh",
+    # <stdlib.h>
+    "abort", "abs", "atexit", "atof", "atoi", "atol", "bsearch",
+    "calloc", "div", "exit", "free", "getenv", "labs", "ldiv", "malloc",
+    "mblen", "mbstowcs", "mbtowc", "onexit", "qsort", "rand", "realloc",
+    "srand", "strtod", "strtol", "strtoul", "system", "wctomb",
+    "wcstombs",
+    # <setjmp.h>
+    "longjmp", "setjmp",
+    # Host Win32 API export names (data/win32_api_names.txt) so a guest
+    # function named like a linked import does not collide at link time.
+}) | _WIN32_EXPORTS
+
+
+def _func_ident(addr, name):
+    """C identifier for the recompiled function at addr.
+
+    Every place a func_db name becomes a C token -- the function definition,
+    its forward declaration, call sites and the dispatch table -- must agree,
+    or the link fails. Reserved names get the same ``_<addr>`` suffix func_id
+    already gives duplicate names.
+    """
+    base = name if name else f"sub_{addr:08X}"
+    if base in _FUNC_RESERVED_IDENT:
+        return f"{base}_{addr:08X}"
+    return base
 
 
 # ── Operand formatting ──────────────────────────────────────
@@ -309,9 +380,12 @@ _EFLAGS_PRESERVE = frozenset({
     "addpd", "subpd", "mulpd", "divpd",
     # SSE/MMX integer
     "movd", "movq", "movntq",
+    "cvtps2pi", "cvttps2pi", "pinsrw", "pextrw",
     "emms",
     "paddb", "paddw", "paddd", "paddq",
     "psubb", "psubw", "psubd",
+    "paddsb", "paddsw", "paddusb", "psubsb", "psubsw", "psubusb",
+    "pavgb", "pavgw", "pminsw", "pmaxsw", "psadbw",
     "pmullw", "pmulhw", "pmulhuw", "pmaddwd",
     "pand", "pandn", "por", "pxor",
     "pcmpeqb", "pcmpeqw", "pcmpeqd",
@@ -324,6 +398,7 @@ _EFLAGS_PRESERVE = frozenset({
     "punpckhbw", "punpckhwd", "punpckhdq", "punpckhqdq",
     "packsswb", "packssdw", "packuswb",
     "pmovmskb",
+    "paddusw", "psubusw",
     # String operations (without rep prefix)
     "stosb", "stosw", "stosd",
     "movsb", "movsw", "movsd",
@@ -968,6 +1043,9 @@ class Lifter:
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
+        # Addresses loaded as immediates into a register inside the current
+        # function, used to resolve `jmp <reg>`. See _lift_jmp.
+        self.imm_code_refs = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -985,6 +1063,7 @@ class Lifter:
             name = self.label_db[addr]
         else:
             name = f"sub_{addr:08X}"
+        name = _func_ident(addr, name)
         self.referenced_calls[addr] = name
         return name
 
@@ -1208,9 +1287,13 @@ class Lifter:
         # Dispatched on the operands rather than the mnemonic, because the
         # integer SIMD names are shared with SSE: `paddw mm0, mm1` and
         # `paddw xmm0, xmm1` differ only in register file.
+        # cvtpi2ps is named here as well: its source may be m64 rather than
+        # an mm register, and dispatching purely on the operands then sent
+        # that form past the MMX lifter to a TODO comment -- the same silent
+        # drop, one addressing mode along.
         if any(op.type == "reg" and op.reg and op.reg.startswith("mm")
                and not op.reg.startswith("xmm") for op in ops) or m in (
-                   "emms", "femms"):
+                   "emms", "femms", "cvtpi2ps"):
             return self._lift_mmx(insn, m, ops)
 
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
@@ -2082,6 +2165,31 @@ class Lifter:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
+            # `jmp <reg>` where the register was loaded with an address
+            # inside this same function: a hand-written continuation chain,
+            # not a call. The XMV YUV-to-RGB converter in Half-Life 2's
+            # loader is built this way -- four blocks that each do
+            # `mov ebx, <next>; jmp <shared tail>`, and the shared tail ends
+            # `jmp ebx`. Treated as an indirect tail call it resolved to
+            # nothing, so the shared tail never came back and the function's
+            # epilogue never ran: every call leaked 0x2C bytes of guest stack
+            # and the converter wrote past its surface until it walked out of
+            # the tiled aperture, 144 MB later.
+            #
+            # The targets are labels in this function, so this is a goto, and
+            # the same shape the memory-operand switch above emits.
+            if ops[0].type == "reg" and self.imm_code_refs:
+                inside = sorted(t for t in self.imm_code_refs
+                                if self.func_start <= t < self.func_end)
+                if inside:
+                    target_expr = _fmt_operand_read(ops[0])
+                    lines = [f"{{ uint32_t _jt = {target_expr};"
+                             f" /* intra-function indirect jmp:"
+                             f" {len(inside)} targets */"]
+                    for t in inside:
+                        lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
+                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    return lines
             target = _fmt_operand_read(ops[0])
             return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
         return ["/* jmp: no target */"]
@@ -2312,6 +2420,7 @@ class Lifter:
         "paddsb": "MMX_PADDSB", "paddsw": "MMX_PADDSW",
         "psubsb": "MMX_PSUBSB", "psubsw": "MMX_PSUBSW",
         "paddusb": "MMX_PADDUSB", "psubusb": "MMX_PSUBUSB",
+        "paddusw": "MMX_PADDUSW", "psubusw": "MMX_PSUBUSW",
         "pmullw": "MMX_PMULLW", "pmulhw": "MMX_PMULHW",
         "pmaddwd": "MMX_PMADDWD",
         "pavgb": "MMX_PAVGB", "pavgw": "MMX_PAVGW",
@@ -2383,6 +2492,25 @@ class Lifter:
             else:
                 return [f"/* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = {self._MMX_SHIFT[m]}({dst.reg}, {cnt}); /* {m} */"]
+
+        # cvtpi2ps: the other direction -- two dwords in, two singles out,
+        # into the LOW half of an xmm whose upper lanes are preserved. The
+        # destination is an xmm and the source an mm register or m64, so
+        # neither goes through the mm paths above and it fell through to a
+        # TODO comment: in Half-Life 2's loader that silently deleted every
+        # integer-to-float step of the XMV YUV-to-RGB converter, which then
+        # ran its whole float pipeline on stale registers and painted every
+        # frame of the intro solid red.
+        if m == "cvtpi2ps" and len(ops) >= 2 and dst.type == "reg" \
+                and dst.reg and dst.reg.startswith("xmm"):
+            s_op = ops[1]
+            if s_op.type == "reg" and s_op.reg and s_op.reg.startswith("mm"):
+                a = s_op.reg
+            elif s_op.type == "mem":
+                a = f"MMX_MEM({_fmt_mem(s_op)})"
+            else:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = XMM_FROM_PI({dst.reg}, {a}); /* cvtpi2ps */"]
 
         # cvtps2pi / cvttps2pi: two singles in, two dwords out. The source is
         # an xmm register or a 64-bit memory operand -- never an mm register,

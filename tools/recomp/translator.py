@@ -23,7 +23,28 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers)
+                     detect_setjmp_helpers, _func_ident)
+
+
+def write_if_changed(path, text):
+    """Write text to path only when it differs from what is already there.
+
+    Every regen rewrites all 54 chunks of generated C. If the bytes are
+    identical the mtime bump still forces the compiler to redo the whole
+    365 MB at /O2, which is minutes of a saturated box for a one-function
+    change. Comparing first makes an unchanged chunk free.
+
+    Returns True if the file was written.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True
 
 
 def _fixup_icall_esp_save(lines):
@@ -600,6 +621,8 @@ class FunctionTranslator:
                 cc = m[1:]
             elif m.startswith("set"):
                 cc = m[3:]
+            elif m.startswith("cmov") and len(m) > 4:
+                cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
                     and last_setter in CF_TRACKED):
                 return True
@@ -656,7 +679,7 @@ class FunctionTranslator:
         if end <= start:
             return None
 
-        name = func_info.get("name", f"sub_{start:08X}")
+        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
 
         # Read bytes from XBE
@@ -676,8 +699,30 @@ class FunctionTranslator:
         if not instructions:
             return None
 
+        # Addresses this function loads as immediates into a register and
+        # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
+        # chain inside one function, and its targets need labels for the
+        # goto the lifter emits -- see _lift_jmp. Restricted to functions
+        # that actually contain a register-operand indirect jmp, so a plain
+        # `mov reg, <address of a function>` for a callback does not start
+        # splitting blocks everywhere.
+        imm_refs = set()
+        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
+               and insn.operands[0].type == "reg" for insn in instructions):
+            for insn in instructions:
+                if insn.mnemonic != "mov" or len(insn.operands) < 2:
+                    continue
+                if insn.operands[0].type != "reg":
+                    continue
+                if insn.operands[1].type != "imm":
+                    continue
+                value = insn.operands[1].imm
+                if start <= value < end:
+                    imm_refs.add(value)
+        self.lifter.imm_code_refs = imm_refs
+
         # Collect switch table targets as extra block leaders
-        switch_leaders = set()
+        switch_leaders = set(imm_refs)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 targets = self.lifter._analyze_switch_table(insn.operands)
@@ -903,10 +948,11 @@ class FunctionTranslator:
         #
         # adc/sbb read CF directly, and so does a jb/jae whose flags came from
         # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
-        # XCompress code are nothing but "add reg,reg" followed by jae. Which
-        # setter a branch reads is the lifter's tracking rule, mirrored here so
-        # only the functions that consume CF declare it: computing it beside
-        # every add in the image would be a line per add in 48,000 functions.
+        # XCompress code are nothing but "add reg,reg" followed by jae, and a
+        # cmovb/cmovae after an add reads the same carry. Which setter a branch
+        # reads is the lifter's tracking rule, mirrored here so only the
+        # functions that consume CF declare it: computing it beside every add
+        # in the image would be a line per add in 48,000 functions.
         has_carry = self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
@@ -956,6 +1002,7 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
+        label_addrs |= imm_refs
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
@@ -1269,7 +1316,7 @@ class BatchTranslator:
 
         # Forward declarations
         for addr, func_info in func_list:
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             decl = self._make_declaration(addr, name)
             c_chunks.append(f"{decl};")
         c_chunks.append("")
@@ -1278,7 +1325,7 @@ class BatchTranslator:
 
         # Translate each function
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 100 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name} at 0x{addr:08X}...")
 
@@ -1382,7 +1429,7 @@ class BatchTranslator:
         }
 
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
                       file=sys.stderr)
@@ -1463,8 +1510,7 @@ class BatchTranslator:
 
         header_lines.extend(["", "#endif /* RECOMP_FUNCS_H */", ""])
 
-        with open(header_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(header_lines))
+        write_if_changed(header_path, "\n".join(header_lines))
 
         # recomp_types.h goes with it.
         #
@@ -1554,8 +1600,7 @@ class BatchTranslator:
             for addr, name, code in chunk:
                 c_lines.append(code)
 
-            with open(c_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(c_lines))
+            write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)
 
             if verbose:
@@ -1608,8 +1653,7 @@ class BatchTranslator:
                 )
             stub_lines.append("")
 
-            with open(stub_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(stub_lines))
+            write_if_changed(stub_path, "\n".join(stub_lines))
             generated_files.append(stub_path)
 
             if verbose:
@@ -1775,5 +1819,4 @@ class BatchTranslator:
             "",
         ])
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        write_if_changed(output_path, "\n".join(lines))

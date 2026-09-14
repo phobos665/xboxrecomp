@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.8.0 LANGUAGES C CXX)
+project(xboxrecomp VERSION 0.9.0 LANGUAGES C CXX)
 
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
