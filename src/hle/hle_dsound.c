@@ -100,10 +100,31 @@ static int voice_field(uint32_t offset)
            offset == SET_ALIGN || offset == SET_VOLUME;
 }
 
+/* A guest address worth dereferencing: title RAM, or the contiguous window
+ * where MmAllocateContiguousMemory memory lives (xbox_memory_layout.c). */
+static int guest_readable(uint32_t va, uint32_t bytes)
+{
+    if (va >= 0x00010000u && (uint64_t)va + bytes <= g_xbox_total_ram)
+        return 1;
+    return va >= 0x80000000u && (uint64_t)va + bytes <= 0x80000000ull + 0x04000000ull;
+}
+
+/* 0 when either pointer on the way is not guest memory. Buffer Release is not
+ * replaced, so a buffer the title freed keeps its slot here until a change is
+ * noticed, and its settings pointers then hold whatever reused that memory.
+ * Burnout 2 crashed reading one (guest 0xFFFFD9AC) from StopEx while loading a
+ * race. A 0 reads as "the buffer changed", and pump() and model_for() retire
+ * the slot. */
 static uint32_t setting(uint32_t iface, uint32_t offset)
 {
-    uint32_t object = voice_field(offset) ? HLE_MEM32(iface - 0x0Cu)
-                                          : HLE_MEM32(iface);
+    uint32_t holder = voice_field(offset) ? iface - 0x0Cu : iface;
+    uint32_t object;
+
+    if (!guest_readable(holder, 4u))
+        return 0u;
+    object = HLE_MEM32(holder);
+    if (!guest_readable(object + offset, 4u))
+        return 0u;
     return HLE_MEM32(object + offset);
 }
 
@@ -197,7 +218,8 @@ static Buffer *model_for(uint32_t iface, uint64_t now)
     int output;
     uint32_t i;
 
-    if (iface == 0u || HLE_MEM32(iface) == 0u || HLE_MEM32(iface - 0x0Cu) == 0u)
+    if (iface == 0u || !guest_readable(iface - 0x0Cu, 0x10u) ||
+        HLE_MEM32(iface) == 0u || HLE_MEM32(iface - 0x0Cu) == 0u)
         return NULL;
     size       = setting(iface, SET_SIZE);
     data       = setting(iface, SET_DATA);
