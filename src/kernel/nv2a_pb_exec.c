@@ -30,7 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
-#include "../d3d/d3d8_vsh.h"   /* the vertex program, parsed and run */
+#include "nv2a_vsh.h"   /* the vertex program, parsed and run */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
@@ -1482,7 +1482,7 @@ static uint32_t vertex_color(uint32_t index)
  * Every batch Burnout 2 draws has a program bound, so without this there is
  * nothing to rasterise: attribute 0 is object space and drawing it as pixels
  * put a white smear across the frame. The parser and the interpreter live in
- * src/d3d/d3d8_vsh.c -- the parser was already there for the D3D11 path.
+ * src/kernel/nv2a_vsh.c -- the same parser the D3D11 path uses.
  *
  * The pipeline after the program is the hardware's: oPos is clip space, so
  * divide by w and then apply SET_VIEWPORT_SCALE and SET_VIEWPORT_OFFSET,
@@ -1507,7 +1507,7 @@ static const NV2AVshProgram *vp_program(void)
     if (sig != parsed_sig || s_gpu.vp_prog_len != parsed_len) {
         int insns = (int)(s_gpu.vp_prog_len / 4);
         memset(&prog, 0, sizeof prog);
-        d3d8_vsh_parse((const DWORD *)s_gpu.vp_prog, insns, &prog);
+        nv2a_vsh_parse((const uint32_t *)s_gpu.vp_prog, insns, &prog);
         parsed_sig = sig;
         parsed_len = s_gpu.vp_prog_len;
         fprintf(stderr, "  [GPU] vertex program parsed: %d instructions, "
@@ -1539,7 +1539,7 @@ static int transform_vertex(uint32_t index, float out[4])
         fetch_attr(&s_gpu.attr[a], index, in[a]);
     }
 
-    d3d8_vsh_execute(prog, in, s_gpu.vp_const, (int)s_gpu.vp_const_hi, &st);
+    nv2a_vsh_execute(prog, in, s_gpu.vp_const, (int)s_gpu.vp_const_hi, &st);
 
     /* Did the program actually produce a position?
      *

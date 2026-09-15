@@ -1,5 +1,5 @@
 """
-Hold src/d3d/d3d8_vsh.c's microcode field table to a known-good program.
+Hold src/kernel/nv2a_vsh.c's microcode field table to a known-good program.
 
     python3 -m pytest tools/vsh_audit/test_vsh_encoding.py
 
@@ -36,7 +36,7 @@ import re
 import pytest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
-VSH_C = os.path.join(ROOT, "src", "d3d", "d3d8_vsh.c")
+VSH_C = os.path.join(ROOT, "src", "kernel", "nv2a_vsh.c")
 
 # Burnout 2's frontend program, as RECOMP_VP_DUMP wrote it.
 PROGRAM = [

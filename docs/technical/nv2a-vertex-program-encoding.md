@@ -1,6 +1,13 @@
 # NV2A vertex program encoding — what is derived, and what is not
 
-`src/d3d/d3d8_vsh.c` parses vertex microcode into `NV2AVshProgram`. Its field
+> **Status, September 2026: applied.** The table below is now the one in
+> `src/kernel/nv2a_vsh.c`, where the parser and the CPU interpreter moved so
+> that `xbox_kernel` builds without a graphics API.
+> `tools/vsh_audit/test_vsh_encoding.py` holds it to the twelve-instruction
+> disassembly further down. The next paragraph describes the table as it was
+> before the fix.
+
+`src/d3d/d3d8_vsh.c` parsed vertex microcode into `NV2AVshProgram`. Its field
 table (`VSH_FIELD_*`) is **wrong**, in a way that cannot be partially right:
 several fields overlap, so a destination register is decoded partly from a
 write mask and an output selector's low bit is the final-instruction flag.
