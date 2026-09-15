@@ -1,25 +1,26 @@
 # NV2A vertex program encoding — what is derived, and what is not
 
-> **Status, September 2026: applied.** The table below is now the one in
-> `src/kernel/nv2a_vsh.c`, where the parser and the CPU interpreter moved so
-> that `xbox_kernel` builds without a graphics API.
-> `tools/vsh_audit/test_vsh_encoding.py` holds it to the twelve-instruction
-> disassembly further down. The next paragraph describes the table as it was
-> before the fix.
+> **Status, September 2026: applied and audited.** The parser and the CPU
+> interpreter live in `src/kernel/nv2a_vsh.c`, moved there so that
+> `xbox_kernel` builds without a graphics API. Two tests hold them:
+> `tools/vsh_audit/test_vsh_encoding.py` checks the field table's constants
+> against the twelve-instruction disassembly below, `tests/nv2a_vsh` runs the
+> real C decoder and interpreter over the rules in **Found by audit**, and
+> `tests/nv2a_vsh_hlsl` compiles the generated HLSL with D3DCompile. The next
+> paragraph describes the table as it was before the fix.
 
 `src/d3d/d3d8_vsh.c` parsed vertex microcode into `NV2AVshProgram`. Its field
-table (`VSH_FIELD_*`) is **wrong**, in a way that cannot be partially right:
-several fields overlap, so a destination register is decoded partly from a
-write mask and an output selector's low bit is the final-instruction flag.
-The consequence is that `d3d8_vsh_execute` writes nothing at all —
-`out_written == 0` for every vertex.
+table (`VSH_FIELD_*`) was **wrong**, in a way that cannot be partially right:
+several fields overlapped, so a destination register was decoded partly from a
+write mask and an output selector's low bit was the final-instruction flag.
+The consequence was that the interpreter (then `d3d8_vsh_execute`) wrote
+nothing at all — `out_written == 0` for every vertex.
 
-Nothing in this repository documents the real encoding, and
-`docs/technical/nv2a-shaders.md` points at a microcode translator in
-`nv2a_pgraph_d3d11.c` that does not exist. So the table below was derived from
+Nothing in this repository documented the real encoding, and
+`docs/technical/nv2a-shaders.md` pointed at a microcode translator in
+`nv2a_pgraph_d3d11.c` that did not exist. So the table below was derived from
 Burnout 2's own microcode rather than from recollection, and each row says
-what makes it believable. **Rows marked `UNRESOLVED` must not be treated as
-known.**
+what made it believable.
 
 ## The sample
 
@@ -48,7 +49,7 @@ insn  11 00000000 0020181B 0836106C 2070F861
 | Field | Position | Why it is believed |
 |---|---|---|
 | `FINAL` | dword3 bit 0 | Set on instruction 11 and on no other. Exactly one final bit is what a valid program has. |
-| `OUT_ADDRESS` | dword3 bits 3-10 | Decodes to 7, 8, 9, 10, 11, 12 across instructions 6-11, which are `oB0`, `oB1`, `oT0`, `oT1`, `oT2`, `oT3` in the output enum's own order. Instruction 0 gives `0xFF`, which the header already defines as "no output". |
+| `OUT_ADDRESS` | dword3 bits 3-10 | Decodes to 7, 8, 9, 10, 11, 12 across instructions 6-11, which are `oB0`, `oB1`, `oT0`, `oT1`, `oT2`, `oT3` in the output enum's own order. Instruction 0 gives `0xFF`. That is not a "no output" code: whether an output is written is `OUT_O_MASK`'s decision, and instruction 0's mask is zero (see **Found by audit**). |
 | `CONST` | dword1 bits 9-16 | With this offset the program reads `c3` into `oD0`, `c4` into `oD1`, `c7` into `oB0`, `c8` into `oB1`, and `c9`-`c12` into `oT0`-`oT3`. The output enum numbers those outputs 3, 4, 7, 8, 9-12. Six consecutive `MOV o<N>, c<N>` is not a coincidence. At the previously assumed offset every source read `c0`. |
 | `MAC` opcode | dword1 bits 21-24 | Yields MOV for the ten output initialisers, MUL at 3 and ADD at 4 — the only two instructions that compute anything. |
 | `ILU` opcode | dword1 bits 25-27 | Yields NOP almost everywhere and RCP at instructions 1-2, which is what a perspective divide looks like. Three bits, not four: the enum has eight entries. |
@@ -61,8 +62,10 @@ insn  11 00000000 0020181B 0836106C 2070F861
 
 The derivation above is correct, and the two fields it could not reach are now
 known. `abaire/nv2a_vsh_asm` is an assembler and disassembler for this exact
-instruction set; its `vsh_instruction.py` defines the encoding as ctypes
-bitfields, LSB-first per dword, and it agrees with every field derived above.
+instruction set; its `src/nv2a_vsh/nv2a_vsh_asm/vsh_instruction.py` defines
+the encoding as ctypes bitfields, LSB-first per dword, and it agrees with every
+field derived above. xemu's `field_mapping[]` in
+`hw/xbox/nv2a/pgraph/glsl/vsh-prog.c` agrees too.
 
 Running its disassembler over Burnout 2's twelve instructions gives ground
 truth, and the result is the canonical Xbox pass-through shader:
@@ -108,28 +111,73 @@ dword0 is unused.
 | | | OUT_MAC_MASK 120 (4) |
 | | | C_MUX 124 (2), C_TEMP_LOW 126 (2) |
 
-Three asymmetries, each of which is a bug in the current parser:
+Four asymmetries, each of which was a bug in the parser before this table was
+applied:
 
 - **A source bank is 1 = temp, 2 = input, 3 = const.** Zero is not a bank. The
-  parser maps the raw value onto an enum that starts at zero, so every operand
-  comes out one bank wrong.
-- **The ILU opcode is three bits**, read as four, which makes unknown opcodes
+  old parser mapped the raw value onto an enum that starts at zero, so every
+  operand came out one bank wrong.
+- **The ILU opcode is three bits**, read as four, which made unknown opcodes
   reachable.
 - **MAC and ILU share one destination temp index** and have a write mask each,
   and there is a *single* output-register write whose source OUT_MUX selects.
-  The parser gives each unit its own output register, which does not exist,
-  and it carries one mask where there are two.
+  The old parser gave each unit its own output register, which does not exist,
+  and carried one mask where there are two. Pairing refines the shared index;
+  see **Found by audit**.
 - **Source C's temp index is split** across dword2 bits 64-65 and dword3 bits
   126-127, so it cannot be read as one field.
 
-A rewrite against this table was attempted and reverted: the scripted edit
-removed declarations it should not have touched, and since the transform is
-identity for the only shader this title currently uploads, the change cannot
-affect the image. It is worth doing before any title that draws real 3D, and
-the disassembler above is the oracle to test it against -- these twelve
-instructions must decode identically.
+A first rewrite against this table was reverted: a scripted edit removed
+declarations it should not have touched. The table was then applied by hand in
+`4c69b4c`. For the one shader Burnout 2 uploads so far the transform is
+identity, so the fix matters for real 3D rather than for the current image.
+
+## Found by audit
+
+An independent audit compared the parser with xemu (`decode_opcode()` in
+`hw/xbox/nv2a/pgraph/glsl/vsh-prog.c`) and with abaire
+(`_disassemble_outputs()` in `vsh_instruction.py`), both read from source.
+Every offset and width above survived. How the fields are *resolved* did not,
+in the places below. Each is now fixed in `nv2a_vsh_parse()` or
+`nv2a_vsh_execute()` and tested in `tests/nv2a_vsh`; a second audit checked
+that each test fails when its fix is removed. None of them changes
+Burnout 2's frontend shader, which is why the twelve instructions above could
+not show them.
+
+| Rule | Evidence |
+|---|---|
+| **A paired ILU writes R1.** When MAC and ILU both run, the ILU's temp write goes to R1 whatever `OUT_TEMP` says. | xemu: `/* Paired ILU opcodes can only write to R1 */`. abaire: "ILU will write to R1 regardless of the encoded target". |
+| **A paired MAC write aimed at R1 is dropped.** | xemu only: `/* Ignore paired MAC opcodes that write to R1 */`. abaire keeps the write. The parser follows xemu, which runs real titles; not verified on hardware. |
+| **`OUT_O_MASK` decides whether there is an output write**, not `OUT_ADDRESS`, and only a unit that runs makes it. The address is read as its low four bits, where 15 is a0.x. | xemu gates the write on `FLD_OUT_O_MASK != 0`, calls `decode_opcode()` only for non-NOP units, and indexes `out_reg_name[ADDRESS & 0xF]`. |
+| **`OUT_ORB` = 0 targets a constant register**, not an output. Recorded as `out_const_index`; not emulated. | xemu: `OUTPUT_C = 0`, and `assert(!"TODO: Emulate writeable const registers")`. abaire writes `c[address]`. |
+| **An oFog write fills the first *k* components** for a *k*-bit mask, from the same-named components of the result. | xemu `fog_mask_str`, used on both sides of its GLSL macros (`dest.mask = _MOV(_in(src)).mask`). Its comment describes taking the most significant masked component instead; the code is followed. |
+| **Only the sources an opcode reads count as inputs.** MOV and ARL read A; MUL, DP3, DPH, DP4, DST, MIN, MAX, SLT and SGE read A and B; ADD reads A and C; MAD reads all three; the ILU reads C. | xemu `mac_opcode_params`. |
+
+The same audit found two faults in the HLSL generator in `src/d3d/d3d8_vsh.c`,
+independent of the field table. It wrote the MAC's temp before evaluating the
+ILU, so an ILU source could read a value the slot had just changed. And it
+evaluated each expression twice, with the temp written in between. Both units
+now compute into locals first and then write, as the CPU interpreter always
+did.
+
+### Where this deliberately differs from xemu
+
+Unverified on hardware either way, and recorded so they are not mistaken for
+agreement:
+
+- **Timing inside a paired slot.** xemu's GLSL writes a paired MAC's *output*
+  before evaluating the ILU; only the MAC's temp write is deferred. Here both
+  units read the register file as it was at the start of the slot.
+- **ILU scalar sources.** For RCP, RCC, RSQ, EXP and LOG, xemu replicates
+  source C's x swizzle (`ilu_force_scalar`), and a paired ADD or MAD then reads
+  that scalar C. Here the MAC keeps C's full swizzle.
+- **ARL** is `floor(A.x + 0.001)` in xemu and plain `floor(A.x)` here.
+- **EXP and LOG** produce vector results in xemu and one replicated value here.
 
 ## Previously unresolved
+
+Both questions below were settled by the references in **Resolved,
+authoritatively**. Kept for the record.
 
 **Source B and source C field positions.** Only one instruction in this
 program uses B (the `MUL` at 3) and four use C, so the sample does not

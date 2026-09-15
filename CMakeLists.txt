@@ -77,6 +77,19 @@ add_subdirectory(src/video)
 # XDK functions replaced by name (tools/recomp/hle.py)
 add_subdirectory(src/hle)
 
+# ── Tests ─────────────────────────────────────────────────────
+
+# Offline tests that need no game files; run with ctest. Only when this is the
+# top-level project, so a title that pulls the toolkit in with
+# add_subdirectory() does not build them.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    enable_testing()
+    add_subdirectory(tests/nv2a_vsh)
+    if(WIN32)
+        add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
+    endif()
+endif()
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries

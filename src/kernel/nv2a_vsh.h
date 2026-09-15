@@ -163,6 +163,11 @@ typedef struct NV2AVshInstruction {
 
     /* Final instruction flag */
     int               is_final;
+
+    /* >= 0: the slot's output write targets constant register N (OUT_ORB
+     * = 0) instead of an output register. Recorded so a consumer can
+     * report it; not emulated, as in xemu. -1 otherwise. */
+    int               out_const_index;
 } NV2AVshInstruction;
 
 /** A complete parsed vertex program. */
@@ -210,6 +215,12 @@ void nv2a_vsh_execute(const NV2AVshProgram *program,
                       const float inputs[][4],
                       const float (*consts)[4], int const_count,
                       NV2AVshState *st);
+
+/**
+ * The mask an output write actually applies: output_mask, except for oFog,
+ * whose writes fill the first k components for a k-bit mask.
+ */
+uint8_t nv2a_vsh_output_write_mask(const NV2AVshDstOperand *dst);
 
 #ifdef __cplusplus
 }

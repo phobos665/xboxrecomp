@@ -149,10 +149,13 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
 
     switch (src->reg_type) {
     case NV2A_VSH_REG_TEMP:
-        if (src->reg_index == 12)
-            sb_append(sb, "R12"); /* oPos alias */
-        else
+        /* R12 is the oPos alias. R13-R15 do not exist: a read of one is
+         * zero, as in the CPU interpreter, instead of an undeclared name that
+         * fails the whole shader's compile. */
+        if (src->reg_index >= 0 && src->reg_index <= 12)
             sb_append(sb, "R%d", src->reg_index);
+        else
+            sb_append(sb, "float4(0,0,0,0)");
         break;
     case NV2A_VSH_REG_INPUT:
         sb_append(sb, "v%d", src->reg_index);
@@ -227,28 +230,30 @@ static const char *output_reg_name(NV2AVshOutputReg reg)
 static void emit_dest_assign(StrBuf *sb, const NV2AVshDstOperand *dst,
                               const char *rhs)
 {
-    /* Write to temp register if valid */
-    if (dst->temp_reg >= 0 && dst->write_mask != 0) {
-        if (dst->temp_reg == 12)
-            sb_append(sb, "    R12");
-        else
-            sb_append(sb, "    R%d", dst->temp_reg);
+    uint8_t omask = nv2a_vsh_output_write_mask(dst);
+
+    /* rhs is a local computed once for the slot, so the order of these two
+     * writes does not change the value. It did while rhs was the expression
+     * itself: the temp write came first and the output then re-evaluated the
+     * expression against the new temp. */
+    if (dst->output_reg != NV2A_VSH_OUT_NONE && omask != 0) {
+        const char *name = output_reg_name(dst->output_reg);
+        if (name) {
+            sb_append(sb, "        %s", name);
+            emit_write_mask(sb, omask);
+            sb_append(sb, " = (%s)", rhs);
+            emit_write_mask(sb, omask);
+            sb_append(sb, ";\n");
+        }
+    }
+
+    /* R13-R15 do not exist; the interpreter ignores writes to them too. */
+    if (dst->temp_reg >= 0 && dst->temp_reg <= 12 && dst->write_mask != 0) {
+        sb_append(sb, "        R%d", dst->temp_reg);
         emit_write_mask(sb, dst->write_mask);
         sb_append(sb, " = (%s)", rhs);
         emit_write_mask(sb, dst->write_mask);
         sb_append(sb, ";\n");
-    }
-
-    /* Write to the output register, under its own mask */
-    if (dst->output_reg != NV2A_VSH_OUT_NONE && dst->output_mask != 0) {
-        const char *name = output_reg_name(dst->output_reg);
-        if (name) {
-            sb_append(sb, "    %s", name);
-            emit_write_mask(sb, dst->output_mask);
-            sb_append(sb, " = (%s)", rhs);
-            emit_write_mask(sb, dst->output_mask);
-            sb_append(sb, ";\n");
-        }
     }
 }
 
@@ -378,17 +383,18 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_ARL:
-        /* a0 = floor(A.x) - special: writes address register, not a float reg */
-        sb_append(sb, "    a0 = (int)floor(");
+        /* a0 = floor(A.x). Held in a local and stored after the ILU has read
+         * its source, like every other write in the slot. */
+        sb_append(sb, "        int _a0 = (int)floor(");
         emit_source(sb, &inst->mac_src[0], 0);
         sb_append(sb, ".x);\n");
-        return; /* No destination register write */
+        return;
 
     default:
         return;
     }
 
-    emit_dest_assign(sb, &inst->mac_dst, expr_buf);
+    sb_append(sb, "        float4 _mac = %s;\n", expr_buf);
 }
 
 /**
@@ -417,10 +423,16 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_ILU_RCC:
-        /* dst = clamp(1.0/C.x, 5.42101e-36, 1.884467e+19).xxxx */
-        sb_append(&expr, "clamp(1.0 / ");
+        /* dst = sign(1/C.x) * clamp(|1/C.x|, 5.42101e-20, 1.8446744e+19),
+         * replicated -- the same asymmetric clamp nv2a_vsh_execute() applies.
+         * The sign is taken as ">= 0", not sign(): at C.x = +/-inf, 1/x is a
+         * signed zero, which sign() makes 0 and the interpreter treats as
+         * positive. 1/0 is +/-inf and clamps to the upper bound. */
+        sb_append(&expr, "(((1.0 / ");
         emit_source(&expr, &inst->ilu_src, 1);
-        sb_append(&expr, ", 5.42101e-36, 1.884467e+19).xxxx");
+        sb_append(&expr, ") >= 0.0 ? 1.0 : -1.0) * clamp(abs(1.0 / ");
+        emit_source(&expr, &inst->ilu_src, 1);
+        sb_append(&expr, "), 5.42101e-20, 1.8446744e+19)).xxxx");
         break;
 
     case NV2A_VSH_ILU_RSQ:
@@ -471,7 +483,7 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         return;
     }
 
-    emit_dest_assign(sb, &inst->ilu_dst, expr_buf);
+    sb_append(sb, "        float4 _ilu = %s;\n", expr_buf);
 }
 
 /**
@@ -594,17 +606,31 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     for (i = 0; i < program->length; i++) {
         const NV2AVshInstruction *inst = &program->insns[i];
 
-        sb_append(&sb, "\n    /* Instruction %d */\n", i);
+        int mac_runs = inst->mac_op != NV2A_VSH_MAC_NOP
+                    && (unsigned)inst->mac_op < NV2A_VSH_MAC_COUNT;
+        int ilu_runs = inst->ilu_op != NV2A_VSH_ILU_NOP;
 
-        /* MAC operation */
-        if (inst->mac_op != NV2A_VSH_MAC_NOP)
+        sb_append(&sb, "\n    /* Instruction %d */\n    {\n", i);
+
+        /* The two units run in parallel: both read the register file as it
+         * was at the start of the slot. So every value is computed into a
+         * local first -- _mac, _a0, _ilu -- and only then written. Emitting
+         * the MAC write before evaluating the ILU let an ILU source read a
+         * temp the MAC had just changed, which the CPU interpreter never did.
+         * MAC opcodes 14 and 15 do not exist and emit nothing. */
+        if (mac_runs)
             emit_mac_op(&sb, inst);
-
-        /* ILU operation (executes in parallel with MAC on hardware;
-         * in HLSL they are sequential but semantically equivalent
-         * because ILU reads source C, not MAC destinations) */
-        if (inst->ilu_op != NV2A_VSH_ILU_NOP)
+        if (ilu_runs)
             emit_ilu_op(&sb, inst);
+
+        if (mac_runs && inst->mac_op == NV2A_VSH_MAC_ARL)
+            sb_append(&sb, "        a0 = _a0;\n");
+        else if (mac_runs)
+            emit_dest_assign(&sb, &inst->mac_dst, "_mac");
+        if (ilu_runs)
+            emit_dest_assign(&sb, &inst->ilu_dst, "_ilu");
+
+        sb_append(&sb, "    }\n");
     }
 
     /* Undo the R12 alias */

@@ -217,9 +217,10 @@ def test_source_banks_are_one_two_three(F):
 def test_the_rcp_writes_only_w(F):
     """Instruction 1 is "RCP R1.w, R1.w" -- the ILU mask is w alone.
 
-    It is the one instruction in the program with a partial write mask, so it
-    is the only evidence here that MAC and ILU carry separate masks over one
-    shared temp index rather than a destination each.
+    It is the one instruction in the program with a partial write mask, which
+    is evidence that MAC and ILU carry separate masks. It is not evidence of a
+    shared temp index: the slot is paired, and a paired ILU writes R1 whatever
+    OUT_TEMP says, so R1 is the answer either way.
     """
     words = PROGRAM[1]
     assert extract(words, F["VSH_FIELD_OUT_ILU_MASK_START"], 4) == 0x1

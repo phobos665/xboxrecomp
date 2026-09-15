@@ -46,10 +46,13 @@ static inline uint32_t vsh_extract(const uint32_t *insn, int start, int count)
  * tools/vsh_audit/test_vsh_encoding.py asserts against.
  *
  * Note what is NOT here, because the hardware does not have it: a separate
- * destination per unit. MAC and ILU share one temp register index
- * (OUT_TEMP) and have a write mask each, and there is a single output
- * register write (OUT_ADDRESS, OUT_O_MASK) fed by whichever unit OUT_MUX
- * selects.
+ * destination per unit. The two units share one temp register index
+ * (OUT_TEMP) with a write mask each, and there is a single output register
+ * write (OUT_ADDRESS under OUT_O_MASK) fed by whichever unit OUT_MUX selects.
+ * A slot where both units run is "paired", and pairing changes the temp
+ * writes: the ILU writes R1 whatever OUT_TEMP says, and xemu drops a paired
+ * MAC write aimed at R1. nv2a_vsh_parse() resolves both, so consumers never
+ * see the raw fields.
  * ================================================================ */
 
 /* dword1 -- source A swizzle, the shared input and const indices, opcodes */
@@ -107,6 +110,15 @@ static inline uint32_t vsh_extract(const uint32_t *insn, int start, int count)
 #define VSH_SRC_BANK_INPUT  2
 #define VSH_SRC_BANK_CONST  3
 
+/* Which of sources A, B and C (bits 0, 1, 2) each MAC opcode reads, from
+ * xemu's mac_opcode_params. The ILU reads C only. */
+static const unsigned char g_mac_reads[NV2A_VSH_MAC_COUNT] = {
+    0, /* NOP */  1, /* MOV: A */  3, /* MUL: A B */  5, /* ADD: A C */
+    7, /* MAD */  3, /* DP3 */     3, /* DPH */       3, /* DP4 */
+    3, /* DST */  3, /* MIN */     3, /* MAX */       3, /* SLT */
+    3, /* SGE */  1, /* ARL: A */
+};
+
 /* ================================================================
  * Microcode Parser
  * ================================================================ */
@@ -141,9 +153,10 @@ static void parse_source(const uint32_t *insn,
         src->reg_index = const_index;
         break;
     default:
-        /* Bank 0 does not exist on this hardware. Seeing one means the
-         * instruction is not laid out the way this table says, so read it as
-         * an untouched temp rather than inventing a register. */
+        /* Bank 0 does not exist on this hardware; xemu asserts on it. Seeing
+         * one means the instruction is not laid out the way this table says.
+         * It reads as R0, which may hold data -- the least surprising choice,
+         * not a correct one. */
         src->reg_type  = NV2A_VSH_REG_TEMP;
         src->reg_index = 0;
         break;
@@ -152,14 +165,13 @@ static void parse_source(const uint32_t *insn,
 
 static NV2AVshOutputReg decode_output_addr(uint32_t out_addr)
 {
-    /* OUT_ADDRESS names the output register. 0xFF is the encoding for "this
-     * instruction writes no output", which the ten initialisers in a
-     * pass-through shader use on their MAC half. */
-    uint32_t out_idx;
+    /* OUT_ADDRESS names the output register in its low four bits, as xemu
+     * reads it. Whether there is an output write at all is OUT_O_MASK's
+     * decision: the 0xFF a pass-through shader leaves here only ever appears
+     * with a zero mask. 1, 2, 13 and 14 name nothing, and 15 is a0.x, which
+     * is not modelled as an output write. */
+    uint32_t out_idx = out_addr & 0xF;
 
-    if (out_addr == 0xFF)
-        return NV2A_VSH_OUT_NONE;
-    out_idx = out_addr & 0xF;
     switch (out_idx) {
     case 0:  return NV2A_VSH_OUT_POS;
     case 3:  return NV2A_VSH_OUT_D0;
@@ -258,19 +270,38 @@ void nv2a_vsh_parse(const uint32_t *microcode, int num_insns,
             }
         }
 
-        /* Destinations. There is one temp index shared by both units, a write
-         * mask each, and a single output register written by whichever unit
-         * OUT_MUX names -- not a destination per unit, which is what the
-         * previous table modelled and the hardware does not have. */
+        /* Destinations, as xemu's decode_opcode() and abaire/nv2a_vsh_asm
+         * resolve them.
+         *
+         * Temps: one index (OUT_TEMP) shared by both units, a write mask each.
+         * When both units run ("paired"), the ILU writes R1 whatever OUT_TEMP
+         * says -- both references agree -- and xemu drops a paired MAC write
+         * aimed at R1. abaire keeps that MAC write; xemu is the one run against
+         * real titles, so it is followed here.
+         *
+         * Output: at most one write per slot, only when OUT_O_MASK is non-zero,
+         * made by the unit OUT_MUX names, and only if that unit runs.
+         *
+         * Timing differs from xemu on purpose. xemu's GLSL writes a paired
+         * MAC's output before the ILU is evaluated (only the MAC's temp write
+         * is deferred), so an ILU reading R12 sees a new oPos. Here both units
+         * read the register file as it was at the start of the slot, which is
+         * what "parallel" means; which one hardware does is unverified. OUT_ORB
+         * says whether the target is an output register or a constant
+         * register; a constant write is recorded and, as in xemu, not
+         * emulated. */
         {
-            int out_temp  = (int)vsh_extract(insn, VSH_FIELD_OUT_TEMP_START, 4);
+            int out_temp      = (int)vsh_extract(insn, VSH_FIELD_OUT_TEMP_START, 4);
             uint32_t mac_mask = vsh_extract(insn, VSH_FIELD_OUT_MAC_MASK_START, 4);
             uint32_t ilu_mask = vsh_extract(insn, VSH_FIELD_OUT_ILU_MASK_START, 4);
             uint32_t o_mask   = vsh_extract(insn, VSH_FIELD_OUT_O_MASK_START, 4);
             uint32_t out_addr = vsh_extract(insn, VSH_FIELD_OUT_ADDRESS_START,
-                                             VSH_FIELD_OUT_ADDRESS_SIZE);
+                                            VSH_FIELD_OUT_ADDRESS_SIZE);
             int ilu_drives_output = (int)vsh_extract(insn, VSH_FIELD_OUT_MUX_START, 1);
-            NV2AVshOutputReg out_reg = decode_output_addr(out_addr);
+            int to_output_reg     = (int)vsh_extract(insn, VSH_FIELD_OUT_ORB_START, 1);
+            int paired = inst->mac_op != NV2A_VSH_MAC_NOP
+                      && inst->ilu_op != NV2A_VSH_ILU_NOP;
+            NV2AVshDstOperand *out_dst = NULL;
 
             inst->mac_dst.temp_reg    = -1;
             inst->mac_dst.write_mask  = 0;
@@ -280,40 +311,59 @@ void nv2a_vsh_parse(const uint32_t *microcode, int num_insns,
             inst->ilu_dst.write_mask  = 0;
             inst->ilu_dst.output_reg  = NV2A_VSH_OUT_NONE;
             inst->ilu_dst.output_mask = 0;
+            inst->out_const_index     = -1;
 
-            if (inst->mac_op != NV2A_VSH_MAC_NOP) {
-                if (mac_mask) {
-                    inst->mac_dst.temp_reg   = out_temp;
-                    inst->mac_dst.write_mask = (uint8_t)mac_mask;
-                }
-                if (!ilu_drives_output && out_reg != NV2A_VSH_OUT_NONE && o_mask) {
-                    inst->mac_dst.output_reg  = out_reg;
-                    inst->mac_dst.output_mask = (uint8_t)o_mask;
-                }
+            if (inst->mac_op != NV2A_VSH_MAC_NOP && mac_mask
+                && !(paired && out_temp == 1)) {
+                inst->mac_dst.temp_reg   = out_temp;
+                inst->mac_dst.write_mask = (uint8_t)mac_mask;
             }
-            if (inst->ilu_op != NV2A_VSH_ILU_NOP) {
-                if (ilu_mask) {
-                    inst->ilu_dst.temp_reg   = out_temp;
-                    inst->ilu_dst.write_mask = (uint8_t)ilu_mask;
-                }
-                if (ilu_drives_output && out_reg != NV2A_VSH_OUT_NONE && o_mask) {
-                    inst->ilu_dst.output_reg  = out_reg;
-                    inst->ilu_dst.output_mask = (uint8_t)o_mask;
+            if (inst->ilu_op != NV2A_VSH_ILU_NOP && ilu_mask) {
+                inst->ilu_dst.temp_reg   = paired ? 1 : out_temp;
+                inst->ilu_dst.write_mask = (uint8_t)ilu_mask;
+            }
+
+            if (o_mask) {
+                if (ilu_drives_output && inst->ilu_op != NV2A_VSH_ILU_NOP)
+                    out_dst = &inst->ilu_dst;
+                else if (!ilu_drives_output && inst->mac_op != NV2A_VSH_MAC_NOP)
+                    out_dst = &inst->mac_dst;
+            }
+            if (out_dst) {
+                if (to_output_reg) {
+                    NV2AVshOutputReg out_reg = decode_output_addr(out_addr);
+                    if (out_reg != NV2A_VSH_OUT_NONE) {
+                        out_dst->output_reg  = out_reg;
+                        out_dst->output_mask = (uint8_t)o_mask;
+                    }
+                } else {
+                    inst->out_const_index = (int)out_addr;
                 }
             }
         }
 
         inst->is_final = vsh_extract(insn, VSH_FIELD_FINAL_START, 1) ? 1 : 0;
 
-        /* Track input register usage */
+        /* Track input register usage -- only for sources the opcodes actually
+         * read. A MOV leaves B and C encoded with whatever bank they happen to
+         * hold. All sources share one v# index, so an unread input source can
+         * only add a v# the slot already reads -- except when the source the
+         * opcode does read is a temp or constant, and then counting the unread
+         * one adds an input the program never touches, shifting every later
+         * element of the D3D11 input layout. Burnout 2's frontend shader has
+         * no such slot. */
         {
             int s;
+            unsigned reads = (unsigned)inst->mac_op < NV2A_VSH_MAC_COUNT
+                           ? g_mac_reads[inst->mac_op] : 0u;
             for (s = 0; s < 3; s++) {
-                if (inst->mac_src[s].reg_type == NV2A_VSH_REG_INPUT)
-                    program->inputs_read |= (1u << inst->mac_src[s].reg_index);
+                if ((reads & (1u << s))
+                    && inst->mac_src[s].reg_type == NV2A_VSH_REG_INPUT)
+                    program->inputs_read |= (uint16_t)(1u << inst->mac_src[s].reg_index);
             }
-            if (inst->ilu_src.reg_type == NV2A_VSH_REG_INPUT)
-                program->inputs_read |= (1u << inst->ilu_src.reg_index);
+            if (inst->ilu_op != NV2A_VSH_ILU_NOP
+                && inst->ilu_src.reg_type == NV2A_VSH_REG_INPUT)
+                program->inputs_read |= (uint16_t)(1u << inst->ilu_src.reg_index);
         }
 
         program->length = i + 1;
@@ -409,20 +459,36 @@ static void vsh_read_src(const NV2AVshSrcOperand *src,
                                src->swizzle.w);
 }
 
+/* xemu's fog_mask_str: a write to oFog fills the first k components for a
+ * k-bit mask, taking the same-named components of the result, instead of the
+ * components the mask names. Every other output uses its mask as encoded. */
+uint8_t nv2a_vsh_output_write_mask(const NV2AVshDstOperand *dst)
+{
+    static const uint8_t fog[16] = {
+        0x0, 0x8, 0x8, 0xC, 0x8, 0xC, 0xC, 0xE,
+        0x8, 0xC, 0xC, 0xE, 0xC, 0xE, 0xE, 0xF,
+    };
+
+    if (dst->output_reg == NV2A_VSH_OUT_FOG)
+        return fog[dst->output_mask & 0xF];
+    return dst->output_mask;
+}
+
 /* write_mask is bit3=x .. bit0=w, per the header. */
 static void vsh_write_dst(const NV2AVshDstOperand *dst, NV2AVshState *st,
                           const float val[4])
 {
     int c;
+    uint8_t omask = nv2a_vsh_output_write_mask(dst);
 
-    if (!dst->write_mask && !dst->output_mask)
+    if (!dst->write_mask && !omask)
         return;
 
     for (c = 0; c < 4; c++) {
         if ((dst->write_mask & (8 >> c))
             && dst->temp_reg >= 0 && dst->temp_reg <= VSH_TEMP_OPOS)
             st->temp[dst->temp_reg][c] = val[c];
-        if ((dst->output_mask & (8 >> c))
+        if ((omask & (8 >> c))
             && dst->output_reg != NV2A_VSH_OUT_NONE
             && dst->output_reg < NV2A_VSH_OUT_COUNT) {
             if (dst->output_reg == NV2A_VSH_OUT_POS)
@@ -431,7 +497,7 @@ static void vsh_write_dst(const NV2AVshDstOperand *dst, NV2AVshState *st,
                 st->out[dst->output_reg][c] = val[c];
         }
     }
-    if (dst->output_mask && dst->output_reg != NV2A_VSH_OUT_NONE
+    if (omask && dst->output_reg != NV2A_VSH_OUT_NONE
         && dst->output_reg < NV2A_VSH_OUT_COUNT)
         st->out_written |= (uint16_t)(1u << dst->output_reg);
     if (dst->temp_reg == VSH_TEMP_OPOS)
