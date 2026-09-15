@@ -566,9 +566,11 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
         case STATUS_CANCELLED:                  return ERROR_CANCELLED;
         case STATUS_ALREADY_COMMITTED:          return ERROR_COMMITMENT_LIMIT;
         default: {
+#ifdef _WIN32
             /* The Xbox kernel's table is NT's, so the host's ntdll holds the
              * right answer for any code not listed above. The comment here
-             * used to promise this fallback without doing it. */
+             * used to promise this fallback without doing it. A POSIX host
+             * has no ntdll, so there only the cases above are mapped. */
             typedef ULONG (__stdcall *NtToDos)(NTSTATUS);
             static NtToDos host_map;
             static int looked_up;
@@ -580,6 +582,7 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
             }
             if (host_map)
                 return host_map(Status);
+#endif
             xbox_log(XBOX_LOG_WARN, XBOX_LOG_RTL,
                 "RtlNtStatusToDosError: unmapped status 0x%08X", Status);
             return ERROR_MR_MID_NOT_FOUND;

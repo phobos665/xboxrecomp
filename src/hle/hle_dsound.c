@@ -37,8 +37,9 @@
  * point at one object; each field is read here from the one the game's own
  * code writes it to. The offsets inside match doaxbv-re's.
  */
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+/* The NT type vocabulary: <windows.h> on Windows, the POSIX primitives
+ * (critical sections, GetTickCount64) elsewhere. */
+#include "platform/xbox_winnt.h"
 #include <stdio.h>
 #include <string.h>
 

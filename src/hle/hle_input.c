@@ -24,8 +24,10 @@
  *    may poll;
  *  - a lock, since nothing guarantees one guest thread.
  */
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+/* The NT type vocabulary: <windows.h> on Windows, the POSIX primitives
+ * (critical sections) elsewhere. XInputOpen and friends below are the XDK
+ * functions being replaced, not calls into the host's XInput. */
+#include "platform/xbox_winnt.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

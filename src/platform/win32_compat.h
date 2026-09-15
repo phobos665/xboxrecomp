@@ -88,6 +88,7 @@ LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 
 /* ---- Critical sections ------------------------------------------------- */
@@ -129,6 +130,13 @@ const char *w32_handle_path(HANDLE h);
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCWSTR name);
 BOOL   SetEvent(HANDLE h);
+
+/* Waitable timers, as far as the kernel bridge uses them: created for
+ * NtCreateTimer and cancelled for NtCancelTimer, never armed. There is
+ * deliberately no SetWaitableTimer, so a future caller fails to build here
+ * instead of getting a timer that silently never fires. */
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
+BOOL   CancelWaitableTimer(HANDLE h);
 BOOL   ResetEvent(HANDLE h);
 BOOL   PulseEvent(HANDLE h);
 
@@ -252,6 +260,15 @@ BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overl
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
 BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
 BOOL   FlushFileBuffers(HANDLE h);
+
+/* SetFilePointerEx move methods, with their Win32 values. */
+#ifndef FILE_BEGIN
+#define FILE_BEGIN   0
+#define FILE_CURRENT 1
+#define FILE_END     2
+#endif
+BOOL   SetFilePointerEx(HANDLE h, LARGE_INTEGER distance,
+                        PLARGE_INTEGER new_position, DWORD method);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
 SHORT GetAsyncKeyState(int vKey);

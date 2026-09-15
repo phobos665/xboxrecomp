@@ -12,11 +12,21 @@ add_library(xbox_hle STATIC
     hle_dsound.c
     dsound_buffer_model.c
     xbox_adpcm.c
-    audio_output_xaudio2.cpp
     hle_input.c
     input_model.c
-    input_host.c
 )
+
+# Host backends. XAudio2 and XInput exist only on Windows. A POSIX host needs
+# its own recomp_audio_output_* (audio_output.h) and recomp_input_host_sample
+# (input_host.h) -- SDL2 is the obvious candidate, since xbox_apu and
+# xbox_input already use it. Until those exist the library compiles on POSIX,
+# but a title that links it there will be missing those symbols.
+if(WIN32)
+    target_sources(xbox_hle PRIVATE
+        audio_output_xaudio2.cpp
+        input_host.c
+    )
+endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 if(WIN32)

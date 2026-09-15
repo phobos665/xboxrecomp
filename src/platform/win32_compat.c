@@ -58,6 +58,12 @@ LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
     return cmp;
 }
 
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGLONG cmp)
+{
+    __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return cmp;
+}
+
 PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -530,6 +536,23 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 {
     (void)name;
     return CreateEventA(sa, manualReset, initialState, NULL);
+}
+
+/* A waitable timer that is never armed is never signalled, which is exactly an
+ * event nobody sets. That is the whole of what the kernel bridge needs: it
+ * creates one for NtCreateTimer and cancels it for NtCancelTimer, and nothing
+ * calls SetWaitableTimer. */
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
+{
+    (void)name;
+    return CreateEventA(sa, manualReset, FALSE, NULL);
+}
+
+/* On Windows, cancelling a timer leaves its signal state alone. */
+BOOL CancelWaitableTimer(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    return (o && o->kind == K_EVENT) ? TRUE : FALSE;
 }
 
 BOOL SetEvent(HANDLE h)
@@ -1211,6 +1234,31 @@ BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
     struct stat st;
     if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
     size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
+}
+
+/* The kernel's asynchronous-read path saves and restores the host position
+ * around each read, because Windows advances a synchronous handle's pointer
+ * and the title then advances it again itself. A POSIX fd has the same
+ * shared offset, so the same save and restore is needed here. */
+BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER distance,
+                      PLARGE_INTEGER new_position, DWORD method)
+{
+    int fd = w32_handle_fd(h);
+    int whence;
+    off_t pos;
+
+    if (fd < 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    switch (method) {
+    case FILE_BEGIN:   whence = SEEK_SET; break;
+    case FILE_CURRENT: whence = SEEK_CUR; break;
+    case FILE_END:     whence = SEEK_END; break;
+    default:           SetLastError(ERROR_GEN_FAILURE); return FALSE;
+    }
+    pos = lseek(fd, (off_t)distance.QuadPart, whence);
+    if (pos == (off_t)-1) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    if (new_position)
+        new_position->QuadPart = (LONGLONG)pos;
     return TRUE;
 }
 
