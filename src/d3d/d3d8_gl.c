@@ -1066,6 +1066,3 @@ IDirect3DDevice8 *d3d8_GetDevice(void)
     return &g_device;
 }
 
-/* Used by nv2a_pb_replay to skip Present when it owns the frame. The
- * Windows backend defines this in d3d8_device.c; we mirror it here. */
-volatile int g_suppress_present = 0;

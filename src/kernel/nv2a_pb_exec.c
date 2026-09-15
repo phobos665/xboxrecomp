@@ -14,7 +14,7 @@
  * need a vertex program executed are counted and skipped rather than drawn
  * somewhere wrong -- see raster_batch(). Texturing, depth and vertex programs
  * are still a renderer, not a command decoder; the upgrade path is the D3D11
- * translator in src/nv2a/nv2a_pgraph_d3d11.c.
+ * D3D8 layer in src/d3d, reached by name from src/hle.
  *
  * Everything this does not handle is counted and ranked by
  * nv2a_pb_exec_report(), so what remains is a list rather than a guess.
@@ -893,7 +893,7 @@ static void clear_surface(uint32_t param)
  * A title running a vertex program hands over object-space positions that mean
  * nothing without executing the program, so those batches are counted and
  * skipped rather than drawn somewhere wrong. Upgrade path is the D3D11
- * translator in src/nv2a/nv2a_pgraph_d3d11.c once vertex programs are
+ * D3D8 layer in src/d3d once vertex programs are
  * translated; this exists to get the first geometry on screen for every title,
  * which in practice is UI, HUD and 2D overlays -- all pre-transformed.
  */

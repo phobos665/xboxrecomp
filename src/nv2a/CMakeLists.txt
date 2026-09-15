@@ -1,16 +1,14 @@
 # NV2A GPU Emulation Library
 # Extracted from xemu (https://github.com/xemu-project/xemu)
 #
-# Register handlers: PMC, PBUS, PTIMER, PFB, PCRTC, PRAMDAC, PFIFO, PGRAPH
+# Register handlers: PMC, PBUS, PTIMER, PFB, PCRTC, PRAMDAC. PGRAPH was never
+# ported from xemu and is now only counted, not emulated -- rendering goes
+# through the D3D8 layer in src/d3d.
 # MMIO interception via VEH (Vectored Exception Handling)
-# Push buffer parsing and command dispatch
 
 add_library(xbox_nv2a STATIC
     nv2a_core.c
-    nv2a_pgraph_d3d11.c
-    nv2a_pb_replay.c
     nv2a_mmio_hook.c
-    nv2a_pb_test.c
 )
 
 target_include_directories(xbox_nv2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -44,8 +44,24 @@ Verify against the repo rather than trusting the README. Known discrepancies as 
 | Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. Win32-only in practice. |
 | Burnout 3 is the proven target | True, and it is a **D3D8LTCG** build on XDK 5849 — so LTCG is not disqualifying. |
 
-The texture layer is the real generalisation blocker: 17 of 66 formats, mipmap level 0 only,
-no palette lookup for P8, no texture coordinate generation.
+**Corrected Sep 2026:** that "17 of 66 formats, mipmap level 0 only, no P8 palette, no
+texture coordinate generation" line described the *software rasteriser*, not the texture
+layer. `src/d3d/d3d8_resources.c` maps ~120 `D3DFMT_` enumerators, builds full mip chains,
+handles cube and volume textures, and bakes P8 through the stage palette;
+`src/d3d/d3d8_shaders.c` does texture coordinate generation. `src/d3d` is 12.5k lines and
+is the renderer. The generalisation blocker is not the texture layer.
+
+**The real blocker is that `src/hle` cannot see `src/d3d`.** `src/hle/CMakeLists.txt`
+links `xbox_hle` against `xbox_kernel` only, so the signature-based D3D8 replacement has
+nowhere to land and `hle_d3d8.c` is two no-ops. Connecting them is the next piece of work.
+
+**Backend decision (Sep 2026): Vulkan**, for portability — Linux, Steam Deck, Android.
+The shader generators stay as they are: `d3d8_combiners.c`, `d3d8_vsh.c` and
+`d3d8_shaders.c` emit HLSL, and DXC compiles HLSL to SPIR-V, so ~4k lines of translation
+survive the move. Do **not** rewrite them to GLSL. Vulkan's costs here are the Y-flip and
+front-face winding inversion (a negative viewport height; note `d3d8_states.c` already
+carries one hand-annotated winding fix, so do not stack a second) and the absence of any
+D3D11On12-style bridge for A/B comparison against the existing D3D11 backend.
 
 ---
 
