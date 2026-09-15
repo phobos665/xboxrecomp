@@ -2,10 +2,12 @@
  * hle_d3d8.c -- Direct3D 8 functions replaced by name.
  *
  * The route the DOAXBV port proved: replace D3D8 at its API and translate to
- * the host's graphics API, rather than emulate the NV2A beneath it. Burnout 2
- * supports doing that wholesale -- no game function reads the D3D device
- * global itself (110 references inside the D3D library, none outside), and
- * only one game function pushes raw GPU methods through BeginPush.
+ * the host's graphics API, rather than emulate the NV2A beneath it. Measured
+ * for Burnout 2 by tools/hle_audit/device_refs.py: no game code reads the
+ * D3D device global itself -- 118 references, all inside the D3D section --
+ * but two game functions fill their own push buffers through BeginPush
+ * (call sites 0x000FA0D9 and 0x000FBE46), and those bypass any replacement
+ * made here.
  *
  * This file starts with the display-filter setters because their correct
  * behaviour on a PC is to do nothing: they tune the TV encoder's flicker
