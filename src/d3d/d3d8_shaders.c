@@ -632,8 +632,10 @@ static int g_layout_cache_count = 0;
  * Each set uses 2 bits at bit position (16 + t*2); 0 means default (2). */
 static UINT fvf_texcoord_size(DWORD fvf, UINT t)
 {
-    DWORD field = (fvf >> (16 + t * 2)) & 0x3;
-    return field == 0 ? 2 : field;
+    /* D3DFVF_TEXTUREFORMAT1..4 are 3, 0, 1, 2 on both the PC and the Xbox
+     * (Cxbx-Reloaded, XbD3D8Types.h), so the field is not the count. */
+    static const UINT floats[4] = { 2, 3, 4, 1 };
+    return floats[(fvf >> (16 + t * 2)) & 0x3];
 }
 
 /*

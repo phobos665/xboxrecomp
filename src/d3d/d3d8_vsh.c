@@ -693,8 +693,10 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
  */
 static UINT vsh_fvf_texcoord_size(DWORD fvf, UINT t)
 {
-    DWORD field = (fvf >> (16 + t * 2)) & 0x3;
-    return field == 0 ? 2 : field;
+    /* D3DFVF_TEXTUREFORMAT1..4 are 3, 0, 1, 2 (see fvf_texcoord_size in
+     * d3d8_shaders.c): the field is not the count. */
+    static const UINT floats[4] = { 2, 3, 4, 1 };
+    return floats[(fvf >> (16 + t * 2)) & 0x3];
 }
 
 static DXGI_FORMAT default_input_format(int vreg, DWORD fvf)

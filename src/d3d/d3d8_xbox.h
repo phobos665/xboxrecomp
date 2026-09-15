@@ -632,14 +632,14 @@ typedef enum D3DCLEAR_FLAGS {
 #define D3DFVF_TEXCOUNT_SHIFT   8
 
 /* Per-texcoord-set component count (number of floats). A 2-bit field per
- * set, starting at bit 16. 0 means the default of 2. Encoded as:
- *   field = (fvf >> (tcoordsize_field_shift + t*2)) & 0x3
- * On Xbox the convention is D3DFVF_TEXCOORDSIZE1..4 shifting each set by 2.
+ * set, starting at bit 16: field = (fvf >> (16 + t*2)) & 0x3. The field is
+ * D3DFVF_TEXTUREFORMATn, which is 3, 0, 1, 2 for 1..4 floats on both the PC
+ * and the Xbox (Cxbx-Reloaded, XbD3D8Types.h) -- not the count itself.
  */
-#define D3DFVF_TEXCOORDSIZE1     0x10000   /* 1 float  (set 0) */
+#define D3DFVF_TEXCOORDSIZE1     0x30000   /* 1 float  (set 0) */
 #define D3DFVF_TEXCOORDSIZE2     0x00000   /* 2 floats (set 0, default) */
-#define D3DFVF_TEXCOORDSIZE3     0x20000   /* 3 floats (set 0) */
-#define D3DFVF_TEXCOORDSIZE4     0x30000   /* 4 floats (set 0) */
+#define D3DFVF_TEXCOORDSIZE3     0x10000   /* 3 floats (set 0) */
+#define D3DFVF_TEXCOORDSIZE4     0x20000   /* 4 floats (set 0) */
 #define D3DFVF_TEXCOORDSIZE_MASK 0xFFFF0000
 
 /* ================================================================

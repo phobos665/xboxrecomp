@@ -884,7 +884,10 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         converted = convert_fan_or_quad(PrimitiveType, pVertexData,
                                          PrimitiveCount, VertexStreamZeroStride,
                                          &vertex_count);
-        if (converted) draw_data = converted;
+        /* Without the converted copy, vertex_count is the triangle-list count
+         * and would read past the caller's vertices. */
+        if (!converted) return E_OUTOFMEMORY;
+        draw_data = converted;
     }
 
     vb_size = vertex_count * VertexStreamZeroStride;
