@@ -31,12 +31,13 @@
  *   - DrawVerticesUP and DrawIndexedVerticesUP, the draws whose vertices the
  *     title hands over directly. In a profiled first minute of Burnout 2
  *     these were 29,087 of 36,275 draws; the rest go through vertex buffers;
- *   - SetTexture, in hle_d3d8_texture.c.
- * Draws under a vertex program are counted and skipped: its constants are
- * set through register-argument functions this file cannot replace yet. So
- * are draws under a declaration-only shader. Render states and vertex
- * buffers are not forwarded: blending, alpha test and depth are the host's
- * defaults, and lighting and culling are off.
+ *   - SetTexture, in hle_d3d8_texture.c;
+ *   - render and texture stage states, in hle_d3d8_state.c;
+ *   - SetStreamSource, DrawVertices and DrawIndexedVertices, the vertex
+ *     buffer draws, and the vertex shader constants, in hle_d3d8_vertex.c.
+ * Draws under a vertex program are counted and skipped: the host lays out a
+ * program's inputs without its vertex declaration, which is not forwarded
+ * yet. So are draws under a declaration-only shader.
  *
  * RECOMP_HLE_D3D8_DUMP=<prefix> writes the host frame to <prefix>NNN.bmp
  * every RECOMP_HLE_D3D8_DUMP_EVERY swaps (default 300), at most 24 files --
@@ -406,9 +407,9 @@ static UINT fvf_stride(DWORD fvf)
 /* hle_d3d8_state.c */
 void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev);
 
-static unsigned long g_draws_up, g_draws_indexed_up, g_draws_program,
-                     g_draws_declaration, g_draws_unknown_vs, g_draws_stride,
-                     g_draws_primitive, g_draws_failed;
+static unsigned long g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
+                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
+                     g_draws_stride, g_draws_primitive, g_draws_failed;
 
 /* The vertex formats draws arrive with, whether or not they are then drawn:
  * a shader handle seen for the first time is logged, up to a limit. */
@@ -435,7 +436,7 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
     note_draw_format(xpt, stride);
     if (g_shadow_vs_is_program) {
         if (g_shadow_vs_kind == SHADER_HOST_PROGRAM)
-            g_draws_program++;           /* its constants are not forwarded */
+            g_draws_program++;           /* its declaration is not forwarded */
         else if (g_shadow_vs_kind == SHADER_DECLARATION)
             g_draws_declaration++;       /* fixed function by declaration */
         else
@@ -623,13 +624,14 @@ HLE_EXPORT(D3DDevice_Swap)
             g_shadow_last_report = now;
         } else if (now - g_shadow_last_report >= 5000) {
             fprintf(stderr, "[HLE-D3D8] shadow: %lu swaps, %lu clears, last clear "
-                    "color 0x%08X | draws: %lu UP + %lu indexed UP drawn; skipped "
-                    "%lu vertex program, %lu declaration shader, %lu unknown shader, "
-                    "%lu stride, %lu primitive, %lu failed\n",
+                    "color 0x%08X | draws: %lu UP + %lu indexed UP + %lu buffer + "
+                    "%lu indexed buffer drawn; skipped %lu vertex program, %lu "
+                    "declaration shader, %lu unknown shader, %lu stride, %lu "
+                    "primitive, %lu failed\n",
                     g_shadow_swaps, g_shadow_clears, g_shadow_last_color,
-                    g_draws_up, g_draws_indexed_up, g_draws_program,
-                    g_draws_declaration, g_draws_unknown_vs, g_draws_stride,
-                    g_draws_primitive, g_draws_failed);
+                    g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
+                    g_draws_program, g_draws_declaration, g_draws_unknown_vs,
+                    g_draws_stride, g_draws_primitive, g_draws_failed);
             fflush(stderr);
             g_shadow_last_report = now;
         }
@@ -794,6 +796,120 @@ HLE_EXPORT(D3DDevice_SetViewport)
 #endif
 }
 
+#ifdef _WIN32
+/* The host half of every non-indexed draw: the UP draw below and the vertex
+ * buffer draws in hle_d3d8_vertex.c. `verts` is already a host pointer to the
+ * first vertex; from_buffer only picks the counter the draw lands in. */
+void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
+                          uint32_t stride, int from_buffer)
+{
+    D3DPRIMITIVETYPE pt;
+    UINT prims;
+    uint8_t *loop = NULL;
+    HRESULT hr;
+
+    if (!g_shadow || !verts || !stride || !count)
+        return;
+    if (!shadow_can_draw(xpt, stride))
+        return;
+    if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
+        g_draws_primitive++;
+        return;
+    }
+    if (xpt == XPT_LINELOOP) {           /* close the loop: repeat vertex 0 */
+        loop = malloc((size_t)(count + 1) * stride);
+        if (!loop) {
+            g_draws_failed++;
+            return;
+        }
+        memcpy(loop, verts, (size_t)count * stride);
+        memcpy(loop + (size_t)count * stride, verts, stride);
+        verts = loop;
+    }
+    hr = g_shadow->lpVtbl->DrawPrimitiveUP(g_shadow, pt, prims, verts, stride);
+    free(loop);
+    if (FAILED(hr))
+        g_draws_failed++;
+    else if (from_buffer)
+        g_draws_vb++;
+    else
+        g_draws_up++;
+}
+
+/* The host half of every indexed draw. `count` counts indices, always 16-bit
+ * on the Xbox, relative to `verts`; the host wants the vertex range too, found
+ * from the largest index. The host's indexed UP draw converts no primitive
+ * types, so fans, polygons, quad lists and line loops are rewritten into index
+ * lists here. */
+void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *idx,
+                                  const void *verts, uint32_t stride, int from_buffer)
+{
+    uint16_t *list = NULL;
+    D3DPRIMITIVETYPE pt;
+    UINT prims, vertices = 0, i, n = 0;
+    HRESULT hr;
+
+    if (!g_shadow || !idx || !verts || !stride || !count)
+        return;
+    if (!shadow_can_draw(xpt, stride))
+        return;
+    if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
+        g_draws_primitive++;
+        return;
+    }
+    for (i = 0; i < count; i++)
+        if ((UINT)idx[i] + 1 > vertices)
+            vertices = (UINT)idx[i] + 1;
+
+    switch (xpt) {
+    case XPT_TRIANGLEFAN:
+    case XPT_POLYGON:
+        list = malloc((size_t)prims * 3 * sizeof *list);
+        for (i = 0; list && i < prims; i++) {
+            list[n++] = idx[0];
+            list[n++] = idx[i + 1];
+            list[n++] = idx[i + 2];
+        }
+        pt = D3DPT_TRIANGLELIST;
+        break;
+    case XPT_QUADLIST:
+        list = malloc((size_t)prims * 6 * sizeof *list);
+        for (i = 0; list && i < prims; i++) {
+            const uint16_t *q = idx + i * 4;
+            list[n++] = q[0]; list[n++] = q[1]; list[n++] = q[2];
+            list[n++] = q[0]; list[n++] = q[2]; list[n++] = q[3];
+        }
+        pt = D3DPT_TRIANGLELIST;
+        prims *= 2;
+        break;
+    case XPT_LINELOOP:
+        list = malloc(((size_t)count + 1) * sizeof *list);
+        if (list) {
+            memcpy(list, idx, (size_t)count * sizeof *list);
+            list[count] = idx[0];
+        }
+        break;
+    default:
+        break;
+    }
+    if ((xpt == XPT_TRIANGLEFAN || xpt == XPT_POLYGON || xpt == XPT_QUADLIST ||
+         xpt == XPT_LINELOOP) && !list) {
+        g_draws_failed++;
+        return;
+    }
+    hr = g_shadow->lpVtbl->DrawIndexedPrimitiveUP(
+        g_shadow, pt, 0, vertices, prims, list ? list : idx, D3DFMT_INDEX16,
+        verts, stride);
+    free(list);
+    if (FAILED(hr))
+        g_draws_failed++;
+    else if (from_buffer)
+        g_draws_indexed_vb++;
+    else
+        g_draws_indexed_up++;
+}
+#endif /* _WIN32 */
+
 /* void D3DDevice_DrawVerticesUP(D3DPRIMITIVETYPE PrimitiveType,
  *     UINT VertexCount, const void *pVertexStreamZeroData,
  *     UINT VertexStreamZeroStride)                                          */
@@ -810,47 +926,15 @@ HLE_EXPORT(D3DDevice_DrawVerticesUP)
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawVerticesUP);
 #ifdef _WIN32
-    if (g_shadow && data && stride && count) {
-        D3DPRIMITIVETYPE pt;
-        UINT prims;
-        const void *verts = HLE_PTR(data);
-        uint8_t *loop = NULL;
-        HRESULT hr;
-
-        if (!shadow_can_draw(xpt, stride))
-            return;
-        if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
-            g_draws_primitive++;
-            return;
-        }
-        if (xpt == XPT_LINELOOP) {       /* close the loop: repeat vertex 0 */
-            loop = malloc((size_t)(count + 1) * stride);
-            if (!loop) {
-                g_draws_failed++;
-                return;
-            }
-            memcpy(loop, verts, (size_t)count * stride);
-            memcpy(loop + (size_t)count * stride, verts, stride);
-            verts = loop;
-        }
-        hr = g_shadow->lpVtbl->DrawPrimitiveUP(g_shadow, pt, prims, verts, stride);
-        free(loop);
-        if (SUCCEEDED(hr))
-            g_draws_up++;
-        else
-            g_draws_failed++;
-    }
+    if (data)
+        hle_d3d8_shadow_draw(xpt, count, HLE_PTR(data), stride, 0);
 #endif
 }
 
 /* void D3DDevice_DrawIndexedVerticesUP(D3DPRIMITIVETYPE PrimitiveType,
  *     UINT VertexCount, const void *pIndexData,
  *     const void *pVertexStreamZeroData, UINT VertexStreamZeroStride)
- *
- * VertexCount counts indices, which are always 16-bit on the Xbox. The host
- * wants the vertex range too, found from the largest index. The host's
- * indexed UP draw converts no primitive types, so fans, polygons, quad lists
- * and line loops are rewritten into index lists here. */
+ * VertexCount counts indices; no base vertex index applies (Cxbx-Reloaded). */
 HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
 {
     static int seen;
@@ -866,68 +950,9 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
 #ifdef _WIN32
-    if (g_shadow && index_va && data && stride && count) {
-        const uint16_t *idx = (const uint16_t *)HLE_PTR(index_va);
-        uint16_t *list = NULL;
-        D3DPRIMITIVETYPE pt;
-        UINT prims, vertices = 0, i, n = 0;
-        HRESULT hr;
-
-        if (!shadow_can_draw(xpt, stride))
-            return;
-        if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
-            g_draws_primitive++;
-            return;
-        }
-        for (i = 0; i < count; i++)
-            if ((UINT)idx[i] + 1 > vertices)
-                vertices = (UINT)idx[i] + 1;
-
-        switch (xpt) {
-        case XPT_TRIANGLEFAN:
-        case XPT_POLYGON:
-            list = malloc((size_t)prims * 3 * sizeof *list);
-            for (i = 0; list && i < prims; i++) {
-                list[n++] = idx[0];
-                list[n++] = idx[i + 1];
-                list[n++] = idx[i + 2];
-            }
-            pt = D3DPT_TRIANGLELIST;
-            break;
-        case XPT_QUADLIST:
-            list = malloc((size_t)prims * 6 * sizeof *list);
-            for (i = 0; list && i < prims; i++) {
-                const uint16_t *q = idx + i * 4;
-                list[n++] = q[0]; list[n++] = q[1]; list[n++] = q[2];
-                list[n++] = q[0]; list[n++] = q[2]; list[n++] = q[3];
-            }
-            pt = D3DPT_TRIANGLELIST;
-            prims *= 2;
-            break;
-        case XPT_LINELOOP:
-            list = malloc(((size_t)count + 1) * sizeof *list);
-            if (list) {
-                memcpy(list, idx, (size_t)count * sizeof *list);
-                list[count] = idx[0];
-            }
-            break;
-        default:
-            break;
-        }
-        if ((xpt == XPT_TRIANGLEFAN || xpt == XPT_POLYGON || xpt == XPT_QUADLIST ||
-             xpt == XPT_LINELOOP) && !list) {
-            g_draws_failed++;
-            return;
-        }
-        hr = g_shadow->lpVtbl->DrawIndexedPrimitiveUP(
-            g_shadow, pt, 0, vertices, prims, list ? list : idx, D3DFMT_INDEX16,
-            HLE_PTR(data), stride);
-        free(list);
-        if (SUCCEEDED(hr))
-            g_draws_indexed_up++;
-        else
-            g_draws_failed++;
-    }
+    if (index_va && data)
+        hle_d3d8_shadow_draw_indexed(xpt, count, (const uint16_t *)HLE_PTR(index_va),
+                                     HLE_PTR(data), stride, 0);
 #endif
 }
 
