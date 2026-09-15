@@ -2078,6 +2078,38 @@ class Lifter:
             if back:
                 back.reverse()
                 targets = back + targets
+
+        # An index that never takes the low values. MSVC's memcpy trail
+        # dispatch `jmp [eax*4 + tbl]` runs after `and eax, 3` on a count
+        # already known to be non-zero, so eax is 1..3, and slot 0 is the tail
+        # of the instruction before the table. On Burnout 2:
+        #
+        #     0011EFFD  jmp dword ptr [eax*4 + 0x11F010]   table 0x11F014
+        #     0011F191  jmp dword ptr [eax*4 + 0x11F19C]   table 0x11F1A0
+        #
+        # Neither scan above finds them: forward stops at the non-address in
+        # slot 0, and the word below the displacement is the previous jump's
+        # opcode. Both lifted to RECOMP_ITAIL, whose arms (0x11F04C, 0x11F1AC,
+        # 0x11F1F8) are not function starts, so they failed to resolve and the
+        # title stalled loading its first race. translator._read_local_jump_table
+        # and DisasmEngine.resync_jump_tables already had this rule; this
+        # reader, used for every ordinary function, did not. The switch matches
+        # by value, so the skipped slots cost nothing, and
+        # _analyze_switch_table still keeps only arms inside the function.
+        if len(targets) < 2:
+            for skip in (1, 2, 3):
+                later = []
+                for i in range(skip, max_entries):
+                    o = offset + i * 4
+                    if o + 4 > len(self.xbe_data):
+                        break
+                    val = struct.unpack_from('<I', self.xbe_data, o)[0]
+                    if not is_code_address(val):
+                        break
+                    later.append(val)
+                if len(later) >= 2:
+                    targets = later
+                    break
         return targets
 
     def _analyze_switch_table(self, ops):
