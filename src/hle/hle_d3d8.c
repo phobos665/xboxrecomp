@@ -35,9 +35,11 @@
  *   - render and texture stage states, in hle_d3d8_state.c;
  *   - SetStreamSource, DrawVertices and DrawIndexedVertices, the vertex
  *     buffer draws, and the vertex shader constants, in hle_d3d8_vertex.c.
- * Draws under a vertex program are counted and skipped: the host lays out a
- * program's inputs without its vertex declaration, which is not forwarded
- * yet. So are draws under a declaration-only shader.
+ * Draws under a vertex program use the declaration the XDK parsed into the
+ * shader object (shadow_read_declaration), with NORMPACKED3 normals unpacked
+ * on the CPU and the XDK's screen-space transform undone on the host (see
+ * "viewports"). A program whose declaration the host cannot lay out is
+ * counted and skipped, and so are draws under a declaration-only shader.
  *
  * RECOMP_HLE_D3D8_DUMP=<prefix> writes the host frame to <prefix>NNN.bmp
  * every RECOMP_HLE_D3D8_DUMP_EVERY swaps (default 300), at most 24 files --
@@ -207,6 +209,75 @@ static HWND shadow_window(UINT width, UINT height)
     return req.hwnd;
 }
 
+/* ------------------------------------------------------------- viewports */
+
+/* Xbox vertex programs end in the XDK's screen-space transform: oPos comes
+ * out in render-target pixels, through the viewport scale and offset the XDK
+ * keeps in constants 58 and 59 (c-38 and c-37), with Z scaled to the depth
+ * buffer's range. The values follow Cxbx-Reloaded
+ * (GetXboxViewportOffsetAndScale, GetZScaleForPixelContainer). The host
+ * programs undo a whole render target's worth of it
+ * (d3d8_vsh_set_screenspace), which leaves the viewport already applied:
+ * program draws use a host viewport over the whole target with depth 0..1,
+ * fixed-function draws the title's own.
+ *
+ * Not handled: X_D3DSCM_NORESERVEDCONSTANTS, which frees 58 and 59 for the
+ * title (a title that then sets them wins until its next SetViewport), and a
+ * depth buffer other than the automatic one -- Z is scaled for the format
+ * CreateDevice asked for. */
+static float        g_z_scale = 1.0f;
+static D3DVIEWPORT8 g_title_viewport;
+static int          g_title_viewport_set;
+static int          g_host_viewport_mode = -1;   /* 0 the title's, 1 whole target */
+
+static float xbox_depth_z_scale(uint32_t format)
+{
+    switch (format) {
+    case 0x2C: case 0x30: return 65535.0f;       /* D16, LIN_D16 */
+    case 0x2A: case 0x2E: return 16777215.0f;    /* D24S8, LIN_D24S8 */
+    case 0x2D: case 0x31: return 511.9375f;      /* F16, LIN_F16 */
+    case 0x2B: case 0x2F: return 1.0e30f;        /* F24S8, LIN_F24S8 */
+    default:              return 1.0f;
+    }
+}
+
+static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
+{
+    float half_w = (float)g_shadow_width / 2.0f;
+    float half_h = (float)g_shadow_height / 2.0f;
+    float reserved[8] = {
+        (float)vp->Width / 2.0f, -(float)vp->Height / 2.0f,
+        (vp->MaxZ - vp->MinZ) * g_z_scale, 1.0f,
+        (float)vp->Width / 2.0f + (float)vp->X, (float)vp->Height / 2.0f + (float)vp->Y,
+        vp->MinZ * g_z_scale, 0.0f
+    };
+    float scale[4]  = { half_w, -half_h, g_z_scale, 1.0f };
+    float offset[4] = { half_w, half_h, 0.0f, 0.0f };
+
+    d3d8_vsh_set_constant(58, reserved, 2);
+    d3d8_vsh_set_screenspace(scale, offset);
+}
+
+static void shadow_use_viewport(int whole_target)
+{
+    D3DVIEWPORT8 vp;
+
+    if (g_host_viewport_mode == whole_target)
+        return;
+    g_host_viewport_mode = whole_target;
+    if (!whole_target && g_title_viewport_set) {
+        vp = g_title_viewport;
+    } else {
+        vp.X = 0;
+        vp.Y = 0;
+        vp.Width = g_shadow_width;
+        vp.Height = g_shadow_height;
+        vp.MinZ = 0.0f;
+        vp.MaxZ = 1.0f;
+    }
+    g_shadow->lpVtbl->SetViewport(g_shadow, &vp);
+}
+
 /* The guest's D3DPRESENT_PARAMETERS is the Xbox layout in 32-bit guest
  * memory: BackBufferWidth at +0, BackBufferHeight at +4, a guest HWND at +24.
  * The host struct holds a pointer-sized HWND, so only the fields the host
@@ -225,6 +296,9 @@ static void shadow_create(uint32_t pp_va)
         width  = HLE_MEM32(pp_va + 0);
         height = HLE_MEM32(pp_va + 4);
     }
+    /* EnableAutoDepthStencil at +32, AutoDepthStencilFormat at +36. */
+    if (pp_va && HLE_MEM32(pp_va + 32))
+        g_z_scale = xbox_depth_z_scale(HLE_MEM32(pp_va + 36));
 
     hwnd = shadow_window(width, height);
     if (!hwnd)
@@ -253,6 +327,11 @@ static void shadow_create(uint32_t pp_va)
     xbox_D3D8SetPresentInterval(0);
     g_shadow_width = width;
     g_shadow_height = height;
+    {
+        /* Until the title sets one: the whole back buffer. */
+        D3DVIEWPORT8 whole = { 0, 0, width, height, 0.0f, 1.0f };
+        shadow_viewport_constants(&whole);
+    }
 
     /* Until the first draw applies the title's own states: nothing culled and
      * no texture. Lighting stays off for good (hle_d3d8_state.c): lights and
@@ -263,8 +342,9 @@ static void shadow_create(uint32_t pp_va)
 
     g_shadow_create_thread = GetCurrentThreadId();
     fprintf(stderr, "[HLE-D3D8] shadow device %ux%u, from the title's own "
-            "CreateDevice parameters, on guest thread %lu\n",
-            width, height, (unsigned long)g_shadow_create_thread);
+            "CreateDevice parameters, on guest thread %lu; vertex program Z "
+            "scale %g\n", width, height, (unsigned long)g_shadow_create_thread,
+            g_z_scale);
     fflush(stderr);
 }
 
@@ -299,15 +379,25 @@ static DWORD xbox_clear_flags_to_host(uint32_t xbox_flags)
 
 enum { SHADER_DECLARATION, SHADER_HOST_PROGRAM, SHADER_NOT_REPLAYED };
 
-static struct {
+#define SHADOW_MAX_PACKED 4              /* NORMPACKED3 registers per program */
+
+struct shadow_program {
     uint32_t guest;
     DWORD    host;
     int      kind;
-} g_programs[SHADOW_MAX_PROGRAMS];
+    /* From the declaration (shadow_read_declaration), host programs only. */
+    int      has_declaration;            /* the host has its vertex layout */
+    UINT     extent;                     /* bytes of a vertex it reads */
+    int      packed_count;               /* NORMPACKED3 registers */
+    UINT     packed_offset[SHADOW_MAX_PACKED];
+};
+
+static struct shadow_program g_programs[SHADOW_MAX_PROGRAMS];
 static int      g_program_count;
 static uint32_t g_shadow_vs;             /* guest handle last selected */
 static int      g_shadow_vs_is_program;  /* bit 0 set: a shader object */
 static int      g_shadow_vs_kind;        /* its kind, or -1 if never created */
+static int      g_shadow_vs_slot = -1;   /* its g_programs entry, or -1 */
 
 /* The handle is the address of the title's shader object, so a shader
  * created after another was deleted can reuse its handle. Creation replaces
@@ -330,10 +420,12 @@ static void shadow_select_vertex_shader(uint32_t handle)
     g_shadow_vs_is_program = (handle & 1) != 0;
     if (!g_shadow_vs_is_program) {
         g_shadow_vs_kind = -1;
+        g_shadow_vs_slot = -1;
         g_shadow->lpVtbl->SetVertexShader(g_shadow, handle);
         return;
     }
     i = shadow_program_find(handle);
+    g_shadow_vs_slot = i;
     g_shadow_vs_kind = i >= 0 ? g_programs[i].kind : -1;
     if (g_shadow_vs_kind == SHADER_HOST_PROGRAM)
         g_shadow->lpVtbl->SetVertexShader(g_shadow, g_programs[i].host);
@@ -435,17 +527,32 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
     note_draw_format(xpt, stride);
     if (g_shadow_vs_is_program) {
-        if (g_shadow_vs_kind == SHADER_HOST_PROGRAM)
-            g_draws_program++;           /* its declaration is not forwarded */
-        else if (g_shadow_vs_kind == SHADER_DECLARATION)
+        const struct shadow_program *p;
+
+        if (g_shadow_vs_kind == SHADER_DECLARATION) {
             g_draws_declaration++;       /* fixed function by declaration */
-        else
+            return 0;
+        }
+        if (g_shadow_vs_kind != SHADER_HOST_PROGRAM || g_shadow_vs_slot < 0) {
             g_draws_unknown_vs++;
-        return 0;
-    }
-    if (fvf_stride(g_shadow_vs) != stride) {
-        g_draws_stride++;
-        return 0;
+            return 0;
+        }
+        p = &g_programs[g_shadow_vs_slot];
+        if (!p->has_declaration) {
+            g_draws_program++;           /* no vertex layout for the host */
+            return 0;
+        }
+        if (stride < p->extent) {        /* the layout would read past a vertex */
+            g_draws_stride++;
+            return 0;
+        }
+        shadow_use_viewport(1);
+    } else {
+        if (fvf_stride(g_shadow_vs) != stride) {
+            g_draws_stride++;
+            return 0;
+        }
+        shadow_use_viewport(0);
     }
     /* The title's render and texture stage states as they stand now, read
      * from its own state arrays (hle_d3d8_state.c). */
@@ -625,7 +732,7 @@ HLE_EXPORT(D3DDevice_Swap)
         } else if (now - g_shadow_last_report >= 5000) {
             fprintf(stderr, "[HLE-D3D8] shadow: %lu swaps, %lu clears, last clear "
                     "color 0x%08X | draws: %lu UP + %lu indexed UP + %lu buffer + "
-                    "%lu indexed buffer drawn; skipped %lu vertex program, %lu "
+                    "%lu indexed buffer drawn; skipped %lu program without layout, %lu "
                     "declaration shader, %lu unknown shader, %lu stride, %lu "
                     "primitive, %lu failed\n",
                     g_shadow_swaps, g_shadow_clears, g_shadow_last_color,
@@ -638,6 +745,136 @@ HLE_EXPORT(D3DDevice_Swap)
     }
 #endif
 }
+
+#ifdef _WIN32
+/* The XDK keeps the declaration it parsed in the shader object itself:
+ * X_D3DVertexShader { RefCount, Flags, ProgramSize, ProgramAndConstantsDwords,
+ * BYTE Dimensionality[4], X_VERTEXATTRIBUTEFORMAT VertexAttribute } -- 16 slots
+ * of { StreamIndex, Offset, Format, 4 bytes }, one per vertex register
+ * (Cxbx-Reloaded, XbD3D8Types.h). Logged for the first programs so a run shows
+ * which vertex formats a title's programs read before the host is taught
+ * them. Format X_D3DVSDT_NONE (0x02) or 0 is an unused register. */
+static void note_vertex_attributes(uint32_t handle)
+{
+    static int notes;
+    uint32_t object = handle & ~1u, i;
+    char line[640];
+    int n;
+
+    if (notes >= 32 || !object)
+        return;
+    notes++;
+    n = snprintf(line, sizeof line, "[HLE-D3D8] shadow declaration 0x%08X flags 0x%X:",
+                 handle, HLE_MEM32(object + 4u));
+    for (i = 0; i < 16u && n > 0 && n < (int)sizeof line; i++) {
+        uint32_t slot = object + 20u + i * 16u;
+        uint32_t format = HLE_MEM32(slot + 8u);
+
+        if (format <= 0x02u)
+            continue;
+        n += snprintf(line + n, sizeof line - (size_t)n, " v%u=s%u+%u:%02X", i,
+                      HLE_MEM32(slot), HLE_MEM32(slot + 4u), format);
+    }
+    fprintf(stderr, "%s\n", line);
+}
+
+/* An X_D3DVSDT format the host reads as it is: its DXGI format and size.
+ * D3DCOLOR is stored BGRA. Three-component shorts and bytes have no DXGI
+ * format, and unnormalised shorts would need an integer shader input, so
+ * those return 0. */
+static int xbox_vsdt_to_dxgi(uint32_t format, DXGI_FORMAT *dxgi, UINT *size)
+{
+    switch (format) {
+    case 0x12: *dxgi = DXGI_FORMAT_R32_FLOAT;          *size = 4;  return 1; /* FLOAT1 */
+    case 0x22: *dxgi = DXGI_FORMAT_R32G32_FLOAT;       *size = 8;  return 1; /* FLOAT2 */
+    case 0x32: *dxgi = DXGI_FORMAT_R32G32B32_FLOAT;    *size = 12; return 1; /* FLOAT3 */
+    case 0x42: *dxgi = DXGI_FORMAT_R32G32B32A32_FLOAT; *size = 16; return 1; /* FLOAT4 */
+    case 0x40: *dxgi = DXGI_FORMAT_B8G8R8A8_UNORM;     *size = 4;  return 1; /* D3DCOLOR */
+    case 0x11: *dxgi = DXGI_FORMAT_R16_SNORM;          *size = 2;  return 1; /* NORMSHORT1 */
+    case 0x21: *dxgi = DXGI_FORMAT_R16G16_SNORM;       *size = 4;  return 1; /* NORMSHORT2 */
+    case 0x41: *dxgi = DXGI_FORMAT_R16G16B16A16_SNORM; *size = 8;  return 1; /* NORMSHORT4 */
+    case 0x14: *dxgi = DXGI_FORMAT_R8_UNORM;           *size = 1;  return 1; /* PBYTE1 */
+    case 0x24: *dxgi = DXGI_FORMAT_R8G8_UNORM;         *size = 2;  return 1; /* PBYTE2 */
+    case 0x44: *dxgi = DXGI_FORMAT_R8G8B8A8_UNORM;     *size = 4;  return 1; /* PBYTE4 */
+    default:   return 0;
+    }
+}
+
+/* The host program's vertex layout, from the same slots: each register at its
+ * declared offset in the stream 0 vertex. NORMPACKED3 (0x16, 11:11:10 signed
+ * bits) has no DXGI format, so each draw copies the vertex behind its unpacked
+ * normals (shadow_expand_vertices): those registers read float3s from the
+ * front, and every other offset moves up by 12 bytes per packed register. A
+ * declaration the host cannot take -- another stream, or a format with no
+ * DXGI equivalent -- leaves has_declaration 0, and its draws are skipped and
+ * counted. */
+static void shadow_read_declaration(int slot, uint32_t handle)
+{
+    static int notes;
+    struct shadow_program *p = &g_programs[slot];
+    D3D8VshInput in[16];
+    uint32_t object = handle & ~1u, i;
+    uint32_t bad_reg = 0, bad_stream = 0, bad_format = 0;
+    UINT shift;
+    int n = 0, packed = 0, refused = 0;
+
+    p->has_declaration = 0;
+    p->extent = 0;
+    p->packed_count = 0;
+    if (!object)
+        return;
+    for (i = 0; i < 16u; i++)
+        if (HLE_MEM32(object + 20u + i * 16u + 8u) == 0x16u)
+            packed++;
+    if (packed > SHADOW_MAX_PACKED)
+        return;
+    shift = (UINT)packed * 12u;
+    packed = 0;
+
+    for (i = 0; i < 16u; i++) {
+        uint32_t attr = object + 20u + i * 16u;
+        uint32_t stream = HLE_MEM32(attr), offset = HLE_MEM32(attr + 4u);
+        uint32_t format = HLE_MEM32(attr + 8u);
+        DXGI_FORMAT dxgi;
+        UINT size;
+
+        if (format <= 0x02u)
+            continue;
+        if (stream != 0u || offset > 0xFFFFu) {
+            refused = 1;
+        } else if (format == 0x16u) {
+            p->packed_offset[packed] = offset;
+            in[n].format = DXGI_FORMAT_R32G32B32_FLOAT;
+            in[n].offset = 12u * (UINT)packed++;
+            size = 4;
+        } else if (xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+            in[n].format = dxgi;
+            in[n].offset = offset + shift;
+        } else {
+            refused = 1;
+        }
+        if (refused) {
+            bad_reg = i;
+            bad_stream = stream;
+            bad_format = format;
+            break;
+        }
+        in[n].reg = (int)i;
+        if (offset + size > p->extent)
+            p->extent = offset + size;
+        n++;
+    }
+
+    if (!refused && n > 0 && SUCCEEDED(d3d8_vsh_set_declaration(p->host, in, n))) {
+        p->has_declaration = 1;
+        p->packed_count = packed;
+    } else if (refused && notes++ < 16) {
+        fprintf(stderr, "[HLE-D3D8] shadow declaration 0x%08X: v%u (stream %u, format "
+                "0x%02X) has no host layout; its draws are skipped\n",
+                handle, bad_reg, bad_stream, bad_format);
+    }
+}
+#endif
 
 /* HRESULT D3DDevice_CreateVertexShader(const DWORD *pDeclaration,
  *     const DWORD *pFunction, DWORD *pHandle, DWORD Usage)
@@ -688,6 +925,8 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
             g_programs[slot].guest = guest;
             g_programs[slot].host = kind == SHADER_HOST_PROGRAM ? host : 0;
             g_programs[slot].kind = kind;
+            g_programs[slot].has_declaration = 0;
+            g_programs[slot].packed_count = 0;
         } else if (kind == SHADER_HOST_PROGRAM) {
             d3d8_vsh_delete_shader(host);
         }
@@ -695,6 +934,12 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
                 kind == SHADER_DECLARATION ? "declaration only"
                 : kind == SHADER_HOST_PROGRAM ? "host program" : "program not replayed",
                 slot < 0 ? " (table full, not tracked)" : "");
+        note_vertex_attributes(guest);
+        if (slot >= 0 && kind == SHADER_HOST_PROGRAM)
+            shadow_read_declaration(slot, guest);
+        /* This entry may be the selected one, recreated under the same handle. */
+        if (slot >= 0 && slot == g_shadow_vs_slot)
+            g_shadow_vs_kind = kind;
     }
 #endif
 }
@@ -791,12 +1036,62 @@ HLE_EXPORT(D3DDevice_SetViewport)
             vp.Width = g_shadow_width - vp.X;
         if (vp.Height > g_shadow_height - vp.Y)
             vp.Height = g_shadow_height - vp.Y;
-        g_shadow->lpVtbl->SetViewport(g_shadow, &vp);
+        g_title_viewport = vp;
+        g_title_viewport_set = 1;
+        g_host_viewport_mode = -1;       /* the next draw picks which to use */
+        shadow_viewport_constants(&vp);
     }
 #endif
 }
 
 #ifdef _WIN32
+/* The vertices a program with NORMPACKED3 registers reads: each vertex copied
+ * behind its unpacked normals, as shadow_read_declaration laid them out. The
+ * bits are x:11, y:11, z:10, signed, divided by 1023, 1023 and 511
+ * (Cxbx-Reloaded's vertex buffer conversion). Returns NULL with *failed clear
+ * when the current program packs nothing, and NULL with *failed set when the
+ * copy cannot be made; otherwise the copy, and *stride grows to match. */
+static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *stride,
+                                       int *failed)
+{
+    const struct shadow_program *p;
+    UINT in_stride = *stride, out_stride, shift, v;
+    uint8_t *out;
+    int k;
+
+    *failed = 0;
+    if (!g_shadow_vs_is_program || g_shadow_vs_slot < 0)
+        return NULL;
+    p = &g_programs[g_shadow_vs_slot];
+    if (!p->packed_count)
+        return NULL;
+    shift = (UINT)p->packed_count * 12u;
+    out_stride = in_stride + shift;
+    out = malloc((size_t)vertices * out_stride);
+    if (!out) {
+        *failed = 1;
+        return NULL;
+    }
+    for (v = 0; v < vertices; v++) {
+        const uint8_t *src = (const uint8_t *)verts + (size_t)v * in_stride;
+        uint8_t *dst = out + (size_t)v * out_stride;
+
+        for (k = 0; k < p->packed_count; k++) {
+            uint32_t bits;
+            float n[3];
+
+            memcpy(&bits, src + p->packed_offset[k], sizeof bits);
+            n[0] = (float)((int32_t)(bits << 21) >> 21) / 1023.0f;
+            n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
+            n[2] = (float)((int32_t)bits >> 22) / 511.0f;
+            memcpy(dst + 12u * (UINT)k, n, sizeof n);
+        }
+        memcpy(dst + shift, src, in_stride);
+    }
+    *stride = out_stride;
+    return out;
+}
+
 /* The host half of every non-indexed draw: the UP draw below and the vertex
  * buffer draws in hle_d3d8_vertex.c. `verts` is already a host pointer to the
  * first vertex; from_buffer only picks the counter the draw lands in. */
@@ -804,8 +1099,9 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
                           uint32_t stride, int from_buffer)
 {
     D3DPRIMITIVETYPE pt;
-    UINT prims;
-    uint8_t *loop = NULL;
+    UINT prims, host_stride = stride;
+    uint8_t *loop = NULL, *expanded;
+    int failed;
     HRESULT hr;
 
     if (!g_shadow || !verts || !stride || !count)
@@ -816,18 +1112,27 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
         g_draws_primitive++;
         return;
     }
+    expanded = shadow_expand_vertices(verts, count, &host_stride, &failed);
+    if (failed) {
+        g_draws_failed++;
+        return;
+    }
+    if (expanded)
+        verts = expanded;
     if (xpt == XPT_LINELOOP) {           /* close the loop: repeat vertex 0 */
-        loop = malloc((size_t)(count + 1) * stride);
+        loop = malloc((size_t)(count + 1) * host_stride);
         if (!loop) {
+            free(expanded);
             g_draws_failed++;
             return;
         }
-        memcpy(loop, verts, (size_t)count * stride);
-        memcpy(loop + (size_t)count * stride, verts, stride);
+        memcpy(loop, verts, (size_t)count * host_stride);
+        memcpy(loop + (size_t)count * host_stride, verts, host_stride);
         verts = loop;
     }
-    hr = g_shadow->lpVtbl->DrawPrimitiveUP(g_shadow, pt, prims, verts, stride);
+    hr = g_shadow->lpVtbl->DrawPrimitiveUP(g_shadow, pt, prims, verts, host_stride);
     free(loop);
+    free(expanded);
     if (FAILED(hr))
         g_draws_failed++;
     else if (from_buffer)
@@ -845,8 +1150,10 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
                                   const void *verts, uint32_t stride, int from_buffer)
 {
     uint16_t *list = NULL;
+    uint8_t *expanded;
     D3DPRIMITIVETYPE pt;
-    UINT prims, vertices = 0, i, n = 0;
+    UINT prims, vertices = 0, i, n = 0, host_stride = stride;
+    int failed;
     HRESULT hr;
 
     if (!g_shadow || !idx || !verts || !stride || !count)
@@ -897,10 +1204,17 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         g_draws_failed++;
         return;
     }
+    expanded = shadow_expand_vertices(verts, vertices, &host_stride, &failed);
+    if (failed) {
+        free(list);
+        g_draws_failed++;
+        return;
+    }
     hr = g_shadow->lpVtbl->DrawIndexedPrimitiveUP(
         g_shadow, pt, 0, vertices, prims, list ? list : idx, D3DFMT_INDEX16,
-        verts, stride);
+        expanded ? expanded : verts, host_stride);
     free(list);
+    free(expanded);
     if (FAILED(hr))
         g_draws_failed++;
     else if (from_buffer)

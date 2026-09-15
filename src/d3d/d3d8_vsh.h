@@ -55,10 +55,26 @@ extern "C" {
  * The microcode is stored as raw DWORDs; parsing and compilation
  * are deferred until the shader is first used in a draw call.
  */
+/**
+ * One vertex register a program reads, laid out as the title's vertex
+ * declaration says: the DXGI format of the bytes stored in the vertex and
+ * their offset from the start of a stream 0 vertex.
+ */
+typedef struct D3D8VshInput {
+    int         reg;        /* v0..v15 */
+    DXGI_FORMAT format;
+    UINT        offset;
+} D3D8VshInput;
+
 typedef struct NV2AVshSlot {
     DWORD   microcode[NV2A_VS_MAX_INSTRUCTIONS * 4]; /* Raw 128-bit instructions */
     int     length;         /* Number of instructions */
     int     in_use;         /* 1 if this slot is allocated */
+    /* The vertex declaration, when one was given (d3d8_vsh_set_declaration).
+     * Without it the input layout is guessed from the registers read. */
+    D3D8VshInput decl[NV2A_VS_MAX_INPUTS];
+    int          decl_count;
+    uint32_t     decl_hash;
 } NV2AVshSlot;
 
 /* ================================================================
@@ -129,6 +145,29 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
  * On Xbox, handles > 0xFFFF are shader handles.
  */
 BOOL d3d8_vsh_is_programmable(DWORD handle);
+
+/**
+ * Give a program the vertex layout its declaration describes. Registers the
+ * program reads are bound at these formats and offsets instead of being
+ * packed one after another at default formats.
+ *
+ * @param handle  The shader handle from d3d8_vsh_create_shader
+ * @param inputs  One entry per declared register (stream 0)
+ * @param count   Number of entries, at most NV2A_VS_MAX_INPUTS; 0 clears it
+ */
+HRESULT d3d8_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count);
+
+/**
+ * Xbox vertex programs write oPos in render-target pixels. With a scale and
+ * offset set, every program undoes that before the rasteriser:
+ *   oPos = (oPos - offset) / scale;  if (w == 0) w = 1;  xyz *= w
+ * (Cxbx-Reloaded, CxbxVertexShaderTemplate.hlsl). Until this is called the
+ * programs leave oPos as they wrote it.
+ *
+ * @param scale   (width / 2, -height / 2, depth-buffer Z scale, 1)
+ * @param offset  (width / 2, height / 2, 0, 0)
+ */
+void d3d8_vsh_set_screenspace(const float scale[4], const float offset[4]);
 
 /**
  * Prepare for a draw call using a programmable vertex shader.
