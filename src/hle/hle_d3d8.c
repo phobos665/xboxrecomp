@@ -253,9 +253,9 @@ static void shadow_create(uint32_t pp_va)
     g_shadow_width = width;
     g_shadow_height = height;
 
-    /* Render states are not forwarded yet, so choose ones that show geometry
-     * rather than hide it: nothing culled, no lighting (an unlit vertex keeps
-     * its own colour), no texture. */
+    /* Until the first draw applies the title's own states: nothing culled and
+     * no texture. Lighting stays off for good (hle_d3d8_state.c): lights and
+     * the material are not forwarded, and an unlit vertex keeps its colour. */
     g_shadow->lpVtbl->SetRenderState(g_shadow, D3DRS_CULLMODE, D3DCULL_NONE);
     g_shadow->lpVtbl->SetRenderState(g_shadow, D3DRS_LIGHTING, FALSE);
     g_shadow->lpVtbl->SetTexture(g_shadow, 0, NULL);
@@ -403,6 +403,9 @@ static UINT fvf_stride(DWORD fvf)
     return size;
 }
 
+/* hle_d3d8_state.c */
+void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev);
+
 static unsigned long g_draws_up, g_draws_indexed_up, g_draws_program,
                      g_draws_declaration, g_draws_unknown_vs, g_draws_stride,
                      g_draws_primitive, g_draws_failed;
@@ -443,6 +446,9 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
         g_draws_stride++;
         return 0;
     }
+    /* The title's render and texture stage states as they stand now, read
+     * from its own state arrays (hle_d3d8_state.c). */
+    hle_d3d8_shadow_apply_states(g_shadow);
     return 1;
 }
 

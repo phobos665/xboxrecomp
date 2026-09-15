@@ -322,11 +322,21 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     state->viewport.MinZ = 0.0f;
     state->viewport.MaxZ = 1.0f;
 
-    /* Default texture stage states:
-     * By default each stage reads its own texcoord set (0,1,2,3). */
+    /* Default texture stage states, as D3D8 documents them: stage 0
+     * modulates texture by diffuse, later stages are off, arguments are
+     * TEXTURE then CURRENT, and each stage reads its own texcoord set.
+     * They must be real values rather than 0: 0 is D3DTA_DIFFUSE, a valid
+     * argument, so the pixel shader setup cannot treat 0 as "unset". */
     memset(state->tss, 0, sizeof(state->tss));
-    for (int s = 0; s < MAX_TEXTURE_STAGES; s++)
+    for (int s = 0; s < MAX_TEXTURE_STAGES; s++) {
+        state->tss[s][D3DTSS_COLOROP]       = s == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+        state->tss[s][D3DTSS_COLORARG1]     = D3DTA_TEXTURE;
+        state->tss[s][D3DTSS_COLORARG2]     = D3DTA_CURRENT;
+        state->tss[s][D3DTSS_ALPHAOP]       = s == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+        state->tss[s][D3DTSS_ALPHAARG1]     = D3DTA_TEXTURE;
+        state->tss[s][D3DTSS_ALPHAARG2]     = D3DTA_CURRENT;
         state->tss[s][D3DTSS_TEXCOORDINDEX] = (DWORD)s;
+    }
 
     /* Identity matrices */
     for (int i = 0; i < MAX_TRANSFORMS; i++) {

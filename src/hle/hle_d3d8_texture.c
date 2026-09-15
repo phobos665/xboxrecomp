@@ -280,6 +280,28 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     return e->host;
 }
 
+/* 1x1 opaque white, created once, never evicted. */
+static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev)
+{
+    static IDirect3DTexture8 *white;
+    static int tried;
+    D3DLOCKED_RECT lr;
+
+    if (white || tried)
+        return white;
+    tried = 1;
+    if (FAILED(dev->lpVtbl->CreateTexture(dev, 1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8,
+                                          D3DPOOL_MANAGED, &white)) || !white) {
+        white = NULL;
+        return NULL;
+    }
+    if (SUCCEEDED(white->lpVtbl->LockRect(white, 0, &lr, NULL, 0))) {
+        memset(lr.pBits, 0xFF, 4);
+        white->lpVtbl->UnlockRect(white, 0);
+    }
+    return white;
+}
+
 static void report(void)
 {
     static DWORD last;
@@ -328,7 +350,14 @@ HLE_EXPORT(D3DDevice_SetTexture)
         if (texture)
             host = host_texture(dev, texture);
         g_bound[stage] = host;
-        dev->lpVtbl->SetTexture(dev, stage, (IDirect3DBaseTexture8 *)host);
+        /* The host pixel shader samples every stage whatever its operation
+         * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
+         * stage with no host texture would turn the draw black once the
+         * title's own texture operations are forwarded. It gets opaque white
+         * instead. That a missing Xbox texture contributes white is assumed,
+         * not verified against hardware. */
+        dev->lpVtbl->SetTexture(dev, stage,
+                                (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
         g_bound_count++;
         report();
     }
