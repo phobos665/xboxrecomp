@@ -380,6 +380,27 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
 #define XBOX_CONTIG_BASE 0x80000000u
 #define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
 
+/* Low physical memory the bump allocator must not hand out.
+ *
+ * MmAllocateContiguousMemory returning physical page 0 is not something real
+ * hardware does -- the low pages belong to the kernel, and titles know it well
+ * enough to park fixed structures there. Burnout 2's XPP library owns
+ * 0x80000000-0x80001000 outright: it carves that page with its own bump
+ * allocator (`mov ebx, 0x80001000; sub ebx, [0x28C160]`, counter initialised
+ * to 0xFE0) and poisons each block it hands out with 0xCCCCCCCC.
+ *
+ * Starting our arena at the window base put both allocators on the same page.
+ * The title built a free list there, XPP's next allocation poisoned the link
+ * fields, and the following pop dereferenced 0xCCCCCCCC. Reserving the low
+ * region costs 1.5% of the window and removes the whole class: any title that
+ * assumes it owns a fixed low physical page now gets to.
+ *
+ * Allocations that name an explicit physical address go through
+ * MmAllocateContiguousMemoryEx, which honours the request directly and is not
+ * affected by this.
+ */
+#define XBOX_CONTIG_RESERVED_LOW (1u * 1024u * 1024u)
+
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
 
@@ -1006,9 +1027,57 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
 
+/* The factory block. Written at manufacture, read-only to a title, and
+ * numbered separately from the user settings above -- so a switch that only
+ * covers 0x00-0x12 answers every one of these from its default arm. Zeroed
+ * defaults are not harmless here: a title ANDs its own certificate region
+ * against XC_FACTORY_GAME_REGION and refuses to run when the result is empty,
+ * which zero always is. */
+#define XC_FACTORY_START_INDEX    0x100
+#define XC_FACTORY_SERIAL_NUMBER  0x100
+#define XC_FACTORY_ETHERNET_ADDR  0x101
+#define XC_FACTORY_ONLINE_KEY     0x102
+#define XC_FACTORY_AV_REGION      0x103
+#define XC_FACTORY_GAME_REGION    0x104
+#define XC_FACTORY_MAX_INDEX      0x104
+
+/* XC_FACTORY_GAME_REGION, and the same bits the XBE certificate uses at
+ * certificate+0xA0 -- the comparison is a bitwise AND, so the two enums are
+ * deliberately identical. */
+#define XC_GAME_REGION_NA            0x00000001
+#define XC_GAME_REGION_JAPAN         0x00000002
+#define XC_GAME_REGION_RESTOFWORLD   0x00000004
+#define XC_GAME_REGION_MANUFACTURING 0x80000000
+
+/* XC_FACTORY_AV_REGION, the EEPROM VideoStandard field. */
+#define XC_AV_STANDARD_NTSC_M     0x00400100
+#define XC_AV_STANDARD_NTSC_J     0x00400200
+#define XC_AV_STANDARD_PAL_I      0x00800300
+
+/* Game region the XBE certificate allows, as parsed during layout init, or 0
+ * if there was no mapped XBE to read it from. */
+uint32_t xbox_kernel_get_xbe_game_region(void);
+
+/* Walk the contiguous allocations, oldest first. Returns 0 past the end. */
+int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size);
+void     xbox_kernel_set_xbe_game_region(uint32_t region);
+
 /* Older spellings kept so existing call sites still build. */
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
 #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
+
+/* Channel configuration and encoder flags in XC_AUDIO.
+ *
+ * The channel count is a small enum in the low bits, and stereo is zero --
+ * so 1 is mono, not stereo. The encoder bits advertise what the console can
+ * send down the digital output, and a title that sees them will ask its
+ * mixer for an encoded stream.
+ */
+#define XC_AUDIO_FLAGS_STEREO       0x00000000
+#define XC_AUDIO_FLAGS_MONO         0x00000001
+#define XC_AUDIO_FLAGS_SURROUND     0x00000002
+#define XC_AUDIO_FLAGS_ENABLE_AC3   0x00010000
+#define XC_AUDIO_FLAGS_ENABLE_DTS   0x00020000
 
 /* Video standard flags in XC_VIDEO */
 #define XC_VIDEO_FLAGS_WIDESCREEN   0x01

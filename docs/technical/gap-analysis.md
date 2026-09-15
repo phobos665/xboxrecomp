@@ -16,9 +16,9 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 |---------|------|-----------|--------|----------|
 | NV2A register read/write (PMC, PFB, PTIMER, etc.) | Full | Full | DONE | - |
 | MMIO interception (VEH-based) | N/A (LLE) | Full | DONE | - |
-| Push buffer parsing (PFIFO DMA pusher) | Full | Stub | N/A | Low (D3D8 API intercept instead) |
-| PGRAPH → D3D11 method translator | N/A | From burnout3 | ADDED | High |
-| Push buffer replay | N/A | From burnout3 | ADDED | Medium |
+| Push buffer parsing (PFIFO DMA pusher) | Full | Decoder in `src/kernel/nv2a_pb_exec.c` (36 of 215 NV097 methods) | PARTIAL | Kept as a diagnostic and as the LLE fallback for titles that hand-roll push buffers; not the rendering path |
+| PGRAPH → D3D11 method translator | N/A | **Removed Sep 2026** | DROPPED | Handled 21 methods, discarded transform programs, constants, vertex formats and combiners; zero commits in this fork |
+| Push buffer replay | N/A | **Removed Sep 2026** | DROPPED | Replayed committed Burnout 3 menu captures against the removed translator |
 | **Register combiners (pixel shaders)** | Full (8 stages, RGB/alpha, final combiner) | Full (8 stages, HLSL generation, 128-entry cache) | DONE | - |
 | **Vertex shader microcode translation** | Full (MAC+ILU ops, 192 constants, 12 temps) | Full (d3d8_vsh.c: parser, HLSL gen, 64-entry cache) | DONE | - |
 | **Texture unswizzling (Z-order/Morton)** | Full | Full | ADDED | High |
@@ -65,7 +65,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Memory management (147 ordinals) | DONE | Win32 heap backend |
+| Memory management | DONE | Win32 heap backend |
 | File I/O with path translation | DONE | Xbox paths → host filesystem |
 | Threading | DONE | Single-thread cooperative model |
 | Synchronization (events, semaphores, waits) | DONE | Win32 primitives |

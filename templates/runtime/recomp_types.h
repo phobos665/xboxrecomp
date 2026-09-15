@@ -60,6 +60,9 @@
  * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
  * missing stdlib.h in kernel_bridge.c, in a hotter path. */
 #include <math.h>
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
@@ -282,6 +285,18 @@ void recomp_icall_fail_log(uint32_t va);
  * vtable call into an unexplained hang. */
 void recomp_icall_not_code_log(uint32_t va);
 
+/* Report a direct call or jump into an address that was never recompiled --
+ * the generated stub in recomp_stubs_unresolved.c. The stub keeps esp
+ * balanced and does nothing else, so whatever the guest code there would have
+ * done is skipped. Once per address, from the runtime, so every title gets it
+ * without touching its recomp_manual.c.
+ *
+ * Burnout 2's sound manager constructor was one of these: reached only by a
+ * static initialiser's tail jump, never discovered, and so never run. A field
+ * it should have set stayed null, and the game crashed a minute later in an
+ * unrelated-looking Pause. */
+void recomp_stub_missing(uint32_t va);
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen
@@ -337,6 +352,7 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+#define MEM64(addr)  (*(volatile uint64_t *)XBOX_PTR(addr))
 
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
@@ -754,24 +770,46 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * call through this macro, which expands to a plain call when the flag is
  * off. That matters because CRT and static-initialiser paths -- where these
  * clobbers actually bite -- are almost entirely direct calls.
- * Generated code emits a direct call as a plain C call to the symbol, with no
- * macro to hook, so a direct callee that clobbers these registers is invisible
- * here. That matters more than it sounds -- CRT and static-initialiser paths
- * are almost entirely direct calls, so this found nothing at all on Half-Life
- * 2's static init, where the clobber demonstrably exists. It is the right tool
- * for vtable-dispatch-heavy code and the wrong one for early boot.
+ * (An earlier note here said direct calls were a plain C call with no macro to
+ * hook, and concluded this was the wrong tool for early boot. That stopped
+ * being true when tools/recomp started routing every direct call through
+ * RECOMP_ABI_CALL. Early boot is now exactly where it earns its keep.)
+ *
+ * Build note: define RECOMP_ABI_CHECK for the runtime libraries too, not only
+ * for the generated game code. The check is emitted into generated code but
+ * recomp_abi_violation_log() is compiled into xbox_kernel, so setting it on the
+ * game target alone produces the calls without the callee and fails to link.
+ * The game template does this with a directory-scope add_compile_definitions()
+ * placed before add_subdirectory().
  */
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
+void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                                  uint32_t edi0, uint32_t esp0, uint32_t pop);
 #define RECOMP_ABI_CALL(va, fn) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
     (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
+/* A direct call whose callee's own `ret N` is known (tools/recomp reads it
+ * from the callee's bytes). Then esp has exactly one right value afterwards,
+ * so a stack that comes back too HIGH -- invisible to the one-sided check
+ * above -- is caught at the call that did it rather than frames later.
+ * Burnout 2's CDirectSoundBuffer_GetStatus came back 8 high once in 4.5
+ * million calls, rotated its caller's saved registers, and the title crashed
+ * three frames up with a code address used as an object. */
+#define RECOMP_ABI_CALL_POP(va, fn, pop) do { \
+    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
+    (fn)(); \
+    if (g_ebx != _ab || g_esi != _as || g_edi != _ad || \
+        g_esp != _ap + 4 + (pop)) \
+        recomp_abi_pop_violation_log((va), _ab, _as, _ad, _ap, (pop)); \
+} while(0)
 #else
 #define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_POP(va, fn, pop) (fn)()
 #endif
 
 /**
@@ -909,21 +947,20 @@ extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 
-/* cvtps2pi / cvttps2pi: the low two packed singles of an SSE register or of a
- * 64-bit memory operand become two signed dwords in an MMX register. The
- * rounding form follows the current rounding mode, round-to-nearest everywhere
- * these titles use it; the truncating form is what a C cast already does.
- *
- * An input that is NaN or outside int32 gives the "integer indefinite" value
- * on hardware, where the C cast is undefined -- and a video decoder pushing
- * coefficients through this reaches that edge often enough to matter. */
+/* CVTPS2PI follows MXCSR; CVTTPS2PI truncates regardless of its rounding mode.
+ * Use SSE scalar conversions to avoid touching the host x87/MMX register file.
+ * Non-x86 hosts use their floating-point environment for rounding instead. */
 static inline int32_t MMX_CVT_F2I(float v, int truncate)
 {
-    if (!(v >= -2147483648.0f && v <= 2147483647.0f))
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttss_si32(_mm_set_ss(v))
+                    : _mm_cvtss_si32(_mm_set_ss(v));
+#else
+    double rounded = truncate ? trunc((double)v) : nearbyint((double)v);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
         return (int32_t)0x80000000u;       /* integer indefinite */
-    if (truncate)
-        return (int32_t)v;
-    return (int32_t)(v < 0.0f ? v - 0.5f : v + 0.5f);
+    return (int32_t)rounded;
+#endif
 }
 
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
@@ -932,6 +969,17 @@ static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
     r.d[0] = MMX_CVT_F2I(lo, truncate);
     r.d[1] = MMX_CVT_F2I(hi, truncate);
     return r;
+}
+
+/** cvtpi2ps: two signed dwords in, two singles out, into the LOW half of the
+ * destination -- lanes 2 and 3 keep whatever they held. That detail is the
+ * whole instruction: code that builds a float4 from two of these relies on
+ * the first one surviving the second. */
+static inline RecompXmm XMM_FROM_PI(RecompXmm dst, RecompMmx src)
+{
+    dst.f[0] = (float)src.d[0];
+    dst.f[1] = (float)src.d[1];
+    return dst;
 }
 
 static inline RecompMmx MMX_MEM(uint32_t addr) {
@@ -959,6 +1007,10 @@ static inline uint8_t recomp_sat_u8(int32_t v) {
     return (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
 }
 
+static inline uint16_t recomp_sat_u16(int32_t v) {
+    return (uint16_t)(v > 65535 ? 65535 : (v < 0 ? 0 : v));
+}
+
 /* -- integer arithmetic, lane-wise, wrapping -------------------- */
 #define RECOMP_MMX_BINOP(NAME, LANES, FIELD, EXPR)                      \
     static inline RecompMmx NAME(RecompMmx a, RecompMmx b) {            \
@@ -981,6 +1033,10 @@ RECOMP_MMX_BINOP(MMX_PADDUSB, 8, ub,
                  recomp_sat_u8((int32_t)a.ub[i] + b.ub[i]))
 RECOMP_MMX_BINOP(MMX_PSUBUSB, 8, ub,
                  recomp_sat_u8((int32_t)a.ub[i] - b.ub[i]))
+RECOMP_MMX_BINOP(MMX_PADDUSW, 4, uw,
+                 recomp_sat_u16((int32_t)a.uw[i] + b.uw[i]))
+RECOMP_MMX_BINOP(MMX_PSUBUSW, 4, uw,
+                 recomp_sat_u16((int32_t)a.uw[i] - b.uw[i]))
 RECOMP_MMX_BINOP(MMX_PMULLW, 4, w, (int16_t)((int32_t)a.w[i] * b.w[i]))
 RECOMP_MMX_BINOP(MMX_PMULHW, 4, w, (int16_t)(((int32_t)a.w[i] * b.w[i]) >> 16))
 RECOMP_MMX_BINOP(MMX_PAVGB, 8, ub, (uint8_t)(((int32_t)a.ub[i] + b.ub[i] + 1) >> 1))

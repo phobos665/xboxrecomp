@@ -22,6 +22,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+/* malloc: without <stdlib.h> its pointer is truncated to int. */
+#include <stdlib.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -156,6 +158,10 @@ static const char g_vs_source[] =
     "        o.pos.y = 1.0 - (input.pos.y / ScreenSize.y) * 2.0;\n"
     "        o.pos.z = input.pos.z;\n"
     "        o.pos.w = 1.0;\n"
+    /* Recover clip W for perspective interpolation without changing screen XYZ.
+     * RHW = 0 is degenerate and titles do emit it for 2D overlays that do not
+     * care; dividing by it culls the whole quad, so leave those alone. */
+    "        if (input.pos.w != 0.0) o.pos /= input.pos.w;\n"
     "        o.tex0 = input.tex0.xyz;\n"
     "        o.tex1 = input.tex1.xyz;\n"
     "        o.tex2 = input.tex2.xyz;\n"
@@ -626,8 +632,10 @@ static int g_layout_cache_count = 0;
  * Each set uses 2 bits at bit position (16 + t*2); 0 means default (2). */
 static UINT fvf_texcoord_size(DWORD fvf, UINT t)
 {
-    DWORD field = (fvf >> (16 + t * 2)) & 0x3;
-    return field == 0 ? 2 : field;
+    /* D3DFVF_TEXTUREFORMAT1..4 are 3, 0, 1, 2 on both the PC and the Xbox
+     * (Cxbx-Reloaded, XbD3D8Types.h), so the field is not the count. */
+    static const UINT floats[4] = { 2, 3, 4, 1 };
+    return floats[(fvf >> (16 + t * 2)) & 0x3];
 }
 
 /*
@@ -1173,13 +1181,15 @@ void d3d8_shaders_prepare_draw(DWORD handle)
             if (colorop == 0) colorop = (stage == 0) ? D3DTOP_MODULATE : D3DTOP_DISABLE;
 
             pc->stage_color[stage][0] = colorop;
-            pc->stage_color[stage][1] = tss[D3DTSS_COLORARG1] ? tss[D3DTSS_COLORARG1] : D3DTA_TEXTURE;
-            pc->stage_color[stage][2] = tss[D3DTSS_COLORARG2] ? tss[D3DTSS_COLORARG2] : D3DTA_CURRENT;
+            /* Arguments are taken as set: 0 is D3DTA_DIFFUSE, and the device
+             * starts with the D3D8 defaults (d3d8_init_default_states). */
+            pc->stage_color[stage][1] = tss[D3DTSS_COLORARG1];
+            pc->stage_color[stage][2] = tss[D3DTSS_COLORARG2];
             pc->stage_color[stage][3] = tss[D3DTSS_ALPHAOP] ? tss[D3DTSS_ALPHAOP] :
                                          (stage == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE);
 
-            pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1] ? tss[D3DTSS_ALPHAARG1] : D3DTA_TEXTURE;
-            pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2] ? tss[D3DTSS_ALPHAARG2] : D3DTA_CURRENT;
+            pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1];
+            pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2];
         }
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);

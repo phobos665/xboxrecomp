@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # Xbox Kernel Replacement Layer
-# Replaces 147 Xbox kernel imports with Win32 equivalents.
+# Replaces Xbox kernel imports with Win32 equivalents.
 # Memory layout, file I/O, threading, synchronization, crypto, HAL.
 
 set(KERNEL_SOURCES
@@ -24,6 +24,7 @@ set(KERNEL_SOURCES
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+    nv2a_vsh.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -48,7 +49,7 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- $<$<NOT:$<CONFIG:Debug>>:/O2> /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)

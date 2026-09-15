@@ -57,13 +57,47 @@ _COD_ENDP = re.compile(r"^(\S+)\s+ENDP\b")
 
 
 def _find_vcvars():
+    """Locate vcvars32.bat for any installed Visual Studio.
+
+    vswhere is Microsoft's supported discovery mechanism and ships with every
+    VS installer since 2017, so ask it first. Hardcoding a version directory
+    finds nothing on a machine whose C++ toolset came from a different release
+    -- a Build Tools install can sit under a version directory like 18, in a
+    BuildTools edition, and not under "2022" at all.
+    """
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if os.path.exists(vswhere):
+        try:
+            out = subprocess.run(
+                [vswhere, "-latest", "-products", "*",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                capture_output=True, text=True, timeout=30)
+            for line in out.stdout.splitlines():
+                root = line.strip()
+                if not root:
+                    continue
+                p = os.path.join(root, "VC", "Auxiliary", "Build", "vcvars32.bat")
+                if os.path.exists(p):
+                    return p
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Fallback: walk the install roots ourselves, newest version directory
+    # first, in case vswhere is missing or reports nothing usable.
     for root in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                  os.environ.get("ProgramFiles", r"C:\Program Files")):
-        for ed in ("Community", "Professional", "Enterprise", "BuildTools"):
-            p = os.path.join(root, "Microsoft Visual Studio", "2022", ed,
-                             "VC", "Auxiliary", "Build", "vcvars32.bat")
-            if os.path.exists(p):
-                return p
+        base = os.path.join(root, "Microsoft Visual Studio")
+        if not os.path.isdir(base):
+            continue
+        for version in sorted(os.listdir(base), reverse=True):
+            for ed in ("Community", "Professional", "Enterprise", "BuildTools", ""):
+                p = os.path.join(base, version, ed,
+                                 "VC", "Auxiliary", "Build", "vcvars32.bat")
+                if os.path.exists(p):
+                    return p
     return None
 
 

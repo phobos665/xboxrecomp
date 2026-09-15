@@ -1,0 +1,4 @@
+[submodule "third_party/XbSymbolDatabase"]
+	path = third_party/XbSymbolDatabase
+	url = https://github.com/Cxbx-Reloaded/XbSymbolDatabase.git
+	ignore = untracked

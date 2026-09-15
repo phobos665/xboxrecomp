@@ -23,7 +23,28 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers)
+                     detect_setjmp_helpers, _func_ident)
+
+
+def write_if_changed(path, text):
+    """Write text to path only when it differs from what is already there.
+
+    Every regen rewrites all 54 chunks of generated C. If the bytes are
+    identical the mtime bump still forces the compiler to redo the whole
+    365 MB at /O2, which is minutes of a saturated box for a one-function
+    change. Comparing first makes an unchanged chunk free.
+
+    Returns True if the file was written.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True
 
 
 def _fixup_icall_esp_save(lines):
@@ -43,24 +64,50 @@ def _fixup_icall_esp_save(lines):
     caller corruption. Leaving an argument behind is the mirror image, and
     shifts the epilogue the other way.
 
-    Push and pop counts separate them. A register popped at least as often as
-    it is pushed is restored on every path out, so a push of it is a save and
-    the argument run ends there -- "at least", not "exactly", because a
-    function with several epilogues pops once per return path. A register
-    pushed more often than it is popped has a push nobody restores -- an
-    argument -- and the run absorbs it as before.
+    A register the function never pops is never restored, so every push of it
+    is an argument. For one it does pop, position decides: **the first push of
+    that register is the save, and any later push of it is an argument.** A
+    prologue saves before it does anything else, so the earliest push is the
+    one the epilogue answers; a second push of the same register is the
+    function passing its value along.
 
-    Where that is still ambiguous, stopping early is the safer error: it
-    under-rewinds, which surfaces as the detectable "epilogue never ran" leak,
-    rather than as a caller silently carrying a wrong register.
+    Two shapes from real titles pin this down, and each defeats one of the
+    simpler rules tried before:
+
+      sub_00135265  edi saved in the prologue, pushed again as an argument to
+                    a virtual call, popped once. "A register the function pops
+                    anywhere ends the run" stops at the *argument* push and
+                    leaves it outside the rewind window, which shifts the
+                    epilogue and returns esi and edi swapped.
+
+      sub_000EC240  esi saved once, passed as an argument twice more, popped in
+                    each of two epilogues: three pushes against two pops.
+                    Comparing push and pop *counts* reads that as "more pushes
+                    than pops, therefore an argument", swallows the save into
+                    the argument run, and a failed lookup rewinds g_esp past
+                    the saved esi so the epilogue pops the wrong slot. The
+                    caller gets back a corrupt `this` and faults several frames
+                    later -- the silent corruption this exists to prevent.
+
+    First-push-is-the-save satisfies both, because in both the save is simply
+    the earliest one.
+
+    Where it is still ambiguous, erring toward "save" is the safe direction:
+    stopping early under-rewinds, which surfaces as the detectable "epilogue
+    never ran" leak, where stopping late corrupts a caller silently.
     """
     import re
-    saves = tuple(
-        "PUSH32(esp, %s)" % reg
-        for reg in ("ebx", "esi", "edi", "ebp")
-        if 0 < sum("PUSH32(esp, %s)" % reg in line for line in lines)
-        <= sum("POP32(esp, %s)" % reg in line for line in lines)
-    )
+    # For each callee-saved register the function actually pops, the index of
+    # its earliest push -- that push, and only that push, is the frame save.
+    save_push_idx = {}
+    for reg in ("ebx", "esi", "edi", "ebp"):
+        if not any("POP32(esp, %s)" % reg in line for line in lines):
+            continue                      # never restored: all pushes are args
+        token = "PUSH32(esp, %s)" % reg
+        for i, line in enumerate(lines):
+            if line.strip().startswith(token):
+                save_push_idx[i] = reg
+                break
     result = []
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
@@ -92,9 +139,11 @@ def _fixup_icall_esp_save(lines):
             # g_esp over a call that had already returned.
             if '/* call 0x' in stripped:
                 break
-            # A saved callee-saved register belongs to this function's frame,
-            # not to the call's arguments; the run ends here.
-            if any(stripped.startswith(save) for save in saves):
+            # The frame save of a callee-saved register belongs to this
+            # function, not to the call's arguments, so the run ends there.
+            # A *later* push of the same register is an argument and is
+            # absorbed like any other.
+            if j in save_push_idx:
                 break
             # Check if this is a PUSH32 line (arg push)
             if stripped.startswith('PUSH32(esp,'):
@@ -116,7 +165,39 @@ def _fixup_icall_esp_save(lines):
             j -= 1
             continue
 
-        insert_before.add(first_push_idx)
+        # Which convention is this call site? A caller that cleans the
+        # arguments itself is cdecl, and the generated code says so plainly:
+        # an "esp = esp + N" follows the call, usually just past the return
+        # label.
+        #
+        # It decides where the capture belongs, because RECOMP_ICALL_SAFE
+        # rewinds g_esp to it when the lookup fails:
+        #
+        #   stdcall  the callee would have cleaned the arguments, so the
+        #            failure path must clean them -- capture above the pushes.
+        #   cdecl    the caller cleans them a few lines later regardless, so
+        #            capturing above the pushes cleans them twice. Capture
+        #            below them instead and the failure path pops only the
+        #            return address, leaving the caller's own add to do its
+        #            job.
+        #
+        # Burnout 2's sub_000E8C30 makes three cdecl indirect calls with four
+        # arguments each. Two of them failed, and 16 bytes cleaned twice per
+        # call put esp 32 bytes high, which its caller's epilogue then popped
+        # esi from -- handing the caller a corrupt `this` several frames from
+        # anything that looked wrong.
+        caller_cleans = False
+        k = icall_idx + 1
+        while k < len(lines) and k <= icall_idx + 6:
+            probe = lines[k].strip()
+            if not probe or re.match(r'^loc_[0-9A-Fa-f]+:', probe):
+                k += 1
+                continue
+            if re.match(r'^esp = esp \+ (0x[0-9A-Fa-f]+|\d+);$', probe):
+                caller_cleans = True
+            break
+
+        insert_before.add(icall_idx if caller_cleans else first_push_idx)
 
     # Build result with saves inserted
     for i, line in enumerate(lines):
@@ -182,7 +263,7 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None):
+                 trace_functions=None, trace_all_entries=False):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
@@ -197,6 +278,12 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
+        # Emit an entry hook in *every* function, so the profiler can report
+        # how many distinct functions a run reached. That count is the only
+        # frontier measure here that rises monotonically with progress: kernel
+        # calls plateau once startup is done, and a raw indirect-call count is
+        # inflated by whichever loop happens to be spinning.
+        self.trace_all_entries = bool(trace_all_entries)
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
@@ -501,6 +588,19 @@ class FunctionTranslator:
 
         backward = scan(-1, 1)
         forward = scan(1, 0)
+        # An index that never takes the low values: MSVC's memcpy trail
+        # dispatch `jmp [eax*4 + tbl]` has eax 1..3, and slot 0 holds the next
+        # instruction's bytes. Same rule as DisasmEngine.resync_jump_tables --
+        # without it the dispatch lifts as a runtime jump and its first case
+        # (Burnout 2's 0x0011F1AC) fails to resolve. The switch matches by
+        # value, so a missing slot costs nothing.
+        if not backward and not forward:
+            for skip in (1, 2, 3):
+                forward = scan(1, skip)
+                if len(forward) >= 2:
+                    break
+            else:
+                forward = []
         if len(backward) + len(forward) < 2:
             return []
         backward.reverse()
@@ -544,6 +644,8 @@ class FunctionTranslator:
                 cc = m[1:]
             elif m.startswith("set"):
                 cc = m[3:]
+            elif m.startswith("cmov") and len(m) > 4:
+                cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
                     and last_setter in CF_TRACKED):
                 return True
@@ -600,7 +702,7 @@ class FunctionTranslator:
         if end <= start:
             return None
 
-        name = func_info.get("name", f"sub_{start:08X}")
+        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
 
         # Read bytes from XBE
@@ -620,8 +722,30 @@ class FunctionTranslator:
         if not instructions:
             return None
 
+        # Addresses this function loads as immediates into a register and
+        # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
+        # chain inside one function, and its targets need labels for the
+        # goto the lifter emits -- see _lift_jmp. Restricted to functions
+        # that actually contain a register-operand indirect jmp, so a plain
+        # `mov reg, <address of a function>` for a callback does not start
+        # splitting blocks everywhere.
+        imm_refs = set()
+        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
+               and insn.operands[0].type == "reg" for insn in instructions):
+            for insn in instructions:
+                if insn.mnemonic != "mov" or len(insn.operands) < 2:
+                    continue
+                if insn.operands[0].type != "reg":
+                    continue
+                if insn.operands[1].type != "imm":
+                    continue
+                value = insn.operands[1].imm
+                if start <= value < end:
+                    imm_refs.add(value)
+        self.lifter.imm_code_refs = imm_refs
+
         # Collect switch table targets as extra block leaders
-        switch_leaders = set()
+        switch_leaders = set(imm_refs)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 targets = self.lifter._analyze_switch_table(insn.operands)
@@ -761,7 +885,7 @@ class FunctionTranslator:
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding
         # a function loses the body you were trying to observe.
-        if start in self.trace_functions:
+        if start in self.trace_functions or self.trace_all_entries:
             lines.append(
                 f'    RECOMP_TRACE_ENTER("{name}", 0x{start:08X});')
         # Entry tracing shows what went in; it cannot show what came back, and
@@ -847,10 +971,11 @@ class FunctionTranslator:
         #
         # adc/sbb read CF directly, and so does a jb/jae whose flags came from
         # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
-        # XCompress code are nothing but "add reg,reg" followed by jae. Which
-        # setter a branch reads is the lifter's tracking rule, mirrored here so
-        # only the functions that consume CF declare it: computing it beside
-        # every add in the image would be a line per add in 48,000 functions.
+        # XCompress code are nothing but "add reg,reg" followed by jae, and a
+        # cmovb/cmovae after an add reads the same carry. Which setter a branch
+        # reads is the lifter's tracking rule, mirrored here so only the
+        # functions that consume CF declare it: computing it beside every add
+        # in the image would be a line per add in 48,000 functions.
         has_carry = self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
@@ -900,6 +1025,7 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
+        label_addrs |= imm_refs
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
@@ -1062,7 +1188,7 @@ class BatchTranslator:
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
-                 trace_functions=None):
+                 trace_functions=None, trace_all_entries=False):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -1131,7 +1257,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=seh_prolog, seh_epilog=seh_epilog,
             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-            trace_functions=trace_functions)
+            trace_functions=trace_functions,
+            trace_all_entries=trace_all_entries)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 
@@ -1212,7 +1339,7 @@ class BatchTranslator:
 
         # Forward declarations
         for addr, func_info in func_list:
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             decl = self._make_declaration(addr, name)
             c_chunks.append(f"{decl};")
         c_chunks.append("")
@@ -1221,7 +1348,7 @@ class BatchTranslator:
 
         # Translate each function
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 100 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name} at 0x{addr:08X}...")
 
@@ -1282,7 +1409,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              keep_bodies=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -1299,6 +1427,12 @@ class BatchTranslator:
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
 
+        keep_bodies: {address: name} for manual addresses whose original body
+        is still wanted, under that name -- a replacement that runs the title's
+        own code first (tools/recomp/hle.py, HLE_ORIGINAL). The body is
+        compiled and declared, but kept out of the dispatch table, so the
+        address still resolves to the replacement.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -1308,6 +1442,8 @@ class BatchTranslator:
         func_list = [item for item in func_list
                      if item[0] not in self.translator.owned_function_starts]
         manual = set(manual or ())
+        keep_bodies = dict(keep_bodies or {})
+        kept_names = set(keep_bodies.values())
         # Hand the set to the lifter so a *direct* call to a replaced
         # function routes through recomp_lookup_manual too. Without this
         # the override only took effect through a function pointer, and
@@ -1325,15 +1461,21 @@ class BatchTranslator:
         }
 
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
                       file=sys.stderr)
 
             if addr in manual:
-                # Hand-written elsewhere: declare it, emit nothing.
+                # Hand-written elsewhere: declare it, emit nothing -- unless a
+                # replacement also runs the original, in which case the body
+                # is lifted under its own name and the address stays manual.
                 manual_decls[addr] = name
-                continue
+                keep = keep_bodies.get(addr)
+                if not keep:
+                    continue
+                func_info = dict(func_info, name=keep)
+                name = keep
 
             code = self.translator.translate_function(addr, func_info)
             if code:
@@ -1406,8 +1548,7 @@ class BatchTranslator:
 
         header_lines.extend(["", "#endif /* RECOMP_FUNCS_H */", ""])
 
-        with open(header_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(header_lines))
+        write_if_changed(header_path, "\n".join(header_lines))
 
         # recomp_types.h goes with it.
         #
@@ -1497,8 +1638,7 @@ class BatchTranslator:
             for addr, name, code in chunk:
                 c_lines.append(code)
 
-            with open(c_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(c_lines))
+            write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)
 
             if verbose:
@@ -1540,14 +1680,18 @@ class BatchTranslator:
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
+                # recomp_stub_missing runs first, while [esp] is still the
+                # return address, so the report names the caller. For a tail
+                # jump nothing was pushed, so it names the jumper's caller --
+                # one frame further up.
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"recomp_stub_missing(0x{addr:08X}u); "
+                    f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
 
-            with open(stub_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(stub_lines))
+            write_if_changed(stub_path, "\n".join(stub_lines))
             generated_files.append(stub_path)
 
             if verbose:
@@ -1566,7 +1710,9 @@ class BatchTranslator:
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
+            # A kept original is not the address's entry: the replacement is.
+            [t for t in translations if t[1] not in kept_names]
+            + [(addr, name, None)
                                   for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
@@ -1713,5 +1859,4 @@ class BatchTranslator:
             "",
         ])
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        write_if_changed(output_path, "\n".join(lines))

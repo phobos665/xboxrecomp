@@ -76,6 +76,30 @@ static void update_irq(MCPXAPUState *d)
     }
 }
 
+/* The APU's interrupt line, for the kernel's timer thread to deliver.
+ *
+ * update_irq() works out the line and hands it to pci_irq_assert(), which in
+ * this standalone build is an empty stub -- so the interrupt DirectSound's ISR
+ * is connected for (vector 6) was never raised. A voice switched off wrote its
+ * "done" notifier, set ISTS, and nothing told the guest. DirectSound only
+ * reads notifiers from that ISR, so a stopped buffer went on reporting
+ * PLAYING, and Burnout 2 waited on it forever at the start of its attract
+ * movie (IDirectSoundBuffer_GetStatus, 4.5 million polls).
+ *
+ * Recomputed here because set_notify_status() sets the source bits without
+ * calling update_irq(); the level is GINTSTS. Registered with the kernel by
+ * the host program (xbox_SetApuInterruptSource), so neither library links
+ * against the other. */
+int mcpx_apu_irq_pending(void)
+{
+    MCPXAPUState *d = g_state;
+
+    if (!d)
+        return 0;
+    update_irq(d);
+    return (qatomic_read(&d->regs[NV_PAPU_ISTS]) & NV_PAPU_ISTS_GINTSTS) != 0;
+}
+
 /* ============================================================
  * MMIO Read / Write
  * ============================================================ */

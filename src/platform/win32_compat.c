@@ -58,6 +58,12 @@ LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
     return cmp;
 }
 
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGLONG cmp)
+{
+    __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return cmp;
+}
+
 PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -117,6 +123,71 @@ VOID DeleteCriticalSection(LPCRITICAL_SECTION cs)
         free(cs->LockSemaphore);
         cs->LockSemaphore = NULL;
     }
+}
+
+/* ===================================================================== */
+/* Slim reader/writer locks                                              */
+/* ===================================================================== */
+
+/* An SRWLOCK is usable straight from SRWLOCK_INIT, so the pthread_rwlock_t
+ * behind it has to appear on first use. Unlike the condition variables below
+ * -- whose lazy init is covered by the caller holding the paired CRITICAL
+ * SECTION -- an SRWLOCK is by definition taken from several threads at once
+ * with nothing else held, so first use genuinely races. Serialise just that:
+ * once Ptr is published, every acquire is a plain atomic load. */
+static pthread_rwlock_t *srw_lazy_init(PSRWLOCK lock)
+{
+    pthread_rwlock_t *rw = __atomic_load_n((pthread_rwlock_t **)&lock->Ptr,
+                                           __ATOMIC_ACQUIRE);
+    if (!rw) {
+        static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&init_lock);
+        rw = (pthread_rwlock_t *)lock->Ptr;
+        if (!rw) {
+            rw = (pthread_rwlock_t *)malloc(sizeof(*rw));
+            pthread_rwlock_init(rw, NULL);
+            __atomic_store_n((pthread_rwlock_t **)&lock->Ptr, rw, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&init_lock);
+    }
+    return rw;
+}
+
+VOID InitializeSRWLock(PSRWLOCK lock)
+{
+    lock->Ptr = NULL;
+    srw_lazy_init(lock);
+}
+
+VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+
+/* ===================================================================== */
+/* One-time initialisation                                               */
+/* ===================================================================== */
+
+/* Win32 semantics: the callback runs at most once for a given INIT_ONCE, and
+ * a callback returning FALSE leaves it un-run so a later call retries. Ptr
+ * doubles as the "done" flag. One global mutex covers every INIT_ONCE --
+ * initialisation is rare, and the fast path never touches it. */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context)
+{
+    static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    if (__atomic_load_n(&once->Ptr, __ATOMIC_ACQUIRE))
+        return TRUE;
+
+    pthread_mutex_lock(&once_lock);
+    BOOL ok = TRUE;
+    if (!once->Ptr) {
+        ok = fn(once, param, context);
+        if (ok)
+            __atomic_store_n(&once->Ptr, (PVOID)1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&once_lock);
+    return ok;
 }
 
 /* ===================================================================== */
@@ -465,6 +536,23 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 {
     (void)name;
     return CreateEventA(sa, manualReset, initialState, NULL);
+}
+
+/* A waitable timer that is never armed is never signalled, which is exactly an
+ * event nobody sets. That is the whole of what the kernel bridge needs: it
+ * creates one for NtCreateTimer and cancels it for NtCancelTimer, and nothing
+ * calls SetWaitableTimer. */
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
+{
+    (void)name;
+    return CreateEventA(sa, manualReset, FALSE, NULL);
+}
+
+/* On Windows, cancelling a timer leaves its signal state alone. */
+BOOL CancelWaitableTimer(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    return (o && o->kind == K_EVENT) ? TRUE : FALSE;
 }
 
 BOOL SetEvent(HANDLE h)
@@ -1137,6 +1225,41 @@ DWORD GetFileSize(HANDLE h, LPDWORD high)
     if (fstat(fd, &st) != 0) return INVALID_FILE_SIZE;
     if (high) *high = (DWORD)(((uint64_t)st.st_size >> 32) & 0xFFFFFFFFu);
     return (DWORD)(st.st_size & 0xFFFFFFFFu);
+}
+
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
+{
+    int fd = w32_handle_fd(h);
+    if (fd < 0 || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
+}
+
+/* The kernel's asynchronous-read path saves and restores the host position
+ * around each read, because Windows advances a synchronous handle's pointer
+ * and the title then advances it again itself. A POSIX fd has the same
+ * shared offset, so the same save and restore is needed here. */
+BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER distance,
+                      PLARGE_INTEGER new_position, DWORD method)
+{
+    int fd = w32_handle_fd(h);
+    int whence;
+    off_t pos;
+
+    if (fd < 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    switch (method) {
+    case FILE_BEGIN:   whence = SEEK_SET; break;
+    case FILE_CURRENT: whence = SEEK_CUR; break;
+    case FILE_END:     whence = SEEK_END; break;
+    default:           SetLastError(ERROR_GEN_FAILURE); return FALSE;
+    }
+    pos = lseek(fd, (off_t)distance.QuadPart, whence);
+    if (pos == (off_t)-1) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    if (new_position)
+        new_position->QuadPart = (LONGLONG)pos;
+    return TRUE;
 }
 
 BOOL FlushFileBuffers(HANDLE h)

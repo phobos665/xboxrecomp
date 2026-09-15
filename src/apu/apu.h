@@ -27,6 +27,11 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
 
+/* Nonzero while the APU's interrupt line is asserted (ISTS.GINTSTS). Hand it
+ * to the kernel with xbox_SetApuInterruptSource() so the timer thread raises
+ * the title's APU ISR (vector 6); nothing else delivers it. */
+int mcpx_apu_irq_pending(void);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);
@@ -70,6 +75,66 @@ void apu_mixer_get_state(int slot, uint32_t *byte_offset, int *active, int *loop
 /* Start/resume or stop playback without changing the current position. */
 void apu_mixer_play(int slot, int looping);
 void apu_mixer_stop(int slot);
+
+
+/* ---- APU register aperture, and the fault handler that serves it ----
+ *
+ * The APU's 512 KB of registers are mapped PAGE_NOACCESS so that a guest
+ * access traps, and apu_hook_handle_mmio() decodes the faulting instruction,
+ * performs the read or write against the emulated APU, advances RIP past it
+ * and reports true. A host program installs a vectored exception handler and
+ * calls this for a fault inside the aperture; returning false means the
+ * instruction was not one the decoder knows, and the fault should be treated
+ * as a real crash.
+ *
+ * Declared here because it is the boundary between the runtime and a
+ * project's own main(): without a declaration the caller gets C89's implicit
+ * int and the bool comes back truncated.
+ */
+#define XBOX_APU_MMIO_BASE  0xFE800000u
+#define XBOX_APU_MMIO_SIZE  0x00080000u
+
+/* The emulated APU the fault handler serves from.
+ *
+ * NULL until mcpx_apu_init_standalone() runs, and apu_hook_handle_mmio()
+ * declines every access while it is -- silently, which is why trapping the
+ * aperture without creating the device turns each APU access into a crash
+ * with no APU log line to explain it.
+ */
+extern MCPXAPUState *g_apu_state;
+
+#ifdef _WIN32
+struct _CONTEXT;
+int apu_hook_handle_mmio(struct _CONTEXT *ctx, uintptr_t fault_addr,
+                         uint32_t fault_xbox_va, int is_write);
+
+/* Apply a guest write to the AC'97 page, dropping the DSP busy bit.
+ *
+ * That page is mapped PAGE_READONLY rather than PAGE_NOACCESS: the codec
+ * status is read constantly and must stay plain memory, while the DSP command
+ * bytes have to be caught at the moment they are written. So only writes
+ * fault, and only writes come here. mcpx_offset is measured from the MCPX
+ * aperture base, host_addr is where the page actually lives.
+ */
+int mcpx_ac97_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
+                           uint32_t mcpx_offset);
+
+/* Apply a guest write to an NV2A interrupt register with the semantics the
+ * hardware has: PCRTC_INTR_0 is write-1-to-clear and PMC_INTR_0 bit 24 is a
+ * summary of it, not storage. A driver acknowledging a vblank writes the one
+ * and spins on the other, so against plain memory it spins for ever.
+ *
+ * `aperture` is the host address the NV2A register window starts at; the
+ * handler needs both registers and only the faulting one's address is known.
+ *
+ * It lives beside the APU handler because that is where the x86-64 store
+ * decoder is, not because it has anything to do with audio.
+ */
+#define XBOX_NV2A_PCRTC_PAGE  0x00600000u   /* 0xFD600000, one 4 KB page */
+
+int nv2a_intr_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
+                           uint32_t nv2a_offset, uintptr_t aperture);
+#endif
 
 #ifdef __cplusplus
 }

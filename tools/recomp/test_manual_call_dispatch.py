@@ -124,3 +124,50 @@ def test_split_translation_passes_manual_set_to_lifter():
             functions, output_dir, manual={TARGET})
 
     assert batch.translator.seen_manual == {TARGET}
+
+
+def test_kept_original_is_lifted_once_and_left_out_of_dispatch():
+    import glob
+    import os
+
+    class FakeTranslator:
+        def __init__(self):
+            self.owned_function_starts = set()
+            self.lifter = Lifter()
+
+        def translate_function(self, addr, func_info):
+            return f"void {func_info['name']}(void) {{}}"
+
+    batch = BatchTranslator.__new__(BatchTranslator)
+    batch.translator = FakeTranslator()
+    functions = [
+        (0x00120000, {"name": "sub_00120000"}),
+        (TARGET, {"name": "sub_001E9100"}),
+    ]
+    kept = "sub_001E9100_hle_original"
+
+    with tempfile.TemporaryDirectory() as output_dir:
+        batch.translate_batch_split(
+            functions, output_dir, manual={TARGET},
+            keep_bodies={TARGET: kept})
+        sources = {}
+        for path in glob.glob(os.path.join(output_dir, "*")):
+            with open(path, encoding="utf-8") as fh:
+                sources[os.path.basename(path)] = fh.read()
+
+    chunks = "".join(text for name, text in sources.items()
+                     if name.endswith(".c") and not name.endswith("_dispatch.c"))
+    dispatch = next(text for name, text in sources.items()
+                    if name.endswith("_dispatch.c"))
+    # By name: the output folder holds other headers too (recomp_types.h), and
+    # glob order differs between Windows and Linux.
+    header = sources["recomp_funcs.h"]
+
+    # The body is emitted once, under its kept name, and never under the
+    # address's own name -- that one belongs to the replacement.
+    assert chunks.count(f"void {kept}(void) {{}}") == 1
+    assert "void sub_001E9100(void) {}" not in chunks
+    assert f"void {kept}(void);" in header
+    # The address dispatches to the replacement, never to the kept body.
+    assert "sub_001E9100 }" in dispatch
+    assert kept not in dispatch

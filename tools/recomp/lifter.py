@@ -14,11 +14,82 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import os
 import re
 import struct
 
 from .disasm import Instruction, Operand
 from .config import is_code_address, is_data_address, va_to_file_offset
+
+# Function export names of the Windows libraries the host exe links
+# (kernel32/user32/gdi32/advapi32/winmm/ws2_32/ole32/dbghelp/...). A guest
+# function that shares one of these names collides with the import at link
+# time (LNK2005) -- every Xbox-era game re-exports shims named like Win32
+# APIs (CreateThread, GetLastError, QueryPerformanceCounter, SetEvent, ...).
+# Generated from the x64 import libs of the Windows SDK with:
+#   Get-ChildItem "$env:WINSDK/Lib/*/um/x64" -Filter *.lib | ForEach-Object {
+#     & dumpbin /exports $_ }  # then keep the indent-only identifier lines
+_WIN32_EXPORTS = set()
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_WIN32_EXPORTS_FILE = os.path.join(_DATA_DIR, "win32_api_names.txt")
+if os.path.exists(_WIN32_EXPORTS_FILE):
+    with open(_WIN32_EXPORTS_FILE, encoding="ascii") as _f:
+        _WIN32_EXPORTS.update(line.strip() for line in _f if line.strip())
+
+
+# C identifiers a recompiled function name must not be: the generated TUs
+# include the C standard headers (math.h/string.h through recomp_types.h,
+# stdlib.h in the dispatch TU), and a recompiled image carries its own copies
+# of the CRT helpers -- Black has a function literally named `onexit`.
+# Emitting `void onexit(void);` next to UCRT's `onexit_t __cdecl onexit(
+# onexit_t)` is a redefinition with different type modifiers and cl fails with
+# C2373. The host Win32 export names are folded in too: the host exe links
+# kernel32.lib et al., and Xbox games re-export shims named exactly like the
+# APIs they wrap, so the same clash happens there for the linker. Mangle with
+# the address, the same suffixed-<addr> scheme func_id already uses for
+# duplicate names.
+_FUNC_RESERVED_IDENT = frozenset({
+    # C and C++ keywords
+    "asm", "auto", "break", "case", "char", "const", "continue",
+    "default", "do", "double", "else", "enum", "extern", "float",
+    "for", "goto", "if", "inline", "int", "long", "register",
+    "restrict", "return", "short", "signed", "sizeof", "static",
+    "struct", "switch", "typedef", "union", "unsigned", "void",
+    "volatile", "while",
+    # <string.h>
+    "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat",
+    "strchr", "strcmp", "strcoll", "strcpy", "strcspn", "strerror",
+    "strlen", "strncat", "strncmp", "strncpy", "strpbrk", "strrchr",
+    "strspn", "strstr", "strtok", "strxfrm",
+    # <math.h>
+    "acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp",
+    "fabs", "floor", "fmod", "frexp", "ldexp", "log", "log10", "modf",
+    "pow", "sin", "sinh", "sqrt", "tan", "tanh",
+    # <stdlib.h>
+    "abort", "abs", "atexit", "atof", "atoi", "atol", "bsearch",
+    "calloc", "div", "exit", "free", "getenv", "labs", "ldiv", "malloc",
+    "mblen", "mbstowcs", "mbtowc", "onexit", "qsort", "rand", "realloc",
+    "srand", "strtod", "strtol", "strtoul", "system", "wctomb",
+    "wcstombs",
+    # <setjmp.h>
+    "longjmp", "setjmp",
+    # Host Win32 API export names (data/win32_api_names.txt) so a guest
+    # function named like a linked import does not collide at link time.
+}) | _WIN32_EXPORTS
+
+
+def _func_ident(addr, name):
+    """C identifier for the recompiled function at addr.
+
+    Every place a func_db name becomes a C token -- the function definition,
+    its forward declaration, call sites and the dispatch table -- must agree,
+    or the link fails. Reserved names get the same ``_<addr>`` suffix func_id
+    already gives duplicate names.
+    """
+    base = name if name else f"sub_{addr:08X}"
+    if base in _FUNC_RESERVED_IDENT:
+        return f"{base}_{addr:08X}"
+    return base
 
 
 # ── Operand formatting ──────────────────────────────────────
@@ -309,9 +380,12 @@ _EFLAGS_PRESERVE = frozenset({
     "addpd", "subpd", "mulpd", "divpd",
     # SSE/MMX integer
     "movd", "movq", "movntq",
+    "cvtps2pi", "cvttps2pi", "pinsrw", "pextrw",
     "emms",
     "paddb", "paddw", "paddd", "paddq",
     "psubb", "psubw", "psubd",
+    "paddsb", "paddsw", "paddusb", "psubsb", "psubsw", "psubusb",
+    "pavgb", "pavgw", "pminsw", "pmaxsw", "psadbw",
     "pmullw", "pmulhw", "pmulhuw", "pmaddwd",
     "pand", "pandn", "por", "pxor",
     "pcmpeqb", "pcmpeqw", "pcmpeqd",
@@ -324,6 +398,7 @@ _EFLAGS_PRESERVE = frozenset({
     "punpckhbw", "punpckhwd", "punpckhdq", "punpckhqdq",
     "packsswb", "packssdw", "packuswb",
     "pmovmskb",
+    "paddusw", "psubusw",
     # String operations (without rep prefix)
     "stosb", "stosw", "stosd",
     "movsb", "movsw", "movsd",
@@ -954,6 +1029,8 @@ class Lifter:
         # The translator reports this at the end of a run, so the next one
         # costs a line of output instead of an afternoon.
         self.unimplemented = {}
+        # callee address -> the argument bytes its own `ret N` pops, or None.
+        self._pop_cache = {}
 
         # Detect if either is missing, so overriding one does not silently
         # leave the other unset -- that is the bug this whole path fixes.
@@ -966,6 +1043,9 @@ class Lifter:
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
+        # Addresses loaded as immediates into a register inside the current
+        # function, used to resolve `jmp <reg>`. See _lift_jmp.
+        self.imm_code_refs = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -983,6 +1063,7 @@ class Lifter:
             name = self.label_db[addr]
         else:
             name = f"sub_{addr:08X}"
+        name = _func_ident(addr, name)
         self.referenced_calls[addr] = name
         return name
 
@@ -1206,9 +1287,13 @@ class Lifter:
         # Dispatched on the operands rather than the mnemonic, because the
         # integer SIMD names are shared with SSE: `paddw mm0, mm1` and
         # `paddw xmm0, xmm1` differ only in register file.
+        # cvtpi2ps is named here as well: its source may be m64 rather than
+        # an mm register, and dispatching purely on the operands then sent
+        # that form past the MMX lifter to a TODO comment -- the same silent
+        # drop, one addressing mode along.
         if any(op.type == "reg" and op.reg and op.reg.startswith("mm")
                and not op.reg.startswith("xmm") for op in ops) or m in (
-                   "emms", "femms"):
+                   "emms", "femms", "cvtpi2ps"):
             return self._lift_mmx(insn, m, ops)
 
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
@@ -1745,6 +1830,33 @@ class Lifter:
     SETJMP_FN = None
     LONGJMP_FN = None
 
+    def callee_pop(self, target):
+        """Argument bytes `target` pops with its own `ret N`, or None.
+
+        Read from the callee's bytes, and only when every ret in its body
+        agrees (hle.stack_cleanup) -- the binary cannot be wrong about what it
+        pops. Feeds RECOMP_ABI_CALL_POP, a diagnostic: an unknown or wrong
+        value only changes what -DRECOMP_ABI_CHECK reports, never what runs.
+        """
+        if target in self._pop_cache:
+            return self._pop_cache[target]
+        pop = None
+        info = self.func_db.get(target)
+        if info is not None and self.xbe_data:
+            end = info.get("end")
+            if isinstance(end, str):
+                try:
+                    end = int(end, 16)
+                except ValueError:
+                    end = None
+            offset = va_to_file_offset(target)
+            if isinstance(end, int) and end > target and offset is not None:
+                from .hle import stack_cleanup
+                pop = stack_cleanup(
+                    self.xbe_data[offset:offset + (end - target)], target)
+        self._pop_cache[target] = pop
+        return pop
+
     def _lift_call(self, insn, ops):
         # x86 'call' pushes the address of the following instruction, then jumps.
         # Push that real guest address, not a placeholder: the value is visible
@@ -1815,11 +1927,20 @@ class Lifter:
                 # direct calls too. Without it the check sees only indirect
                 # ones, and CRT and static-init paths -- where callee-saved
                 # clobbers actually bite -- are almost entirely direct. Expands
-                # to a plain call when the flag is off.
-                lines.append(
-                    f"PUSH32(esp, 0x{ret_va:08X}u); "
-                    f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
-                    f"/* call 0x{insn.call_target:08X} */")
+                # to a plain call when the flag is off. When the callee's own
+                # `ret N` is known, the exact form checks esp both ways.
+                pop = self.callee_pop(insn.call_target)
+                if pop is None:
+                    lines.append(
+                        f"PUSH32(esp, 0x{ret_va:08X}u); "
+                        f"RECOMP_ABI_CALL(0x{insn.call_target:08X}u, {name}); "
+                        f"/* call 0x{insn.call_target:08X} */")
+                else:
+                    lines.append(
+                        f"PUSH32(esp, 0x{ret_va:08X}u); "
+                        f"RECOMP_ABI_CALL_POP(0x{insn.call_target:08X}u, "
+                        f"{name}, {pop}u); "
+                        f"/* call 0x{insn.call_target:08X} */")
             # esp immediately after the callee returns. A per-call delta is the
             # only way to attribute a leak to one callee rather than to the
             # function containing them all.
@@ -1905,6 +2026,90 @@ class Lifter:
             if not is_code_address(val):
                 break
             targets.append(val)
+
+        # The displacement names index 0, which is not always the first entry.
+        #
+        # MSVC's memcpy tail dispatch counts remaining bytes *down*, so its
+        # index is negative and the displacement points at the last entry:
+        #
+        #     0011F176  jmp dword ptr [ecx*4 + 0x11F248]
+        #
+        # over a table running 0x0011F22C-0x0011F24C. Reading forward from
+        # 0x0011F248 finds one entry and then the unrolled copy blocks, which
+        # do not read as code addresses -- so the scan stopped at one,
+        # _analyze_switch_table rejected it as too short, and the dispatch
+        # lifted to RECOMP_ITAIL. Its arms are inside memcpy rather than
+        # function starts, so every one of them failed to resolve at runtime
+        # and the path through them skipped the epilogue.
+        #
+        # Only look backwards when the forward scan came up short. A healthy
+        # forward table is followed by whatever the compiler put next, and
+        # extending such a table backwards would swallow the code before it on
+        # the strength of a few words that happen to read as addresses.
+        if len(targets) < 2:
+            # ...and never over the dispatch instruction's own displacement.
+            #
+            # MSVC usually puts the table immediately after the jump, and
+            # `jmp dword ptr [reg*4 + disp32]` is FF 24 8D <disp32> (or
+            # FF 24 85 for a base-less scale-4 form) -- so the four bytes just
+            # below the table are the displacement, and its value is the table
+            # address itself, which reads as a perfectly good code address.
+            # Accepting it prepends a bogus leading entry, and
+            # _analyze_switch_table below stops at the first entry outside the
+            # function, so one bogus word discards the whole switch.
+            #
+            # The engine has instruction bounds and uses those; here there is
+            # only the image, so test for the opcode directly and keep the
+            # value check as a backstop for encodings this does not name.
+            floor = 0
+            if offset >= 7 and self.xbe_data[offset - 7:offset - 4] in (
+                    b"\xff\x24\x8d", b"\xff\x24\x85"):
+                floor = offset - 4       # the disp belongs to the jump
+
+            back = []
+            for i in range(1, max_entries + 1):
+                o = offset - i * 4
+                if o < 0 or o >= floor > 0:
+                    break
+                val = struct.unpack_from('<I', self.xbe_data, o)[0]
+                if not is_code_address(val) or val == table_va:
+                    break
+                back.append(val)
+            if back:
+                back.reverse()
+                targets = back + targets
+
+        # An index that never takes the low values. MSVC's memcpy trail
+        # dispatch `jmp [eax*4 + tbl]` runs after `and eax, 3` on a count
+        # already known to be non-zero, so eax is 1..3, and slot 0 is the tail
+        # of the instruction before the table. On Burnout 2:
+        #
+        #     0011EFFD  jmp dword ptr [eax*4 + 0x11F010]   table 0x11F014
+        #     0011F191  jmp dword ptr [eax*4 + 0x11F19C]   table 0x11F1A0
+        #
+        # Neither scan above finds them: forward stops at the non-address in
+        # slot 0, and the word below the displacement is the previous jump's
+        # opcode. Both lifted to RECOMP_ITAIL, whose arms (0x11F04C, 0x11F1AC,
+        # 0x11F1F8) are not function starts, so they failed to resolve and the
+        # title stalled loading its first race. translator._read_local_jump_table
+        # and DisasmEngine.resync_jump_tables already had this rule; this
+        # reader, used for every ordinary function, did not. The switch matches
+        # by value, so the skipped slots cost nothing, and
+        # _analyze_switch_table still keeps only arms inside the function.
+        if len(targets) < 2:
+            for skip in (1, 2, 3):
+                later = []
+                for i in range(skip, max_entries):
+                    o = offset + i * 4
+                    if o + 4 > len(self.xbe_data):
+                        break
+                    val = struct.unpack_from('<I', self.xbe_data, o)[0]
+                    if not is_code_address(val):
+                        break
+                    later.append(val)
+                if len(later) >= 2:
+                    targets = later
+                    break
         return targets
 
     def _analyze_switch_table(self, ops):
@@ -1992,6 +2197,31 @@ class Lifter:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
+            # `jmp <reg>` where the register was loaded with an address
+            # inside this same function: a hand-written continuation chain,
+            # not a call. The XMV YUV-to-RGB converter in Half-Life 2's
+            # loader is built this way -- four blocks that each do
+            # `mov ebx, <next>; jmp <shared tail>`, and the shared tail ends
+            # `jmp ebx`. Treated as an indirect tail call it resolved to
+            # nothing, so the shared tail never came back and the function's
+            # epilogue never ran: every call leaked 0x2C bytes of guest stack
+            # and the converter wrote past its surface until it walked out of
+            # the tiled aperture, 144 MB later.
+            #
+            # The targets are labels in this function, so this is a goto, and
+            # the same shape the memory-operand switch above emits.
+            if ops[0].type == "reg" and self.imm_code_refs:
+                inside = sorted(t for t in self.imm_code_refs
+                                if self.func_start <= t < self.func_end)
+                if inside:
+                    target_expr = _fmt_operand_read(ops[0])
+                    lines = [f"{{ uint32_t _jt = {target_expr};"
+                             f" /* intra-function indirect jmp:"
+                             f" {len(inside)} targets */"]
+                    for t in inside:
+                        lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
+                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    return lines
             target = _fmt_operand_read(ops[0])
             return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
         return ["/* jmp: no target */"]
@@ -2222,6 +2452,7 @@ class Lifter:
         "paddsb": "MMX_PADDSB", "paddsw": "MMX_PADDSW",
         "psubsb": "MMX_PSUBSB", "psubsw": "MMX_PSUBSW",
         "paddusb": "MMX_PADDUSB", "psubusb": "MMX_PSUBUSB",
+        "paddusw": "MMX_PADDUSW", "psubusw": "MMX_PSUBUSW",
         "pmullw": "MMX_PMULLW", "pmulhw": "MMX_PMULHW",
         "pmaddwd": "MMX_PMADDWD",
         "pavgb": "MMX_PAVGB", "pavgw": "MMX_PAVGW",
@@ -2293,6 +2524,25 @@ class Lifter:
             else:
                 return [f"/* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = {self._MMX_SHIFT[m]}({dst.reg}, {cnt}); /* {m} */"]
+
+        # cvtpi2ps: the other direction -- two dwords in, two singles out,
+        # into the LOW half of an xmm whose upper lanes are preserved. The
+        # destination is an xmm and the source an mm register or m64, so
+        # neither goes through the mm paths above and it fell through to a
+        # TODO comment: in Half-Life 2's loader that silently deleted every
+        # integer-to-float step of the XMV YUV-to-RGB converter, which then
+        # ran its whole float pipeline on stale registers and painted every
+        # frame of the intro solid red.
+        if m == "cvtpi2ps" and len(ops) >= 2 and dst.type == "reg" \
+                and dst.reg and dst.reg.startswith("xmm"):
+            s_op = ops[1]
+            if s_op.type == "reg" and s_op.reg and s_op.reg.startswith("mm"):
+                a = s_op.reg
+            elif s_op.type == "mem":
+                a = f"MMX_MEM({_fmt_mem(s_op)})"
+            else:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = XMM_FROM_PI({dst.reg}, {a}); /* cvtpi2ps */"]
 
         # cvtps2pi / cvttps2pi: two singles in, two dwords out. The source is
         # an xmm register or a 64-bit memory operand -- never an mm register,

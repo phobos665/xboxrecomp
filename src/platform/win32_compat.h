@@ -29,6 +29,7 @@ extern "C" {
 #define WAIT_IO_COMPLETION   0x000000C0u
 #define WAIT_TIMEOUT         0x00000102u
 #define WAIT_FAILED          0xFFFFFFFFu
+#define MAXIMUM_WAIT_OBJECTS 64
 #ifndef INFINITE
 #define INFINITE             0xFFFFFFFFu
 #endif
@@ -75,6 +76,7 @@ typedef VOID  (WINAPI *WAITORTIMERCALLBACK)(PVOID lpParameter, BOOLEAN TimerOrWa
 typedef void  *LPSECURITY_ATTRIBUTES;
 typedef void  *PTP_CALLBACK_INSTANCE;
 typedef VOID  (WINAPI *PTP_SIMPLE_CALLBACK)(PTP_CALLBACK_INSTANCE Instance, PVOID Context);
+typedef BOOL  (WINAPI *PINIT_ONCE_FN)(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context);
 
 /* ---- Last-error -------------------------------------------------------- */
 DWORD GetLastError(void);
@@ -86,6 +88,7 @@ LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 
 /* ---- Critical sections ------------------------------------------------- */
@@ -95,6 +98,16 @@ VOID EnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID LeaveCriticalSection(LPCRITICAL_SECTION cs);
 BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID DeleteCriticalSection(LPCRITICAL_SECTION cs);
+
+/* ---- Slim reader/writer locks ------------------------------------------ */
+VOID InitializeSRWLock(PSRWLOCK lock);
+VOID AcquireSRWLockShared(PSRWLOCK lock);
+VOID ReleaseSRWLockShared(PSRWLOCK lock);
+VOID AcquireSRWLockExclusive(PSRWLOCK lock);
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock);
+
+/* ---- One-time initialisation ------------------------------------------- */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context);
 
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
@@ -117,6 +130,13 @@ const char *w32_handle_path(HANDLE h);
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCWSTR name);
 BOOL   SetEvent(HANDLE h);
+
+/* Waitable timers, as far as the kernel bridge uses them: created for
+ * NtCreateTimer and cancelled for NtCancelTimer, never armed. There is
+ * deliberately no SetWaitableTimer, so a future caller fails to build here
+ * instead of getting a timer that silently never fires. */
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
+BOOL   CancelWaitableTimer(HANDLE h);
 BOOL   ResetEvent(HANDLE h);
 BOOL   PulseEvent(HANDLE h);
 
@@ -238,7 +258,17 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
 BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped);
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
+BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
 BOOL   FlushFileBuffers(HANDLE h);
+
+/* SetFilePointerEx move methods, with their Win32 values. */
+#ifndef FILE_BEGIN
+#define FILE_BEGIN   0
+#define FILE_CURRENT 1
+#define FILE_END     2
+#endif
+BOOL   SetFilePointerEx(HANDLE h, LARGE_INTEGER distance,
+                        PLARGE_INTEGER new_position, DWORD method);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
 SHORT GetAsyncKeyState(int vKey);
@@ -479,6 +509,11 @@ void  _aligned_free(void *ptr);
 /* ---- Case-insensitive string compare --------------------------------- */
 int _stricmp(const char *a, const char *b);
 int _strnicmp(const char *a, const char *b, SIZE_T n);
+
+/* ---- MSVC CRT "safe" variants ---------------------------------------- */
+/* strtok_s takes the same (str, delim, context) arguments as POSIX strtok_r
+ * and returns the same thing, so the name is all that differs. */
+#define strtok_s strtok_r
 
 /* ---- Wide-string helpers (operate on the 16-bit Xbox WCHAR) ----------
  * Named xbox_wcs* (not macros over wcs*) so they never collide with the

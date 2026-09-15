@@ -14,6 +14,8 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+/* getenv: without <stdlib.h> its pointer is truncated to int. */
+#include <stdlib.h>
 
 #include "video_player.h"
 #include "d3d/d3d8_xbox.h"

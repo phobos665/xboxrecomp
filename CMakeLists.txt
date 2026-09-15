@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.8.0 LANGUAGES C)
+project(xboxrecomp VERSION 0.9.0 LANGUAGES C CXX)
 
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
 # Pattern: extract emulator subsystems (xemu) into reusable static libraries.
 #
 # Libraries:
-#   xbox_kernel    - Xbox kernel replacement layer (147 imports → Win32)
+#   xbox_kernel    - Xbox kernel replacement layer (Xbox kernel ordinals → Win32)
 #   xbox_d3d8      - D3D8 → D3D11 graphics compatibility
 #   xbox_dsound    - DirectSound → software mixer compatibility
 #   xbox_input     - Xbox gamepad → XInput compatibility
@@ -21,6 +21,24 @@ add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
+
+# An implicit declaration is an error, everywhere, in every configuration.
+#
+# C89's rule is that an undeclared function returns int, and on this target
+# that silently truncates a 64-bit return value to 32 bits and sign extends
+# it. Seven files used getenv, malloc or calloc without <stdlib.h> and so
+# received corrupted pointers: RECOMP_WATCHDOG_SECS faulted on
+# 0xFFFFFFFFA94859D5 about one run in three and was inert the rest of the
+# time, and two D3D8 draw paths were allocating through a truncated malloc.
+#
+# It was a warning the whole time (C4013, alongside C4047 for the assignment).
+# A warning among hundreds in a build this size is not a signal, so it is an
+# error now. C4047 stays a warning: it fires on legitimate casts elsewhere.
+if(MSVC)
+    add_compile_options(/we4013)
+else()
+    add_compile_options(-Werror=implicit-function-declaration)
+endif()
 
 # Option to build examples
 
@@ -56,6 +74,22 @@ add_subdirectory(src/input)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# XDK functions replaced by name (tools/recomp/hle.py)
+add_subdirectory(src/hle)
+
+# ── Tests ─────────────────────────────────────────────────────
+
+# Offline tests that need no game files; run with ctest. Only when this is the
+# top-level project, so a title that pulls the toolkit in with
+# add_subdirectory() does not build them.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    enable_testing()
+    add_subdirectory(tests/nv2a_vsh)
+    if(WIN32)
+        add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
+    endif()
+endif()
+
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
@@ -69,5 +103,6 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_apu
     xbox_nv2a
     xbox_video
+    xbox_hle
 )
 

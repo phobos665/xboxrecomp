@@ -33,6 +33,29 @@ add_compile_definitions(
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 
+# ── Bring-up diagnostics ────────────────────────────────────────
+#
+# ebx/esi/edi are callee-saved on x86 and the recompiler keeps them in globals,
+# so a function whose epilogue did not lift correctly corrupts its *caller*.
+# There is no crash and no message where the failure happens: the caller
+# carries on with a wrong loop cursor or a wrong `this` and faults somewhere
+# unrelated, often several frames away.
+#
+# With this on, every call -- direct and indirect -- checks that ebx, esi and
+# edi came back unchanged and that esp came back at least 4 higher, and names
+# the offending function. Off by default because it costs a few compares per
+# call; leave it on until a title boots.
+#
+# Directory scope, and set before add_subdirectory, deliberately: the check is
+# emitted into generated game code but recomp_abi_violation_log() is compiled
+# into xbox_kernel. Defining it on the game target alone builds the calls
+# without the callee and fails to link.
+option(RECOMP_ABI_CHECK "Verify callee-saved registers across every call" OFF)
+if(RECOMP_ABI_CHECK)
+    add_compile_definitions(RECOMP_ABI_CHECK)
+    message(STATUS "ABI check enabled: callee-saved registers verified per call")
+endif()
+
 # Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
@@ -94,9 +117,23 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE
         /LARGEADDRESSAWARE
+        # A PDB in every configuration, so the crash handler's SymFromAddr can
+        # name the generated function a host RIP is in. Linker-only: without
+        # /Zi it holds public symbols -- every sub_XXXXXXXX -- and costs no
+        # recompile of the large generated files.
+        /DEBUG
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+
+    # Drop MSVC's Debug runtime checks. /RTC1 traps a local read before its
+    # first write, and lifted code does that deliberately: an fpo_leaf function
+    # inherits its caller's frame, so it reads ebp before assigning it and
+    # picks the value up from g_seh_ebp. That is correct by design here, but
+    # /RTC1 cannot know it and aborts through a message box -- which never
+    # reaches stderr, so the run looks like a silent hang at the first lifted
+    # frame. Debug is the configuration bring-up uses, so this cannot stay on.
+    string(REGEX REPLACE "/RTC[1csu]+" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
 endif()
 
 # ── Game-specific additions ─────────────────────────────────────

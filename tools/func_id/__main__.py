@@ -2,8 +2,8 @@
 CLI entry point for the function identification tool.
 
 Usage:
-    py -3 -m tools.func_id "Burnout 3 Takedown/default.xbe" [-v]
-    py -3 -m tools.func_id path/to/default.xbe --functions path/to/functions.json -v
+    python3 -m tools.func_id game_files/default.xbe [-v]
+    python3 -m tools.func_id game_files/default.xbe --functions path/to/functions.json -v
 """
 
 import argparse

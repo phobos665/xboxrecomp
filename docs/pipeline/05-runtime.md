@@ -331,18 +331,27 @@ Keyboard input is also mapped for testing: WASD for movement, Shift for boost, e
 
 Not all translated functions work correctly. The runtime supports **manual overrides** -- hand-written C functions that replace specific translated functions:
 
+Overrides are **data, not code**. They live in `title_overrides.c`, which is
+per-title; the dispatch machinery in `recomp_manual.c` is engine code and is
+never edited per game.
+
 ```c
-// recomp_manual.c
-recomp_func_t recomp_lookup_manual(uint32_t xbox_va) {
-    switch (xbox_va) {
-        case 0x000636D0: return manual_sub_000636D0;  // physics
-        case 0x000110E0: return manual_sub_000110E0;  // frame pump
-        case 0x00011240: return manual_sub_00011240;  // resource loader
-        // ... 30+ overrides ...
-        default: return NULL;
-    }
-}
+// title_overrides.c
+const recomp_override_t g_title_overrides[] = {
+    RECOMP_OVERRIDE(0x000636D0, manual_sub_000636D0,
+        "Lifter mis-orders the x87 spill, so integration diverges from xemu; "
+        "remove when the FP stack model lands"),
+    RECOMP_OVERRIDE(0x000110E0, manual_sub_000110E0,
+        "Frame pump waits on a vblank bit the NV2A HLE never sets"),
+    { 0, 0, 0, 0 }
+};
 ```
+
+Every entry needs a reason, enforced at compile time (the macro takes three
+arguments) and again at startup (`recomp_overrides_init()` aborts on an empty
+one and rejects duplicate VAs). An override whose rationale was never recorded
+cannot be re-evaluated later, so it survives every cleanup and quietly changes
+behaviour for the next title.
 
 Manual overrides are the primary debugging tool. When a function crashes or produces wrong results, you replace it with a hand-written version that either:
 - **Stubs it** (returns immediately, optionally returning a success code)

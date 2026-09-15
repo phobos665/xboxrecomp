@@ -18,6 +18,8 @@
 #include "d3d8_internal.h"
 #include <stdio.h>
 #include <string.h>
+/* malloc: without <stdlib.h> its pointer is truncated to int. */
+#include <stdlib.h>
 
 /* ================================================================
  * Internal device state
@@ -222,6 +224,17 @@ static HRESULT d3d11_create_device_and_swap_chain(
         &state->d3d11_context
     );
 
+    /* The debug layer is only present with Graphics Tools installed. Without
+     * it a Debug build would have no device at all. */
+    if (FAILED(hr) && (create_flags & D3D11_CREATE_DEVICE_DEBUG)) {
+        fprintf(stderr, "D3D8: D3D11 debug layer unavailable (0x%08lX), creating without it\n", hr);
+        create_flags &= ~(UINT)D3D11_CREATE_DEVICE_DEBUG;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                           create_flags, NULL, 0, D3D11_SDK_VERSION,
+                                           &scd, &state->swap_chain, &state->d3d11_device,
+                                           &feature_level, &state->d3d11_context);
+    }
+
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
         return hr;
@@ -309,11 +322,21 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     state->viewport.MinZ = 0.0f;
     state->viewport.MaxZ = 1.0f;
 
-    /* Default texture stage states:
-     * By default each stage reads its own texcoord set (0,1,2,3). */
+    /* Default texture stage states, as D3D8 documents them: stage 0
+     * modulates texture by diffuse, later stages are off, arguments are
+     * TEXTURE then CURRENT, and each stage reads its own texcoord set.
+     * They must be real values rather than 0: 0 is D3DTA_DIFFUSE, a valid
+     * argument, so the pixel shader setup cannot treat 0 as "unset". */
     memset(state->tss, 0, sizeof(state->tss));
-    for (int s = 0; s < MAX_TEXTURE_STAGES; s++)
+    for (int s = 0; s < MAX_TEXTURE_STAGES; s++) {
+        state->tss[s][D3DTSS_COLOROP]       = s == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+        state->tss[s][D3DTSS_COLORARG1]     = D3DTA_TEXTURE;
+        state->tss[s][D3DTSS_COLORARG2]     = D3DTA_CURRENT;
+        state->tss[s][D3DTSS_ALPHAOP]       = s == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+        state->tss[s][D3DTSS_ALPHAARG1]     = D3DTA_TEXTURE;
+        state->tss[s][D3DTSS_ALPHAARG2]     = D3DTA_CURRENT;
         state->tss[s][D3DTSS_TEXCOORDINDEX] = (DWORD)s;
+    }
 
     /* Identity matrices */
     for (int i = 0; i < MAX_TRANSFORMS; i++) {
@@ -871,7 +894,10 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         converted = convert_fan_or_quad(PrimitiveType, pVertexData,
                                          PrimitiveCount, VertexStreamZeroStride,
                                          &vertex_count);
-        if (converted) draw_data = converted;
+        /* Without the converted copy, vertex_count is the triangle-list count
+         * and would read past the caller's vertices. */
+        if (!converted) return E_OUTOFMEMORY;
+        draw_data = converted;
     }
 
     vb_size = vertex_count * VertexStreamZeroStride;
@@ -1367,6 +1393,18 @@ static HRESULT __stdcall dev_EndPush(IDirect3DDevice8 *self, DWORD *pPush)
     return E_NOTIMPL;
 }
 
+/* DXGI sync interval for Swap. 1 waits for vertical blank, which is right
+ * when this device is the title's display. A device run beside the title's
+ * own D3D8 (hle_d3d8.c shadow mode) must not block: the title paces its
+ * loader on frames presented, so a vsync wait here throttled Burnout 2 from
+ * about 136 frames a second to 27 and cut how far a run got by two thirds. */
+static UINT g_present_interval = 1;
+
+void xbox_D3D8SetPresentInterval(UINT interval)
+{
+    g_present_interval = interval;
+}
+
 static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
 {
     (void)self; (void)Flags;
@@ -1381,7 +1419,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         DispatchMessageA(&msg);
     }
 
-    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    return IDXGISwapChain_Present(g_device_state.swap_chain, g_present_interval, 0);
 }
 
 /* ================================================================

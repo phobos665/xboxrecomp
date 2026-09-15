@@ -9,7 +9,6 @@
  */
 
 #include "nv2a_state.h"
-#include "nv2a_pgraph_d3d11.h"
 
 /* ============================================================
  * Global state
@@ -547,14 +546,14 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 {
     g_pgraph_method_count++;
 
-    /* Route through D3D11 translator first */
-    if (pgraph_d3d11_method(subchannel, method, param)) {
-        /* Handled by D3D11 translator — still store in regs for state queries */
-        if (method < 0x2000 * 4) {
-            d->pgraph.regs[method / 4] = param;
-        }
-        return;
-    }
+    /* No translator sits behind this any more. The D3D11 PGRAPH path was
+     * removed: it handled 21 methods, discarded transform programs, transform
+     * constants, vertex array formats and the register combiners outright, and
+     * had not been touched in this fork. Rendering goes through the D3D8 layer
+     * in src/d3d, reached by name from src/hle.
+     *
+     * What remains here is a counter and an unhandled-method log, which is
+     * what a title touching PGRAPH registers directly still needs. */
 
     /* Log unhandled methods (first 20 + periodic) */
     if (g_pgraph_method_count <= 20 || (g_pgraph_method_count % 5000) == 0) {

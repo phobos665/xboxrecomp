@@ -38,6 +38,20 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
+/* Xbox volume geometry.
+ *
+ * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
+ * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
+ * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
+ * product to equal the cluster size it was built for. Half-Life 2 checks for
+ * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
+ * aborts CRT init before main ever runs -- the process then exits cleanly,
+ * which reads as a title that did nothing rather than one that failed.
+ *
+ * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+#define XBOX_BYTES_PER_SECTOR       512u
+#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
@@ -153,8 +167,19 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* XBOX_FILE_NO_INTERMEDIATE_BUFFERING is deliberately not passed on.
+         *
+         * On the Xbox it is a performance hint for DVD reads. On the host,
+         * FILE_FLAG_NO_BUFFERING imposes rules the guest never agreed to:
+         * buffer addresses and lengths must be sector-aligned, and so must
+         * the file pointer. A read that ends at a file's end leaves the
+         * pointer mid-sector, after which SetFilePointerEx(0, FILE_CURRENT)
+         * fails with ERROR_INVALID_PARAMETER. XAPI's SetFilePointer asks
+         * exactly that after each read, got STATUS_UNSUCCESSFUL back, and
+         * Burnout 2 showed its dirty-disc screen after special.rws -- a
+         * 96,068-byte file read as 96,256. Buffered, the host pointer lands
+         * where the Xbox kernel's CurrentByteOffset would. */
+        (void)XBOX_FILE_NO_INTERMEDIATE_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
@@ -469,20 +494,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             return STATUS_NOT_IMPLEMENTED;
     }
 }
-
-/* Xbox volume geometry.
- *
- * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
- * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
- * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
- * product to equal the cluster size it was built for. Half-Life 2 checks for
- * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
- * aborts CRT init before main ever runs -- the process then exits cleanly,
- * which reads as a title that did nothing rather than one that failed.
- *
- * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
-#define XBOX_BYTES_PER_SECTOR       512u
-#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,

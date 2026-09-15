@@ -76,6 +76,25 @@ def scan_log(text):
     return out
 
 
+REPO = Path(__file__).resolve().parent.parent.parent
+
+
+def _xbe_title_id(xbe):
+    """Title ID from an XBE certificate, eight uppercase hex digits, or None."""
+    try:
+        data = Path(xbe).read_bytes()
+    except OSError:
+        return None
+    if len(data) < 0x011C or data[:4] != b"XBEH":
+        return None
+    base = int.from_bytes(data[0x0104:0x0108], "little")
+    cert = int.from_bytes(data[0x0118:0x011C], "little")
+    off = cert - base
+    if off < 0 or off + 12 > len(data):
+        return None
+    return "%08X" % int.from_bytes(data[off + 8:off + 12], "little")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -84,13 +103,41 @@ def main(argv=None):
     ap.add_argument("--functions", type=Path, required=True,
                     help="disasm functions.json, to report whether a candidate "
                          "is a new function or an alias inside a known one")
-    ap.add_argument("--seeds", type=Path, required=True,
-                    help="seed file to update (created if absent)")
+    ap.add_argument("--seeds", type=Path,
+                    help="seed file to update (created if absent). Defaults to "
+                         "config/seeds/<TITLEID>.json for the XBE given, since "
+                         "a seed only means anything for the title it was "
+                         "observed on.")
     ap.add_argument("--analysis-json", type=Path,
                     help="xbe_parser output; only needed when it is not named "
                          "<xbe stem>_analysis.json next to the XBE")
+    ap.add_argument("--prune", action="store_true",
+                    help="re-test seeds already in the file and "
+                         "drop any that fail the gates")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+
+    # Which file, and does it belong to this title?
+    #
+    # Seeds are per-title: an address that is a function start in one image is
+    # the middle of something else in the next, and tools.disasm only refuses a
+    # seed that lands mid-instruction. Naming the file after the title ID is
+    # what keeps them apart, so default to the right one and say so when an
+    # explicit path disagrees.
+    title = _xbe_title_id(args.xbe)
+    if args.seeds is None:
+        if not title:
+            print("error: cannot read a title ID from %s; pass --seeds"
+                  % args.xbe, file=sys.stderr)
+            return 2
+        args.seeds = (REPO / "config" / "seeds" / (title + ".json"))
+        print("seeds: %s (title %s)" % (args.seeds.name, title))
+    elif title and args.seeds.stem.upper() != title:
+        print("warning: %s is not named for title %s; a seed written to the "
+              "wrong title's file is applied to that title instead"
+              % (args.seeds.name, title), file=sys.stderr)
+
+    args.seeds.parent.mkdir(parents=True, exist_ok=True)
 
     candidates = scan_log(args.log.read_text(errors="replace"))
     if not candidates:
@@ -118,6 +165,22 @@ def main(argv=None):
     starts = [b[0] for b in bounds]
 
     existing = json.loads(args.seeds.read_text()) if args.seeds.exists() else []
+
+    if args.prune:
+        # Seeds accepted before this check existed are still in the file.
+        # Re-test them rather than trusting that they were ever verified.
+        kept, dropped = [], 0
+        for entry in existing:
+            unsaved = engine.entry_pops_unsaved(int(entry["start"], 0))
+            if unsaved:
+                print("  - %s  pruned: restores %s without saving it"
+                      % (entry["start"], "/".join(unsaved)))
+                dropped += 1
+                continue
+            kept.append(entry)
+        print("  pruned %d of %d existing seed(s)" % (dropped, dropped + len(kept)))
+        existing = kept
+
     have = {e["start"].lower() for e in existing if isinstance(e, dict)}
 
     added = 0
@@ -131,6 +194,17 @@ def main(argv=None):
             continue
         if not engine.probes_as_function_body(va):
             print("  - %08X  does not read as a function body" % va)
+            continue
+        unsaved = engine.entry_pops_unsaved(va)
+        if unsaved:
+            # Restoring a register it never saved means this is the middle of
+            # a function, whatever else it looks like. Seeding it makes the
+            # recompiler emit an epilogue that runs against the *caller's*
+            # stack, so the caller resumes with a corrupted register and faults
+            # somewhere unrelated -- worse than the missing target, because a
+            # missing one is reported and this is silent.
+            print("  - %08X  restores %s without saving it: mid-function"
+                  % (va, "/".join(unsaved)))
             continue
         i = bisect.bisect_right(starts, va) - 1
         inside = i >= 0 and bounds[i][0] < va < bounds[i][1]

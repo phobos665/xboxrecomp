@@ -11,6 +11,8 @@
  * Input comes from the host through the existing xbox_input layer, so a real
  * pad plugged into the PC drives this one.
  */
+#include <stdlib.h>
+#include <stdio.h>
 #include "usb_gamepad.h"
 
 #include <string.h>
@@ -151,6 +153,106 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  *   4..11  analog buttons A B X Y Black White, then the two triggers
  *   12..19 four signed 16-bit stick axes, little endian
  */
+
+/* Say that the title is polling, and optionally press something.
+ *
+ * Two separate questions, answered in one place because both need the report
+ * path. "Is it waiting for input" cannot be settled by the absence of USB
+ * logging when there is no USB logging; and a title sitting on a press-start
+ * screen cannot be advanced by an unattended run however long it is given.
+ *
+ * RECOMP_FAKE_INPUT=start        holds START, pressed and released on a cycle
+ * RECOMP_FAKE_INPUT=a            the A button
+ * RECOMP_FAKE_INPUT=start,a      cycles through them in turn
+ *
+ * RECOMP_FAKE_INPUT_MS=<n>       how long each press and gap lasts (default
+ *                                500, so a press every second)
+ *
+ * Pressed and released rather than held: a menu advances on the edge, and a
+ * button that is never released reads as one press forever.
+ */
+static struct { const char *name; int digital; unsigned bit; } FAKE_BUTTONS[] = {
+    { "start", 0, XBOX_GAMEPAD_START      },
+    { "back",  0, XBOX_GAMEPAD_BACK       },
+    { "up",    0, XBOX_GAMEPAD_DPAD_UP    },
+    { "down",  0, XBOX_GAMEPAD_DPAD_DOWN  },
+    { "left",  0, XBOX_GAMEPAD_DPAD_LEFT  },
+    { "right", 0, XBOX_GAMEPAD_DPAD_RIGHT },
+    { "a",     1, XBOX_BUTTON_A           },
+    { "b",     1, XBOX_BUTTON_B           },
+    { "x",     1, XBOX_BUTTON_X           },
+    { "y",     1, XBOX_BUTTON_Y           },
+};
+
+static void fake_input_apply(uint8_t *out)
+{
+    static int checked;
+    static char spec[64];
+    const char *env;
+    unsigned long period;
+    unsigned long long now;
+    const char *p;
+    int index = 0, want, i;
+
+    if (!checked) {
+        checked = 1;
+        env = getenv("RECOMP_FAKE_INPUT");
+        if (env) {
+            strncpy(spec, env, sizeof spec - 1);
+            fprintf(stderr, "  [PAD] synthetic input: %s\n", spec);
+            fflush(stderr);
+        }
+    }
+    if (!spec[0])
+        return;
+
+    env = getenv("RECOMP_FAKE_INPUT_MS");
+    period = env ? strtoul(env, NULL, 0) : 0;
+    if (!period)
+        period = 500;
+
+    now = (unsigned long long)GetTickCount64();
+
+    /* Odd half of the cycle is the gap, so every press has an edge. */
+    if ((now / period) % 2 == 0)
+        return;
+
+    /* Which button this cycle: the list is walked in turn so a sequence like
+     * "start,a" can get through a title screen and then a menu. */
+    {
+        int count = 1;
+        for (p = spec; *p; p++)
+            if (*p == ',')
+                count++;
+        want = (int)((now / (period * 2)) % (unsigned long long)count);
+    }
+
+    p = spec;
+    while (index < want && (p = strchr(p, ',')) != NULL) {
+        p++;
+        index++;
+    }
+    if (!p)
+        return;
+
+    for (i = 0; i < (int)(sizeof FAKE_BUTTONS / sizeof FAKE_BUTTONS[0]); i++) {
+        size_t n = strlen(FAKE_BUTTONS[i].name);
+        if (strncmp(p, FAKE_BUTTONS[i].name, n) != 0)
+            continue;
+        if (p[n] && p[n] != ',')
+            continue;
+        if (FAKE_BUTTONS[i].digital) {
+            out[4 + FAKE_BUTTONS[i].bit] = 0xFF;   /* full pressure */
+        } else {
+            unsigned bits = (unsigned)(out[2] | (out[3] << 8));
+            bits |= FAKE_BUTTONS[i].bit;
+            out[2] = (uint8_t)(bits & 0xFF);
+            out[3] = (uint8_t)((bits >> 8) & 0xFF);
+        }
+        return;
+    }
+}
+
 int usb_gamepad_report(uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -159,6 +261,17 @@ int usb_gamepad_report(uint8_t *out, int max)
 
     if (max < 20)
         return 0;
+
+    /* Unconditional, and bounded: whether the title reads the pad at all is
+     * the first question about input, and there was no way to answer it. */
+    {
+        static unsigned polls;
+        if (polls++ < 3 || polls % 1000 == 0) {
+            fprintf(stderr, "  [PAD] report #%u requested\n", polls);
+            fflush(stderr);
+        }
+    }
+
     memset(out, 0, 20);
     out[0] = 0;
     out[1] = 20;
@@ -181,5 +294,6 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    fake_input_apply(out);
     return 20;
 }

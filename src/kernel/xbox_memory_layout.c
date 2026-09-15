@@ -15,8 +15,24 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include <stdio.h>
+/* <stdlib.h> is load-bearing, not tidiness.
+ *
+ * Without it MSVC applies the implicit-declaration rule and assumes
+ * `int getenv()`, so the returned pointer is truncated to 32 bits and sign
+ * extended. RECOMP_WATCHDOG_SECS was the visible symptom: `if (!secs ||
+ * !*secs)` dereferenced 0xFFFFFFFFA94859D5 and faulted about one run in
+ * three, and when the truncated byte happened to read zero it returned
+ * early instead -- so the watchdog was either a crash or silently inert,
+ * and never once fired. The `getenv(...) != NULL` tests elsewhere in this
+ * file survived only because a truncated non-zero value is still non-zero.
+ */
+#include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+
+#if !defined(_WIN32)
+#include <unistd.h>   /* _exit */
+#endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -79,6 +95,12 @@ static void *g_nv2a_memory = NULL;
 /* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
+/* The AC97 page, offset from the MCPX base. Same constant as apu.h; the
+ * kernel does not link the APU library, so it is repeated rather than
+ * shared. */
+#define XBOX_MCPX_AC97_PAGE 0x00400000u
+/* The CRTC page, offset from the NV2A base. Same constant as apu.h. */
+#define XBOX_NV2A_PCRTC_PAGE 0x00600000u
 static void *g_mcpx_memory = NULL;
 
 /* Flash ROM. The console's 256 KB flash is mirrored through the top of the
@@ -99,6 +121,12 @@ static void *g_mcpx_memory = NULL;
 #define XBOX_FLASH_BASE 0xFF000000u
 #define XBOX_FLASH_SIZE (1u * 1024u * 1024u)
 static void *g_flash_memory = NULL;
+/* The contiguous window's backing section. It is a file mapping rather than
+ * plain committed memory for one reason: the tiled aperture has to be a
+ * second view of the very same bytes, and only a mapping can be mapped
+ * twice. See the tiled aperture below for why that matters.
+ */
+static HANDLE g_contig_mapping = NULL;
 /* How much of the tiled aperture can exist.
  *
  * Two ceilings, both below the mapped RAM size once that is large:
@@ -157,6 +185,25 @@ static volatile LONG g_nv2a_ack_stop = 0;
  * that is not listed still hangs -- run the title and the watchdog sample will
  * name the register.
  */
+/* The interrupt-status registers, as opposed to the busy bits that share the
+ * same table. Only these are the title's to clear. */
+static int intr_status_reg(uint32_t offset)
+{
+    return offset == 0x000100u      /* PMC_INTR_0   */
+        || offset == 0x600100u;     /* PCRTC_INTR_0 */
+}
+
+/* Set when the vblank tick is delivering interrupts, so the acknowledgement
+ * thread knows a real ISR is servicing them. */
+/* Written by the timer thread, read by the acknowledgement thread, so it is
+ * shared state and gets the same interlocked treatment as g_nv2a_ack_stop. */
+static volatile LONG s_vblank_owns_intr = 0;
+
+void xbox_NV2A_VblankOwnsInterrupts(int owns)
+{
+    InterlockedExchange(&s_vblank_owns_intr, owns ? 1 : 0);
+}
+
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
 
@@ -276,7 +323,6 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
             device_ptr_va, put_off, get_ptr_off);
     return 0;
 }
-
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
  * have built it yet. */
@@ -408,6 +454,40 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
     return 0;
 }
 
+/* A real swap happened: advance every registered counter, and remember when.
+ *
+ * The timer below exists for a title nothing presents for. Once the
+ * pushbuffer executor is actually running flips, the timer is the wrong
+ * clock and an actively harmful one: Half-Life 2's loader paces its intro on
+ * this count, so a 62 Hz timer against an executor managing a fraction of a
+ * frame per second ran the video forward in virtual time far faster than it
+ * could be drawn. Only every few hundredth frame was ever presented, each one
+ * sampled part way through its own decode -- which looks exactly like a
+ * stalling, blocky video rather than a clock running away.
+ */
+static DWORD g_frame_counter_flip_ms;
+
+void xbox_Nv2aFrameCounterFlip(void)
+{
+    int i;
+
+    g_frame_counter_flip_ms = GetTickCount();
+    if (!g_frame_counter_flip_ms)
+        g_frame_counter_flip_ms = 1;          /* 0 means "never" */
+    for (i = 0; i < g_frame_counter_count; i++) {
+        uint32_t dev;
+
+        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
+            continue;
+        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
+                               + g_memory_offset) += 1;
+    }
+}
+
 static void frame_counters_tick(void)
 {
     DWORD now = GetTickCount();
@@ -418,6 +498,13 @@ static void frame_counters_tick(void)
     if (g_frame_counter_last_ms
             && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
         return;
+    /* Something is presenting: let it drive the count instead. Two seconds,
+     * because the executor's flips are not evenly spaced and a title that
+     * genuinely stops presenting still has to be got moving again. */
+    if (g_frame_counter_flip_ms && (now - g_frame_counter_flip_ms) < 2000) {
+        g_frame_counter_last_ms = now;
+        return;
+    }
     g_frame_counter_last_ms = now;
 
     for (i = 0; i < g_frame_counter_count; i++) {
@@ -529,6 +616,29 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+
+            /* Leave the interrupt status alone once something actually
+             * raises interrupts.
+             *
+             * Holding these at zero was correct while nothing here ever
+             * raised a GPU interrupt -- "none pending" was the truth, and a
+             * title's ISR re-entering on a bit that never cleared is how
+             * Halo reached a native stack overflow.
+             *
+             * With RECOMP_VBLANK the vblank tick raises one and the title's
+             * own ISR services it, so the premise is gone. Burnout 2's
+             * deferred routine reads PMC_INTR_0 through the context the
+             * kernel handed it (0x00226EB8 holds 0xFD000000, so the flags it
+             * tests are at 0xFD000100) and decides from those bits what work
+             * to do. Clearing them from here meant the routine ran 4,818
+             * times and found nothing pending every time.
+             *
+             * The ISR clears them itself, which is what write-1-to-clear is
+             * for; this thread stops competing with it. */
+            if (InterlockedCompareExchange(&s_vblank_owns_intr, 0, 0)
+                && intr_status_reg(NV2A_ACK[i].offset))
+                continue;
+
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
@@ -561,7 +671,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * screen. Nothing here scans out, so this is the one place that says
          * whether the guest is producing an image at all -- and where it is.
          * Gated, because it is a bring-up question, not a runtime one. */
-        if (s_nv2a_trace) {
+        /* Not gated on the trace flag: nv2a_pb_scan is what drives the
+         * executor, and it already returns unless RECOMP_PB_SCAN or
+         * RECOMP_PB_EXEC asked for it. Gating the call as well meant
+         * RECOMP_PB_EXEC on its own did nothing at all, and the executor
+         * only ran when someone happened to also be tracing. */
+        {
             /* Is the title submitting GPU work at all? PUT is where the
              * title's pushbuffer writer has got to; if it never moves, nothing
              * is being drawn and the missing piece is upstream of the GPU. */
@@ -596,7 +711,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
-                    if (now_ms - last_report > 10000) {
+                    if (s_nv2a_trace && now_ms - last_report > 10000) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
@@ -611,7 +726,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                {
+                if (s_nv2a_trace) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
@@ -759,6 +874,37 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
         fflush(stderr);
     }
     hits[i]++;
+}
+
+/* The exact form, for a direct call whose callee's `ret N` is known: esp must
+ * come back exactly 4 + N higher. Reports once per callee, and says which way
+ * esp is off, since "too high" is the case the one-sided check above misses. */
+void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                                  uint32_t edi0, uint32_t esp0, uint32_t pop)
+{
+    enum { SLOTS = 64 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    int i;
+    int want = 4 + (int)pop, got = (int)(g_esp - esp0);
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            return;
+    if (count == SLOTS)
+        return;
+    seen[count++] = va;
+    fprintf(stderr, "[ABI] sub_%08X:%s%s%s%s\n"
+                    "      esp %+d, expected %+d (ret %u); ebx %08X->%08X"
+                    " esi %08X->%08X edi %08X->%08X esp %08X->%08X\n",
+            va,
+            g_ebx != ebx0 ? " ebx" : "",
+            g_esi != esi0 ? " esi" : "",
+            g_edi != edi0 ? " edi" : "",
+            got > want ? " esp-too-high" : got < want ? " esp-too-low" : "",
+            got, want, pop, ebx0, g_ebx, esi0, g_esi, edi0, g_edi,
+            esp0, g_esp);
+    fflush(stderr);
 }
 #endif
 
@@ -1275,6 +1421,30 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    /* The certificate, for the region a title is allowed to run in.
+     *
+     * dwCertificateAddr sits at header+0x0118 and is a plain VA -- unlike the
+     * thunk pointer above it is not XOR-obfuscated. dwGameRegion is at
+     * certificate+0xA0. A title reads XC_FACTORY_GAME_REGION and ANDs it
+     * against this, so reporting a console region the disc does not allow is
+     * indistinguishable to the title from a region-locked-out console.
+     */
+    if (xbe_size >= 0x011C) {
+        uint32_t cert_va = *(const uint32_t *)(xbe + 0x0118);
+        uint32_t base_va = *(const uint32_t *)(xbe + 0x0104);
+
+        /* The headers map 1:1 from file offset 0, so VA minus base is the
+         * file offset -- true for the certificate, which always lives in
+         * them. */
+        uint32_t cert_off = cert_va - base_va;
+
+        if (cert_va >= base_va && (uint64_t)cert_off + 0xA4 <= (uint64_t)xbe_size) {
+            uint32_t region = *(const uint32_t *)(xbe + cert_off + 0xA0);
+            xbox_kernel_set_xbe_game_region(region);
+            fprintf(stderr, "  XBE certificate: game region 0x%08X\n", region);
+        }
+    }
+
     /*
      * NOTE: .rdata is NOT set read-only.
      * VirtualProtect rounds to page boundaries, and the .rdata end (0x003B2454)
@@ -1448,12 +1618,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
-        g_contig_memory = VirtualAlloc(
-            (LPVOID)contig_native,
-            XBOX_CONTIG_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        g_contig_mapping = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+            0, (DWORD)XBOX_CONTIG_SIZE, NULL);
+        g_contig_memory = g_contig_mapping
+            ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
+                              0, 0, XBOX_CONTIG_SIZE, (LPVOID)contig_native)
+            : NULL;
+        if (!g_contig_memory)
+            g_contig_memory = VirtualAlloc(
+                (LPVOID)contig_native,
+                XBOX_CONTIG_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE
+            );
         if (g_contig_memory) {
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
@@ -1496,6 +1674,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
+        /* Trap writes to the CRTC interrupt page when the vblank chain runs.
+         *
+         * PCRTC_INTR_0 is write-1-to-clear and PMC_INTR_0 bit 24 is a summary
+         * of it. A guest ISR acknowledges by writing the one and spinning on
+         * the other, and against plain memory that spin never ends: Burnout
+         * 2's D3D8 does it on the DPC, which this runtime dispatches from the
+         * timer thread -- the same thread that raises the next vblank. One
+         * frame was delivered and the clock stopped.
+         *
+         * PAGE_READONLY, not PAGE_NOACCESS: the status registers are read far
+         * more than written, and only the write needs different semantics.
+         * Only when RECOMP_VBLANK is set, because that is the only thing that
+         * raises an interrupt for anyone to acknowledge.
+         */
+        if (g_nv2a_memory && getenv("RECOMP_VBLANK")) {
+            DWORD old_nv;
+            if (VirtualProtect((char *)g_nv2a_memory + XBOX_NV2A_PCRTC_PAGE,
+                               4096, PAGE_READONLY, &old_nv))
+                fprintf(stderr, "  NV2A: 0x%08X..0x%08X write-trapped "
+                        "(PCRTC interrupt status)\n",
+                        XBOX_NV2A_BASE + XBOX_NV2A_PCRTC_PAGE,
+                        XBOX_NV2A_BASE + XBOX_NV2A_PCRTC_PAGE + 4096);
+            else
+                fprintf(stderr, "  WARNING: NV2A PCRTC page protect failed "
+                        "(error %lu); the vblank ack will spin\n",
+                        GetLastError());
+        }
+
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
@@ -1579,19 +1785,65 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  *
                  * Enabled by the same variable, because neither half is any
                  * use without the other. */
+                /* Registers only, not the DSP's memory.
+                 *
+                 * The aperture's first 512 KB holds two different kinds of
+                 * thing. Up to 0x30000 are registers the emulated APU models:
+                 * the PAPU block below 0x20000 and the voice processor from
+                 * 0x20000. From 0x30000 up are the GP and EP DSPs' own program
+                 * and data memory, which apu_core.c ignores -- so trapping
+                 * them buys nothing and costs correctness.
+                 *
+                 * It cost a crash, not just cycles. A title loads DSP firmware
+                 * by copying it into that window, and MSVC compiles the lifted
+                 * copy into AVX: the fault at offset 0x30314 was C5 FE 6F 02,
+                 * `vmovdqu ymm0, [rdx]`, which the MMIO decoder does not
+                 * handle and never should -- a 32-byte vector load is not a
+                 * register access. Left as plain memory the copy just lands,
+                 * which is what the hardware does and what a stubbed DSP
+                 * needs.
+                 */
                 DWORD old_protect;
-                if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
+                #define XBOX_APU_REG_BYTES 0x00030000u
+                if (VirtualProtect((char *)g_mcpx_memory, XBOX_APU_REG_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
-                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
-                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
+                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
+                            " (registers; DSP memory above stays plain)\n",
+                            XBOX_MCPX_BASE,
+                            XBOX_MCPX_BASE + XBOX_APU_REG_BYTES);
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
                 fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
+
+                /* Writes to this page trap; reads do not.
+                 *
+                 * PAGE_READONLY rather than PAGE_NOACCESS, because the two
+                 * things on it want opposite treatment. The codec status is
+                 * read and has to stay plain memory -- it is polled a
+                 * thousand times in a row. The DSP command bytes have to be
+                 * caught at the instant they are written, because the wait
+                 * that follows reads the byte once and then spins on the
+                 * register copy, so anything that changes memory afterwards
+                 * arrives too late to be seen.
+                 *
+                 * Set the codec bit before protecting: afterwards this is not
+                 * writable from here either.
+                 */
+                if (VirtualProtect((char *)g_mcpx_memory + XBOX_MCPX_AC97_PAGE,
+                                   4096, PAGE_READONLY, &old_protect)) {
+                    fprintf(stderr, "  AC97: 0x%08X..0x%08X write-trapped\n",
+                            XBOX_MCPX_BASE + XBOX_MCPX_AC97_PAGE,
+                            XBOX_MCPX_BASE + XBOX_MCPX_AC97_PAGE + 4096);
+                } else {
+                    fprintf(stderr, "  WARNING: AC97 page protect failed "
+                            "(error %lu); the DSP wait will not clear\n",
+                            GetLastError());
+                }
             }
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
@@ -1746,13 +1998,35 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     {
         uintptr_t tiled_native = XBOX_TILED_BASE + g_memory_offset;
         size_t tiled_size = xbox_TiledApertureSize();
-        g_tiled_view = MapViewOfFileEx(
-            g_mapping_handle,
-            FILE_MAP_ALL_ACCESS,
-            0, 0,
-            tiled_size,
-            (LPVOID)tiled_native
-        );
+        /* A view of the CONTIGUOUS window, not of RAM.
+         *
+         * On hardware all three -- physical P, 0x80000000+P and 0xF0000000+P
+         * -- are one and the same memory. Here they cannot be: the XBE image
+         * is loaded at its own VA in the RAM mapping, so aliasing the
+         * contiguous window onto RAM would drop a title's pinned physical
+         * pools on top of its own code (Halo pins 3.4 MB at 0x61000, which is
+         * inside its image). The contiguous window therefore has separate
+         * storage, and the question becomes which of the two the tiled
+         * aperture should be a view of.
+         *
+         * It is the contiguous one. A tiled address is a GPU surface address
+         * by construction, and GPU surfaces come from
+         * MmAllocateContiguousMemory -- so the pairing that has to hold is
+         * tiled to contiguous. Against RAM instead, Half-Life 2's loader wrote
+         * every decoded video frame through 0xF1C63000 while D3D sampled the
+         * texture at 0x81C63000, and the sampler read zeros: 1.8 billion black
+         * pixels rasterised, perfectly, from an empty texture.
+         */
+        if (tiled_size > XBOX_CONTIG_SIZE)
+            tiled_size = XBOX_CONTIG_SIZE;
+        g_tiled_view = g_contig_mapping
+            ? MapViewOfFileEx(
+                g_contig_mapping,
+                FILE_MAP_ALL_ACCESS,
+                0, 0,
+                tiled_size,
+                (LPVOID)tiled_native)
+            : NULL;
         if (g_tiled_view) {
             /* Prove the alias rather than assert it. Everything the title
              * renders goes through this window and is read back through the
@@ -1764,21 +2038,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 volatile uint32_t *via_tiled =
                     (volatile uint32_t *)((uintptr_t)(XBOX_TILED_BASE + 0x1000)
                                           + g_memory_offset);
-                volatile uint32_t *via_ram =
-                    (volatile uint32_t *)((uintptr_t)0x1000 + g_memory_offset);
-                uint32_t saved = *via_ram;
+                volatile uint32_t *via_contig =
+                    (volatile uint32_t *)((uintptr_t)(XBOX_CONTIG_BASE + 0x1000)
+                                          + g_memory_offset);
+                uint32_t saved = *via_contig;
 
                 *via_tiled = 0xA5C30F17u;
-                if (*via_ram != 0xA5C30F17u)
+                if (*via_contig != 0xA5C30F17u)
                     fprintf(stderr, "  WARNING: tiled aperture does NOT alias"
-                            " RAM (wrote A5C30F17, read %08X) -- rendering"
-                            " will read empty buffers\n", *via_ram);
+                            " the contiguous window (wrote A5C30F17, read"
+                            " %08X) -- the GPU will sample empty textures\n",
+                            *via_contig);
                 else
-                    fprintf(stderr, "  Tiled aperture alias verified\n");
-                *via_ram = saved;
+                    fprintf(stderr, "  Tiled aperture alias verified"
+                            " (tiled 0x%08X == contiguous 0x%08X)\n",
+                            XBOX_TILED_BASE, XBOX_CONTIG_BASE);
+                *via_contig = saved;
             }
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
-                    " (aliases RAM)\n",
+                    " (aliases the contiguous window)\n",
                     (unsigned)(g_memory_size / (1024 * 1024)),
                     XBOX_TILED_BASE);
         } else {
@@ -2068,7 +2346,22 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * the GPU-instance bridge, so the two do not meet until the window is full.
  * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
  * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+static uint32_t g_contig_next =
+    XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW;
+
+/* What each contiguous block is, so its size can be answered later.
+ *
+ * The arena is a bump allocator and blocks are never freed, so this only ever
+ * grows and needs no free list -- but MmQueryAllocationSize has to be able to
+ * answer for these addresses, and without a record the only honest answer is
+ * zero. DirectSound allocates its DSP buffers here and then asks how big they
+ * are; a zero told it the block was not real, and it retried, which is why a
+ * run spent 103 of its last 400 kernel calls back in
+ * MmAllocateContiguousMemoryEx.
+ */
+#define XBOX_CONTIG_MAX_BLOCKS 512
+static struct { uint32_t addr, size; } g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+static int g_contig_block_count;
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
@@ -2089,8 +2382,34 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     }
 
     g_contig_next = result + size;
+
+    if (g_contig_block_count < XBOX_CONTIG_MAX_BLOCKS) {
+        g_contig_blocks[g_contig_block_count].addr = result;
+        g_contig_blocks[g_contig_block_count].size = size;
+        g_contig_block_count++;
+    }
+
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
+}
+
+/* Walk the contiguous blocks this runtime handed out.
+ *
+ * Exposed because the DirectSound DSP doorbell lives inside one of them and
+ * its address is not derivable from any APU register: GPSADDR and friends
+ * point at the DSP's own scratch, while the command block is an ordinary
+ * contiguous allocation. Rather than have each title name the address, the
+ * APU can look for it.
+ *
+ * Returns 0 when `index` is past the end, so a caller can just count up.
+ */
+int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size)
+{
+    if (index < 0 || index >= g_contig_block_count)
+        return 0;
+    if (addr) *addr = g_contig_blocks[index].addr;
+    if (size) *size = g_contig_blocks[index].size;
+    return 1;
 }
 
 /* How much of the window has been handed out.
@@ -2226,6 +2545,15 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
             xbox_va <  g_heap_blocks[i].addr + g_heap_blocks[i].size)
             return g_heap_blocks[i].size - (xbox_va - g_heap_blocks[i].addr);
     }
+
+    /* Contiguous memory is a separate arena, and a caller asking about a
+     * block from MmAllocateContiguousMemory is asking the same question. */
+    for (i = 0; i < g_contig_block_count; i++) {
+        if (xbox_va >= g_contig_blocks[i].addr &&
+            xbox_va <  g_contig_blocks[i].addr + g_contig_blocks[i].size)
+            return g_contig_blocks[i].size - (xbox_va - g_contig_blocks[i].addr);
+    }
+
     return 0;
 }
 

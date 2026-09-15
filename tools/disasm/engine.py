@@ -256,6 +256,31 @@ class DisasmEngine:
         Returns the number of tables resynced.
         """
         resynced = 0
+
+        # Where each dispatch instruction ends, keyed by the table it names.
+        #
+        # A table cannot start before the instruction that addresses it: the
+        # candidate came from that instruction's displacement, and MSVC puts
+        # the table straight after the jump, so the four bytes below the table
+        # *are* the displacement -- and its value is the table address, which
+        # the backward scan happily reads as entry -1. It then moved the start
+        # back a slot and the cleanup below deleted the jump, so
+        # _find_function_end saw neither a table nor an instruction at the
+        # dispatch and ended the function there. Every function with an inline
+        # switch was truncated, on every title.
+        #
+        # Keyed on insn.jump_table rather than on "an instruction ends here",
+        # because with a negative index the candidate is in the middle of the
+        # table and nothing ends at it. Built once: scanning the instruction
+        # map per candidate is quadratic on a real image.
+        dispatch_end = {}
+        for insn in self.instructions.values():
+            jt = getattr(insn, "jump_table", None)
+            if jt is None:
+                continue
+            if insn.end_address > dispatch_end.get(jt, 0):
+                dispatch_end[jt] = insn.end_address
+
         for tbl in sorted(self._jt_candidates):
             # XBEs mark .rdata and .data executable, so "points at an
             # executable section" alone would let an array of data pointers
@@ -273,12 +298,115 @@ class DisasmEngine:
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
-            if entries < min_entries:
+
+            # An index that never takes the low values. MSVC's memcpy trail
+            # dispatch is `jmp [eax*4 + tbl]` with eax 1..3, so slot 0 is never
+            # read and the compiler lets the next instruction's bytes sit there:
+            # Burnout 2's 0x0011F191 names 0x0011F19C, whose first word is the
+            # tail of the `jmp [ecx*4 + 0x11F298]` at 0x0011F198 and a nop, and
+            # the three real entries follow. Scanning from the base found no
+            # table, the dispatch lifted as a runtime jump, and its first case
+            # (0x0011F1AC) failed to resolve. Skip up to three unused leading
+            # slots when real entries follow them; the table then starts at the
+            # first real one, so the cleanup below leaves the shared bytes to
+            # the instruction that owns them.
+            if entries == 0:
+                for skip in (1, 2, 3):
+                    run = 0
+                    while run < max_entries:
+                        target = self.image.read_u32_at_va(
+                            tbl + (skip + run) * 4)
+                        if target is None or not (lo <= target < hi):
+                            break
+                        run += 1
+                    if run >= min_entries:
+                        tbl += skip * 4
+                        entries = run
+                        break
+
+            # ...and backwards, because the index can be negative.
+            #
+            # `jmp [reg*4 + disp]` says where index 0 lands, not where the
+            # table starts. MSVC's memcpy tail dispatch counts its remaining
+            # bytes down rather than up, so disp names the *last* entry and the
+            # rest sit below it. Burnout 2's memcpy does exactly that at
+            # 0x0011F176: `jmp dword ptr [ecx*4 + 0x11F248]` over a table that
+            # runs 0x0011F22C-0x0011F24C.
+            #
+            # Scanning forward alone found one entry there, which is under
+            # min_entries, so the table was left as data the sweep had already
+            # hallucinated instructions over. _find_function_end then walked
+            # memcpy into the table, found no instruction at 0x0011F248, and
+            # ended the function -- 165 bytes short, with every unrolled copy
+            # block and the epilogue outside it. memcpy returned without
+            # restoring esi, edi or esp, and every caller paid for it.
+            # ...but not over the dispatch instruction itself.
+            #
+            # MSVC usually puts the table immediately after the jump, and
+            # `jmp dword ptr [reg*4 + disp32]` is FF 24 8D <disp32> -- so the
+            # four bytes at tbl-4 are the jump's own displacement, and its
+            # value *is* tbl, which is inside the section. The scan accepted
+            # it, moved the table start back a slot, and the cleanup below
+            # deleted the jump. _find_function_end then found neither a table
+            # nor an instruction at the dispatch and ended the function there,
+            # truncating every function with an inline switch on every title.
+            #
+            # The invariant is ownership, not the value: the table cannot
+            # begin before the instruction that addresses it has ended.
+            # Testing the value instead (target == tbl) would only catch the
+            # index-0 layout and would miss it whenever the compiler picked a
+            # different entry to name.
+            floor = dispatch_end.get(tbl, lo)
+            if floor < lo:
+                floor = lo
+
+            # A backward entry must also point near the dispatch, as a case
+            # label does. "Inside the section" alone is a weak test for bytes
+            # that are code: when the table is not straight after the jump --
+            # the epilogue sits between them -- the words below the table are
+            # that epilogue, and its small immediates read as .text addresses.
+            # Burnout 2's sub_00092AE0 dispatches at 0x00092C25 through a
+            # table at 0x00092D8C, preceded by `add esp,0x218; ret 4`: the
+            # bytes C4 18 02 00 and 00 C2 04 00 read as 0x000218C4 and
+            # 0x0004C200, the start moved back 8 bytes, and the cleanup below
+            # deleted the epilogue. The function then returned without freeing
+            # its 0x218-byte frame; the attract movie's path string was popped
+            # into its callers' registers, main returned, and the title booted
+            # to the dashboard. memcpy's backward entries, which this scan
+            # exists for, point a few hundred bytes away.
+            #
+            # "Near" has to be close, not merely in the same neighbourhood of
+            # the image: sub_0003EB80's table at 0x0003EC28 is preceded by
+            # `pop ebp; ret 4` -- the target of a jne -- whose bytes read as
+            # 0x0004C25D, 55 KB from the dispatch. Case labels cluster, so the
+            # test is the cluster: within 4 KB of the dispatch, or of the
+            # span the forward entries already cover.
+            near = dispatch_end.get(tbl, tbl)
+            forward = [self.image.read_u32_at_va(tbl + k * 4)
+                       for k in range(entries)] + [near]
+            cluster_lo = min(forward) - 0x1000
+            cluster_hi = max(forward) + 0x1000
+
+            back = 0
+            while back < max_entries:
+                addr = tbl - (back + 1) * 4
+                if addr < floor:
+                    break
+                target = self.image.read_u32_at_va(addr)
+                if target is None or not (lo <= target < hi):
+                    break
+                if not (cluster_lo <= target <= cluster_hi):
+                    break
+                back += 1
+
+            if entries + back < min_entries:
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
                 # would delete real instructions.
                 continue
 
+            tbl -= back * 4
+            entries += back
             end = tbl + entries * 4
             for insn in self.get_instructions_in_range(
                     tbl - 16, end):
@@ -383,6 +511,7 @@ class DisasmEngine:
         if not data:
             return None
 
+        limit = addr + len(data)
         count = 0
         for decoded in self._cs.disasm(data, addr):
             count += 1
@@ -394,11 +523,124 @@ class DisasmEngine:
             if mnemonic in config.JMP_MNEMONICS:
                 try:
                     ops = decoded.operands
-                except Exception:
+                except Exception:                    # noqa: BLE001
                     return None
                 if not ops or ops[0].type != CS_OP_IMM:
                     return None             # indirect: nothing to name
-                return ops[0].imm & 0xFFFFFFFF
+                target = ops[0].imm & 0xFFFFFFFF
+                # Same rule as block_extent_end: a forward jump landing inside
+                # the window is MSVC skipping an else-branch, not the block's
+                # tail. Without this the two probes disagree about where a
+                # block ends -- block_tail_jump(0x00120307) answered 0x00120321,
+                # that function's own internal else-skip, so the caller both
+                # believed the block ended in a tail jump and registered an
+                # alias at an address in the middle of the function.
+                if decoded.address < target < limit:
+                    continue
+                return target
+        return None
+
+    def entry_pops_unsaved(self, addr: int, max_insns: int = 256):
+        """Callee-saved registers this address pops without ever pushing.
+
+        A function entry saves what it restores. An address that pops ebx, esi,
+        edi or ebp having never pushed it is not an entry point: it is the
+        middle of a function whose prologue did the pushing. Calling it as a
+        function runs the epilogue against the caller's stack, so the caller
+        gets back whatever happened to be there -- silent register corruption,
+        surfacing far away.
+
+        Returns the offending register names, or an empty list.
+
+        Scanned linearly to the first ret, which is the same shape
+        probes_as_function_body accepts, so the two agree about what body they
+        are talking about. Deliberately conservative: a register both pushed
+        and popped is fine however unbalanced the counts, because one prologue
+        push commonly answers several epilogue pops.
+
+        __SEH_epilog legitimately has this shape -- unwinding the caller's
+        frame is its whole job -- so it is a real exception rather than a
+        failure of the rule. It is identified by byte pattern elsewhere and
+        never needs seeding.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return []
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return []
+
+        saved = ("ebx", "esi", "edi", "ebp")
+        pushed = set()
+        popped = []
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            if count > max_insns:
+                break
+            mnemonic = decoded.mnemonic.lower()
+            operand = decoded.op_str.strip().lower()
+            if mnemonic == "push" and operand in saved:
+                pushed.add(operand)
+            elif mnemonic == "pop" and operand in saved:
+                if operand not in pushed and operand not in popped:
+                    popped.append(operand)
+            elif mnemonic in config.RET_MNEMONICS:
+                break
+        return popped
+
+    def block_extent_end(self, addr: int, max_insns: int = 256):
+        """
+        Where the straight-line run at `addr` ends: the address just past its
+        terminating ret or direct jmp, or None if it runs longer than the
+        window without reaching either.
+
+        This is the extent that probes_as_returning_body and block_tail_jump
+        actually inspected, so it is the honest end for a body they accepted.
+        Bounding an alias by "the next known function start" instead is only a
+        proxy, and where starts are sparse it produces a body spanning a large
+        part of the section.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return None
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return None
+
+        limit = addr + len(data)
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            if count > max_insns:
+                return None
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return decoded.address + decoded.size
+            if mnemonic in config.JMP_MNEMONICS:
+                # A forward jump that stays inside the window being scanned is
+                # ordinary control flow, not the end of anything -- MSVC emits
+                # it constantly to skip an else-branch, and
+                # probes_as_returning_body already says so. Treating every jmp
+                # as a terminator cut Burnout 2's sub_00120307 to 20 bytes at
+                # its own "jmp 0x120321", stranding the epilogue that restores
+                # esi. That function is a global constructor, so _initterm
+                # called it with esi holding the cursor into the initialiser
+                # table, got esi back clobbered, and walked off the table into
+                # whatever followed -- calling the middle of an unrelated
+                # function as if it were the next constructor.
+                #
+                # Only a backward jump, or one leaving the window, is
+                # tail-call shaped and ends the run.
+                try:
+                    operands = decoded.operands
+                except Exception:                    # noqa: BLE001
+                    return decoded.address + decoded.size
+                if operands and operands[0].type == CS_OP_IMM:
+                    target = operands[0].imm & 0xFFFFFFFF
+                    if decoded.address < target < limit:
+                        continue
+                return decoded.address + decoded.size
         return None
 
     def probes_as_returning_body(self, addr: int,

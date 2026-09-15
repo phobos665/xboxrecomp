@@ -106,6 +106,37 @@ def check_data_matches_binary(xbe_path, summary_path):
         sys.exit(1)
 
 
+def game_categories(classification_db):
+    """Every category that is game code, plus the unclassified remainder.
+
+    Naming the three categories game_engine/game_vtable/unknown explicitly
+    silently dropped every subsystem func_id manages to identify: on Burnout 2
+    that excluded game_render, game_audio, game_network, game_vehicle, game_io,
+    game_input, game_ui and game_physics. The symptom is an unresolved indirect
+    call into code that was discovered and classified but never translated --
+    the sharper the classifier gets, the more --game-only leaves out.
+
+    Take every "game_*" category instead, so a new one is included by default,
+    and keep "unknown" because an unclassified function is far more likely to
+    be game code than library code.
+
+    "crt" is included too, because nothing replaces it. The CRT is statically
+    linked into the XBE and the runtime provides no native substitute, so an
+    excluded CRT function does not become a fast native call -- it becomes a
+    stub that pops the return address and returns whatever was already in eax.
+    Burnout 2 calls _ftol2 510 times; stubbing it makes every float-to-int
+    conversion in the game produce garbage, which surfaces much later as a
+    corrupt pointer in an unrelated function. Excluding library code is only
+    sound once something actually implements it.
+    """
+    categories = {"unknown", "crt"}
+    for entry in classification_db.values():
+        category = entry.get("category")
+        if category and category.startswith("game_"):
+            categories.add(category)
+    return categories
+
+
 def list_categories(translator):
     """Print category breakdown."""
     cats = {}
@@ -202,6 +233,14 @@ def main():
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
                              "hand-written definition links instead")
+    parser.add_argument("--hle-symbols", metavar="FILE",
+                        help="tools.xdk_symbols JSON for this XBE. XDK functions "
+                             "with an HLE_EXPORT(Name) implementation are "
+                             "replaced by name instead of lifted "
+                             "(see tools/recomp/hle.py)")
+    parser.add_argument("--hle-impl", metavar="PATH", action="append",
+                        help="C file or directory to scan for HLE_EXPORT(Name) "
+                             "markers (repeatable; default: src/hle)")
     parser.add_argument("--exclude-manual", metavar="FILE",
                         nargs="?", const="src/game/recomp/recomp_manual.c",
                         help="Scan a C file (default recomp_manual.c) for the "
@@ -215,6 +254,13 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
+    parser.add_argument("--trace-all-entries", action="store_true",
+                        help="Emit an entry hook in every function. With "
+                             "RECOMP_TRACE_PROFILE set at run time this reports "
+                             "how many distinct functions the run reached -- a "
+                             "frontier measure that rises with progress, unlike "
+                             "kernel calls (flat once startup ends) or raw "
+                             "indirect-call counts (inflated by spin loops)")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -271,6 +317,7 @@ def main():
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
         trace_functions=_load_addrs(args.trace_functions),
+        trace_all_entries=args.trace_all_entries,
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
     )
@@ -307,7 +354,7 @@ def main():
 
         if args.game_only:
             funcs = translator.get_functions_by_category(
-                categories={"game_engine", "game_vtable", "unknown"})
+                categories=game_categories(translator.classification_db))
         elif args.category:
             funcs = translator.get_functions_by_category(
                 categories={args.category})
@@ -328,13 +375,13 @@ def main():
         funcs = translator.get_functions_by_category(categories=categories)
     elif args.game_only:
         # Game-specific functions only
-        categories = {"game_engine", "game_vtable", "unknown"}
+        categories = game_categories(translator.classification_db)
         funcs = translator.get_functions_by_category(categories=categories)
     elif args.all:
         funcs = translator.get_functions_by_category()
     else:
         # Default: game functions only
-        categories = {"game_engine", "game_vtable", "unknown"}
+        categories = game_categories(translator.classification_db)
         funcs = translator.get_functions_by_category(categories=categories)
 
     print(f"\nTranslating {len(funcs)} functions...", file=sys.stderr)
@@ -424,13 +471,104 @@ def main():
                   + (f"; {len(wrap & known)} wrapped as sub_X_gen" if wrap else ""),
                   file=sys.stderr)
 
+        # XDK functions replaced by name (tools/recomp/hle.py). Planned after
+        # the hand-written set is complete, so title code keeps winning, and
+        # before translation, so the replaced bodies are not lifted.
+        hle_replace = {}
+        # XDK variables the replacements import by name. Scanned whether or not
+        # there is a symbols file: the implementations declare them either
+        # way, so the generated file has to define them either way (as 0 when
+        # they cannot be named) or the build does not link.
+        from .hle import imported_variables, load_variables, resolve_variables
+        hle_impl_paths = args.hle_impl or [os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))), "src", "hle")]
+        hle_var_names = imported_variables(
+            [p for p in hle_impl_paths if os.path.exists(p)])
+        hle_variables = {name: 0 for name in hle_var_names}
+        if args.hle_symbols and hle_var_names:
+            hle_variables, var_notes = resolve_variables(
+                hle_var_names, load_variables(args.hle_symbols))
+            print(f"XDK variables imported by name: "
+                  f"{sum(1 for v in hle_variables.values() if v)} of "
+                  f"{len(hle_var_names)}", file=sys.stderr)
+            for note in var_notes:
+                print(f"  hle: {note}", file=sys.stderr)
+        if args.hle_symbols:
+            from .config import va_to_file_offset
+            from .hle import implemented_names, load_symbols, plan, stack_cleanup
+            xbe_bytes = translator.translator.xbe_data
+
+            def _cleanup(addr):
+                # Argument bytes the function's own `ret N` pops, read from the
+                # binary: the thunk pops exactly what the lifted body would.
+                info = translator.func_db.get(addr) or {}
+                end = info.get("end")
+                if isinstance(end, str):
+                    end = int(end, 16)
+                off = va_to_file_offset(addr)
+                if not end or end <= addr or off is None or not xbe_bytes:
+                    return None
+                return stack_cleanup(xbe_bytes[off:off + (end - addr)], addr)
+            impl_paths = args.hle_impl or [os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)))), "src", "hle")]
+            implemented = implemented_names(
+                [p for p in impl_paths if os.path.exists(p)])
+            hle_replace, hle_notes = plan(load_symbols(args.hle_symbols),
+                                          implemented, set(translator.func_db),
+                                          manual, _cleanup)
+            for addr in hle_replace:
+                translator.func_db[addr]["name"] = f"sub_{addr:08X}"
+            manual |= set(hle_replace)
+            print(f"XDK functions replaced by name: {len(hle_replace)} of "
+                  f"{len(implemented)} implemented", file=sys.stderr)
+            for note in hle_notes:
+                print(f"  hle: {note}", file=sys.stderr)
+
+        # Replacements that run the title's own body first (HLE_ORIGINAL):
+        # those bodies are still lifted, under their own name. Scanned whether
+        # or not there is a symbols file, like the imported variables, because
+        # the implementations declare the pointers either way.
+        from .hle import keep_originals, wanted_originals
+        wanted = wanted_originals([p for p in hle_impl_paths if os.path.exists(p)])
+        hle_keep = keep_originals(hle_replace, wanted)
+        # A body can only be kept if this lift emits it: translate_batch_split
+        # drops owned function starts, and --game-only never passes some
+        # categories in. Pointing recomp_hle.c at a body that is not there
+        # fails the link, so such an original is left 0 instead, and the
+        # replacement reports it at run time.
+        lifted = ({item[0] for item in funcs}
+                  - set(translator.translator.owned_function_starts))
+        for addr in sorted(set(hle_keep) - lifted):
+            name = hle_replace[addr][0]
+            print(f"warning: {name} at 0x{addr:08X} is replaced but its body is "
+                  f"not lifted in this run, so hle_original_{name} is 0",
+                  file=sys.stderr)
+            del hle_keep[addr]
+        hle_originals = {name: None for name in wanted}
+        for addr in hle_keep:
+            hle_originals[hle_replace[addr][0]] = addr
+        if wanted:
+            print(f"Original bodies kept for replacements that run them: "
+                  f"{len(hle_keep)} of {len(wanted)}", file=sys.stderr)
+
         stats = translator.translate_batch_split(
             funcs,
             output_dir=gen_dir,
             chunk_size=args.split,
             verbose=args.verbose,
             manual=manual,
+            keep_bodies=hle_keep,
         )
+
+        # Written after translation, which clears stale files from gen_dir, and
+        # written even when empty, so a stale thunk file from an earlier lift
+        # can never define a function this lift generated.
+        from .hle import render_thunks
+        with open(os.path.join(gen_dir, "recomp_hle.c"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(render_thunks(hle_replace, hle_variables, hle_originals))
 
         t_translate = time.time() - t0
         print(f"\n=== Split Translation Complete ({t_translate:.1f}s) ===",
