@@ -6201,22 +6201,8 @@ static void bridge_DbgLoadImageSymbols(void)
     g_eax = 0;
 }
 
-/* --- DbgPrint (ordinal 8, __cdecl varargs, 0 fixed args) --- */
-static void bridge_DbgPrint(void)
-{
-    /* First vararg is a guest format string. Log it verbatim (never treat it
-     * as a format, it is guest-owned); caller cleans the stack (__cdecl). */
-    const char *fmt = (const char *)XBOX_TO_NATIVE(STACK_ARG(0));
-    if (fmt && KERNEL_LOG_ON()) {
-        size_t i, n = 0;
-        for (i = 0; i < 512 && fmt[i]; i++)
-            n++;
-        fwrite(fmt, 1, n, stderr);
-        fputc('\n', stderr);
-        fflush(stderr);
-    }
-    g_eax = 0;
-}
+/* --- DbgPrint (ordinal 8) is defined earlier in this file, beside
+ * bridge_guest_string(), which it uses to expand %s safely. --- */
 
 /* --- DbgPrompt (ordinal 10, 2 args = 8 bytes) --- */
 static void bridge_DbgPrompt(void)

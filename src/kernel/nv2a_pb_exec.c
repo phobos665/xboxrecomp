@@ -1215,6 +1215,7 @@ static uint32_t blend_pixel(uint32_t src_argb, uint32_t dst_argb)
         out |= (uint32_t)v << (24 - 8 * ch);
     }
     return out;
+}
 
 /* The surface, resolved once per batch.
  *
