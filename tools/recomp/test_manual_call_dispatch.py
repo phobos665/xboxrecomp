@@ -159,7 +159,9 @@ def test_kept_original_is_lifted_once_and_left_out_of_dispatch():
                      if name.endswith(".c") and not name.endswith("_dispatch.c"))
     dispatch = next(text for name, text in sources.items()
                     if name.endswith("_dispatch.c"))
-    header = next(text for name, text in sources.items() if name.endswith(".h"))
+    # By name: the output folder holds other headers too (recomp_types.h), and
+    # glob order differs between Windows and Linux.
+    header = sources["recomp_funcs.h"]
 
     # The body is emitted once, under its kept name, and never under the
     # address's own name -- that one belongs to the replacement.
