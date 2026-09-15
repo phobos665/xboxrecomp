@@ -1173,8 +1173,19 @@ class FunctionDetector:
             # alias copies that jump back like this, 42 of them into
             # sub_000FFF20 alone; the alias mechanism is what makes those
             # labels callable.
+            # Conditional jumps too, when they land inside a function. A
+            # conditional branch out of a body lifts exactly like a tail jmp:
+            # `if (cc) { sub_TARGET(); return; }`. Burnout 2's sub_000C08F0 is
+            # split at 0x000C0A07 by a DSOUND data word that happens to equal
+            # it, and the split-off tail closes its loop with `jne 0x000C0960`
+            # back into the host. With no entry there that was a call to an
+            # empty stub: the loop body was skipped, the frame leaked, and the
+            # front end's element list walk called a null callback forever on
+            # the first race's loading screen. Into a gap a conditional jump is
+            # weaker evidence of a function start than a jmp, so those are
+            # still left alone below.
             for insn in self.engine.get_instructions_in_range(a_start, a_end):
-                if not insn.is_jump or insn.is_cond_jump:
+                if not insn.is_branch:      # jmp or Jcc; is_jump is jmp only
                     continue
                 target = insn.jump_target
                 if target is None or a_start <= target < a_end:
@@ -1194,6 +1205,8 @@ class FunctionDetector:
                     if target not in self.engine.instructions:
                         continue
                     end = bounds[j][1]
+                elif insn.is_cond_jump:
+                    continue
                 else:
                     # In a gap: the same evidence _pass_call_targets asks of a
                     # target it has to realign, plus the checks that keep

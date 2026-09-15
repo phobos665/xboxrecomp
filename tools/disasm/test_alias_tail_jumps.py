@@ -129,6 +129,35 @@ def test_a_real_function_jumping_into_another_gets_an_entry():
     assert det._alias_entries.get(BASE + 3) == BASE + 5
 
 
+def test_a_conditional_jump_into_a_function_gets_an_entry():
+    # A conditional branch out of a body lifts like a tail jmp, so a label it
+    # lands on inside another function needs an entry too. Burnout 2's
+    # split-off loop tail sub_000C0A07 closes its loop with `jne 0x000C0960`
+    # back into sub_000C08F0; without an entry that was an empty stub.
+    #   BASE+0x00  host:   push esi; mov esi, ecx; pop esi; ret
+    #   BASE+0x50  jumper: jne BASE+3; ret
+    code = bytearray(_layout(b"\xc3"))
+    code[0x50:0x57] = b"\x0f\x85" + _rel32(BASE + 0x56, BASE + 0x03) + b"\xc3"
+    det, sec = _detector(bytes(code))
+    det._alias_entries = {}
+    det.functions[BASE + 0x50] = SimpleNamespace(start=BASE + 0x50, end=BASE + 0x57)
+    assert det._pass_alias_tail_jumps([sec]) >= 1, det._alias_entries
+    assert det._alias_entries.get(BASE + 3) == BASE + 5
+
+
+def test_a_conditional_jump_into_a_gap_is_not_an_entry():
+    # The same conditional branch aimed at a gap: weaker evidence of a function
+    # start than a jmp, so no entry is invented there, even over a body the
+    # probe would accept from a jmp (see the first test).
+    code = bytearray(_layout(b"\x8b\xc1\xc7\x40\x04\x00\x00\x00\x00\xc3"))
+    code[0x50:0x57] = b"\x0f\x85" + _rel32(BASE + 0x56, BASE + 0x30) + b"\xc3"
+    det, sec = _detector(bytes(code))
+    det._alias_entries = {}
+    det.functions[BASE + 0x50] = SimpleNamespace(start=BASE + 0x50, end=BASE + 0x57)
+    det._pass_alias_tail_jumps([sec])
+    assert BASE + 0x30 not in det._alias_entries, det._alias_entries
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
