@@ -48,6 +48,7 @@
 /* Window title for the SDL window, configurable per title via
  * xbox_D3D8SetWindowTitle(). Default is a generic name. */
 static const char *g_window_title = "Xbox Game";
+static UINT g_present_interval = 1;     /* xbox_D3D8SetPresentInterval */
 
 void xbox_D3D8SetWindowTitle(const char *title)
 {
@@ -1006,7 +1007,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
         return D3DERR_INVALIDCALL;
     }
     SDL_GL_MakeCurrent(g.window, g.glctx);
-    SDL_GL_SetSwapInterval(1);
+    SDL_GL_SetSwapInterval(g_present_interval);
 
     fprintf(stderr, "[d3d8_gl] GL %s / GLSL %s\n",
             glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
@@ -1053,6 +1054,13 @@ IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion)
 IDirect3DDevice8 *xbox_GetD3DDevice(void)
 {
     return &g_device;
+}
+
+void xbox_D3D8SetPresentInterval(UINT interval)
+{
+    g_present_interval = interval;
+    if (g.glctx)
+        SDL_GL_SetSwapInterval((int)interval);
 }
 
 void d3d8_PresentFrame(void)

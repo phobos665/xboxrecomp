@@ -1156,6 +1156,12 @@ void xbox_D3D8SetWindowTitle(const char *title);
 IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /**
+ * DXGI sync interval Swap presents with (default 1, wait for vertical blank).
+ * 0 presents without waiting, for a device that is not the title's display.
+ */
+void xbox_D3D8SetPresentInterval(UINT interval);
+
+/**
  * Present frame and pump window messages.
  * Called from recompiled game code (replaces RW driver Present path).
  */

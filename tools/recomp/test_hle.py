@@ -92,5 +92,52 @@ class Render(unittest.TestCase):
                       src)
 
 
+class Originals(unittest.TestCase):
+    """HLE_ORIGINAL: a replacement that also runs the title's own body."""
+
+    def test_markers_are_found_and_comments_are_not(self):
+        from tools.recomp.hle import wanted_originals
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "d3d.c"), "w") as f:
+                f.write("HLE_ORIGINAL(D3DDevice_Clear);\n"
+                        "  HLE_ORIGINAL( D3DDevice_Swap );\n"
+                        "/* HLE_ORIGINAL(NotReal) is mentioned mid-comment */\n"
+                        "/*\n"
+                        "   HLE_ORIGINAL(QuotedOnItsOwnLine);\n"
+                        " */\n")
+            self.assertEqual(wanted_originals([d]),
+                             {"D3DDevice_Clear", "D3DDevice_Swap"})
+
+    def test_only_replaced_functions_keep_a_body(self):
+        from tools.recomp.hle import keep_originals
+        replace = {0x0021CA20: ("D3DDevice_Clear", 24),
+                   0x002224A0: ("D3DDevice_Swap", 4)}
+        self.assertEqual(
+            keep_originals(replace, {"D3DDevice_Clear", "Direct3D_CreateDevice"}),
+            {0x0021CA20: "sub_0021CA20_hle_original"})
+
+    def test_render_points_each_original_at_its_body(self):
+        src = render_thunks({0x0021CA20: ("D3DDevice_Clear", 24)},
+                            originals={"D3DDevice_Clear": 0x0021CA20,
+                                       "Direct3D_CreateDevice": None})
+        # The address itself is still the replacement.
+        self.assertIn("void sub_0021CA20(void) { hle_D3DDevice_Clear(); g_esp += 28; }", src)
+        self.assertIn("void sub_0021CA20_hle_original(void);", src)
+        self.assertIn("void (*const hle_original_D3DDevice_Clear)(void) = "
+                      "sub_0021CA20_hle_original;", src)
+        # Asked for but not replaced in this title: defined, so the build links.
+        self.assertIn("void (*const hle_original_Direct3D_CreateDevice)(void) = 0;", src)
+
+    def test_no_originals_renders_as_before(self):
+        replace = {0x10: ("D3DDevice_Swap", 4)}
+        plain = render_thunks(replace)
+        self.assertEqual(plain, render_thunks(replace, originals={}))
+        self.assertNotIn("hle_original", plain)
+        # And the block really is what originals add, so the equality above
+        # is not two empty renders agreeing.
+        self.assertIn("hle_original_D3DDevice_Swap",
+                      render_thunks(replace, originals={"D3DDevice_Swap": 0x10}))
+
+
 if __name__ == "__main__":
     unittest.main()

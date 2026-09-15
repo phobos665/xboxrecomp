@@ -1409,7 +1409,8 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False, manual=None):
+                              prefix="recomp", verbose=False, manual=None,
+                              keep_bodies=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -1426,6 +1427,12 @@ class BatchTranslator:
         is how a game replaces a recompiled XDK routine (a D3D8 entry point,
         say) with one that drives the host runtime instead of the hardware.
 
+        keep_bodies: {address: name} for manual addresses whose original body
+        is still wanted, under that name -- a replacement that runs the title's
+        own code first (tools/recomp/hle.py, HLE_ORIGINAL). The body is
+        compiled and declared, but kept out of the dispatch table, so the
+        address still resolves to the replacement.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -1435,6 +1442,8 @@ class BatchTranslator:
         func_list = [item for item in func_list
                      if item[0] not in self.translator.owned_function_starts]
         manual = set(manual or ())
+        keep_bodies = dict(keep_bodies or {})
+        kept_names = set(keep_bodies.values())
         # Hand the set to the lifter so a *direct* call to a replaced
         # function routes through recomp_lookup_manual too. Without this
         # the override only took effect through a function pointer, and
@@ -1458,9 +1467,15 @@ class BatchTranslator:
                       file=sys.stderr)
 
             if addr in manual:
-                # Hand-written elsewhere: declare it, emit nothing.
+                # Hand-written elsewhere: declare it, emit nothing -- unless a
+                # replacement also runs the original, in which case the body
+                # is lifted under its own name and the address stays manual.
                 manual_decls[addr] = name
-                continue
+                keep = keep_bodies.get(addr)
+                if not keep:
+                    continue
+                func_info = dict(func_info, name=keep)
+                name = keep
 
             code = self.translator.translate_function(addr, func_info)
             if code:
@@ -1695,7 +1710,9 @@ class BatchTranslator:
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
+            # A kept original is not the address's entry: the replacement is.
+            [t for t in translations if t[1] not in kept_names]
+            + [(addr, name, None)
                                   for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")

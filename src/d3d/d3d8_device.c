@@ -224,6 +224,17 @@ static HRESULT d3d11_create_device_and_swap_chain(
         &state->d3d11_context
     );
 
+    /* The debug layer is only present with Graphics Tools installed. Without
+     * it a Debug build would have no device at all. */
+    if (FAILED(hr) && (create_flags & D3D11_CREATE_DEVICE_DEBUG)) {
+        fprintf(stderr, "D3D8: D3D11 debug layer unavailable (0x%08lX), creating without it\n", hr);
+        create_flags &= ~(UINT)D3D11_CREATE_DEVICE_DEBUG;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                           create_flags, NULL, 0, D3D11_SDK_VERSION,
+                                           &scd, &state->swap_chain, &state->d3d11_device,
+                                           &feature_level, &state->d3d11_context);
+    }
+
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
         return hr;
@@ -1369,6 +1380,18 @@ static HRESULT __stdcall dev_EndPush(IDirect3DDevice8 *self, DWORD *pPush)
     return E_NOTIMPL;
 }
 
+/* DXGI sync interval for Swap. 1 waits for vertical blank, which is right
+ * when this device is the title's display. A device run beside the title's
+ * own D3D8 (hle_d3d8.c shadow mode) must not block: the title paces its
+ * loader on frames presented, so a vsync wait here throttled Burnout 2 from
+ * about 136 frames a second to 27 and cut how far a run got by two thirds. */
+static UINT g_present_interval = 1;
+
+void xbox_D3D8SetPresentInterval(UINT interval)
+{
+    g_present_interval = interval;
+}
+
 static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
 {
     (void)self; (void)Flags;
@@ -1383,7 +1406,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         DispatchMessageA(&msg);
     }
 
-    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    return IDXGISwapChain_Present(g_device_state.swap_chain, g_present_interval, 0);
 }
 
 /* ================================================================

@@ -38,6 +38,24 @@ extern ptrdiff_t g_xbox_mem_offset;
  * symbols could not name it, so check before use. */
 #define HLE_IMPORT_VAR(name) extern const uint32_t hle_var_##name
 
+/* Declares the original, lifted body of a replaced function as
+ * hle_original_<name>, for a replacement that runs the title's own code and
+ * then does its own work. Must start a line, like HLE_EXPORT: tools.recomp
+ * scans for it, keeps the body as sub_XXXXXXXX_hle_original, and defines the
+ * pointer in recomp_hle.c -- 0 when this title does not replace the function. */
+#define HLE_ORIGINAL(name) extern void (*const hle_original_##name)(void)
+
+/* Run the original body with the guest stack exactly as the caller left it.
+ * The body pops its own return address and arguments, as its `ret N` does;
+ * esp is put back afterwards so the thunk's pop is the only one. g_eax keeps
+ * the original's result. */
+#define HLE_CALL_ORIGINAL(name)                                                \
+    do {                                                                       \
+        uint32_t hle_esp_ = g_esp;                                             \
+        hle_original_##name();                                                 \
+        g_esp = hle_esp_;                                                      \
+    } while (0)
+
 /* Guest memory at a guest address. */
 #define HLE_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define HLE_PTR(va)   ((void *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))

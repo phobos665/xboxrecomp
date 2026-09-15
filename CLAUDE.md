@@ -51,9 +51,12 @@ handles cube and volume textures, and bakes P8 through the stage palette;
 `src/d3d/d3d8_shaders.c` does texture coordinate generation. `src/d3d` is 12.5k lines and
 is the renderer. The generalisation blocker is not the texture layer.
 
-**The real blocker is that `src/hle` cannot see `src/d3d`.** `src/hle/CMakeLists.txt`
-links `xbox_hle` against `xbox_kernel` only, so the signature-based D3D8 replacement has
-nowhere to land and `hle_d3d8.c` is two no-ops. Connecting them is the next piece of work.
+**The real blocker was that `src/hle` could not see `src/d3d`.** It can now (Sep 2026):
+`xbox_hle` links `xbox_d3d8` on Windows, and `hle_d3d8.c` replaces `CreateDevice`, `Clear`
+and `Swap` by name. Each runs the title's own body first (`HLE_ORIGINAL`), and with
+`RECOMP_HLE_D3D8=shadow` repeats the call on a host device in a second window. Nothing is
+drawn there yet; drawing through it, and a path for titles that fill push buffers through
+`BeginPush`, are the next pieces of work.
 
 **Backend decision (Sep 2026): Vulkan**, for portability — Linux, Steam Deck, Android.
 The shader generators stay as they are: `d3d8_combiners.c`, `d3d8_vsh.c` and

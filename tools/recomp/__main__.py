@@ -526,12 +526,40 @@ def main():
             for note in hle_notes:
                 print(f"  hle: {note}", file=sys.stderr)
 
+        # Replacements that run the title's own body first (HLE_ORIGINAL):
+        # those bodies are still lifted, under their own name. Scanned whether
+        # or not there is a symbols file, like the imported variables, because
+        # the implementations declare the pointers either way.
+        from .hle import keep_originals, wanted_originals
+        wanted = wanted_originals([p for p in hle_impl_paths if os.path.exists(p)])
+        hle_keep = keep_originals(hle_replace, wanted)
+        # A body can only be kept if this lift emits it: translate_batch_split
+        # drops owned function starts, and --game-only never passes some
+        # categories in. Pointing recomp_hle.c at a body that is not there
+        # fails the link, so such an original is left 0 instead, and the
+        # replacement reports it at run time.
+        lifted = ({item[0] for item in funcs}
+                  - set(translator.translator.owned_function_starts))
+        for addr in sorted(set(hle_keep) - lifted):
+            name = hle_replace[addr][0]
+            print(f"warning: {name} at 0x{addr:08X} is replaced but its body is "
+                  f"not lifted in this run, so hle_original_{name} is 0",
+                  file=sys.stderr)
+            del hle_keep[addr]
+        hle_originals = {name: None for name in wanted}
+        for addr in hle_keep:
+            hle_originals[hle_replace[addr][0]] = addr
+        if wanted:
+            print(f"Original bodies kept for replacements that run them: "
+                  f"{len(hle_keep)} of {len(wanted)}", file=sys.stderr)
+
         stats = translator.translate_batch_split(
             funcs,
             output_dir=gen_dir,
             chunk_size=args.split,
             verbose=args.verbose,
             manual=manual,
+            keep_bodies=hle_keep,
         )
 
         # Written after translation, which clears stale files from gen_dir, and
@@ -540,7 +568,7 @@ def main():
         from .hle import render_thunks
         with open(os.path.join(gen_dir, "recomp_hle.c"), "w",
                   encoding="utf-8") as fh:
-            fh.write(render_thunks(hle_replace, hle_variables))
+            fh.write(render_thunks(hle_replace, hle_variables, hle_originals))
 
         t_translate = time.time() - t0
         print(f"\n=== Split Translation Complete ({t_translate:.1f}s) ===",

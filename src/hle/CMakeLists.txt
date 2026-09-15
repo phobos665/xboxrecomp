@@ -31,4 +31,7 @@ target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 if(WIN32)
     target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
+    # The D3D8 replacements drive the host renderer in src/d3d, and open a
+    # window of their own for it.
+    target_link_libraries(xbox_hle PRIVATE xbox_d3d8 user32)
 endif()
