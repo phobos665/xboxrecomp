@@ -117,85 +117,81 @@ static inline uint32_t vsh_extract(const DWORD *insn, int start, int count)
  * the LSB of word[0].
  */
 
-/* Word 0 fields */
-#define VSH_FIELD_ILU_OP_START      25
-#define VSH_FIELD_ILU_OP_SIZE       4
-#define VSH_FIELD_MAC_OP_START      21
-#define VSH_FIELD_MAC_OP_SIZE       4
-#define VSH_FIELD_CONST_IDX_START   13
-#define VSH_FIELD_CONST_IDX_SIZE    8
-#define VSH_FIELD_INPUT_IDX_START   9
-#define VSH_FIELD_INPUT_IDX_SIZE    4
+/* ================================================================
+ * Microcode field table
+ *
+ * Absolute bit offsets; dword N starts at bit 32*N, LSB-first within each
+ * dword. dword0 carries no fields -- it is zero in every instruction of
+ * every program observed, which is what exposed the previous table: it
+ * placed the opcodes there and so read zero for all of them.
+ *
+ * Derived from Burnout 2's own microcode and then confirmed field by field
+ * against abaire/nv2a_vsh_asm, whose vsh_instruction.py defines the same
+ * encoding as ctypes bitfields. docs/technical/nv2a-vertex-program-encoding.md
+ * records the derivation and carries the twelve-instruction disassembly that
+ * tools/vsh_audit/test_vsh_encoding.py asserts against.
+ *
+ * Note what is NOT here, because the hardware does not have it: a separate
+ * destination per unit. MAC and ILU share one temp register index
+ * (OUT_TEMP) and have a write mask each, and there is a single output
+ * register write (OUT_ADDRESS, OUT_O_MASK) fed by whichever unit OUT_MUX
+ * selects.
+ * ================================================================ */
 
-/* Source A (spans word 0 and word 1) */
-#define VSH_FIELD_SRC_A_NEG_START   8
-#define VSH_FIELD_SRC_A_NEG_SIZE    1
-#define VSH_FIELD_SRC_A_TYPE_START  6
-#define VSH_FIELD_SRC_A_TYPE_SIZE   2
-#define VSH_FIELD_SRC_A_IDX_START   2
-#define VSH_FIELD_SRC_A_IDX_SIZE    4
-#define VSH_FIELD_SRC_A_SWZ_X_START 38  /* word 1 bit 6 = abs bit 38 */
-#define VSH_FIELD_SRC_A_SWZ_X_SIZE  2
-#define VSH_FIELD_SRC_A_SWZ_Y_START 36
-#define VSH_FIELD_SRC_A_SWZ_Y_SIZE  2
-#define VSH_FIELD_SRC_A_SWZ_Z_START 34
-#define VSH_FIELD_SRC_A_SWZ_Z_SIZE  2
+/* dword1 -- source A swizzle, the shared input and const indices, opcodes */
 #define VSH_FIELD_SRC_A_SWZ_W_START 32
-#define VSH_FIELD_SRC_A_SWZ_W_SIZE  2
+#define VSH_FIELD_SRC_A_SWZ_Z_START 34
+#define VSH_FIELD_SRC_A_SWZ_Y_START 36
+#define VSH_FIELD_SRC_A_SWZ_X_START 38
+#define VSH_FIELD_SRC_A_NEG_START   40
+#define VSH_FIELD_INPUT_IDX_START   41
+#define VSH_FIELD_INPUT_IDX_SIZE     4
+#define VSH_FIELD_CONST_IDX_START   45
+#define VSH_FIELD_CONST_IDX_SIZE     8
+#define VSH_FIELD_MAC_OP_START      53
+#define VSH_FIELD_MAC_OP_SIZE        4
+/* Three bits, not four: the ILU enum has eight entries, and reading a fourth
+ * bit makes opcodes that do not exist reachable. */
+#define VSH_FIELD_ILU_OP_START      57
+#define VSH_FIELD_ILU_OP_SIZE        3
 
-/* Source B (word 1) */
-#define VSH_FIELD_SRC_B_NEG_START   55
-#define VSH_FIELD_SRC_B_NEG_SIZE    1
-#define VSH_FIELD_SRC_B_TYPE_START  53
-#define VSH_FIELD_SRC_B_TYPE_SIZE   2
-#define VSH_FIELD_SRC_B_IDX_START   49
-#define VSH_FIELD_SRC_B_IDX_SIZE    4
-#define VSH_FIELD_SRC_B_SWZ_X_START 47
-#define VSH_FIELD_SRC_B_SWZ_X_SIZE  2
-#define VSH_FIELD_SRC_B_SWZ_Y_START 45
-#define VSH_FIELD_SRC_B_SWZ_Y_SIZE  2
-#define VSH_FIELD_SRC_B_SWZ_Z_START 43
-#define VSH_FIELD_SRC_B_SWZ_Z_SIZE  2
-#define VSH_FIELD_SRC_B_SWZ_W_START 41
-#define VSH_FIELD_SRC_B_SWZ_W_SIZE  2
+/* dword2 -- sources C, B and A's bank/temp */
+#define VSH_FIELD_SRC_C_TEMP_HI_START 64   /* high 2 bits; low 2 at bit 126 */
+#define VSH_FIELD_SRC_C_SWZ_W_START   66
+#define VSH_FIELD_SRC_C_SWZ_Z_START   68
+#define VSH_FIELD_SRC_C_SWZ_Y_START   70
+#define VSH_FIELD_SRC_C_SWZ_X_START   72
+#define VSH_FIELD_SRC_C_NEG_START     74
+#define VSH_FIELD_SRC_B_MUX_START     75
+#define VSH_FIELD_SRC_B_TEMP_START    77
+#define VSH_FIELD_SRC_B_SWZ_W_START   81
+#define VSH_FIELD_SRC_B_SWZ_Z_START   83
+#define VSH_FIELD_SRC_B_SWZ_Y_START   85
+#define VSH_FIELD_SRC_B_SWZ_X_START   87
+#define VSH_FIELD_SRC_B_NEG_START     89
+#define VSH_FIELD_SRC_A_MUX_START     90
+#define VSH_FIELD_SRC_A_TEMP_START    92
 
-/* Source C (word 1/2 boundary) */
-#define VSH_FIELD_SRC_C_NEG_START   40
-#define VSH_FIELD_SRC_C_NEG_SIZE    1
-#define VSH_FIELD_SRC_C_TYPE_START  66
-#define VSH_FIELD_SRC_C_TYPE_SIZE   2
-#define VSH_FIELD_SRC_C_IDX_START   62
-#define VSH_FIELD_SRC_C_IDX_SIZE    4
-#define VSH_FIELD_SRC_C_SWZ_X_START 60
-#define VSH_FIELD_SRC_C_SWZ_X_SIZE  2
-#define VSH_FIELD_SRC_C_SWZ_Y_START 58
-#define VSH_FIELD_SRC_C_SWZ_Y_SIZE  2
-#define VSH_FIELD_SRC_C_SWZ_Z_START 56
-#define VSH_FIELD_SRC_C_SWZ_Z_SIZE  2
-#define VSH_FIELD_SRC_C_SWZ_W_START 68
-#define VSH_FIELD_SRC_C_SWZ_W_SIZE  2
+/* dword3 -- flags, the single output write, the shared temp, source C's bank */
+#define VSH_FIELD_FINAL_START         96
+#define VSH_FIELD_A0X_START           97   /* a0.x relative addressing */
+#define VSH_FIELD_OUT_MUX_START       98   /* 0 = MAC drives the output, 1 = ILU */
+#define VSH_FIELD_OUT_ADDRESS_START   99
+#define VSH_FIELD_OUT_ADDRESS_SIZE     8
+#define VSH_FIELD_OUT_ORB_START      107
+#define VSH_FIELD_OUT_O_MASK_START   108
+#define VSH_FIELD_OUT_ILU_MASK_START 112
+#define VSH_FIELD_OUT_TEMP_START     116
+#define VSH_FIELD_OUT_MAC_MASK_START 120
+#define VSH_FIELD_SRC_C_MUX_START    124
+#define VSH_FIELD_SRC_C_TEMP_LO_START 126
 
-/* MAC destination (word 2) */
-#define VSH_FIELD_MAC_DST_TEMP_START   76
-#define VSH_FIELD_MAC_DST_TEMP_SIZE    4
-#define VSH_FIELD_MAC_DST_MASK_START   72
-#define VSH_FIELD_MAC_DST_MASK_SIZE    4
-#define VSH_FIELD_MAC_DST_OUT_START    70
-#define VSH_FIELD_MAC_DST_OUT_SIZE     8  /* mux field for output reg select */
-
-/* ILU destination (word 3) */
-#define VSH_FIELD_ILU_DST_TEMP_START   108
-#define VSH_FIELD_ILU_DST_TEMP_SIZE    4
-#define VSH_FIELD_ILU_DST_MASK_START   104
-#define VSH_FIELD_ILU_DST_MASK_SIZE    4
-#define VSH_FIELD_ILU_DST_OUT_START    96
-#define VSH_FIELD_ILU_DST_OUT_SIZE     8
-
-/* Misc flags */
-#define VSH_FIELD_REL_ADDR_START   109  /* relative addressing flag (a0.x) */
-#define VSH_FIELD_REL_ADDR_SIZE    1
-#define VSH_FIELD_FINAL_START      0    /* bit 0 of word 3, but stored at bit 96 abs */
-#define VSH_FIELD_FINAL_BIT        96   /* Actually stored at a specific position */
+/* Source banks. Zero is not a bank -- the previous table mapped the raw
+ * value onto an enum starting at zero, so every operand came out one bank
+ * wrong. */
+#define VSH_SRC_BANK_TEMP   1
+#define VSH_SRC_BANK_INPUT  2
+#define VSH_SRC_BANK_CONST  3
 
 /* ================================================================
  * Module State
@@ -247,48 +243,54 @@ static uint32_t fnv1a_hash(const void *data, size_t len)
  * ================================================================ */
 
 static void parse_source(const DWORD *insn,
-                          int neg_start, int type_start, int idx_start,
+                          int neg_start, int mux_start, int temp_index,
                           int swz_x_start, int swz_y_start,
                           int swz_z_start, int swz_w_start,
                           int input_index, int const_index,
                           NV2AVshSrcOperand *src)
 {
-    uint32_t reg_type = vsh_extract(insn, type_start, 2);
-    uint32_t reg_idx  = vsh_extract(insn, idx_start, 4);
+    uint32_t bank = vsh_extract(insn, mux_start, 2);
 
-    src->negate   = vsh_extract(insn, neg_start, 1);
+    src->negate    = vsh_extract(insn, neg_start, 1);
     src->swizzle.x = (uint8_t)vsh_extract(insn, swz_x_start, 2);
     src->swizzle.y = (uint8_t)vsh_extract(insn, swz_y_start, 2);
     src->swizzle.z = (uint8_t)vsh_extract(insn, swz_z_start, 2);
     src->swizzle.w = (uint8_t)vsh_extract(insn, swz_w_start, 2);
-    src->rel_addr = 0;
+    src->rel_addr  = 0;
 
-    switch (reg_type) {
-    case 0: /* Temp register */
+    switch (bank) {
+    case VSH_SRC_BANK_TEMP:
         src->reg_type  = NV2A_VSH_REG_TEMP;
-        src->reg_index = (int)reg_idx;
+        src->reg_index = temp_index;
         break;
-    case 1: /* Input register v# */
+    case VSH_SRC_BANK_INPUT:
         src->reg_type  = NV2A_VSH_REG_INPUT;
         src->reg_index = input_index;
         break;
-    case 2: /* Constant register c# */
+    case VSH_SRC_BANK_CONST:
         src->reg_type  = NV2A_VSH_REG_CONST;
         src->reg_index = const_index;
         break;
     default:
-        /* Treat as temp */
+        /* Bank 0 does not exist on this hardware. Seeing one means the
+         * instruction is not laid out the way this table says, so read it as
+         * an untouched temp rather than inventing a register. */
         src->reg_type  = NV2A_VSH_REG_TEMP;
         src->reg_index = 0;
         break;
     }
 }
 
-static NV2AVshOutputReg decode_output_mux(uint32_t mux_val)
+static NV2AVshOutputReg decode_output_addr(uint32_t out_addr)
 {
-    /* The output register mux field encodes which output register.
-     * The low nibble gives the output type. */
-    uint32_t out_idx = mux_val & 0xF;
+    /* OUT_ADDRESS names the output register. 0xFF is the encoding for "this
+     * instruction writes no output", which the ten initialisers in a
+     * pass-through shader use on their MAC half. */
+    uint32_t out_idx;
+
+    if (out_addr == 0xFF)
+        return NV2A_VSH_OUT_NONE;
+    out_idx = out_addr & 0xF;
     switch (out_idx) {
     case 0:  return NV2A_VSH_OUT_POS;
     case 3:  return NV2A_VSH_OUT_D0;
@@ -337,92 +339,102 @@ void d3d8_vsh_parse(const DWORD *microcode, int num_insns,
         if (inst->input_index >= NV2A_VS_MAX_INPUTS)
             inst->input_index = 0;
 
-        /* Parse source operands A, B, C */
-        parse_source(insn,
-                     VSH_FIELD_SRC_A_NEG_START, VSH_FIELD_SRC_A_TYPE_START,
-                     VSH_FIELD_SRC_A_IDX_START,
-                     VSH_FIELD_SRC_A_SWZ_X_START, VSH_FIELD_SRC_A_SWZ_Y_START,
-                     VSH_FIELD_SRC_A_SWZ_Z_START, VSH_FIELD_SRC_A_SWZ_W_START,
-                     inst->input_index, inst->const_index,
-                     &inst->mac_src[0]);
+        /* Source C's temp index is split across two dwords and cannot be
+         * read as one field. */
+        {
+            int c_temp = (int)((vsh_extract(insn, VSH_FIELD_SRC_C_TEMP_HI_START, 2) << 2)
+                             |  vsh_extract(insn, VSH_FIELD_SRC_C_TEMP_LO_START, 2));
+            int a_temp = (int)vsh_extract(insn, VSH_FIELD_SRC_A_TEMP_START, 4);
+            int b_temp = (int)vsh_extract(insn, VSH_FIELD_SRC_B_TEMP_START, 4);
 
-        parse_source(insn,
-                     VSH_FIELD_SRC_B_NEG_START, VSH_FIELD_SRC_B_TYPE_START,
-                     VSH_FIELD_SRC_B_IDX_START,
-                     VSH_FIELD_SRC_B_SWZ_X_START, VSH_FIELD_SRC_B_SWZ_Y_START,
-                     VSH_FIELD_SRC_B_SWZ_Z_START, VSH_FIELD_SRC_B_SWZ_W_START,
-                     inst->input_index, inst->const_index,
-                     &inst->mac_src[1]);
+            parse_source(insn,
+                         VSH_FIELD_SRC_A_NEG_START, VSH_FIELD_SRC_A_MUX_START,
+                         a_temp,
+                         VSH_FIELD_SRC_A_SWZ_X_START, VSH_FIELD_SRC_A_SWZ_Y_START,
+                         VSH_FIELD_SRC_A_SWZ_Z_START, VSH_FIELD_SRC_A_SWZ_W_START,
+                         inst->input_index, inst->const_index,
+                         &inst->mac_src[0]);
 
-        parse_source(insn,
-                     VSH_FIELD_SRC_C_NEG_START, VSH_FIELD_SRC_C_TYPE_START,
-                     VSH_FIELD_SRC_C_IDX_START,
-                     VSH_FIELD_SRC_C_SWZ_X_START, VSH_FIELD_SRC_C_SWZ_Y_START,
-                     VSH_FIELD_SRC_C_SWZ_Z_START, VSH_FIELD_SRC_C_SWZ_W_START,
-                     inst->input_index, inst->const_index,
-                     &inst->mac_src[2]);
+            parse_source(insn,
+                         VSH_FIELD_SRC_B_NEG_START, VSH_FIELD_SRC_B_MUX_START,
+                         b_temp,
+                         VSH_FIELD_SRC_B_SWZ_X_START, VSH_FIELD_SRC_B_SWZ_Y_START,
+                         VSH_FIELD_SRC_B_SWZ_Z_START, VSH_FIELD_SRC_B_SWZ_W_START,
+                         inst->input_index, inst->const_index,
+                         &inst->mac_src[1]);
+
+            parse_source(insn,
+                         VSH_FIELD_SRC_C_NEG_START, VSH_FIELD_SRC_C_MUX_START,
+                         c_temp,
+                         VSH_FIELD_SRC_C_SWZ_X_START, VSH_FIELD_SRC_C_SWZ_Y_START,
+                         VSH_FIELD_SRC_C_SWZ_Z_START, VSH_FIELD_SRC_C_SWZ_W_START,
+                         inst->input_index, inst->const_index,
+                         &inst->mac_src[2]);
+        }
 
         /* ILU source = source C */
         inst->ilu_src = inst->mac_src[2];
 
-        /* Check for relative addressing */
+        /* Relative addressing through a0.x */
         {
-            uint32_t rel = vsh_extract(insn, VSH_FIELD_REL_ADDR_START,
-                                        VSH_FIELD_REL_ADDR_SIZE);
+            uint32_t rel = vsh_extract(insn, VSH_FIELD_A0X_START, 1);
             if (rel) {
-                /* Mark const-type sources as relatively addressed */
-                int s;
-                for (s = 0; s < 3; s++) {
-                    if (inst->mac_src[s].reg_type == NV2A_VSH_REG_CONST)
-                        inst->mac_src[s].rel_addr = 1;
+                int t;
+                for (t = 0; t < 3; t++) {
+                    if (inst->mac_src[t].reg_type == NV2A_VSH_REG_CONST)
+                        inst->mac_src[t].rel_addr = 1;
                 }
                 if (inst->ilu_src.reg_type == NV2A_VSH_REG_CONST)
                     inst->ilu_src.rel_addr = 1;
             }
         }
 
-        /* MAC destination */
+        /* Destinations. There is one temp index shared by both units, a write
+         * mask each, and a single output register written by whichever unit
+         * OUT_MUX names -- not a destination per unit, which is what the
+         * previous table modelled and the hardware does not have. */
         {
-            uint32_t temp_idx = vsh_extract(insn, VSH_FIELD_MAC_DST_TEMP_START,
-                                             VSH_FIELD_MAC_DST_TEMP_SIZE);
-            uint32_t mask     = vsh_extract(insn, VSH_FIELD_MAC_DST_MASK_START,
-                                             VSH_FIELD_MAC_DST_MASK_SIZE);
-            uint32_t out_mux  = vsh_extract(insn, VSH_FIELD_MAC_DST_OUT_START,
-                                             VSH_FIELD_MAC_DST_OUT_SIZE);
+            int out_temp  = (int)vsh_extract(insn, VSH_FIELD_OUT_TEMP_START, 4);
+            uint32_t mac_mask = vsh_extract(insn, VSH_FIELD_OUT_MAC_MASK_START, 4);
+            uint32_t ilu_mask = vsh_extract(insn, VSH_FIELD_OUT_ILU_MASK_START, 4);
+            uint32_t o_mask   = vsh_extract(insn, VSH_FIELD_OUT_O_MASK_START, 4);
+            uint32_t out_addr = vsh_extract(insn, VSH_FIELD_OUT_ADDRESS_START,
+                                             VSH_FIELD_OUT_ADDRESS_SIZE);
+            int ilu_drives_output = (int)vsh_extract(insn, VSH_FIELD_OUT_MUX_START, 1);
+            NV2AVshOutputReg out_reg = decode_output_addr(out_addr);
+
+            inst->mac_dst.temp_reg    = -1;
+            inst->mac_dst.write_mask  = 0;
+            inst->mac_dst.output_reg  = NV2A_VSH_OUT_NONE;
+            inst->mac_dst.output_mask = 0;
+            inst->ilu_dst.temp_reg    = -1;
+            inst->ilu_dst.write_mask  = 0;
+            inst->ilu_dst.output_reg  = NV2A_VSH_OUT_NONE;
+            inst->ilu_dst.output_mask = 0;
 
             if (inst->mac_op != NV2A_VSH_MAC_NOP) {
-                inst->mac_dst.temp_reg   = (int)temp_idx;
-                inst->mac_dst.write_mask = (uint8_t)mask;
-                inst->mac_dst.output_reg = decode_output_mux(out_mux);
-            } else {
-                inst->mac_dst.temp_reg   = -1;
-                inst->mac_dst.write_mask = 0;
-                inst->mac_dst.output_reg = NV2A_VSH_OUT_NONE;
+                if (mac_mask) {
+                    inst->mac_dst.temp_reg   = out_temp;
+                    inst->mac_dst.write_mask = (uint8_t)mac_mask;
+                }
+                if (!ilu_drives_output && out_reg != NV2A_VSH_OUT_NONE && o_mask) {
+                    inst->mac_dst.output_reg  = out_reg;
+                    inst->mac_dst.output_mask = (uint8_t)o_mask;
+                }
             }
-        }
-
-        /* ILU destination */
-        {
-            uint32_t temp_idx = vsh_extract(insn, VSH_FIELD_ILU_DST_TEMP_START,
-                                             VSH_FIELD_ILU_DST_TEMP_SIZE);
-            uint32_t mask     = vsh_extract(insn, VSH_FIELD_ILU_DST_MASK_START,
-                                             VSH_FIELD_ILU_DST_MASK_SIZE);
-            uint32_t out_mux  = vsh_extract(insn, VSH_FIELD_ILU_DST_OUT_START,
-                                             VSH_FIELD_ILU_DST_OUT_SIZE);
-
             if (inst->ilu_op != NV2A_VSH_ILU_NOP) {
-                inst->ilu_dst.temp_reg   = (int)temp_idx;
-                inst->ilu_dst.write_mask = (uint8_t)mask;
-                inst->ilu_dst.output_reg = decode_output_mux(out_mux);
-            } else {
-                inst->ilu_dst.temp_reg   = -1;
-                inst->ilu_dst.write_mask = 0;
-                inst->ilu_dst.output_reg = NV2A_VSH_OUT_NONE;
+                if (ilu_mask) {
+                    inst->ilu_dst.temp_reg   = out_temp;
+                    inst->ilu_dst.write_mask = (uint8_t)ilu_mask;
+                }
+                if (ilu_drives_output && out_reg != NV2A_VSH_OUT_NONE && o_mask) {
+                    inst->ilu_dst.output_reg  = out_reg;
+                    inst->ilu_dst.output_mask = (uint8_t)o_mask;
+                }
             }
         }
 
-        /* Final instruction flag (bit 0 of word 3) */
-        inst->is_final = (insn[3] & 1) ? 1 : 0;
+        inst->is_final = vsh_extract(insn, VSH_FIELD_FINAL_START, 1) ? 1 : 0;
 
         /* Track input register usage */
         {
@@ -609,14 +621,14 @@ static void emit_dest_assign(StrBuf *sb, const NV2AVshDstOperand *dst,
         sb_append(sb, ";\n");
     }
 
-    /* Write to output register if specified */
-    if (dst->output_reg != NV2A_VSH_OUT_NONE && dst->write_mask != 0) {
+    /* Write to the output register, under its own mask */
+    if (dst->output_reg != NV2A_VSH_OUT_NONE && dst->output_mask != 0) {
         const char *name = output_reg_name(dst->output_reg);
         if (name) {
             sb_append(sb, "    %s", name);
-            emit_write_mask(sb, dst->write_mask);
+            emit_write_mask(sb, dst->output_mask);
             sb_append(sb, " = (%s)", rhs);
-            emit_write_mask(sb, dst->write_mask);
+            emit_write_mask(sb, dst->output_mask);
             sb_append(sb, ";\n");
         }
     }
@@ -1581,15 +1593,15 @@ static void vsh_write_dst(const NV2AVshDstOperand *dst, NV2AVshState *st,
 {
     int c;
 
-    if (!dst->write_mask)
+    if (!dst->write_mask && !dst->output_mask)
         return;
 
     for (c = 0; c < 4; c++) {
-        if (!(dst->write_mask & (8 >> c)))
-            continue;
-        if (dst->temp_reg >= 0 && dst->temp_reg <= VSH_TEMP_OPOS)
+        if ((dst->write_mask & (8 >> c))
+            && dst->temp_reg >= 0 && dst->temp_reg <= VSH_TEMP_OPOS)
             st->temp[dst->temp_reg][c] = val[c];
-        if (dst->output_reg != NV2A_VSH_OUT_NONE
+        if ((dst->output_mask & (8 >> c))
+            && dst->output_reg != NV2A_VSH_OUT_NONE
             && dst->output_reg < NV2A_VSH_OUT_COUNT) {
             if (dst->output_reg == NV2A_VSH_OUT_POS)
                 st->temp[VSH_TEMP_OPOS][c] = val[c];   /* oPos *is* R12 */
@@ -1597,7 +1609,7 @@ static void vsh_write_dst(const NV2AVshDstOperand *dst, NV2AVshState *st,
                 st->out[dst->output_reg][c] = val[c];
         }
     }
-    if (dst->output_reg != NV2A_VSH_OUT_NONE
+    if (dst->output_mask && dst->output_reg != NV2A_VSH_OUT_NONE
         && dst->output_reg < NV2A_VSH_OUT_COUNT)
         st->out_written |= (uint16_t)(1u << dst->output_reg);
     if (dst->temp_reg == VSH_TEMP_OPOS)

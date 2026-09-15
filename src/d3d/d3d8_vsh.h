@@ -228,7 +228,12 @@ typedef struct NV2AVshSrcOperand {
 typedef struct NV2AVshDstOperand {
     int               temp_reg;    /* Temp register index (0-12), or -1 if none */
     NV2AVshOutputReg  output_reg;  /* Output register, or NV2A_VSH_OUT_NONE */
-    uint8_t           write_mask;  /* Bitmask: bit3=x, bit2=y, bit1=z, bit0=w */
+    uint8_t           write_mask;  /* Temp write mask: bit3=x, bit2=y, bit1=z, bit0=w */
+    /* The output write has its own mask (OUT_O_MASK) and it is not the temp
+     * mask: an instruction can write a temp and an output with different
+     * masks in the same slot. Using one mask for both wrote channels the
+     * program never asked for. */
+    uint8_t           output_mask;
 } NV2AVshDstOperand;
 
 /**
