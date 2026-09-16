@@ -12,6 +12,8 @@ add_library(xbox_hle STATIC
     hle_d3d8_state.c
     hle_d3d8_texture.c
     hle_d3d8_vertex.c
+    hle_d3d8_capture.c
+    d3d8_capture.c
     hle_dsound.c
     dsound_buffer_model.c
     xbox_adpcm.c

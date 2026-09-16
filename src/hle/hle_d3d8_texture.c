@@ -38,6 +38,7 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
+#include "hle_d3d8_capture.h"
 
 /* From hle_d3d8.c: the shadow device, or NULL, and its swap count. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
@@ -62,6 +63,9 @@ typedef struct {
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
+/* The guest container behind each stage's host texture, so a frame capture
+ * that begins after the title bound its textures can re-read their texels. */
+static uint32_t      g_bound_va[MAX_STAGES];
 
 static unsigned long g_bound_count, g_uploads, g_reuploads, g_skip_type,
                      g_skip_cube, g_skip_format, g_skip_range, g_skip_create;
@@ -302,6 +306,42 @@ static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev)
     return white;
 }
 
+/* Records what is bound to one stage. read_layout is called again rather than
+ * threaded through host_texture: on the path that reaches here it has already
+ * succeeded once, and it bumps its skip counters only when it fails, so this
+ * second call cannot double-count. */
+static void capture_stage(uint32_t stage, uint32_t va)
+{
+    texture_layout t;
+    HleD3D8CaptureTexture c;
+
+    if (!hle_d3d8_capture_active())
+        return;
+    if (!va || !read_layout(va, &t)) {
+        hle_d3d8_capture_unbind_texture(stage);
+        return;
+    }
+    c.guest_va    = va;
+    c.format      = t.fmt;
+    c.width       = t.width;
+    c.height      = t.height;
+    c.levels      = t.levels;
+    c.linear      = t.linear;
+    c.guest_pitch = t.guest_pitch;
+    c.texels      = HLE_PTR(CONTIG_BASE + t.phys);
+    hle_d3d8_capture_bind_texture(stage, &c);
+}
+
+/* Called by the capture at frame start: every stage as it stands, so a replay
+ * starts from the same bindings rather than from an empty device. */
+void hle_d3d8_capture_snapshot_textures(void)
+{
+    uint32_t s;
+
+    for (s = 0; s < MAX_STAGES; s++)
+        capture_stage(s, g_bound_va[s]);
+}
+
 static void report(void)
 {
     static DWORD last;
@@ -350,6 +390,8 @@ HLE_EXPORT(D3DDevice_SetTexture)
         if (texture)
             host = host_texture(dev, texture);
         g_bound[stage] = host;
+        g_bound_va[stage] = host ? texture : 0;
+        capture_stage(stage, g_bound_va[stage]);
         /* The host pixel shader samples every stage whatever its operation
          * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
          * stage with no host texture would turn the draw black once the

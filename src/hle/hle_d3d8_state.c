@@ -62,6 +62,7 @@ HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_combiners.h"
+#include "hle_d3d8_capture.h"
 
 #define XRS_COUNT        167         /* X_D3DRS_DONOTCULLUNCOMPRESSED + 1 */
 #define XRS_REMOVED      154         /* X_D3DRS_MULTISAMPLETYPE */
@@ -571,12 +572,16 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
     for (i = 0; i < sizeof g_rs_map / sizeof g_rs_map[0]; i++) {
         uint32_t x = g_rs_map[i].xbox;
         uint32_t v = guest_rs(x);
+        DWORD host_value;
 
         if (g_prev_valid && g_prev_rs[x] == v)
             continue;
         g_prev_rs[x] = v;
-        vt->SetRenderState(dev, (D3DRENDERSTATETYPE)g_rs_map[i].host,
-                           rs_to_host(g_rs_map[i].kind, v));
+        host_value = rs_to_host(g_rs_map[i].kind, v);
+        vt->SetRenderState(dev, (D3DRENDERSTATETYPE)g_rs_map[i].host, host_value);
+        /* The capture records the host value, which is what was applied --
+         * see d3d8_capture.h on why the guest array is not stored raw. */
+        hle_d3d8_capture_render_state(g_rs_map[i].host, host_value);
     }
 
     for (s = 0; s < STAGES; s++) {
@@ -585,18 +590,33 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
         for (i = 0; i < sizeof g_ts_map / sizeof g_ts_map[0]; i++) {
             uint32_t x = g_ts_map[i].xbox;
             uint32_t v = HLE_MEM32(base + 4 * x);
+            DWORD host_value;
 
             /* The host's SetTexture rewrites COLOROP whenever a texture is
              * bound or unbound, so the operations are set on every draw. */
             if (g_prev_valid && g_prev_tss[s][x] == v && g_ts_map[i].kind != TS_OP)
                 continue;
             g_prev_tss[s][x] = v;
+            host_value = ts_to_host(g_ts_map[i].kind, v);
             vt->SetTextureStageState(dev, (DWORD)s,
                                      (D3DTEXTURESTAGESTATETYPE)g_ts_map[i].host,
-                                     ts_to_host(g_ts_map[i].kind, v));
+                                     host_value);
+            hle_d3d8_capture_stage_state((uint32_t)s, g_ts_map[i].host, host_value);
         }
     }
     forward_pixel_shader(dev, vt);
     g_prev_valid = 1;
+    /* Everything applied for this draw goes into the capture as one batch,
+     * immediately before the draw chunk itself. */
+    hle_d3d8_capture_states_flush();
+}
+
+/* Called by the capture at frame start. A captured frame must carry every
+ * state it draws with, but this file only sets what changed since the last
+ * draw -- inside one frame that can be almost nothing. Forgetting the memo
+ * makes the next draw re-apply the whole set, so the capture sees it. */
+void hle_d3d8_shadow_states_invalidate(void)
+{
+    g_prev_valid = 0;
 }
 #endif /* _WIN32 */
