@@ -43,3 +43,9 @@ tools/split/output/
 
 # Runtime log written by the kernel layer next to the executable
 xbox_kernel.log
+
+# D3D8 frame captures (RECOMP_D3D8_CAPTURE, src/hle/d3d8_capture.h). A capture
+# holds the title's own textures and vertices, so it is game content: never
+# commit one. The round-trip test writes its synthetic capture as .tmp.
+*.d3dcap
+d3d8_capture_*.tmp

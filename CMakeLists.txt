@@ -77,6 +77,12 @@ add_subdirectory(src/video)
 # XDK functions replaced by name (tools/recomp/hle.py)
 add_subdirectory(src/hle)
 
+# Frame replay tool: replays a D3D8 capture into the host renderer with no
+# game running (src/hle/d3d8_capture.h). Windows only, like the D3D11 backend.
+if(WIN32)
+    add_subdirectory(src/replay)
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────
 
 # Offline tests that need no game files; run with ctest. Only when this is the
@@ -85,6 +91,7 @@ add_subdirectory(src/hle)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     enable_testing()
     add_subdirectory(tests/nv2a_vsh)
+    add_subdirectory(tests/d3d8_capture)        # portable: the capture container
     if(WIN32)
         add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
     endif()

@@ -61,6 +61,8 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
+#include "d3d8_xbox_map.h"
+#include "hle_d3d8_capture.h"
 #endif
 
 static void first_call(int *seen, const char *name, uint32_t arg)
@@ -267,25 +269,11 @@ static void shadow_create(uint32_t pp_va)
     fflush(stderr);
 }
 
-/* Xbox D3DCLEAR_* bits: TARGET is 0xF0, one bit per channel (0x10 R, 0x20 G,
- * 0x40 B, 0x80 A); ZBUFFER is 0x01 and STENCIL 0x02. The host layer takes the
- * PC values. The first calls log the title's raw flags, so this mapping is
- * checked against what the title really passes. Two things are not honoured
- * yet: a per-channel target mask (any target bit clears all four channels, as
- * Cxbx-Reloaded also does) and clear rectangles, which the host dev_Clear
- * ignores, so a rectangle-limited clear clears the whole target. */
-static DWORD xbox_clear_flags_to_host(uint32_t xbox_flags)
-{
-    DWORD host = 0;
-
-    if (xbox_flags & 0xF0)
-        host |= D3DCLEAR_TARGET;
-    if (xbox_flags & 0x01)
-        host |= D3DCLEAR_ZBUFFER;
-    if (xbox_flags & 0x02)
-        host |= D3DCLEAR_STENCIL;
-    return host;
-}
+/* xbox_clear_flags_to_host() moved to d3d8_xbox_map.h: a frame capture stores
+ * the title's own Xbox flags, so the replay tool (src/replay) has to convert
+ * them exactly as this path does, and one shared copy cannot drift. The first
+ * Clear calls still log the raw flags below, so the mapping stays checkable
+ * against what the title really passes. */
 
 /* ----------------------------------------------------------- vertex shaders */
 
@@ -296,12 +284,24 @@ static DWORD xbox_clear_flags_to_host(uint32_t xbox_flags)
  * the title creates it, and found again here by its guest handle. */
 #define SHADOW_MAX_PROGRAMS 128
 
+/* Declaration token stream cap, for capture. The XDK's own declarations are
+ * far shorter; this only stops a bad pointer running away. */
+#define SHADOW_MAX_DECLARATION 256
+
+/* Defined with the other capture glue at the end of the shadow section. */
+static void shadow_capture_program(uint32_t guest, uint32_t function,
+                                   uint32_t declaration);
+
 enum { SHADER_DECLARATION, SHADER_HOST_PROGRAM, SHADER_NOT_REPLAYED };
 
 static struct {
     uint32_t guest;
     DWORD    host;
     int      kind;
+    /* The guest pFunction the program was created from. Kept only so a frame
+     * capture that begins after the title created its shaders can re-read the
+     * microcode and be self-contained (hle_d3d8_capture.c). */
+    uint32_t function;
 } g_programs[SHADOW_MAX_PROGRAMS];
 static int      g_program_count;
 static uint32_t g_shadow_vs;             /* guest handle last selected */
@@ -325,6 +325,7 @@ static void shadow_select_vertex_shader(uint32_t handle)
 {
     int i;
 
+    hle_d3d8_capture_vs_select(handle);
     g_shadow_vs = handle;
     g_shadow_vs_is_program = (handle & 1) != 0;
     if (!g_shadow_vs_is_program) {
@@ -340,39 +341,10 @@ static void shadow_select_vertex_shader(uint32_t handle)
 
 /* ---------------------------------------------------------------- drawing */
 
-/* Xbox D3DPRIMITIVETYPE (Cxbx-Reloaded, XbD3D8Types.h) and a vertex count,
- * against the host's PC numbering and a primitive count. Line loops, quad
- * strips and polygons have no PC equivalent: a quad strip draws as the
- * triangle strip over the same vertices, a polygon as a fan, and a line loop
- * as a strip that repeats its first vertex. */
-enum {
-    XPT_POINTLIST = 1, XPT_LINELIST, XPT_LINELOOP, XPT_LINESTRIP,
-    XPT_TRIANGLELIST, XPT_TRIANGLESTRIP, XPT_TRIANGLEFAN,
-    XPT_QUADLIST, XPT_QUADSTRIP, XPT_POLYGON
-};
-
-static int xbox_primitive_to_host(uint32_t xpt, uint32_t vertices,
-                                  D3DPRIMITIVETYPE *pt, UINT *prims)
-{
-    switch (xpt) {
-    case XPT_POINTLIST:     *pt = D3DPT_POINTLIST;     *prims = vertices;       break;
-    case XPT_LINELIST:      *pt = D3DPT_LINELIST;      *prims = vertices / 2;   break;
-    case XPT_LINELOOP:      *pt = D3DPT_LINESTRIP;     *prims = vertices;       break;
-    case XPT_LINESTRIP:     *pt = D3DPT_LINESTRIP;     *prims = vertices - 1;   break;
-    case XPT_TRIANGLELIST:  *pt = D3DPT_TRIANGLELIST;  *prims = vertices / 3;   break;
-    case XPT_TRIANGLESTRIP: *pt = D3DPT_TRIANGLESTRIP; *prims = vertices - 2;   break;
-    case XPT_QUADSTRIP:     /* whole quads only; an odd last vertex is unused */
-                            *pt = D3DPT_TRIANGLESTRIP; *prims = (vertices & ~1u) - 2; break;
-    case XPT_TRIANGLEFAN:
-    case XPT_POLYGON:       *pt = D3DPT_TRIANGLEFAN;   *prims = vertices - 2;   break;
-    case XPT_QUADLIST:      *pt = D3DPT_QUADLIST;      *prims = vertices / 4;   break;
-    default:
-        return 0;
-    }
-    /* A single point is a valid draw (Cxbx-Reloaded, IsValidXboxVertexCount);
-     * too few vertices for anything else leaves prims at 0 or wrapped below. */
-    return (int)*prims > 0 && *prims <= vertices;
-}
+/* The Xbox primitive types (XPT_*) and xbox_primitive_to_host() moved to
+ * d3d8_xbox_map.h, for the same reason as the clear flags: a capture stores
+ * the title's own primitive type and the replay tool converts it with the
+ * same table. */
 
 /* FVF vertex size, as the host computes it for its input layout. A draw
  * whose stride disagrees would be read at the wrong offsets, so it is
@@ -586,6 +558,7 @@ HLE_EXPORT(D3DDevice_Clear)
                     "z %g stencil %u\n", flags, color, z, stencil);
         g_shadow->lpVtbl->Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags),
                                 color, z, stencil);
+        hle_d3d8_capture_clear(flags, color, z_bits, stencil);
         g_shadow_clears++;
         g_shadow_last_color = color;
     }
@@ -617,6 +590,9 @@ HLE_EXPORT(D3DDevice_Swap)
         g_shadow_swap_thread = thread;
 
         g_shadow_swaps++;
+        /* The frame boundary for capture: closes the frame being recorded, or
+         * starts recording if this is the requested swap. */
+        hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
         shadow_dump_frame();             /* before Present discards the buffer */
         g_shadow->lpVtbl->Swap(g_shadow, 0);
         if (!g_shadow_last_report) {
@@ -651,6 +627,7 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
     uint32_t function = HLE_ARG(1);
 #ifdef _WIN32
     uint32_t handle_va = HLE_ARG(2);
+    uint32_t declaration = HLE_ARG(0);
 #endif
 
     first_call(&seen, "D3DDevice_CreateVertexShader", function);
@@ -686,6 +663,7 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
             g_programs[slot].guest = guest;
             g_programs[slot].host = kind == SHADER_HOST_PROGRAM ? host : 0;
             g_programs[slot].kind = kind;
+            g_programs[slot].function = function;
         } else if (kind == SHADER_HOST_PROGRAM) {
             d3d8_vsh_delete_shader(host);
         }
@@ -693,6 +671,8 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
                 kind == SHADER_DECLARATION ? "declaration only"
                 : kind == SHADER_HOST_PROGRAM ? "host program" : "program not replayed",
                 slot < 0 ? " (table full, not tracked)" : "");
+        if (kind == SHADER_HOST_PROGRAM)
+            shadow_capture_program(guest, function, declaration);
     }
 #endif
 }
@@ -752,11 +732,16 @@ HLE_EXPORT(D3DDevice_SetTransform)
     HLE_CALL_ORIGINAL(D3DDevice_SetTransform);
 #ifdef _WIN32
     if (g_shadow && matrix && state < 10) {
-        static const DWORD host_state[10] = { 2, 3, 16, 17, 18, 19, 256, 257, 258, 259 };
         D3DMATRIX m;
+        DWORD host_state;
 
         memcpy(&m, HLE_PTR(matrix), sizeof m);
-        g_shadow->lpVtbl->SetTransform(g_shadow, (D3DTRANSFORMSTATETYPE)host_state[state], &m);
+        if (xbox_transform_state_to_host(state, &host_state))
+            g_shadow->lpVtbl->SetTransform(g_shadow,
+                (D3DTRANSFORMSTATETYPE)host_state, &m);
+        /* The capture keeps the Xbox state number; replay maps it with the
+         * same table. */
+        hle_d3d8_capture_transform(state, (const float *)&m);
     }
 #endif
 }
@@ -790,6 +775,8 @@ HLE_EXPORT(D3DDevice_SetViewport)
         if (vp.Height > g_shadow_height - vp.Y)
             vp.Height = g_shadow_height - vp.Y;
         g_shadow->lpVtbl->SetViewport(g_shadow, &vp);
+        /* The clamped viewport, which is what was applied. */
+        hle_d3d8_capture_viewport(vp.X, vp.Y, vp.Width, vp.Height, vp.MinZ, vp.MaxZ);
     }
 #endif
 }
@@ -823,6 +810,9 @@ HLE_EXPORT(D3DDevice_DrawVerticesUP)
             g_draws_primitive++;
             return;
         }
+        /* Before the line-loop copy below: a capture stores the draw as the
+         * title made it, and replay redoes that rewriting itself. */
+        hle_d3d8_capture_draw_up(xpt, count, verts, stride);
         if (xpt == XPT_LINELOOP) {       /* close the loop: repeat vertex 0 */
             loop = malloc((size_t)(count + 1) * stride);
             if (!loop) {
@@ -883,6 +873,11 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
             if ((UINT)idx[i] + 1 > vertices)
                 vertices = (UINT)idx[i] + 1;
 
+        /* Before the index rewriting below, and with the same vertex range
+         * the host draw is given. */
+        hle_d3d8_capture_draw_indexed_up(xpt, count, idx, HLE_PTR(data), stride,
+                                         vertices * stride);
+
         switch (xpt) {
         case XPT_TRIANGLEFAN:
         case XPT_POLYGON:
@@ -932,6 +927,49 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
 }
 
 #ifdef _WIN32
+/* Records a created vertex program into the capture: the NV2A microcode,
+ * which replay rebuilds the host program from, and the declaration token
+ * stream that came with it. The declaration is a DWORD stream ending in
+ * D3DVSD_END, 0xFFFFFFFF (Cxbx-Reloaded, XbD3D8Types.h); it is read here for
+ * completeness only, since the host CreateVertexShader ignores it. */
+static void shadow_capture_program(uint32_t guest, uint32_t function,
+                                   uint32_t declaration)
+{
+    uint32_t tokens[SHADOW_MAX_DECLARATION];
+    uint32_t header, n = 0;
+
+    if (!hle_d3d8_capture_active() || !function)
+        return;
+    header = HLE_MEM32(function);
+    if ((header & 0xFFFF) != 0x2078 || (header >> 16) == 0 || (header >> 16) > 136)
+        return;
+    while (declaration && n < SHADOW_MAX_DECLARATION) {
+        tokens[n] = HLE_MEM32(declaration + 4u * n);
+        if (tokens[n++] == 0xFFFFFFFFu)
+            break;
+    }
+    hle_d3d8_capture_vs_program(guest, (const uint32_t *)HLE_PTR(function + 4),
+                                header >> 16, n ? tokens : NULL, n);
+}
+
+/* Called by the capture at frame start: a frame that draws with a shader
+ * created earlier has to carry that shader, or a replay has nothing to
+ * select. The microcode is re-read from the guest, which assumes the title
+ * has not freed it -- guarded by the same header check as creation. */
+void hle_d3d8_capture_snapshot_shader(void)
+{
+    int slot;
+
+    if (!g_shadow_vs)
+        return;
+    if (g_shadow_vs_is_program) {
+        slot = shadow_program_find(g_shadow_vs);
+        if (slot >= 0 && g_programs[slot].kind == SHADER_HOST_PROGRAM)
+            shadow_capture_program(g_shadow_vs, g_programs[slot].function, 0);
+    }
+    hle_d3d8_capture_vs_select(g_shadow_vs);
+}
+
 /* For hle_d3d8_texture.c: the shadow device (NULL when shadow mode is off)
  * and the frame count its cache ages entries by. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void)

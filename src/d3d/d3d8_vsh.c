@@ -1058,6 +1058,11 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle)
     return S_OK;
 }
 
+const float *d3d8_vsh_constants(void)
+{
+    return &g_vsh_constants.c[0][0];
+}
+
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
 {
     int end_reg;

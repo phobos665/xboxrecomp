@@ -123,6 +123,18 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
 
 /**
+ * The whole constant bank, as NV2A_VS_MAX_CONSTANTS float4 registers laid out
+ * back to back (NV2AVSConstants).
+ *
+ * Constants arrive a few registers at a time and are never read back by the
+ * renderer, so nothing needed this until frame capture: a capture has to be
+ * self-contained, and the frame it records draws with constants set before it
+ * began (src/hle/hle_d3d8_capture.c). Read-only; the pointer stays valid for
+ * the life of the process.
+ */
+const float *d3d8_vsh_constants(void);
+
+/**
  * Check if a shader handle refers to a programmable vertex shader
  * (as opposed to an FVF code).
  *
