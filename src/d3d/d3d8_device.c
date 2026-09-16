@@ -875,6 +875,31 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     return S_OK;
 }
 
+UINT d3d8_up_vertices_read(D3DPRIMITIVETYPE type, UINT prims)
+{
+    UINT n;
+
+    map_primitive_type(type, prims, &n);
+    if (!n)
+        return 0;
+    /* map_primitive_type counts what is drawn; fans and quads are expanded
+     * from fewer caller vertices (convert_fan_or_quad). */
+    if (type == D3DPT_TRIANGLEFAN)
+        return prims + 2;
+    if (type == D3DPT_QUADLIST)
+        return prims * 4;
+    return n;
+}
+
+UINT d3d8_up_indices_read(D3DPRIMITIVETYPE type, UINT prims)
+{
+    UINT n;
+
+    /* The indexed draw converts nothing: it reads what it draws. */
+    map_primitive_type(type, prims, &n);
+    return n;
+}
+
 static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexData, UINT VertexStreamZeroStride)
 {
     (void)self;

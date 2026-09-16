@@ -1527,6 +1527,40 @@ static const IDirect3DTexture8Vtbl g_tex_vtbl = {
     tex_GetLevelDesc, tex_GetSurfaceLevel, tex_LockRect, tex_UnlockRect,
 };
 
+/* Read-only views of a 2D texture for frame capture (src/hle/hle_d3d8_record.c).
+ * The vtable is the type test: cube and volume textures share this struct's
+ * prefix (d3d8_internal.h) but not its vtable, and their sys_mem is laid out
+ * differently, so they are refused rather than misread. Going through
+ * LockRect instead would work, but UnlockRect re-uploads the level to the GPU
+ * even for a read-only lock. */
+BOOL d3d8_texture_info(IDirect3DBaseTexture8 *texture, D3D8TextureInfo *info)
+{
+    const D3D8Texture *tex = (const D3D8Texture *)texture;
+
+    if (!tex || !info || tex->iface.lpVtbl != &g_tex_vtbl || !tex->sys_mem)
+        return FALSE;
+    info->format = tex->d3d8_format;
+    info->width  = tex->width;
+    info->height = tex->height;
+    info->levels = tex->levels;
+    info->usage  = tex->usage;
+    return TRUE;
+}
+
+BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
+                        const BYTE **bits, UINT *pitch, UINT *rows)
+{
+    const D3D8Texture *tex = (const D3D8Texture *)texture;
+
+    if (!tex || tex->iface.lpVtbl != &g_tex_vtbl || !tex->sys_mem ||
+        level >= tex->levels || !bits || !pitch || !rows)
+        return FALSE;
+    *bits  = tex->sys_mem + tex_level_offset(tex, level);
+    *pitch = tex_level_pitch(tex, level);
+    *rows  = tex_level_rows(tex, level);
+    return TRUE;
+}
+
 HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DTexture8 **ppTex)
 {
     D3D8Texture *tex;

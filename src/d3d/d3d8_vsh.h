@@ -182,6 +182,30 @@ HRESULT d3d8_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int c
 void d3d8_vsh_set_screenspace(const float scale[4], const float offset[4]);
 
 /**
+ * What d3d8_vsh_set_screenspace last set, and whether it is on. Frame capture
+ * (src/hle/hle_d3d8_record.c) reads it into a capture's opening snapshot.
+ */
+void d3d8_vsh_get_screenspace(float scale[4], float offset[4], int *enabled);
+
+/**
+ * Turn the screen-space undo off again, as it is before the first
+ * d3d8_vsh_set_screenspace. Nothing in a live run needs this; the replay tool
+ * does, to put a capture that begins with it off back into that state on
+ * every loop.
+ */
+void d3d8_vsh_clear_screenspace(void);
+
+/**
+ * One stored program, by slot index (0 .. NV2A_VS_MAX_SLOTS-1): its handle,
+ * microcode (length instructions of 4 DWORDs) and declaration. FALSE for a
+ * free slot. The pointers stay valid until the slot is deleted. For frame
+ * capture, which has to carry every program a frame may select, including
+ * those created long before it.
+ */
+BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
+                       int *length, const D3D8VshInput **decl, int *decl_count);
+
+/**
  * Prepare for a draw call using a programmable vertex shader.
  *
  * - Parses microcode if not yet parsed

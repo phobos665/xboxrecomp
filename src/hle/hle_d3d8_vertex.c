@@ -38,7 +38,7 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
-#include "hle_d3d8_capture.h"
+#include "hle_d3d8_record.h"
 
 /* From hle_d3d8.c. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
@@ -242,8 +242,7 @@ static void forward_constants(uint32_t reg, uint32_t data, uint32_t count)
         count = MAX_CONSTANT_REGISTERS - reg;
     if (!guest_readable(data, (uint64_t)count * 16u))
         return;
-    d3d8_vsh_set_constant((int)reg, (const float *)HLE_PTR(data), (int)count);
-    hle_d3d8_capture_vs_constants(reg, (const float *)HLE_PTR(data), count);
+    host_vsh_set_constant((int)reg, (const float *)HLE_PTR(data), (int)count);
 }
 #endif
 

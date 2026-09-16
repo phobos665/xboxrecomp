@@ -1,6 +1,6 @@
 /*
- * d3d8_capture.h -- the D3D8 frame capture container: one frame of the
- * title's D3D8 calls plus every byte they read.
+ * d3d8_capture.h -- the D3D8 frame capture container: one frame of the calls
+ * shadow mode made on the HOST renderer, plus every byte they read.
  *
  * Why this exists: reaching an interesting frame in shadow mode
  * (hle_d3d8.c, RECOMP_HLE_D3D8=shadow) means running the title for minutes
@@ -9,49 +9,71 @@
  * src/replay with no game running, and so turns a change to the shader
  * translation into an image to look at rather than another play-through.
  *
+ * Why the host boundary (version 2). Version 1 recorded the title's Xbox
+ * values, and the replay tool repeated shadow mode's Xbox-to-host conversion.
+ * That conversion kept growing -- vertex declarations, NORMPACKED3 unpacking,
+ * the screen-space undo and its constants, the per-draw viewport choice,
+ * pixel shader forwarding -- and every piece the replay did not copy made a
+ * replayed frame differ from the live one. Now the capture holds exactly what
+ * src/hle handed to src/d3d, after all conversion, and replay is a player
+ * with no Xbox knowledge: it calls the same host functions with the same
+ * arguments. A replay therefore shows what the host renderer does with the
+ * frame. It cannot be used to re-examine the Xbox-to-host conversion; that
+ * needs a live run.
+ *
  * This file is the container only: no Direct3D, no Windows, no guest memory.
  * It builds on every platform so the round-trip test (tests/d3d8_capture)
- * runs in the Linux CI job as well as the Windows one. The guest side that
- * fills it is hle_d3d8_capture.c, which is Windows-only like the rest of
- * shadow mode; the reader side is src/replay.
+ * runs in the Linux CI job as well as the Windows one. The writer's driver is
+ * hle_d3d8_record.c, Windows-only like the rest of shadow mode; the reader's
+ * is src/replay.
  *
  * ------------------------------------------------------------------ layout
  *
  * Little-endian throughout, and no packing pragmas: every field of every
- * payload struct below is a 4-byte uint32_t or float, so each struct is the
- * same size and shape on MSVC x64 and gcc x86-64. That is the whole of the
- * portability argument -- the guest is x86-32 LE and both hosts are x86-64
- * LE (CLAUDE.md), so nothing is byte-swapped anywhere. A capture written on
- * one host and read on the other is byte-identical; a capture is NOT a
- * long-term archive format, and the version is checked exactly, not ranged.
+ * payload struct below is a 4-byte uint32_t, int32_t or float, so each struct
+ * is the same size and shape on MSVC x64 and gcc x86-64. Host enum values
+ * (D3DRENDERSTATETYPE, D3DFORMAT, DXGI_FORMAT, ...) are stored as uint32_t,
+ * which is their size on both. Guest and hosts are all little-endian
+ * (CLAUDE.md), so nothing is byte-swapped. A capture is NOT a long-term
+ * archive format, and the version is checked exactly, not ranged.
  *
  *   D3D8CapHeader                      (32 bytes, at offset 0)
- *   then chunk_count chunks, in the order the title made the calls:
+ *   then chunk_count chunks:
  *     uint32_t type;                   D3D8CAP_* below
  *     uint32_t bytes;                  payload length, NOT counting these 8
  *     uint8_t  payload[bytes];
  *     uint8_t  pad[];                  to the next 4-byte boundary
  *
- * Chunks are in call order and replay walks them in call order: the format
- * carries no random access and no index, because a frame is replayed whole.
- * Textures and vertex shader programs are the exception to pure call order --
- * they are emitted once, the first time the frame refers to them, and then
- * referred to by id, so a texture bound by forty draws is stored once.
+ * A capture has two parts, in this order:
+ *   1. a snapshot of the host's state at the frame boundary, read back from
+ *      src/d3d itself rather than from src/hle's change caches, and ended by
+ *      one D3D8CAP_FRAME_START chunk;
+ *   2. every host call shadow mode made until the next Swap, in call order.
+ * The snapshot uses the same chunk types as the calls, so replay has one path
+ * for both. Its order is fixed by the writer: programs and their
+ * declarations, constants, screen-space, combiner token, vertex shader,
+ * textures, transforms, viewport, render states, texture stage states. The
+ * stage states come after the textures because the host's SetTexture
+ * rewrites D3DTSS_COLOROP (d3d8_device.c, dev_SetTexture).
  *
- * Not in the format, deliberately:
- *   - pixel shaders / register combiner state. The title's combiner state is
- *     not forwarded to the host device yet (hle_d3d8_state.c lists the pixel
- *     shader states among what it does not send), so there is nothing to
- *     record that replay could use.
- *   - lights and materials, for the same reason: shadow mode holds LIGHTING
- *     off because it forwards neither.
+ * Handles. Vertex program handles are the host's own (d3d8_vsh.c, slot +
+ * 0x10000). Replay creates its own programs and maps each recorded handle to
+ * the one it got. Textures are numbered by the capture: a host texture object
+ * gets an id the first time the capture needs its contents, and
+ * D3D8CAP_TEXTURE_RELEASE retires the id when shadow mode releases the
+ * object, so an object reallocated at the same address gets a new id.
+ *
+ * Not in the format:
  *   - push-buffer traffic. A title that fills its own push buffer through
- *     BeginPush (Burnout 2 does, at two call sites -- see hle_d3d8.c) bypasses
- *     the replacements entirely, so those draws are invisible here. A capture
- *     of such a frame is silently incomplete, which is the format's main
- *     known limitation.
- *   - anything time-varying: no timestamps, no frame pacing. A capture is a
- *     frame's worth of state and data, not a recording of a run.
+ *     BeginPush (Burnout 2 does, at two call sites -- see hle_d3d8.c)
+ *     bypasses every replacement, so shadow mode never draws those, and
+ *     neither does a replay.
+ *   - host state src/hle never sets: lights, material, palettes, stream
+ *     sources, render targets, the device's own pixel shader handle. A replay
+ *     leaves them at the device's defaults, as the live run does.
+ *   - cube and volume textures, which shadow mode does not create. One bound
+ *     on a stage would be recorded as nothing bound.
+ *   - anything time-varying: no timestamps, no frame pacing.
  */
 #ifndef XBOXRECOMP_D3D8_CAPTURE_H
 #define XBOXRECOMP_D3D8_CAPTURE_H
@@ -68,8 +90,10 @@ extern "C" {
 #define D3D8CAP_MAGIC_BYTES  8
 
 /* Bumped on any change to a payload struct or chunk meaning. The reader
- * refuses anything else rather than guessing: captures are cheap to retake. */
-#define D3D8CAP_VERSION      1u
+ * refuses anything else rather than guessing: captures are cheap to retake.
+ * Version 1 was the title-level format; its chunk numbers mean different
+ * things here. */
+#define D3D8CAP_VERSION      2u
 
 /* The conventional extension. .gitignore has it: a capture contains the
  * title's own textures and vertices, so it is game content and must never be
@@ -78,18 +102,26 @@ extern "C" {
 
 enum {
     D3D8CAP_END                 = 0,  /* optional terminator; readers stop at EOF too */
-    D3D8CAP_CLEAR               = 1,  /* D3D8CapClear */
-    D3D8CAP_TRANSFORM           = 2,  /* D3D8CapTransform */
-    D3D8CAP_VIEWPORT            = 3,  /* D3D8CapViewport */
-    D3D8CAP_RENDER_STATE        = 4,  /* D3D8CapStateBatch + D3D8CapStatePair[] */
-    D3D8CAP_TEXTURE_STAGE_STATE = 5,  /* D3D8CapStageBatch + D3D8CapStatePair[] */
-    D3D8CAP_VS_PROGRAM          = 6,  /* D3D8CapVsProgram + microcode + declaration */
-    D3D8CAP_VS_SELECT           = 7,  /* D3D8CapVsSelect */
-    D3D8CAP_VS_CONSTANTS        = 8,  /* D3D8CapVsConstants + float4[count] */
-    D3D8CAP_TEXTURE             = 9,  /* D3D8CapTexture + D3D8CapTextureLevel[] + texels */
-    D3D8CAP_SET_TEXTURE         = 10, /* D3D8CapSetTexture */
-    D3D8CAP_DRAW_UP             = 11, /* D3D8CapDrawUp + vertices */
-    D3D8CAP_DRAW_INDEXED_UP     = 12  /* D3D8CapDrawIndexedUp + indices + vertices */
+    D3D8CAP_FRAME_START         = 1,  /* no payload: the snapshot ends here */
+    D3D8CAP_CLEAR               = 2,  /* D3D8CapClear + D3D8CapRect[rect_count] */
+    D3D8CAP_RENDER_STATE        = 3,  /* D3D8CapRenderState */
+    D3D8CAP_TEXTURE_STAGE_STATE = 4,  /* D3D8CapStageState */
+    D3D8CAP_TRANSFORM           = 5,  /* D3D8CapTransform */
+    D3D8CAP_VIEWPORT            = 6,  /* D3D8CapViewport */
+    D3D8CAP_SET_TEXTURE         = 7,  /* D3D8CapSetTexture */
+    D3D8CAP_SET_VERTEX_SHADER   = 8,  /* D3D8CapSetVertexShader */
+    D3D8CAP_DRAW_UP             = 9,  /* D3D8CapDrawUp + vertices */
+    D3D8CAP_DRAW_INDEXED_UP     = 10, /* D3D8CapDrawIndexedUp + indices + vertices */
+    D3D8CAP_TEXTURE             = 11, /* D3D8CapTexture + D3D8CapLevel[levels] + bytes */
+    D3D8CAP_TEXTURE_LEVEL       = 12, /* D3D8CapTextureLevel + bytes */
+    D3D8CAP_TEXTURE_RELEASE     = 13, /* D3D8CapTextureId */
+    D3D8CAP_VS_CREATE           = 14, /* D3D8CapVsCreate + uint32_t[insn_count * 4] */
+    D3D8CAP_VS_DELETE           = 15, /* D3D8CapVsHandle */
+    D3D8CAP_VS_DECLARATION      = 16, /* D3D8CapVsDeclaration + D3D8CapVsInput[count] */
+    D3D8CAP_VS_CONSTANTS        = 17, /* D3D8CapVsConstants + float[count * 4] */
+    D3D8CAP_VS_SCREENSPACE      = 18, /* D3D8CapVsScreenspace */
+    D3D8CAP_PS_TOKEN            = 19, /* D3D8CapPsToken */
+    D3D8CAP_CHUNK_KINDS         = 20  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -97,83 +129,90 @@ typedef struct {
     uint32_t version;                     /* D3D8CAP_VERSION */
     uint32_t header_bytes;                /* sizeof(D3D8CapHeader); chunks start here */
     uint32_t frame;                       /* which swap this was, counting from 1 */
-    uint32_t width, height;               /* the shadow device's back buffer */
+    uint32_t width, height;               /* the host device's back buffer */
     uint32_t chunk_count;                 /* content chunks, excluding the END
                                            * terminator; patched in at close,
                                            * and 0 in a capture whose run died
                                            * before it closed */
 } D3D8CapHeader;
 
-/* Xbox D3DCLEAR_* flags and the raw D3DCOLOR, exactly as the title passed
- * them: the Xbox-to-PC flag mapping lives in hle_d3d8.c and is applied at
- * replay, so a capture keeps the guest's own values and a fix to that mapping
- * changes what an existing capture draws. z is the float's bits, because the
- * guest passed it as a stack DWORD. */
-typedef struct { uint32_t flags, color, z_bits, stencil; } D3D8CapClear;
+/* IDirect3DDevice8::Clear, as called. flags are the host's D3DCLEAR_*, after
+ * shadow mode's Xbox mapping. */
+typedef struct {
+    uint32_t rect_count, flags, color;
+    float    z;
+    uint32_t stencil;
+} D3D8CapClear;
+typedef struct { int32_t x1, y1, x2, y2; } D3D8CapRect;     /* D3DRECT */
 
-/* state is the Xbox D3DTRANSFORMSTATETYPE (VIEW 0, PROJECTION 1, TEXTURE0-3
- * 2-5, WORLD-WORLD3 6-9); hle_d3d8.c maps it to the PC numbering at replay. */
+typedef struct { uint32_t state, value; } D3D8CapRenderState;
+typedef struct { uint32_t stage, type, value; } D3D8CapStageState;
+
+/* state is the host D3DTRANSFORMSTATETYPE (VIEW 2, PROJECTION 3, TEXTURE0-3
+ * 16-19, WORLD-WORLD3 256-259). */
 typedef struct { uint32_t state; float m[16]; } D3D8CapTransform;
 
 typedef struct { uint32_t x, y, width, height; float min_z, max_z; } D3D8CapViewport;
 
-/* Render and texture stage states are stored as HOST values, already through
- * the converters in hle_d3d8_state.c. They are what that file actually set on
- * the device, captured at the point it set them, so a capture cannot be used
- * to re-examine the Xbox-to-PC state conversion -- only what came out of it.
- * The alternative, storing the guest arrays raw, would make a capture depend
- * on the title's XDK layout being known at replay time, which is exactly the
- * per-title coupling a capture is meant to remove. */
-typedef struct { uint32_t count; } D3D8CapStateBatch;
-typedef struct { uint32_t stage, count; } D3D8CapStageBatch;
-typedef struct { uint32_t state, value; } D3D8CapStatePair;
-
-/* A vertex shader the title created. guest_handle is the address of its
- * X_D3DVertexShader with bit 0 set, the handle the title then selects by.
- * The microcode is insn_count NV2A instructions of 4 DWORDs (hle_d3d8.c,
- * D3DDevice_CreateVertexShader), and is what replay recreates the host
- * program from. decl_dwords is the declaration token stream that followed, as
- * DWORDs; it is recorded for completeness and is not yet consumed at replay,
- * because the host CreateVertexShader ignores pDeclaration (d3d8_device.c). */
-typedef struct { uint32_t guest_handle, insn_count, decl_dwords; } D3D8CapVsProgram;
-
-/* An FVF code (bit 0 clear) or a program handle (bit 0 set), as the title
- * passed it to SetVertexShader -- the same discriminator hle_d3d8.c uses. */
-typedef struct { uint32_t guest_handle; } D3D8CapVsSelect;
-
-/* first_reg is already 0..191, the host's own range. The whole bank is
- * written once at frame start so a replay does not depend on constants set
- * in earlier frames; later chunks in the same frame are incremental updates. */
-typedef struct { uint32_t first_reg, count; } D3D8CapVsConstants;
-
-/* format is the Xbox D3DFORMAT code; the host D3D8 layer takes those directly
- * (hle_d3d8_texture.c). Levels are stored already in the Xbox's own packing,
- * swizzled or compressed as they were in guest memory, because that is what
- * the host upload path expects. linear marks the non-zero-Size case, whose
- * rows are padded to 64 bytes in the guest. */
-typedef struct {
-    uint32_t id;                       /* referred to by D3D8CapSetTexture */
-    uint32_t format, width, height, levels, linear;
-} D3D8CapTexture;
-
-/* One per level, in level order, then all the texel bytes back to back in the
- * same order. pitch/rows are the guest's, so replay needs no format maths and
- * a change to d3d8_row_pitch cannot silently re-interpret an old capture. */
-typedef struct { uint32_t pitch, rows, bytes; } D3D8CapTextureLevel;
-
-/* texture_id 0 means "nothing bound at this stage". */
+/* texture_id 0 is SetTexture(stage, NULL). */
 typedef struct { uint32_t stage, texture_id; } D3D8CapSetTexture;
 
-/* prim is the Xbox D3DPRIMITIVETYPE; the conversion to a PC type and a
- * primitive count is hle_d3d8.c's and is applied at replay. vertex_bytes is
- * what the draw actually reads -- vertex_count * stride for a UP draw, and
- * (highest index + 1) * stride for an indexed one. */
-typedef struct { uint32_t prim, vertex_count, stride, vertex_bytes; } D3D8CapDrawUp;
+/* The argument to the host's SetVertexShader: an FVF code, or a program
+ * handle (d3d8_vsh_is_programmable), which replay maps to its own. */
+typedef struct { uint32_t handle; } D3D8CapSetVertexShader;
 
-/* Indices are always 16-bit on the Xbox, so index_bytes is index_count * 2. */
+/* DrawPrimitiveUP. prim_type is the host D3DPRIMITIVETYPE; vertex_bytes is
+ * what the host read: d3d8_up_vertices_read() vertices of `stride`. */
+typedef struct { uint32_t prim_type, prim_count, stride, vertex_bytes; } D3D8CapDrawUp;
+
+/* DrawIndexedPrimitiveUP. index_format is the host D3DFORMAT (INDEX16 101 or
+ * INDEX32 102); index_bytes covers d3d8_up_indices_read() indices, and
+ * vertex_bytes is num_vertices * stride, the range the host uploads. */
 typedef struct {
-    uint32_t prim, index_count, stride, vertex_bytes, index_bytes;
+    uint32_t prim_type, min_index, num_vertices, prim_count;
+    uint32_t index_format, index_bytes, stride, vertex_bytes;
 } D3D8CapDrawIndexedUp;
+
+/* A host texture's creation and full contents: CreateTexture with these
+ * arguments (pool D3DPOOL_MANAGED, the only one src/hle uses), then every
+ * level filled. format is the D3DFORMAT the host was given -- an Xbox format
+ * code, which src/d3d takes directly. The level bytes are the host's
+ * system-memory copy (d3d8_texture_level), rows of `pitch` bytes, so replay
+ * writes them back through LockRect unchanged. A TEXTURE chunk for an id that
+ * replay already holds replaces that texture's contents. */
+typedef struct {
+    uint32_t id, format, width, height, levels, usage;
+} D3D8CapTexture;
+typedef struct { uint32_t pitch, rows, bytes; } D3D8CapLevel;
+
+/* One level filled again: shadow mode locked and unlocked a texture the
+ * capture already holds (hle_d3d8_texture.c re-uploads a texture whose guest
+ * texels changed). */
+typedef struct { uint32_t id, level, pitch, rows, bytes; } D3D8CapTextureLevel;
+
+typedef struct { uint32_t id; } D3D8CapTextureId;
+
+/* d3d8_vsh_create_shader; handle is what it returned. */
+typedef struct { uint32_t handle, insn_count; } D3D8CapVsCreate;
+typedef struct { uint32_t handle; } D3D8CapVsHandle;
+
+/* d3d8_vsh_set_declaration. The host's D3D8VshInput is { int reg;
+ * DXGI_FORMAT format; UINT offset; } (d3d8_vsh.h), copied field by field. */
+typedef struct { uint32_t handle, count; } D3D8CapVsDeclaration;
+typedef struct { int32_t reg; uint32_t dxgi_format, offset; } D3D8CapVsInput;
+
+/* d3d8_vsh_set_constant; first_reg is 0..191. */
+typedef struct { uint32_t first_reg, count; } D3D8CapVsConstants;
+
+/* d3d8_vsh_set_screenspace when enabled is 1. enabled 0 appears only in a
+ * snapshot taken before anything turned it on. */
+typedef struct { uint32_t enabled; float scale[4], offset[4]; } D3D8CapVsScreenspace;
+
+/* d3d8_combiners_set_pixel_shader. */
+typedef struct { uint32_t token; } D3D8CapPsToken;
+
+/* A short name for a chunk type ("draw_up"), or "unknown", for logs. */
+const char *d3d8cap_chunk_name(uint32_t type);
 
 /* ------------------------------------------------------------------ writer */
 
@@ -214,7 +253,8 @@ typedef struct D3D8CapReader D3D8CapReader;
 
 /* Reads the whole capture into memory -- a frame is tens of megabytes at
  * most, and replay walks it repeatedly. On failure returns NULL and writes a
- * reason into err (never truncated to nothing; err may be NULL). */
+ * reason into err (never truncated to nothing; err may be NULL). A capture of
+ * any other version, including version 1, is refused. */
 D3D8CapReader *d3d8cap_open(const char *path, char *err, size_t err_bytes);
 
 const D3D8CapHeader *d3d8cap_header(const D3D8CapReader *r);

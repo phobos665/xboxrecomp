@@ -54,6 +54,27 @@ const D3DMATERIAL8  *d3d8_GetMaterial(void);
 UINT                 d3d8_GetNumLights(void);
 DWORD                d3d8_GetCurrentFVF(void);
 
+/* How many vertices DrawPrimitiveUP reads from the caller, and how many
+ * indices DrawIndexedPrimitiveUP reads, for a primitive type and count; 0 for
+ * a type the draw refuses. Kept beside the draws (d3d8_device.c) so frame
+ * capture (src/hle/hle_d3d8_record.c) copies exactly the bytes the host read. */
+UINT                 d3d8_up_vertices_read(D3DPRIMITIVETYPE type, UINT prims);
+UINT                 d3d8_up_indices_read(D3DPRIMITIVETYPE type, UINT prims);
+
+/* A 2D texture as the host holds it, for frame capture. Both return FALSE
+ * for anything that is not a D3D8Texture (cube, volume, surface). The level
+ * bytes are the texture's own system-memory copy, in the Xbox packing the
+ * upload path takes (d3d8_resources.c, tex_LockRect); valid until the
+ * texture is released or locked for writing. */
+typedef struct D3D8TextureInfo {
+    D3DFORMAT format;
+    UINT      width, height, levels;
+    DWORD     usage;
+} D3D8TextureInfo;
+BOOL d3d8_texture_info(IDirect3DBaseTexture8 *texture, D3D8TextureInfo *info);
+BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
+                        const BYTE **bits, UINT *pitch, UINT *rows);
+
 /* ================================================================
  * Resource wrapper structures
  * ================================================================ */

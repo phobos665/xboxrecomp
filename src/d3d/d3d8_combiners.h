@@ -360,6 +360,12 @@ void d3d8_combiners_mark_dirty(void);
 void d3d8_combiners_set_pixel_shader(DWORD token);
 
 /**
+ * The token last passed to d3d8_combiners_set_pixel_shader (0 if none), for
+ * frame capture's opening snapshot (src/hle/hle_d3d8_record.c).
+ */
+DWORD d3d8_combiners_get_pixel_shader(void);
+
+/**
  * Get whether a combiner pixel shader is currently active.
  */
 BOOL d3d8_combiners_active(void);

@@ -2,10 +2,10 @@
  * d3d8_replay.c -- replay one captured frame into the host renderer.
  *
  * The point of the whole capture path: change the shader translation, the
- * combiners or the state conversion, rebuild, and look at the new image in
- * seconds instead of running the title for five minutes and driving its menus
- * to the moment of interest. A capture replays byte-identically every time,
- * so two images differ only where the code changed.
+ * combiners or the state handling in src/d3d, rebuild, and look at the new
+ * image in seconds instead of running the title for five minutes and driving
+ * its menus to the moment of interest. A capture replays byte-identically
+ * every time, so two images differ only where the code changed.
  *
  *   d3d8_replay <capture> [--out <prefix>] [--loops <n>] [--dump-every]
  *               [--hold] [--quiet]
@@ -15,25 +15,30 @@
  *                    path's RECOMP_HLE_D3D8_DUMP writes, so a replay image
  *                    and a live frame can be put side by side.
  *   --loops <n>      replay the frame n times (default 1). The device is
- *                    created once; each loop walks the capture again.
+ *                    created once; each loop walks the capture again from
+ *                    its snapshot.
  *   --dump-every     write a BMP after every loop, not just the last, so a
  *                    frame that is not idempotent shows itself.
  *   --hold           leave the window up until it is closed.
+ *   --quiet          only errors.
  *
- * No game files, no recompiled title and no guest memory: the capture carries
- * every byte the frame reads. It links the host D3D8 layer (src/d3d) directly
- * and creates the device the same way hle_d3d8.c's shadow_create does.
+ * A player, not an emulator. A version 2 capture holds the calls shadow mode
+ * made on the host renderer after all of its Xbox conversion (d3d8_capture.h),
+ * so this file has no Xbox knowledge at all: each chunk is one call into
+ * src/d3d with the recorded arguments. The only translation is of handles --
+ * vertex program handles and texture objects are this process's own, so the
+ * recorded ones are mapped to them. If a replayed frame differs from the live
+ * one, the difference is in the capture, or in what src/d3d does with the
+ * same calls; it cannot come from a second copy of shadow mode's logic.
  *
- * What replay does NOT reproduce, beyond what d3d8_capture.h already lists:
- *   - the vertex declaration that came with a program is read from the
- *     capture but not applied, because the host CreateVertexShader ignores
- *     pDeclaration (d3d8_device.c) and builds its input layout from the
- *     microcode's inputs instead. A capture carries it so that a replay can
- *     start using it without retaking captures.
- *   - a stage whose capture says "nothing bound" gets the same 1x1 opaque
- *     white texture hle_d3d8_texture.c binds, for the same reason: the host
- *     pixel shader samples every stage whatever its operation, and an unbound
- *     D3D11 slot reads as zero, which would turn the draw black.
+ * No game files, no recompiled title and no guest memory. It links the host
+ * D3D8 layer (src/d3d) directly and creates the device the same way
+ * hle_d3d8.c's shadow_create does.
+ *
+ * Between loops every program and texture this tool created is deleted, so
+ * each loop starts from the capture's snapshot alone. What the snapshot does
+ * not carry (d3d8_capture.h, "Not in the format") stays as the device left
+ * it, which is the device's default because nothing here sets it either.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -43,10 +48,11 @@
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
 #include "d3d8_vsh.h"
+#include "d3d8_combiners.h"
 #include "d3d8_capture.h"
-#include "d3d8_xbox_map.h"
 
-#define REPLAY_MAX_TEXTURES 512
+#define REPLAY_MAX_PROGRAMS 256
+#define REPLAY_STAGES       4
 
 static int g_quiet;
 
@@ -164,289 +170,396 @@ static void dump_bmp(IDirect3DDevice8 *dev, const char *path, UINT w, UINT h)
 /* ------------------------------------------------------------ replay state */
 
 typedef struct {
-    IDirect3DDevice8  *dev;
-    UINT               width, height;
+    IDirect3DDevice8   *dev;
+    UINT                width, height;
 
-    /* Capture texture id -> host texture. Index 0 is unused: id 0 means
-     * "nothing bound". */
-    IDirect3DTexture8 *textures[REPLAY_MAX_TEXTURES];
-    IDirect3DTexture8 *white;
+    /* Capture texture id -> this process's texture. Ids are handed out in
+     * order by the writer, so a growable array indexed by id is enough. */
+    IDirect3DTexture8 **textures;
+    uint32_t            texture_slots;
 
-    /* Guest program handle -> host handle from d3d8_vsh_create_shader. */
-    struct { uint32_t guest; DWORD host; } programs[128];
-    int                program_count;
+    /* Recorded program handle -> the handle d3d8_vsh_create_shader gave us. */
+    struct { DWORD recorded, ours; } programs[REPLAY_MAX_PROGRAMS];
+    int                 program_count;
 
-    unsigned long      draws, skipped;
+    unsigned long       kinds[D3D8CAP_CHUNK_KINDS];
+    unsigned long       unknown, malformed, failed, unmapped;
 } Replay;
 
-/* 1x1 opaque white, for a stage the capture says has nothing bound --
- * hle_d3d8_texture.c does the same, and for the same reason. */
-static IDirect3DTexture8 *white_texture(Replay *r)
+static IDirect3DTexture8 **texture_slot(Replay *r, uint32_t id, int grow)
 {
-    D3DLOCKED_RECT lr;
-
-    if (r->white)
-        return r->white;
-    if (FAILED(r->dev->lpVtbl->CreateTexture(r->dev, 1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8,
-                                             D3DPOOL_MANAGED, &r->white)) || !r->white) {
-        r->white = NULL;
+    if (id == 0)
         return NULL;
+    if (id >= r->texture_slots) {
+        uint32_t n = r->texture_slots ? r->texture_slots : 256;
+        IDirect3DTexture8 **t;
+
+        if (!grow || id > 0x00FFFFFFu)
+            return NULL;
+        while (n <= id)
+            n *= 2;
+        t = realloc(r->textures, (size_t)n * sizeof *t);
+        if (!t)
+            return NULL;
+        memset(t + r->texture_slots, 0, (size_t)(n - r->texture_slots) * sizeof *t);
+        r->textures = t;
+        r->texture_slots = n;
     }
-    if (SUCCEEDED(r->white->lpVtbl->LockRect(r->white, 0, &lr, NULL, 0))) {
-        memset(lr.pBits, 0xFF, 4);
-        r->white->lpVtbl->UnlockRect(r->white, 0);
-    }
-    return r->white;
+    return &r->textures[id];
 }
 
-static void replay_texture(Replay *r, const D3D8CapChunk *c)
+static void fill_level(Replay *r, IDirect3DTexture8 *tex, UINT level,
+                       const uint8_t *src, uint32_t pitch, uint32_t rows)
+{
+    D3DLOCKED_RECT lr;
+    uint32_t y, row;
+
+    if (FAILED(tex->lpVtbl->LockRect(tex, level, &lr, NULL, 0))) {
+        r->failed++;
+        return;
+    }
+    /* The pitch was the host's own at capture time; it only differs here if
+     * src/d3d changed its row maths since, and then the narrower wins. */
+    if (lr.Pitch == (INT)pitch) {
+        memcpy(lr.pBits, src, (size_t)pitch * rows);
+    } else {
+        row = pitch < (uint32_t)lr.Pitch ? pitch : (uint32_t)lr.Pitch;
+        for (y = 0; y < rows; y++)
+            memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch,
+                   src + (size_t)y * pitch, row);
+        r->malformed++;
+    }
+    tex->lpVtbl->UnlockRect(tex, level);
+}
+
+static void do_texture(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapTexture *t = c->data;
-    const D3D8CapTextureLevel *levels;
-    const uint8_t *texels;
-    IDirect3DTexture8 *host = NULL;
+    const D3D8CapLevel *levels;
+    const uint8_t *bytes;
+    IDirect3DTexture8 **slot, *tex;
     size_t total = 0, offset = 0;
     uint32_t l;
 
-    if (c->bytes < sizeof *t || t->id == 0 || t->id >= REPLAY_MAX_TEXTURES)
+    if (c->bytes < sizeof *t || !(slot = texture_slot(r, t->id, 1))) {
+        r->malformed++;
         return;
+    }
     levels = d3d8cap_tail(c, sizeof *t, (size_t)t->levels * sizeof *levels);
-    if (!levels)
+    if (!levels) {
+        r->malformed++;
         return;
-    for (l = 0; l < t->levels; l++)
+    }
+    for (l = 0; l < t->levels; l++) {
+        if ((uint64_t)levels[l].pitch * levels[l].rows != levels[l].bytes) {
+            r->malformed++;
+            return;
+        }
         total += levels[l].bytes;
-    texels = d3d8cap_tail(c, sizeof *t + (size_t)t->levels * sizeof *levels, total);
-    if (!texels)
+    }
+    bytes = d3d8cap_tail(c, sizeof *t + (size_t)t->levels * sizeof *levels, total);
+    if (!bytes) {
+        r->malformed++;
         return;
+    }
 
+    /* An id seen again is the same texture written again (a later loop, or a
+     * writer that re-emits): replace it. */
+    if (*slot) {
+        (*slot)->lpVtbl->Release(*slot);
+        *slot = NULL;
+    }
+    tex = NULL;
     if (FAILED(r->dev->lpVtbl->CreateTexture(r->dev, t->width, t->height, t->levels,
-                                             0, (D3DFORMAT)t->format,
-                                             D3DPOOL_MANAGED, &host)) || !host) {
+                                             t->usage, (D3DFORMAT)t->format,
+                                             D3DPOOL_MANAGED, &tex)) || !tex) {
         note("[replay] texture %u (format 0x%02X %ux%u) could not be created\n",
              t->id, t->format, t->width, t->height);
+        r->failed++;
         return;
     }
-
-    /* Level by level, exactly as hle_d3d8_texture.c's upload() does it: the
-     * capture holds the guest's own pitch, so a linear texture whose rows are
-     * padded to 64 bytes is copied row by row and everything else in one go. */
     for (l = 0; l < t->levels; l++) {
-        D3DLOCKED_RECT lr;
-        const uint8_t *src = texels + offset;
-
+        fill_level(r, tex, l, bytes + offset, levels[l].pitch, levels[l].rows);
         offset += levels[l].bytes;
-        if (FAILED(host->lpVtbl->LockRect(host, l, &lr, NULL, 0)))
-            break;
-        if (lr.Pitch == (INT)levels[l].pitch) {
-            memcpy(lr.pBits, src, levels[l].bytes);
-        } else {
-            uint32_t y;
-            uint32_t row = levels[l].pitch < (uint32_t)lr.Pitch
-                         ? levels[l].pitch : (uint32_t)lr.Pitch;
-            for (y = 0; y < levels[l].rows; y++)
-                memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch,
-                       src + (size_t)y * levels[l].pitch, row);
-        }
-        host->lpVtbl->UnlockRect(host, l);
     }
-
-    if (r->textures[t->id])
-        r->textures[t->id]->lpVtbl->Release(r->textures[t->id]);
-    r->textures[t->id] = host;
+    *slot = tex;
 }
 
-static void replay_vs_program(Replay *r, const D3D8CapChunk *c)
+static void do_texture_level(Replay *r, const D3D8CapChunk *c)
 {
-    const D3D8CapVsProgram *p = c->data;
-    const uint32_t *code;
-    DWORD host = 0;
+    const D3D8CapTextureLevel *t = c->data;
+    IDirect3DTexture8 **slot;
+    const uint8_t *bytes;
+
+    if (c->bytes < sizeof *t || (uint64_t)t->pitch * t->rows != t->bytes ||
+        !(bytes = d3d8cap_tail(c, sizeof *t, t->bytes))) {
+        r->malformed++;
+        return;
+    }
+    slot = texture_slot(r, t->id, 0);
+    if (!slot || !*slot) {
+        r->unmapped++;
+        return;
+    }
+    fill_level(r, *slot, t->level, bytes, t->pitch, t->rows);
+}
+
+static void do_texture_release(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapTextureId *t = c->data;
+    IDirect3DTexture8 **slot;
+
+    if (c->bytes < sizeof *t) {
+        r->malformed++;
+        return;
+    }
+    slot = texture_slot(r, t->id, 0);
+    if (!slot || !*slot) {
+        r->unmapped++;
+        return;
+    }
+    (*slot)->lpVtbl->Release(*slot);
+    *slot = NULL;
+}
+
+static int program_find(const Replay *r, DWORD recorded)
+{
     int i;
 
-    if (c->bytes < sizeof *p)
-        return;
-    code = d3d8cap_tail(c, sizeof *p, (size_t)p->insn_count * 4u * sizeof(uint32_t));
-    if (!code)
-        return;
-    if (FAILED(d3d8_vsh_create_shader((const DWORD *)code, (int)p->insn_count, &host)))
-        return;
-    /* Each loop walks the capture again and recreates every program; the
-     * host has only NV2A_VS_MAX_SLOTS of them, so the previous one goes. */
     for (i = 0; i < r->program_count; i++)
-        if (r->programs[i].guest == p->guest_handle) {
-            d3d8_vsh_delete_shader(r->programs[i].host);
-            r->programs[i].host = host;
-            return;
-        }
-    if (r->program_count < (int)(sizeof r->programs / sizeof r->programs[0])) {
-        r->programs[r->program_count].guest = p->guest_handle;
-        r->programs[r->program_count].host  = host;
-        r->program_count++;
-    }
+        if (r->programs[i].recorded == recorded)
+            return i;
+    return -1;
 }
 
-static void replay_vs_select(Replay *r, const D3D8CapChunk *c)
+static void program_forget(Replay *r, int i)
 {
-    const D3D8CapVsSelect *s = c->data;
+    r->programs[i] = r->programs[--r->program_count];
+}
+
+static void do_vs_create(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapVsCreate *p = c->data;
+    const DWORD *code;
+    DWORD ours = 0;
     int i;
 
-    if (c->bytes < sizeof *s)
-        return;
-    /* Bit 0 set means the handle is the address of the title's shader object;
-     * anything else is an FVF code, which the host takes as it is
-     * (hle_d3d8.c, shadow_select_vertex_shader). */
-    if (!(s->guest_handle & 1u)) {
-        r->dev->lpVtbl->SetVertexShader(r->dev, s->guest_handle);
+    if (c->bytes < sizeof *p || !p->insn_count ||
+        !(code = d3d8cap_tail(c, sizeof *p, (size_t)p->insn_count * 4u * sizeof(DWORD)))) {
+        r->malformed++;
         return;
     }
-    for (i = 0; i < r->program_count; i++)
-        if (r->programs[i].guest == s->guest_handle) {
-            r->dev->lpVtbl->SetVertexShader(r->dev, r->programs[i].host);
-            return;
-        }
-    /* A program selected but never created inside the captured frame: its
-     * CreateVertexShader happened earlier and the capture's frame-start
-     * snapshot could only record the handle, not the microcode. */
-    r->skipped++;
+    /* A recorded handle is only reused after its delete; a stale mapping
+     * would mean a delete was lost, and the old program must not leak. */
+    i = program_find(r, p->handle);
+    if (i >= 0) {
+        d3d8_vsh_delete_shader(r->programs[i].ours);
+        program_forget(r, i);
+    }
+    if (FAILED(d3d8_vsh_create_shader(code, (int)p->insn_count, &ours))) {
+        r->failed++;
+        return;
+    }
+    if (r->program_count >= REPLAY_MAX_PROGRAMS) {
+        d3d8_vsh_delete_shader(ours);
+        r->failed++;
+        return;
+    }
+    r->programs[r->program_count].recorded = p->handle;
+    r->programs[r->program_count].ours = ours;
+    r->program_count++;
 }
 
-static void replay_draw_up(Replay *r, const D3D8CapChunk *c)
+static void do_vs_delete(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapVsHandle *p = c->data;
+    int i;
+
+    if (c->bytes < sizeof *p) {
+        r->malformed++;
+        return;
+    }
+    i = program_find(r, p->handle);
+    if (i < 0) {
+        r->unmapped++;
+        return;
+    }
+    d3d8_vsh_delete_shader(r->programs[i].ours);
+    program_forget(r, i);
+}
+
+static void do_vs_declaration(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapVsDeclaration *p = c->data;
+    const D3D8CapVsInput *in;
+    D3D8VshInput decl[NV2A_VS_MAX_INPUTS];
+    uint32_t k;
+    int i;
+
+    if (c->bytes < sizeof *p || p->count > NV2A_VS_MAX_INPUTS ||
+        !(in = d3d8cap_tail(c, sizeof *p, (size_t)p->count * sizeof *in))) {
+        r->malformed++;
+        return;
+    }
+    i = program_find(r, p->handle);
+    if (i < 0) {
+        r->unmapped++;
+        return;
+    }
+    for (k = 0; k < p->count; k++) {
+        decl[k].reg    = in[k].reg;
+        decl[k].format = (DXGI_FORMAT)in[k].dxgi_format;
+        decl[k].offset = in[k].offset;
+    }
+    if (FAILED(d3d8_vsh_set_declaration(r->programs[i].ours, decl, (int)p->count)))
+        r->failed++;
+}
+
+static void do_set_vertex_shader(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapSetVertexShader *p = c->data;
+    DWORD handle;
+    int i;
+
+    if (c->bytes < sizeof *p) {
+        r->malformed++;
+        return;
+    }
+    handle = p->handle;
+    if (d3d8_vsh_is_programmable(handle)) {
+        i = program_find(r, handle);
+        if (i < 0) {                     /* selecting a program nobody created */
+            r->unmapped++;
+            return;
+        }
+        handle = r->programs[i].ours;
+    }
+    r->dev->lpVtbl->SetVertexShader(r->dev, handle);
+}
+
+static void do_draw_up(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapDrawUp *d = c->data;
     const void *verts;
-    D3DPRIMITIVETYPE pt;
-    UINT prims;
-    uint8_t *loop = NULL;
+    uint64_t need;
 
-    if (c->bytes < sizeof *d)
-        return;
-    verts = d3d8cap_tail(c, sizeof *d, d->vertex_bytes);
-    if (!verts)
-        return;
-    if (!xbox_primitive_to_host(d->prim, d->vertex_count, &pt, &prims)) {
-        r->skipped++;
+    if (c->bytes < sizeof *d || !d->stride ||
+        !(verts = d3d8cap_tail(c, sizeof *d, d->vertex_bytes))) {
+        r->malformed++;
         return;
     }
-    if (d->prim == XPT_LINELOOP) {       /* close the loop: repeat vertex 0 */
-        loop = malloc((size_t)(d->vertex_count + 1) * d->stride);
-        if (!loop) {
-            r->skipped++;
-            return;
-        }
-        memcpy(loop, verts, (size_t)d->vertex_count * d->stride);
-        memcpy(loop + (size_t)d->vertex_count * d->stride, verts, d->stride);
-        verts = loop;
+    /* The host reads what its own count says; never more than was recorded. */
+    need = (uint64_t)d3d8_up_vertices_read((D3DPRIMITIVETYPE)d->prim_type,
+                                           d->prim_count) * d->stride;
+    if (need > d->vertex_bytes) {
+        r->malformed++;
+        return;
     }
-    if (SUCCEEDED(r->dev->lpVtbl->DrawPrimitiveUP(r->dev, pt, prims, verts, d->stride)))
-        r->draws++;
-    else
-        r->skipped++;
-    free(loop);
+    if (FAILED(r->dev->lpVtbl->DrawPrimitiveUP(r->dev, (D3DPRIMITIVETYPE)d->prim_type,
+                                               d->prim_count, verts, d->stride)))
+        r->failed++;
 }
 
-/* The host's indexed UP draw converts no primitive types, so fans, polygons,
- * quad lists and line loops are rewritten into index lists here -- the same
- * rewriting hle_d3d8.c does on the live path. */
-static void replay_draw_indexed_up(Replay *r, const D3D8CapChunk *c)
+static void do_draw_indexed_up(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapDrawIndexedUp *d = c->data;
-    const uint16_t *idx;
-    const void *verts;
-    uint16_t *list = NULL;
-    D3DPRIMITIVETYPE pt;
-    UINT prims, vertices = 0, i, n = 0;
-    HRESULT hr;
+    const void *idx, *verts;
+    uint64_t need;
 
-    if (c->bytes < sizeof *d)
-        return;
-    idx = d3d8cap_tail(c, sizeof *d, d->index_bytes);
-    verts = d3d8cap_tail(c, sizeof *d + d->index_bytes, d->vertex_bytes);
-    if (!idx || !verts)
-        return;
-    if (!xbox_primitive_to_host(d->prim, d->index_count, &pt, &prims)) {
-        r->skipped++;
+    if (c->bytes < sizeof *d || !d->stride ||
+        !(idx = d3d8cap_tail(c, sizeof *d, d->index_bytes)) ||
+        !(verts = d3d8cap_tail(c, sizeof *d + (size_t)d->index_bytes, d->vertex_bytes))) {
+        r->malformed++;
         return;
     }
-    for (i = 0; i < d->index_count; i++)
-        if ((UINT)idx[i] + 1 > vertices)
-            vertices = (UINT)idx[i] + 1;
-
-    switch (d->prim) {
-    case XPT_TRIANGLEFAN:
-    case XPT_POLYGON:
-        list = malloc((size_t)prims * 3 * sizeof *list);
-        for (i = 0; list && i < prims; i++) {
-            list[n++] = idx[0];
-            list[n++] = idx[i + 1];
-            list[n++] = idx[i + 2];
-        }
-        pt = D3DPT_TRIANGLELIST;
-        break;
-    case XPT_QUADLIST:
-        list = malloc((size_t)prims * 6 * sizeof *list);
-        for (i = 0; list && i < prims; i++) {
-            const uint16_t *q = idx + i * 4;
-            list[n++] = q[0]; list[n++] = q[1]; list[n++] = q[2];
-            list[n++] = q[0]; list[n++] = q[2]; list[n++] = q[3];
-        }
-        pt = D3DPT_TRIANGLELIST;
-        prims *= 2;
-        break;
-    case XPT_LINELOOP:
-        list = malloc(((size_t)d->index_count + 1) * sizeof *list);
-        if (list) {
-            memcpy(list, idx, (size_t)d->index_count * sizeof *list);
-            list[d->index_count] = idx[0];
-        }
-        break;
-    default:
-        break;
-    }
-    if ((d->prim == XPT_TRIANGLEFAN || d->prim == XPT_POLYGON ||
-         d->prim == XPT_QUADLIST || d->prim == XPT_LINELOOP) && !list) {
-        r->skipped++;
+    need = (uint64_t)d3d8_up_indices_read((D3DPRIMITIVETYPE)d->prim_type, d->prim_count) *
+           (d->index_format == D3DFMT_INDEX32 ? 4u : 2u);
+    if (need > d->index_bytes ||
+        (uint64_t)d->num_vertices * d->stride > d->vertex_bytes) {
+        r->malformed++;
         return;
     }
-    hr = r->dev->lpVtbl->DrawIndexedPrimitiveUP(r->dev, pt, 0, vertices, prims,
-                                                list ? list : idx, D3DFMT_INDEX16,
-                                                verts, d->stride);
-    free(list);
-    if (SUCCEEDED(hr))
-        r->draws++;
-    else
-        r->skipped++;
+    if (FAILED(r->dev->lpVtbl->DrawIndexedPrimitiveUP(
+            r->dev, (D3DPRIMITIVETYPE)d->prim_type, d->min_index, d->num_vertices,
+            d->prim_count, idx, (D3DFORMAT)d->index_format, verts, d->stride)))
+        r->failed++;
 }
 
 static void replay_chunk(Replay *r, const D3D8CapChunk *c)
 {
+    if (c->type >= D3D8CAP_CHUNK_KINDS) {
+        /* Cannot come from a writer of this version; skipped, not fatal. */
+        r->unknown++;
+        return;
+    }
+    r->kinds[c->type]++;
+
     switch (c->type) {
+    case D3D8CAP_FRAME_START:
+        break;
     case D3D8CAP_CLEAR: {
         const D3D8CapClear *p = c->data;
-        float z;
+        const D3D8CapRect *rects = NULL;
+        D3DRECT out[16];
+        uint32_t i;
 
-        if (c->bytes < sizeof *p)
+        if (c->bytes < sizeof *p || p->rect_count > 16 ||
+            (p->rect_count &&
+             !(rects = d3d8cap_tail(c, sizeof *p, (size_t)p->rect_count * sizeof *rects)))) {
+            r->malformed++;
             break;
-        memcpy(&z, &p->z_bits, sizeof z);
-        r->dev->lpVtbl->Clear(r->dev, 0, NULL, xbox_clear_flags_to_host(p->flags),
-                              p->color, z, p->stencil);
+        }
+        for (i = 0; i < p->rect_count; i++) {
+            out[i].x1 = rects[i].x1;
+            out[i].y1 = rects[i].y1;
+            out[i].x2 = rects[i].x2;
+            out[i].y2 = rects[i].y2;
+        }
+        r->dev->lpVtbl->Clear(r->dev, p->rect_count, p->rect_count ? out : NULL,
+                              p->flags, p->color, p->z, p->stencil);
+        break;
+    }
+    case D3D8CAP_RENDER_STATE: {
+        const D3D8CapRenderState *p = c->data;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        r->dev->lpVtbl->SetRenderState(r->dev, (D3DRENDERSTATETYPE)p->state, p->value);
+        break;
+    }
+    case D3D8CAP_TEXTURE_STAGE_STATE: {
+        const D3D8CapStageState *p = c->data;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        r->dev->lpVtbl->SetTextureStageState(r->dev, p->stage,
+                                             (D3DTEXTURESTAGESTATETYPE)p->type, p->value);
         break;
     }
     case D3D8CAP_TRANSFORM: {
         const D3D8CapTransform *p = c->data;
         D3DMATRIX m;
-        DWORD host;
 
-        if (c->bytes < sizeof *p || !xbox_transform_state_to_host(p->state, &host))
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
             break;
+        }
         memcpy(&m, p->m, sizeof m);
-        r->dev->lpVtbl->SetTransform(r->dev, (D3DTRANSFORMSTATETYPE)host, &m);
+        r->dev->lpVtbl->SetTransform(r->dev, (D3DTRANSFORMSTATETYPE)p->state, &m);
         break;
     }
     case D3D8CAP_VIEWPORT: {
         const D3D8CapViewport *p = c->data;
         D3DVIEWPORT8 vp;
 
-        if (c->bytes < sizeof *p)
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
             break;
+        }
         vp.X = p->x;
         vp.Y = p->y;
         vp.Width = p->width;
@@ -456,77 +569,124 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         r->dev->lpVtbl->SetViewport(r->dev, &vp);
         break;
     }
-    case D3D8CAP_RENDER_STATE: {
-        const D3D8CapStateBatch *b = c->data;
-        const D3D8CapStatePair *pairs;
-        uint32_t i;
+    case D3D8CAP_SET_TEXTURE: {
+        const D3D8CapSetTexture *p = c->data;
+        IDirect3DTexture8 **slot;
 
-        if (c->bytes < sizeof *b)
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
             break;
-        pairs = d3d8cap_tail(c, sizeof *b, (size_t)b->count * sizeof *pairs);
-        for (i = 0; pairs && i < b->count; i++)
-            r->dev->lpVtbl->SetRenderState(r->dev,
-                (D3DRENDERSTATETYPE)pairs[i].state, pairs[i].value);
+        }
+        slot = texture_slot(r, p->texture_id, 0);
+        if (p->texture_id && (!slot || !*slot))
+            r->unmapped++;               /* its TEXTURE chunk failed: bind nothing */
+        r->dev->lpVtbl->SetTexture(r->dev, p->stage,
+            (IDirect3DBaseTexture8 *)(slot ? *slot : NULL));
         break;
     }
-    case D3D8CAP_TEXTURE_STAGE_STATE: {
-        const D3D8CapStageBatch *b = c->data;
-        const D3D8CapStatePair *pairs;
-        uint32_t i;
-
-        if (c->bytes < sizeof *b)
-            break;
-        pairs = d3d8cap_tail(c, sizeof *b, (size_t)b->count * sizeof *pairs);
-        for (i = 0; pairs && i < b->count; i++)
-            r->dev->lpVtbl->SetTextureStageState(r->dev, b->stage,
-                (D3DTEXTURESTAGESTATETYPE)pairs[i].state, pairs[i].value);
+    case D3D8CAP_SET_VERTEX_SHADER:
+        do_set_vertex_shader(r, c);
         break;
-    }
-    case D3D8CAP_VS_PROGRAM:
-        replay_vs_program(r, c);
+    case D3D8CAP_DRAW_UP:
+        do_draw_up(r, c);
         break;
-    case D3D8CAP_VS_SELECT:
-        replay_vs_select(r, c);
+    case D3D8CAP_DRAW_INDEXED_UP:
+        do_draw_indexed_up(r, c);
+        break;
+    case D3D8CAP_TEXTURE:
+        do_texture(r, c);
+        break;
+    case D3D8CAP_TEXTURE_LEVEL:
+        do_texture_level(r, c);
+        break;
+    case D3D8CAP_TEXTURE_RELEASE:
+        do_texture_release(r, c);
+        break;
+    case D3D8CAP_VS_CREATE:
+        do_vs_create(r, c);
+        break;
+    case D3D8CAP_VS_DELETE:
+        do_vs_delete(r, c);
+        break;
+    case D3D8CAP_VS_DECLARATION:
+        do_vs_declaration(r, c);
         break;
     case D3D8CAP_VS_CONSTANTS: {
         const D3D8CapVsConstants *p = c->data;
         const float *data;
 
-        if (c->bytes < sizeof *p)
+        if (c->bytes < sizeof *p || p->count > NV2A_VS_MAX_CONSTANTS ||
+            !(data = d3d8cap_tail(c, sizeof *p, (size_t)p->count * 4u * sizeof(float)))) {
+            r->malformed++;
             break;
-        data = d3d8cap_tail(c, sizeof *p, (size_t)p->count * 4u * sizeof(float));
-        if (data)
-            r->dev->lpVtbl->SetVertexShaderConstant(r->dev, (INT)p->first_reg,
-                                                    data, p->count);
+        }
+        d3d8_vsh_set_constant((int)p->first_reg, data, (int)p->count);
         break;
     }
-    case D3D8CAP_TEXTURE:
-        replay_texture(r, c);
-        break;
-    case D3D8CAP_SET_TEXTURE: {
-        const D3D8CapSetTexture *p = c->data;
-        IDirect3DTexture8 *tex;
+    case D3D8CAP_VS_SCREENSPACE: {
+        const D3D8CapVsScreenspace *p = c->data;
 
-        if (c->bytes < sizeof *p)
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
             break;
-        tex = p->texture_id && p->texture_id < REPLAY_MAX_TEXTURES
-            ? r->textures[p->texture_id] : NULL;
-        r->dev->lpVtbl->SetTexture(r->dev, p->stage,
-            (IDirect3DBaseTexture8 *)(tex ? tex : white_texture(r)));
+        }
+        if (p->enabled)
+            d3d8_vsh_set_screenspace(p->scale, p->offset);
+        else
+            d3d8_vsh_clear_screenspace();
         break;
     }
-    case D3D8CAP_DRAW_UP:
-        replay_draw_up(r, c);
+    case D3D8CAP_PS_TOKEN: {
+        const D3D8CapPsToken *p = c->data;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        d3d8_combiners_set_pixel_shader(p->token);
         break;
-    case D3D8CAP_DRAW_INDEXED_UP:
-        replay_draw_indexed_up(r, c);
-        break;
+    }
     default:
-        /* An unknown chunk from a newer writer cannot appear: the reader
-         * refuses a version it does not know. Anything else is skipped so a
-         * future additive chunk does not stop an old replay. */
+        r->unknown++;
         break;
     }
+}
+
+/* Everything this loop created goes, so the next loop starts from the
+ * capture's snapshot alone. Stages are cleared first: the host keeps a raw
+ * pointer to each bound texture. */
+static void end_loop(Replay *r)
+{
+    uint32_t i;
+
+    for (i = 0; i < REPLAY_STAGES; i++)
+        r->dev->lpVtbl->SetTexture(r->dev, i, NULL);
+    for (i = 1; i < r->texture_slots; i++)
+        if (r->textures[i]) {
+            r->textures[i]->lpVtbl->Release(r->textures[i]);
+            r->textures[i] = NULL;
+        }
+    while (r->program_count > 0) {
+        d3d8_vsh_delete_shader(r->programs[r->program_count - 1].ours);
+        r->program_count--;
+    }
+}
+
+static void report_loop(const Replay *r, int loop)
+{
+    char line[1024];
+    int n, k;
+
+    n = snprintf(line, sizeof line, "[replay] loop %d executed:", loop);
+    for (k = 0; k < D3D8CAP_CHUNK_KINDS && n > 0 && n < (int)sizeof line; k++)
+        if (r->kinds[k])
+            n += snprintf(line + n, sizeof line - (size_t)n, " %s %lu",
+                          d3d8cap_chunk_name((uint32_t)k), r->kinds[k]);
+    note("%s\n", line);
+    if (r->failed || r->malformed || r->unmapped || r->unknown || !g_quiet)
+        fprintf(stderr, "[replay] loop %d: %lu host calls failed, %lu malformed chunks, "
+                "%lu unmapped handles, %lu unknown chunks\n", loop, r->failed,
+                r->malformed, r->unmapped, r->unknown);
 }
 
 static void usage(void)
@@ -593,6 +753,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* As hle_d3d8.c's shadow_create. */
     memset(&pp, 0, sizeof pp);
     pp.BackBufferWidth = r.width;
     pp.BackBufferHeight = r.height;
@@ -611,20 +772,17 @@ int main(int argc, char **argv)
     }
     xbox_D3D8SetPresentInterval(0);      /* never wait for vblank: this is a tool */
 
-    /* The same starting point shadow mode gives its device, so a replay and a
-     * live frame begin from the same state. Everything else in the capture is
-     * the title's own. */
-    r.dev->lpVtbl->SetRenderState(r.dev, D3DRS_CULLMODE, D3DCULL_NONE);
-    r.dev->lpVtbl->SetRenderState(r.dev, D3DRS_LIGHTING, FALSE);
-    r.dev->lpVtbl->SetTexture(r.dev, 0, NULL);
-
     for (loop = 0; loop < loops; loop++) {
         D3D8CapChunk c;
 
-        r.draws = r.skipped = 0;
+        memset(r.kinds, 0, sizeof r.kinds);
+        r.unknown = r.malformed = r.failed = r.unmapped = 0;
         d3d8cap_rewind(cap);
         while (d3d8cap_next(cap, &c))
             replay_chunk(&r, &c);
+        if (!r.kinds[D3D8CAP_FRAME_START])
+            fprintf(stderr, "[replay] loop %d: no frame_start chunk -- the capture is "
+                    "truncated inside its snapshot\n", loop);
 
         if (dump_every || loop == loops - 1) {
             snprintf(out, sizeof out, "%s%03d.bmp", prefix, loop);
@@ -632,7 +790,8 @@ int main(int argc, char **argv)
         }
         r.dev->lpVtbl->Swap(r.dev, 0);
         pump();
-        note("[replay] loop %d: %lu draws, %lu skipped\n", loop, r.draws, r.skipped);
+        report_loop(&r, loop);
+        end_loop(&r);
     }
 
     if (hold) {
@@ -644,11 +803,7 @@ int main(int argc, char **argv)
         }
     }
 
-    for (i = 1; i < REPLAY_MAX_TEXTURES; i++)
-        if (r.textures[i])
-            r.textures[i]->lpVtbl->Release(r.textures[i]);
-    if (r.white)
-        r.white->lpVtbl->Release(r.white);
+    free(r.textures);
     d3d8cap_close_read(cap);
     return 0;
 }

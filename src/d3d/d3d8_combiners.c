@@ -1062,6 +1062,11 @@ void d3d8_combiners_set_pixel_shader(DWORD token)
     }
 }
 
+DWORD d3d8_combiners_get_pixel_shader(void)
+{
+    return g_ps_token;
+}
+
 BOOL d3d8_combiners_active(void)
 {
     return g_ps_token != 0;

@@ -1,15 +1,10 @@
 /*
  * d3d8_xbox_map.h -- Xbox D3D8 enumerations to the host layer's PC ones.
  *
- * These conversions were private to hle_d3d8.c until the frame replay tool
- * (src/replay) needed exactly the same ones: a capture stores the title's own
- * Xbox values, so replay converts them the same way the live shadow path
- * does, and a fix to one has to be a fix to both. Two copies of a primitive
- * table would diverge silently and show up as a replay that draws something
- * the run did not.
- *
- * Header-only and static inline, because the two users are a static library
- * and a standalone executable that deliberately does not link it.
+ * Used by shadow mode (hle_d3d8.c). The frame replay tool shared these while
+ * captures held Xbox values; captures now hold host values (d3d8_capture.h,
+ * version 2), so replay no longer needs them. Header-only and static inline
+ * all the same, so a second user can include them without linking xbox_hle.
  *
  * Windows only: the host D3D8 types come from d3d8_xbox.h, which is part of
  * the D3D11 backend. Everything here is pure value mapping -- no device, no

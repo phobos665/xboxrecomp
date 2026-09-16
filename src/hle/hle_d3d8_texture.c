@@ -38,7 +38,7 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
-#include "hle_d3d8_capture.h"
+#include "hle_d3d8_record.h"
 
 /* From hle_d3d8.c: the shadow device, or NULL, and its swap count. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
@@ -63,9 +63,6 @@ typedef struct {
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
-/* The guest container behind each stage's host texture, so a frame capture
- * that begins after the title bound its textures can re-read their texels. */
-static uint32_t      g_bound_va[MAX_STAGES];
 
 static unsigned long g_bound_count, g_uploads, g_reuploads, g_skip_type,
                      g_skip_cube, g_skip_format, g_skip_range, g_skip_create;
@@ -172,7 +169,7 @@ static void upload(IDirect3DTexture8 *host, const texture_layout *t)
         uint32_t rows = level_rows(t->fmt, h);
         D3DLOCKED_RECT lr;
 
-        if (FAILED(host->lpVtbl->LockRect(host, l, &lr, NULL, 0)))
+        if (FAILED(host_LockRect(host, l, &lr, NULL, 0)))
             return;
         if (t->linear) {             /* guest rows are padded to 64 bytes */
             for (y = 0; y < rows; y++)
@@ -182,7 +179,7 @@ static void upload(IDirect3DTexture8 *host, const texture_layout *t)
             memcpy(lr.pBits, src, (size_t)pitch * rows);
             src += (size_t)pitch * rows;
         }
-        host->lpVtbl->UnlockRect(host, l);
+        host_UnlockRect(host, l);
     }
 }
 
@@ -224,7 +221,7 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
         return NULL;
     (void)dev;
     if (victim->host)
-        victim->host->lpVtbl->Release(victim->host);
+        host_ReleaseTexture(victim->host);
     memset(victim, 0, sizeof *victim);
     return victim;
 }
@@ -266,8 +263,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e = cache_slot(dev, now);
     if (!e)
         return NULL;
-    if (FAILED(dev->lpVtbl->CreateTexture(dev, t.width, t.height, t.levels, 0,
-                                          (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &e->host)) ||
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, 0,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &e->host)) ||
         !e->host) {
         memset(e, 0, sizeof *e);
         g_skip_create++;
@@ -294,52 +291,16 @@ static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev)
     if (white || tried)
         return white;
     tried = 1;
-    if (FAILED(dev->lpVtbl->CreateTexture(dev, 1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8,
-                                          D3DPOOL_MANAGED, &white)) || !white) {
+    if (FAILED(host_CreateTexture(dev, 1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8,
+                                  D3DPOOL_MANAGED, &white)) || !white) {
         white = NULL;
         return NULL;
     }
-    if (SUCCEEDED(white->lpVtbl->LockRect(white, 0, &lr, NULL, 0))) {
+    if (SUCCEEDED(host_LockRect(white, 0, &lr, NULL, 0))) {
         memset(lr.pBits, 0xFF, 4);
-        white->lpVtbl->UnlockRect(white, 0);
+        host_UnlockRect(white, 0);
     }
     return white;
-}
-
-/* Records what is bound to one stage. read_layout is called again rather than
- * threaded through host_texture: on the path that reaches here it has already
- * succeeded once, and it bumps its skip counters only when it fails, so this
- * second call cannot double-count. */
-static void capture_stage(uint32_t stage, uint32_t va)
-{
-    texture_layout t;
-    HleD3D8CaptureTexture c;
-
-    if (!hle_d3d8_capture_active())
-        return;
-    if (!va || !read_layout(va, &t)) {
-        hle_d3d8_capture_unbind_texture(stage);
-        return;
-    }
-    c.guest_va    = va;
-    c.format      = t.fmt;
-    c.width       = t.width;
-    c.height      = t.height;
-    c.levels      = t.levels;
-    c.linear      = t.linear;
-    c.guest_pitch = t.guest_pitch;
-    c.texels      = HLE_PTR(CONTIG_BASE + t.phys);
-    hle_d3d8_capture_bind_texture(stage, &c);
-}
-
-/* Called by the capture at frame start: every stage as it stands, so a replay
- * starts from the same bindings rather than from an empty device. */
-void hle_d3d8_capture_snapshot_textures(void)
-{
-    uint32_t s;
-
-    for (s = 0; s < MAX_STAGES; s++)
-        capture_stage(s, g_bound_va[s]);
 }
 
 static void report(void)
@@ -390,16 +351,14 @@ HLE_EXPORT(D3DDevice_SetTexture)
         if (texture)
             host = host_texture(dev, texture);
         g_bound[stage] = host;
-        g_bound_va[stage] = host ? texture : 0;
-        capture_stage(stage, g_bound_va[stage]);
         /* The host pixel shader samples every stage whatever its operation
          * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
          * stage with no host texture would turn the draw black once the
          * title's own texture operations are forwarded. It gets opaque white
          * instead. That a missing Xbox texture contributes white is assumed,
          * not verified against hardware. */
-        dev->lpVtbl->SetTexture(dev, stage,
-                                (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
+        host_SetTexture(dev, stage,
+                        (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
         g_bound_count++;
         report();
     }

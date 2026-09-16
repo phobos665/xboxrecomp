@@ -266,6 +266,19 @@ void d3d8cap_close_read(D3D8CapReader *r)
     free(r);
 }
 
+const char *d3d8cap_chunk_name(uint32_t type)
+{
+    static const char *const names[D3D8CAP_CHUNK_KINDS] = {
+        "end", "frame_start", "clear", "render_state", "texture_stage_state",
+        "transform", "viewport", "set_texture", "set_vertex_shader", "draw_up",
+        "draw_indexed_up", "texture", "texture_level", "texture_release",
+        "vs_create", "vs_delete", "vs_declaration", "vs_constants",
+        "vs_screenspace", "ps_token"
+    };
+
+    return type < D3D8CAP_CHUNK_KINDS ? names[type] : "unknown";
+}
+
 const void *d3d8cap_tail(const D3D8CapChunk *c, size_t head, size_t want)
 {
     if (!c || !c->data || c->bytes < head || c->bytes - head < want)

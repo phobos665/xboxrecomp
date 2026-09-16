@@ -1266,6 +1266,38 @@ void d3d8_vsh_set_screenspace(const float scale[4], const float offset[4])
     g_vsh_screen_dirty = TRUE;
 }
 
+void d3d8_vsh_get_screenspace(float scale[4], float offset[4], int *enabled)
+{
+    if (scale)
+        memcpy(scale, g_vsh_screen.scale, sizeof(g_vsh_screen.scale));
+    if (offset)
+        memcpy(offset, g_vsh_screen.offset, sizeof(g_vsh_screen.offset));
+    if (enabled)
+        *enabled = g_vsh_screen.enable[0] != 0.0f;
+}
+
+void d3d8_vsh_clear_screenspace(void)
+{
+    memset(&g_vsh_screen, 0, sizeof(g_vsh_screen));
+    g_vsh_screen_dirty = TRUE;
+}
+
+BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
+                       int *length, const D3D8VshInput **decl, int *decl_count)
+{
+    const NV2AVshSlot *vsh;
+
+    if (slot < 0 || slot >= NV2A_VS_MAX_SLOTS || !g_vsh_slots[slot].in_use)
+        return FALSE;
+    vsh = &g_vsh_slots[slot];
+    if (handle)     *handle = (DWORD)(slot + 0x10000);
+    if (microcode)  *microcode = vsh->microcode;
+    if (length)     *length = vsh->length;
+    if (decl)       *decl = vsh->decl;
+    if (decl_count) *decl_count = vsh->decl_count;
+    return TRUE;
+}
+
 BOOL d3d8_vsh_is_programmable(DWORD handle)
 {
     return (handle >= 0x10000) ? TRUE : FALSE;

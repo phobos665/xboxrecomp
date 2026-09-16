@@ -61,8 +61,7 @@ HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 
 #ifdef _WIN32
 #include "d3d8_xbox.h"
-#include "d3d8_combiners.h"
-#include "hle_d3d8_capture.h"
+#include "hle_d3d8_record.h"
 
 #define XRS_COUNT        167         /* X_D3DRS_DONOTCULLUNCOMPRESSED + 1 */
 #define XRS_REMOVED      154         /* X_D3DRS_MULTISAMPLETYPE */
@@ -460,7 +459,7 @@ static uint32_t host_texture_modes(uint32_t xbox_modes)
 
 /* Slots 0-56 and the complex slot 136 are outside g_rs_map, so they share
  * g_prev_rs with it without colliding. */
-static void forward_pixel_shader(IDirect3DDevice8 *dev, const IDirect3DDevice8Vtbl *vt)
+static void forward_pixel_shader(IDirect3DDevice8 *dev)
 {
     /* Opt-in: RECOMP_HLE_D3D8_PS=1. Off, the host keeps its fixed-function
      * pixel path, which is what drew Burnout 2's menus, HUD and car correctly
@@ -491,13 +490,13 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev, const IDirect3DDevice8Vt
             if (g_prev_valid && g_prev_rs[x] == v)
                 continue;
             g_prev_rs[x] = v;
-            vt->SetRenderState(dev, (D3DRENDERSTATETYPE)(g_ps_map[g].host + i), v);
+            host_SetRenderState(dev, (D3DRENDERSTATETYPE)(g_ps_map[g].host + i), v);
         }
     }
     if (!g_prev_valid || g_prev_rs[XRS_COMPLEX] != modes) {
         g_prev_rs[XRS_COMPLEX] = modes;
-        vt->SetRenderState(dev, (D3DRENDERSTATETYPE)D3DRS_PSTEXTUREMODES,
-                           host_texture_modes(modes));
+        host_SetRenderState(dev, (D3DRENDERSTATETYPE)D3DRS_PSTEXTUREMODES,
+                            host_texture_modes(modes));
     }
 
     /* The token's low four bits are the combiner count; its texture mode bits
@@ -512,7 +511,7 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev, const IDirect3DDevice8Vt
      * no stage sampling anything, every model came out a flat white
      * silhouette. */
     token = count & 0xFu;
-    d3d8_combiners_set_pixel_shader(token);
+    host_combiners_set_pixel_shader(token);
 
     {
         /* How many draws actually have a pixel shader configured. A draw with
@@ -561,13 +560,11 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev, const IDirect3DDevice8Vt
 
 void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
 {
-    const IDirect3DDevice8Vtbl *vt;
     size_t i;
     int s;
 
     if (!dev || !state_ready())
         return;
-    vt = dev->lpVtbl;
 
     for (i = 0; i < sizeof g_rs_map / sizeof g_rs_map[0]; i++) {
         uint32_t x = g_rs_map[i].xbox;
@@ -578,10 +575,7 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
             continue;
         g_prev_rs[x] = v;
         host_value = rs_to_host(g_rs_map[i].kind, v);
-        vt->SetRenderState(dev, (D3DRENDERSTATETYPE)g_rs_map[i].host, host_value);
-        /* The capture records the host value, which is what was applied --
-         * see d3d8_capture.h on why the guest array is not stored raw. */
-        hle_d3d8_capture_render_state(g_rs_map[i].host, host_value);
+        host_SetRenderState(dev, (D3DRENDERSTATETYPE)g_rs_map[i].host, host_value);
     }
 
     for (s = 0; s < STAGES; s++) {
@@ -598,25 +592,12 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
                 continue;
             g_prev_tss[s][x] = v;
             host_value = ts_to_host(g_ts_map[i].kind, v);
-            vt->SetTextureStageState(dev, (DWORD)s,
-                                     (D3DTEXTURESTAGESTATETYPE)g_ts_map[i].host,
-                                     host_value);
-            hle_d3d8_capture_stage_state((uint32_t)s, g_ts_map[i].host, host_value);
+            host_SetTextureStageState(dev, (DWORD)s,
+                                      (D3DTEXTURESTAGESTATETYPE)g_ts_map[i].host,
+                                      host_value);
         }
     }
-    forward_pixel_shader(dev, vt);
+    forward_pixel_shader(dev);
     g_prev_valid = 1;
-    /* Everything applied for this draw goes into the capture as one batch,
-     * immediately before the draw chunk itself. */
-    hle_d3d8_capture_states_flush();
-}
-
-/* Called by the capture at frame start. A captured frame must carry every
- * state it draws with, but this file only sets what changed since the last
- * draw -- inside one frame that can be almost nothing. Forgetting the memo
- * makes the next draw re-apply the whole set, so the capture sees it. */
-void hle_d3d8_shadow_states_invalidate(void)
-{
-    g_prev_valid = 0;
 }
 #endif /* _WIN32 */
