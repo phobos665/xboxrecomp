@@ -563,10 +563,12 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     }
     sb_append(&sb, "};\n\n");
 
-    /* Output structure. D3D11 links stages by register order, so this starts
-     * with exactly what the pixel shaders read (d3d8_shaders.c and
-     * d3d8_combiners.c, PS_IN): fog at TEXCOORD4 and a view-space position
-     * for table fog at TEXCOORD5. Everything else comes after. */
+    /* Output structure. D3D11 matches a pixel shader's inputs to these by
+     * semantic name and index, so the names are the ones the pixel shaders
+     * ask for (d3d8_shaders.c and d3d8_combiners.c, PS_IN): fog at TEXCOORD4
+     * and a view-space position for table fog at TEXCOORD5. An earlier
+     * version wrote fog to FOG, which no pixel shader here reads, so fog
+     * never reached them. The order is only for reading. */
     sb_append(&sb,
         "struct VS_OUT {\n"
         "    float4 oPos : SV_POSITION;\n"
@@ -876,6 +878,12 @@ static VshCacheEntry *cache_insert(uint32_t hash)
             if (evict->layouts[j])
                 ID3D11InputLayout_Release(evict->layouts[j]);
         }
+        /* The declaration-keyed layouts are a second set, and leak with the
+         * entry if they are not released here too. */
+        for (j = 0; j < evict->decl_layout_count; j++) {
+            if (evict->decl_layouts[j])
+                ID3D11InputLayout_Release(evict->decl_layouts[j]);
+        }
         memset(evict, 0, sizeof(*evict));
         evict->hash   = hash;
         evict->in_use = 1;
@@ -979,6 +987,9 @@ static ID3D11InputLayout *create_vsh_input_layout_decl(
                 break;
             }
         }
+        if (!in)
+            fprintf(stderr, "D3D8 VSH: a program reads v%d, which its declaration "
+                    "does not feed; it reads the vertex's first byte instead\n", i);
         elems[elem_count].SemanticName         = "ATTR";
         elems[elem_count].SemanticIndex        = (UINT)i;
         elems[elem_count].Format               = in ? in->format : DXGI_FORMAT_R8_UNORM;
