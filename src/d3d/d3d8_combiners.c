@@ -37,6 +37,7 @@
 #include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -141,33 +142,47 @@ static void parse_combiner_input(DWORD packed, NV2ACombinerInput *input)
 
 /**
  * Parse a 32-bit input register DWORD containing 4 packed inputs.
- * Layout: [31:24]=D [23:16]=C [15:8]=B [7:0]=A
+ *
+ * The Xbox packs A first, in the most significant byte:
+ *   PS_COMBINERINPUTS(a,b,c,d) = ((a)<<24)|((b)<<16)|((c)<<8)|(d)
+ * (Cxbx-Reloaded, XbPixelShader.h). Layout: [31:24]=A [23:16]=B [15:8]=C
+ * [7:0]=D.
+ *
+ * This read them the other way round, exchanging A with D and B with C in
+ * every stage and in the final combiner. A stage whose other pair is zero
+ * survives that, because AB + CD is symmetric, which is why textured
+ * geometry still looked roughly right while the final combiner did not.
  */
 static void parse_four_inputs(DWORD dword, NV2ACombinerInput inputs[4])
 {
-    parse_combiner_input((dword >>  0) & 0xFF, &inputs[0]); /* A */
-    parse_combiner_input((dword >>  8) & 0xFF, &inputs[1]); /* B */
-    parse_combiner_input((dword >> 16) & 0xFF, &inputs[2]); /* C */
-    parse_combiner_input((dword >> 24) & 0xFF, &inputs[3]); /* D */
+    parse_combiner_input((dword >> 24) & 0xFF, &inputs[0]); /* A */
+    parse_combiner_input((dword >> 16) & 0xFF, &inputs[1]); /* B */
+    parse_combiner_input((dword >>  8) & 0xFF, &inputs[2]); /* C */
+    parse_combiner_input((dword >>  0) & 0xFF, &inputs[3]); /* D */
 }
 
 /**
  * Parse a 32-bit output configuration DWORD for one channel.
  *
- * Output DWORD layout:
- *   [3:0]   AB destination register
- *   [7:4]   CD destination register
+ * Output DWORD layout (the PS_COMBINEROUTPUT_* flags sit from bit 12):
+ *   [3:0]   CD destination register
+ *   [7:4]   AB destination register
  *   [11:8]  SUM destination register
- *   [12]    CD dot product flag
- *   [13]    AB dot product flag
- *   [14]    mux_sum flag (mux instead of sum)
- *   [17:15] output mapping (scale/bias)
- *   Bits 18-31 are reserved/unused.
+ *   [12]    CD dot product flag         (CD_DOT_PRODUCT 0x01)
+ *   [13]    AB dot product flag         (AB_DOT_PRODUCT 0x02)
+ *   [14]    mux instead of sum          (AB_CD_MUX 0x04)
+ *   [17:15] output mapping (scale/bias) (OUTPUTMAPPING_* 0x08-0x38)
+ *   [18]    CD blue to alpha            (CD_BLUE_TO_ALPHA 0x40) - not handled
+ *   [19]    AB blue to alpha            (AB_BLUE_TO_ALPHA 0x80) - not handled
  */
 static void parse_output(DWORD dword, NV2ACombinerOutput *output)
 {
-    output->ab_dst     = (NV2ACombinerRegister)((dword >>  0) & 0xF);
-    output->cd_dst     = (NV2ACombinerRegister)((dword >>  4) & 0xF);
+    /* PS_COMBINEROUTPUTS(ab,cd,mux_sum,flags) =
+     *     ((flags)<<12)|((mux_sum)<<8)|((ab)<<4)|(cd)
+     * (Cxbx-Reloaded, XbPixelShader.h), so CD is the low nibble and AB the
+     * next one. These two were the other way round here. */
+    output->cd_dst     = (NV2ACombinerRegister)((dword >>  0) & 0xF);
+    output->ab_dst     = (NV2ACombinerRegister)((dword >>  4) & 0xF);
     output->sum_dst    = (NV2ACombinerRegister)((dword >>  8) & 0xF);
     output->cd_dot     = (dword >> 12) & 1;
     output->ab_dot     = (dword >> 13) & 1;
@@ -203,15 +218,23 @@ void d3d8_combiners_parse_token(DWORD token, const DWORD *rs,
     /* Parse per-stage inputs and outputs from render states */
     d3d8_combiners_from_render_states(rs, state);
 
-    /* Preserve the token-derived fields (from_render_states may overwrite) */
+    /* Preserve the token-derived fields (from_render_states may overwrite).
+     *
+     * The texture modes come back only when the token actually carries them.
+     * A token with all its mode bits clear means "the modes are in
+     * D3DRS_PSTEXTUREMODES", which from_render_states has just read; putting
+     * the zeros back defeated that path entirely and left every stage
+     * sampling a 2D texture, including the stages with nothing bound. */
     state->num_stages = token & 0xF;
     if (state->num_stages < 1) state->num_stages = 1;
     if (state->num_stages > NV2A_MAX_COMBINER_STAGES)
         state->num_stages = NV2A_MAX_COMBINER_STAGES;
-    state->tex_mode[0] = (NV2ATextureMode)((token >>  8) & 0xF);
-    state->tex_mode[1] = (NV2ATextureMode)((token >> 12) & 0xF);
-    state->tex_mode[2] = (NV2ATextureMode)((token >> 16) & 0xF);
-    state->tex_mode[3] = (NV2ATextureMode)((token >> 20) & 0xF);
+    if (((token >> 8) & 0xFFFF) != 0) {
+        state->tex_mode[0] = (NV2ATextureMode)((token >>  8) & 0xF);
+        state->tex_mode[1] = (NV2ATextureMode)((token >> 12) & 0xF);
+        state->tex_mode[2] = (NV2ATextureMode)((token >> 16) & 0xF);
+        state->tex_mode[3] = (NV2ATextureMode)((token >> 20) & 0xF);
+    }
     state->flags = (token >> 24) & 0xFF;
 }
 
@@ -266,13 +289,23 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
         DWORD abcd = rs[D3DRS_PSFINALCOMBINERINPUTSABCD];
         DWORD efg  = rs[D3DRS_PSFINALCOMBINERINPUTSEFG];
 
-        parse_combiner_input((abcd >>  0) & 0xFF, &state->final_input[0]); /* A */
-        parse_combiner_input((abcd >>  8) & 0xFF, &state->final_input[1]); /* B */
-        parse_combiner_input((abcd >> 16) & 0xFF, &state->final_input[2]); /* C */
-        parse_combiner_input((abcd >> 24) & 0xFF, &state->final_input[3]); /* D */
-        parse_combiner_input((efg  >>  0) & 0xFF, &state->final_input[4]); /* E */
-        parse_combiner_input((efg  >>  8) & 0xFF, &state->final_input[5]); /* F */
-        parse_combiner_input((efg  >> 16) & 0xFF, &state->final_input[6]); /* G */
+        /* Same packing as every other input DWORD: the first input is in the
+         * most significant byte. Read low-first, Burnout 2's fog lerp
+         * (A = fog alpha, B = r0, C = fog colour, D = zero) came out as
+         * "r0 + fog alpha", which saturates to white, and G -- the final
+         * alpha -- was read as zero.
+         *
+         * The low byte of EFG is PS_FINALCOMBINERSETTING (CLAMP_SUM 0x80,
+         * COMPLEMENT_V1 0x40, COMPLEMENT_R0 0x20), which is not applied yet: a
+         * title relying on those flags gets the uncomplemented, unclamped
+         * value. */
+        parse_combiner_input((abcd >> 24) & 0xFF, &state->final_input[0]); /* A */
+        parse_combiner_input((abcd >> 16) & 0xFF, &state->final_input[1]); /* B */
+        parse_combiner_input((abcd >>  8) & 0xFF, &state->final_input[2]); /* C */
+        parse_combiner_input((abcd >>  0) & 0xFF, &state->final_input[3]); /* D */
+        parse_combiner_input((efg  >> 24) & 0xFF, &state->final_input[4]); /* E */
+        parse_combiner_input((efg  >> 16) & 0xFF, &state->final_input[5]); /* F */
+        parse_combiner_input((efg  >>  8) & 0xFF, &state->final_input[6]); /* G */
     }
 
     /* Per-stage constant colors */
@@ -465,7 +498,9 @@ static const char *output_map_prefix(NV2AOutputMapping map)
     case NV2A_OUT_SHIFTLEFT_1:      return "(";
     case NV2A_OUT_SHIFTLEFT_1_BIAS: return "((";
     case NV2A_OUT_SHIFTLEFT_2:      return "(";
+    case NV2A_OUT_SHIFTLEFT_2_BIAS: return "((";
     case NV2A_OUT_SHIFTRIGHT_1:     return "(";
+    case NV2A_OUT_SHIFTRIGHT_1_BIAS: return "((";
     default:                        return "";
     }
 }
@@ -478,7 +513,9 @@ static const char *output_map_suffix(NV2AOutputMapping map)
     case NV2A_OUT_SHIFTLEFT_1:      return " * 2.0)";
     case NV2A_OUT_SHIFTLEFT_1_BIAS: return " - 0.5) * 2.0)";
     case NV2A_OUT_SHIFTLEFT_2:      return " * 4.0)";
+    case NV2A_OUT_SHIFTLEFT_2_BIAS: return " - 0.5) * 4.0)";
     case NV2A_OUT_SHIFTRIGHT_1:     return " * 0.5)";
+    case NV2A_OUT_SHIFTRIGHT_1_BIAS: return " - 0.5) * 0.5)";
     default:                        return "";
     }
 }
@@ -527,6 +564,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float3 tc1     : TEXCOORD1;\n");
     EMIT("    float3 tc2     : TEXCOORD2;\n");
     EMIT("    float3 tc3     : TEXCOORD3;\n");
+    /* The fog register's alpha is the fog factor the vertex stage
+     * interpolated, which both vertex paths write to TEXCOORD4
+     * (d3d8_shaders.c for fixed function, d3d8_vsh.c for a program). */
+    EMIT("    float  fog     : TEXCOORD4;\n");
     EMIT("};\n\n");
 
     /* ---- Main function ---- */
@@ -537,7 +578,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float4 r_zero = float4(0, 0, 0, 0);\n");
     EMIT("    float4 r_c0   = c0[0];\n");
     EMIT("    float4 r_c1   = c1[0];\n");
-    EMIT("    float4 r_fog  = fog_color;\n");
+    /* The NV2A fog register is the fog colour in rgb and the interpolated fog
+     * factor in alpha. Taking alpha from the fog colour instead made the
+     * final combiner's usual lerp -- A = fog alpha, B = shaded colour,
+     * C = fog colour -- constant across the frame, which washed the whole
+     * image in fog colour or saturated it to white. */
+    EMIT("    float4 r_fog  = float4(fog_color.rgb, input.fog);\n");
 
     /* Vertex colors: Xbox D3DCOLOR is BGRA in memory, the vertex shader
      * should have already swizzled to RGBA. */
@@ -785,6 +831,25 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("        if (!alpha_pass) discard;\n");
     EMIT("    }\n\n");
 
+    {
+        /* Debug switch, RECOMP_D3D8_PS_SHOW=v0|v1|t0|t1|r0|r1:
+         * replaces the result with one register, so a frame shows what the
+         * combiners were actually handed rather than what they made of it. */
+        static const char *show = (const char *)-1;
+        static const char *names[] = { "v0", "v1", "t0", "t1", "r0", "r1" };
+        size_t n;
+
+        if (show == (const char *)-1)
+            show = getenv("RECOMP_D3D8_PS_SHOW");
+        for (n = 0; show && n < sizeof names / sizeof names[0]; n++) {
+            if (strcmp(show, names[n]) == 0) {
+                EMIT("    result.rgb = r_%s.rgb;\n", names[n]);
+                EMIT("    result.a = 1.0;\n");
+                break;
+            }
+        }
+    }
+
     EMIT("    return result;\n");
     EMIT("}\n");
 
@@ -811,6 +876,28 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
     if (len < 0) {
         fprintf(stderr, "NV2A combiners: HLSL generation failed (buffer overflow)\n");
         return NULL;
+    }
+
+    {
+        /* Debug switch, RECOMP_D3D8_PS_DUMP=1: prints the first two
+         * shaders built. The source is otherwise only printed when the
+         * compile fails, which says nothing about a shader that compiles and
+         * draws the wrong colour. */
+        static int dumps = -1;
+
+        if (dumps < 0)
+            dumps = getenv("RECOMP_D3D8_PS_DUMP") ? 0 : 99;
+        if (dumps < 2) {
+            dumps++;
+            fprintf(stderr, "NV2A combiners: state stages %d, tex_mode %d %d %d %d, "
+                    "c0[0] 0x%08lX c1[0] 0x%08lX, final_c0 0x%08lX final_c1 0x%08lX\n",
+                    state->num_stages, (int)state->tex_mode[0], (int)state->tex_mode[1],
+                    (int)state->tex_mode[2], (int)state->tex_mode[3],
+                    (unsigned long)state->c0[0], (unsigned long)state->c1[0],
+                    (unsigned long)state->final_c0, (unsigned long)state->final_c1);
+            fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End HLSL ---\n", hlsl);
+            fflush(stderr);
+        }
     }
 
     hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
