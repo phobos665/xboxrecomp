@@ -65,9 +65,10 @@
 static int g_quiet;
 /* --no-combiners: ignore the recorded combiner token, so the frame draws with
  * the host's fixed-function pixel path. A capture taken with the title's pixel
- * shaders forwarded (RECOMP_HLE_D3D8_PS=1) holds both the combiner states and
- * the token, so one frame can be drawn both ways and compared -- which runs of
- * the title cannot do, since no two land on the same moment. */
+ * shaders forwarded (the default; RECOMP_HLE_D3D8_PS=0 turns it off) holds
+ * both the combiner states and the token, so one frame can be drawn both ways
+ * and compared -- which runs of the title cannot do, since no two land on the
+ * same moment. */
 static int g_no_combiners;
 /* Draw-level bisection: --draws N executes only the first N draws, --skip-draw
  * N leaves out draw N (0-based), --list-draws prints each draw with the state

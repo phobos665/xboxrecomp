@@ -35,8 +35,9 @@
  * with no host equivalent is replaced by the nearest one and logged once.
  *
  * Pixel shader states (0-56, and PSTextureModes at 136) are forwarded to the
- * host's register combiners only with RECOMP_HLE_D3D8_PS=1; see
- * forward_pixel_shader for why that is opt-in for now.
+ * host's register combiners; RECOMP_HLE_D3D8_PS=0 turns that off and leaves
+ * the host on its fixed-function pixel path. The setup comes from the shader
+ * object D3DDevice_SetPixelShader selects, not from the render states.
  *
  * Forwarded but not yet used by the host: SHADEMODE, DITHERENABLE,
  * COLORVERTEX, NORMALIZENORMALS, RESULTARG, BUMPENVMAT*, MIPMAPLODBIAS,
@@ -557,12 +558,16 @@ static void ps_count_draw(uint32_t token)
  * g_prev_rs with it without colliding. */
 static void forward_pixel_shader(IDirect3DDevice8 *dev)
 {
-    /* Opt-in: RECOMP_HLE_D3D8_PS=1. Off, the host keeps its fixed-function
-     * pixel path, which is what drew Burnout 2's menus, HUD and car correctly
-     * before any of this existed. On, those same screens have come out with
-     * content missing, and runs never land on the same moment twice, so which
-     * of the two is closer to the title is not settled yet. Until a captured
-     * frame can be replayed both ways, forwarding stays off by default. */
+    /* On by default; RECOMP_HLE_D3D8_PS=0 keeps the host's fixed-function
+     * pixel path instead.
+     *
+     * This was opt-in while the combiner path lost content: Burnout 2's car,
+     * HUD and text drew nothing with it on. Both causes are fixed -- an alpha
+     * input without the alpha bit reads blue (d3d8_combiners.c), and the
+     * combiner setup comes from the shader object rather than the render
+     * states (above) -- and the two paths now agree on a replayed race frame.
+     * With it on, the title's own shaders draw its logos, title screen,
+     * loading screens, pause menu, HUD text and race. */
     static int enabled = -1;
     uint32_t modes, count, token;
     size_t g;
@@ -570,7 +575,7 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
 
     if (enabled < 0) {
         const char *v = getenv("RECOMP_HLE_D3D8_PS");
-        enabled = v && v[0] == '1';
+        enabled = !(v && v[0] == '0');
     }
     if (!enabled)
         return;
