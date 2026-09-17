@@ -481,29 +481,55 @@ static uint32_t host_texture_modes(uint32_t xbox_modes)
 #define PSDEF_MODES       0xD8
 
 static uint32_t g_ps_def;            /* guest VA of the definition, 0 = none */
+static uint32_t g_ps_handle;         /* the object it came out of */
 static int      g_ps_def_seen, g_ps_dirty;
-/* Set once the title has selected a shader through SetPixelShader. From then
- * on this call is the authority: a handle of 0 means no pixel shader, and the
- * host goes back to fixed function whatever the render states still hold. */
-static int      g_ps_selects;
+/* Set once a shader object has been read successfully. From then on
+ * SetPixelShader is the authority: handle 0 means no pixel shader, and the
+ * host goes back to fixed function whatever the render states still hold.
+ * Until then nothing here is trusted, because a title whose objects are laid
+ * out differently would otherwise have every draw quietly demoted. */
+static int      g_ps_def_ok;
+
+/* A guest heap pointer, roughly: inside the console's RAM, aligned, not a
+ * small integer. HLE_MEM32 has no mapped-page check, so a handle that is a
+ * token rather than a pointer would fault on the read below. */
+static int plausible_va(uint32_t va)
+{
+    return va >= 0x10000u && va < 0x08000000u && (va & 3u) == 0u;
+}
 
 void hle_d3d8_pixel_shader_selected(uint32_t handle)
 {
-    uint32_t def = handle ? handle + PSDEF_AT_HANDLE : 0;
+    uint32_t def = 0;
 
     /* The object carries a pointer to its own definition just in front of it
-     * (+0x08). Anything else is a layout this code has not seen, and the
-     * render states stay in charge. */
-    if (handle && HLE_MEM32(handle + PSDEF_SELF_PTR) != def)
-        def = 0;
+     * (+0x08). Without that, this is a layout this code has not seen: say so
+     * once, and leave the combiners alone rather than guessing. */
+    if (handle) {
+        if (!plausible_va(handle) ||
+            HLE_MEM32(handle + PSDEF_SELF_PTR) != handle + PSDEF_AT_HANDLE) {
+            static int warned;
+
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[HLE-D3D8] shadow pixel shader: SetPixelShader(0x%08X) "
+                        "is not a shader object with a definition at +0x%02X; pixel "
+                        "shaders are left off (RECOMP_HLE_D3D8_PS=1 forwards the "
+                        "render states instead)\n", handle, PSDEF_AT_HANDLE);
+            }
+            return;
+        }
+        def = handle + PSDEF_AT_HANDLE;
+    }
     if (def && !g_ps_def_seen) {
         g_ps_def_seen = 1;
         fprintf(stderr, "[HLE-D3D8] shadow pixel shader: definitions read from the "
                 "shader object (+0x%02X); count 0x%08X, texture modes 0x%08X\n",
                 PSDEF_AT_HANDLE, HLE_MEM32(def + 0xD4), HLE_MEM32(def + PSDEF_MODES));
     }
+    g_ps_handle = handle;
     g_ps_def = def;
-    g_ps_selects = 1;
+    g_ps_def_ok = 1;
     g_ps_dirty = 1;                  /* re-forward this shader's own states */
 }
 
@@ -522,17 +548,16 @@ static uint32_t ps_state(uint32_t xbox)
     else if (xbox <= 44)  off = 0xA8 + 4 * (xbox - 42);
     else if (xbox <= 52)  off = 0xB4 + 4 * (xbox - 45);
     else if (xbox == 53)  off = 0xD4;
+    else if (xbox == 54)  off = PSDEF_MODES;      /* PSTextureModes */
     else if (xbox == 55)  off = 0xDC;
     else if (xbox == 56)  off = 0xE0;
     else                  return guest_rs(xbox);
     return HLE_MEM32(g_ps_def + off);
 }
 
-/* How many draws actually have a pixel shader configured. A draw with no
- * combiner falls back to the host's fixed function, which modulates by a
- * diffuse colour the title's own shader may never write -- so a large
- * "without" count on a frame that renders black says the black is not the
- * combiners' fault. */
+/* How many draws run the title's combiners, and how many go to the host's
+ * fixed-function pixel path instead -- either because the title has no pixel
+ * shader selected, or because its combiner count is zero. */
 static void ps_count_draw(uint32_t token)
 {
     static unsigned long with, without;
@@ -555,7 +580,8 @@ static void ps_count_draw(uint32_t token)
 }
 
 /* Slots 0-56 and the complex slot 136 are outside g_rs_map, so they share
- * g_prev_rs with it without colliding. */
+ * g_prev_rs with it without colliding -- g_prev_rs holds what was last sent
+ * to the host, whichever source the value came from. */
 static void forward_pixel_shader(IDirect3DDevice8 *dev)
 {
     /* On by default; RECOMP_HLE_D3D8_PS=0 keeps the host's fixed-function
@@ -568,26 +594,64 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
      * states (above) -- and the two paths now agree on a replayed race frame.
      * With it on, the title's own shaders draw its logos, title screen,
      * loading screens, pause menu, HUD text and race. */
-    static int enabled = -1;
+    static int setting = -1;
     uint32_t modes, count, token;
     size_t g;
     int i;
 
-    if (enabled < 0) {
+    if (setting < 0) {
         const char *v = getenv("RECOMP_HLE_D3D8_PS");
-        enabled = !(v && v[0] == '0');
+        setting = v ? v[0] : 0;
     }
-    if (!enabled)
+    if (setting == '0')
+        return;
+    /* Without a shader object this code understands, the only source left is
+     * the render state array -- and that array does not follow what the title
+     * draws with, so it is opt-in (RECOMP_HLE_D3D8_PS=1) rather than the
+     * default. */
+    if (!g_ps_def_ok && setting != '1')
         return;
 
-    if (g_ps_selects && !g_ps_def) {
+    /* The object can be deleted while selected (DeletePixelShader is not
+     * replaced), and the guest allocator may hand the block to something
+     * else. Re-check it rather than compiling a shader out of whatever is
+     * there now. */
+    if (g_ps_def && HLE_MEM32(g_ps_handle + PSDEF_SELF_PTR) != g_ps_def) {
+        static int warned;
+
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[HLE-D3D8] shadow pixel shader: the selected shader "
+                    "object 0x%08X no longer holds its definition; drawing fixed "
+                    "function until the title selects another\n", g_ps_handle);
+        }
+        g_ps_def = 0;
+    }
+
+    if (g_ps_def_ok && !g_ps_def) {
         /* The title turned its pixel shader off. */
         host_combiners_set_pixel_shader(0);
         ps_count_draw(0);
         return;
     }
-    modes = g_ps_def ? HLE_MEM32(g_ps_def + PSDEF_MODES) : guest_rs(XRS_COMPLEX);
+    modes = ps_state(54);                         /* PSTextureModes      */
     count = ps_state(53);                         /* PSCOMBINERCOUNT     */
+
+    if (g_ps_def) {
+        /* Structure comes from the definition, constants from the render
+         * states, where SetPixelShaderConstant is assumed to land. Say so
+         * once if the definition's own first constant disagrees: that is the
+         * signal the assumption is wrong. */
+        static int checked;
+
+        if (!checked && HLE_MEM32(g_ps_def + 0x28) != guest_rs(10)) {
+            checked = 1;
+            fprintf(stderr, "[HLE-D3D8] shadow pixel shader: the definition's C0 "
+                    "(0x%08X) and the render state's (0x%08X) differ; constants are "
+                    "taken from the render states\n",
+                    HLE_MEM32(g_ps_def + 0x28), guest_rs(10));
+        }
+    }
 
     for (g = 0; g < sizeof g_ps_map / sizeof g_ps_map[0]; g++) {
         for (i = 0; i < (int)g_ps_map[g].count; i++) {

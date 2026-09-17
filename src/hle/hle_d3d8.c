@@ -1006,8 +1006,9 @@ HLE_EXPORT(D3DDevice_SelectVertexShader)
  * definition's offset was found. */
 HLE_EXPORT(D3DDevice_SetPixelShader)
 {
-    static int seen, dumped;
+    static int seen;
 #ifdef _WIN32
+    static int dumped;
     uint32_t handle = HLE_ARG(0);
 #endif
 
@@ -1019,7 +1020,8 @@ HLE_EXPORT(D3DDevice_SetPixelShader)
 #ifdef _WIN32
     if (g_shadow)
         hle_d3d8_pixel_shader_selected(handle);
-    if (handle && dumped < 6 && getenv("RECOMP_HLE_D3D8_PS_PROBE")) {
+    if (handle >= 0x10000u && handle < 0x08000000u && !(handle & 3u) &&
+        dumped < 6 && getenv("RECOMP_HLE_D3D8_PS_PROBE")) {
         int i;
 
         dumped++;
