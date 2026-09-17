@@ -107,6 +107,12 @@ static int                g_shadow_mode = -1;
 static int                g_shadow_tried;
 static IDirect3DDevice8  *g_shadow;
 static UINT               g_shadow_width, g_shadow_height;
+/* The render target being drawn into: the back buffer, or an offscreen one the
+ * title selected (shadow_set_render_target). Viewports and the programs'
+ * screen-space undo are relative to it. */
+static UINT               g_target_width, g_target_height;
+static unsigned long      g_target_sets, g_target_scratch, g_target_failed;
+static unsigned long      g_frame_draws;    /* draws since the last Swap */
 static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
 static int                g_shadow_thread_notes;
@@ -215,6 +221,13 @@ static HWND shadow_window(UINT width, UINT height)
     return req.hwnd;
 }
 
+/* The surfaces the XDK sets as target and depth inside CreateDevice -- the
+ * frame buffer and the automatic depth buffer, 0 until seen -- and the host
+ * device's own depth surface (shadow_set_render_target). */
+static int      g_in_create_device;
+static uint32_t g_backbuffer_va, g_autodepth_va;
+static IDirect3DSurface8 *g_device_depth;
+
 /* ------------------------------------------------------------- viewports */
 
 /* Xbox vertex programs end in the XDK's screen-space transform: oPos comes
@@ -227,10 +240,12 @@ static HWND shadow_window(UINT width, UINT height)
  * program draws use a host viewport over the whole target with depth 0..1,
  * fixed-function draws the title's own.
  *
+ * Z is scaled for the format of the depth surface bound with the current
+ * render target (shadow_set_render_target), the CreateDevice one to begin
+ * with.
+ *
  * Not handled: X_D3DSCM_NORESERVEDCONSTANTS, which frees 58 and 59 for the
- * title (a title that then sets them wins until its next SetViewport), and a
- * depth buffer other than the automatic one -- Z is scaled for the format
- * CreateDevice asked for. */
+ * title (a title that then sets them wins until its next SetViewport). */
 static float        g_z_scale = 1.0f;
 static D3DVIEWPORT8 g_title_viewport;
 static int          g_title_viewport_set;
@@ -249,8 +264,8 @@ static float xbox_depth_z_scale(uint32_t format)
 
 static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
 {
-    float half_w = (float)g_shadow_width / 2.0f;
-    float half_h = (float)g_shadow_height / 2.0f;
+    float half_w = (float)g_target_width / 2.0f;
+    float half_h = (float)g_target_height / 2.0f;
     float reserved[8] = {
         (float)vp->Width / 2.0f, -(float)vp->Height / 2.0f,
         (vp->MaxZ - vp->MinZ) * g_z_scale, 1.0f,
@@ -276,8 +291,8 @@ static void shadow_use_viewport(int whole_target)
     } else {
         vp.X = 0;
         vp.Y = 0;
-        vp.Width = g_shadow_width;
-        vp.Height = g_shadow_height;
+        vp.Width = g_target_width;
+        vp.Height = g_target_height;
         vp.MinZ = 0.0f;
         vp.MaxZ = 1.0f;
     }
@@ -333,6 +348,9 @@ static void shadow_create(uint32_t pp_va)
     xbox_D3D8SetPresentInterval(0);
     g_shadow_width = width;
     g_shadow_height = height;
+    g_target_width = width;
+    g_target_height = height;
+    g_device_depth = host_DeviceDepthSurface(g_shadow);
     {
         /* Until the title sets one: the whole back buffer. */
         D3DVIEWPORT8 whole = { 0, 0, width, height, 0.0f, 1.0f };
@@ -461,6 +479,10 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev);
 static unsigned long g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
                      g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                      g_draws_stride, g_draws_primitive, g_draws_failed;
+/* Draws arriving on a guest thread other than the one that swaps. A loader
+ * thread drawing to warm caches puts geometry through the host that no
+ * presented frame ever contains -- it would count as drawn and never show. */
+static unsigned long g_draws_off_thread;
 
 /* The vertex formats draws arrive with, whether or not they are then drawn:
  * a shader handle seen for the first time is logged, up to a limit. */
@@ -484,6 +506,8 @@ static void note_draw_format(uint32_t xpt, uint32_t stride)
 /* Common checks for a draw under the current vertex shader. */
 static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
+    if (g_shadow_swap_thread && GetCurrentThreadId() != g_shadow_swap_thread)
+        g_draws_off_thread++;
     note_draw_format(xpt, stride);
     if (g_shadow_vs_is_program) {
         const struct shadow_program *p;
@@ -516,6 +540,7 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
     /* The title's render and texture stage states as they stand now, read
      * from its own state arrays (hle_d3d8_state.c). */
     hle_d3d8_shadow_apply_states(g_shadow);
+    g_frame_draws++;
     return 1;
 }
 
@@ -525,6 +550,7 @@ static void shadow_dump_frame(void)
 {
     static const char *prefix;
     static int configured, every = 300, written;
+    static unsigned long min_draws, last_dump;
     IDirect3DSurface8 *surf = NULL;
     D3DLOCKED_RECT lr;
     char path[512];
@@ -539,9 +565,22 @@ static void shadow_dump_frame(void)
         prefix = getenv("RECOMP_HLE_D3D8_DUMP");
         if (e && atoi(e) > 0)
             every = atoi(e);
+        /* RECOMP_HLE_D3D8_DUMP_MINDRAWS=<n>: dump only frames with at least n
+         * draws, at least `every` swaps apart. A title's 3D frames can be rare
+         * among its 2D ones, and a fixed interval keeps missing them. */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_MINDRAWS");
+        if (e && atol(e) > 0)
+            min_draws = (unsigned long)atol(e);
     }
-    if (!prefix || !*prefix || written >= 24 || (g_shadow_swaps % (unsigned long)every) != 0)
+    if (!prefix || !*prefix || written >= 24)
         return;
+    if (min_draws) {
+        if (g_frame_draws < min_draws || (last_dump && g_shadow_swaps - last_dump < (unsigned long)every))
+            return;
+        last_dump = g_shadow_swaps;
+    } else if ((g_shadow_swaps % (unsigned long)every) != 0) {
+        return;
+    }
 
     if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
         return;
@@ -594,6 +633,9 @@ HLE_ORIGINAL(D3DDevice_SetVertexShader);
 HLE_ORIGINAL(D3DDevice_SelectVertexShader);
 HLE_ORIGINAL(D3DDevice_SetTransform);
 HLE_ORIGINAL(D3DDevice_SetViewport);
+HLE_ORIGINAL(D3DDevice_SetRenderTarget);
+HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
+HLE_ORIGINAL(D3DDevice_SetVertexData2f);
 HLE_ORIGINAL(D3DDevice_DrawVerticesUP);
 HLE_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
 
@@ -621,8 +663,15 @@ HLE_EXPORT(Direct3D_CreateDevice)
     first_call(&seen, "Direct3D_CreateDevice", pp_va);
     if (original_missing(hle_original_Direct3D_CreateDevice, "Direct3D_CreateDevice"))
         HLE_RETURN(0x80004005u);                 /* E_FAIL */
+#ifdef _WIN32
+    g_in_create_device = 1;
+#endif
     HLE_CALL_ORIGINAL(Direct3D_CreateDevice);
 #ifdef _WIN32
+    g_in_create_device = 0;
+    if (!g_backbuffer_va)
+        fprintf(stderr, "[HLE-D3D8] CreateDevice set no render target; the back "
+                "buffer is taken to be any parentless surface of its size\n");
     /* Only beside a guest device that exists: the original's HRESULT. */
     if (shadow_requested() && !g_shadow_tried && (int32_t)g_eax >= 0)
         shadow_create(pp_va);
@@ -687,6 +736,7 @@ HLE_EXPORT(D3DDevice_Swap)
          * starts recording if this is the requested swap. */
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
         shadow_dump_frame();             /* before Present discards the buffer */
+        g_frame_draws = 0;
         host_Swap(g_shadow, 0);
         if (!g_shadow_last_report) {
             g_shadow_last_report = now;
@@ -695,11 +745,16 @@ HLE_EXPORT(D3DDevice_Swap)
                     "color 0x%08X | draws: %lu UP + %lu indexed UP + %lu buffer + "
                     "%lu indexed buffer drawn; skipped %lu program without layout, %lu "
                     "declaration shader, %lu unknown shader, %lu stride, %lu "
-                    "primitive, %lu failed\n",
+                    "primitive, %lu failed; %lu off the swapping thread\n",
                     g_shadow_swaps, g_shadow_clears, g_shadow_last_color,
                     g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
-                    g_draws_stride, g_draws_primitive, g_draws_failed);
+                    g_draws_stride, g_draws_primitive, g_draws_failed,
+                    g_draws_off_thread);
+            if (g_target_sets)
+                fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
+                        "scratch target, %lu failed\n", g_target_sets,
+                        g_target_scratch, g_target_failed);
             fflush(stderr);
             g_shadow_last_report = now;
         }
@@ -941,6 +996,61 @@ HLE_EXPORT(D3DDevice_SelectVertexShader)
 #endif
 }
 
+/* void D3DDevice_SetVertexDataColor(INT Register, D3DCOLOR Color)
+ * The current value of an input register: what a vertex program reads from a
+ * register the vertex does not carry. Burnout 2 sets v3, the diffuse colour,
+ * to each object's material colour before drawing it. The body writes
+ * NV097_SET_VERTEX_DATA4UB, so it still runs. */
+HLE_EXPORT(D3DDevice_SetVertexDataColor)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t reg = HLE_ARG(0), color = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_SetVertexDataColor", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetVertexDataColor,
+                         "D3DDevice_SetVertexDataColor"))
+        return;
+    HLE_CALL_ORIGINAL(D3DDevice_SetVertexDataColor);
+#ifdef _WIN32
+    if (g_shadow) {
+        float v[4];
+
+        v[0] = (float)((color >> 16) & 0xFF) / 255.0f;
+        v[1] = (float)((color >>  8) & 0xFF) / 255.0f;
+        v[2] = (float)( color        & 0xFF) / 255.0f;
+        v[3] = (float)((color >> 24) & 0xFF) / 255.0f;
+        host_vsh_set_vertex_data((int)reg, v);
+    }
+#endif
+}
+
+/* void D3DDevice_SetVertexData2f(INT Register, float a, float b)
+ * NV097_SET_VERTEX_DATA2F_M: the register becomes (a, b, 0, 1). */
+HLE_EXPORT(D3DDevice_SetVertexData2f)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t reg = HLE_ARG(0), a = HLE_ARG(1), b = HLE_ARG(2);
+#endif
+
+    first_call(&seen, "D3DDevice_SetVertexData2f", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetVertexData2f,
+                         "D3DDevice_SetVertexData2f"))
+        return;
+    HLE_CALL_ORIGINAL(D3DDevice_SetVertexData2f);
+#ifdef _WIN32
+    if (g_shadow) {
+        float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+        memcpy(&v[0], &a, 4);
+        memcpy(&v[1], &b, 4);
+        host_vsh_set_vertex_data((int)reg, v);
+    }
+#endif
+}
+
 /* HRESULT D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE State,
  *     const D3DMATRIX *pMatrix)
  * The Xbox packs the states together -- VIEW 0, PROJECTION 1, TEXTURE0-3
@@ -988,21 +1098,231 @@ HLE_EXPORT(D3DDevice_SetViewport)
         memcpy(&vp, HLE_PTR(viewport), sizeof vp);
         /* XDK code passes Width and Height of INT_MAX to mean "the whole
          * render target" (Cxbx-Reloaded, CxbxImpl_SetViewport), and D3D11
-         * would take that literally. The shadow backbuffer is the only
-         * target here, so the viewport is kept inside it. */
-        if (vp.X > g_shadow_width)
-            vp.X = g_shadow_width;
-        if (vp.Y > g_shadow_height)
-            vp.Y = g_shadow_height;
-        if (vp.Width > g_shadow_width - vp.X)
-            vp.Width = g_shadow_width - vp.X;
-        if (vp.Height > g_shadow_height - vp.Y)
-            vp.Height = g_shadow_height - vp.Y;
+         * would take that literally, so the viewport is kept inside the
+         * current render target. */
+        if (vp.X > g_target_width)
+            vp.X = g_target_width;
+        if (vp.Y > g_target_height)
+            vp.Y = g_target_height;
+        if (vp.Width > g_target_width - vp.X)
+            vp.Width = g_target_width - vp.X;
+        if (vp.Height > g_target_height - vp.Y)
+            vp.Height = g_target_height - vp.Y;
         g_title_viewport = vp;
         g_title_viewport_set = 1;
         g_host_viewport_mode = -1;       /* the next draw picks which to use */
         shadow_viewport_constants(&vp);
     }
+#endif
+}
+
+#ifdef _WIN32
+/* ------------------------------------------------------------ render targets
+ *
+ * Titles draw into textures -- Burnout 2 renders its world several times a
+ * frame into offscreen targets (and cube map faces) before it composes the
+ * screen -- and without this every one of those passes, and the clear before
+ * each, landed on the shadow back buffer and wiped what came before.
+ *
+ * An Xbox surface is a pixel container with a Parent at +20: the texture it
+ * is a level of, or NULL for a surface of its own (Cxbx-Reloaded,
+ * XbD3D8Types.h, X_D3DSurface). The target becomes:
+ *   - the host back buffer, for the surface the XDK itself set during
+ *     CreateDevice (or, if it set none, a parentless surface of the back
+ *     buffer's size);
+ *   - level 0 of a host render target texture, for a 2D texture's surface --
+ *     the same one SetTexture binds (hle_d3d8_render_texture), so what was
+ *     drawn is what the title then samples;
+ *   - a scratch target of the surface's size for anything else (cube map
+ *     faces, other levels, parentless surfaces of another size), so those
+ *     passes at least stop drawing over the screen. Their contents are not
+ *     used yet.
+ * Depth: none when the title passes none. The CreateDevice depth surface with
+ * the back buffer is the host device's own; any other request gets a host
+ * depth surface of the target's size, since D3D11 accepts depth only at the
+ * target's exact size. As on the
+ * Xbox (Cxbx-Reloaded, CxbxImpl_SetRenderTarget), a new target resets the
+ * viewport to all of it. */
+IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va);
+
+#define SHADOW_SCRATCH 8
+#define SURFACE_PARENT 20
+
+static struct { UINT width, height; IDirect3DTexture8 *texture; } g_scratch[SHADOW_SCRATCH];
+static struct { UINT width, height; IDirect3DSurface8 *surface; } g_depths[SHADOW_SCRATCH];
+
+static void surface_measure(uint32_t va, UINT *w, UINT *h, uint32_t *fmt)
+{
+    uint32_t format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+
+    *fmt = (format >> 8) & 0xFF;
+    if (size) {                          /* linear: width-1 and height-1 */
+        *w = (size & 0xFFF) + 1;
+        *h = ((size >> 12) & 0xFFF) + 1;
+    } else {                             /* log2 dimensions */
+        *w = 1u << ((format >> 20) & 0xF);
+        *h = 1u << ((format >> 24) & 0xF);
+    }
+}
+
+static IDirect3DTexture8 *scratch_target(UINT w, UINT h)
+{
+    int i;
+
+    for (i = 0; i < SHADOW_SCRATCH; i++) {
+        if (g_scratch[i].texture && g_scratch[i].width == w && g_scratch[i].height == h)
+            return g_scratch[i].texture;
+    }
+    for (i = 0; i < SHADOW_SCRATCH; i++) {
+        if (g_scratch[i].texture)
+            continue;
+        if (FAILED(host_CreateTexture(g_shadow, w, h, 1, D3DUSAGE_RENDERTARGET,
+                                      D3DFMT_LIN_X8R8G8B8, D3DPOOL_DEFAULT,
+                                      &g_scratch[i].texture)))
+            return g_scratch[i].texture = NULL;
+        g_scratch[i].width = w;
+        g_scratch[i].height = h;
+        return g_scratch[i].texture;
+    }
+    return NULL;
+}
+
+static IDirect3DSurface8 *depth_surface(UINT w, UINT h)
+{
+    int i;
+
+    for (i = 0; i < SHADOW_SCRATCH; i++) {
+        if (g_depths[i].surface && g_depths[i].width == w && g_depths[i].height == h)
+            return g_depths[i].surface;
+    }
+    for (i = 0; i < SHADOW_SCRATCH; i++) {
+        if (g_depths[i].surface)
+            continue;
+        if (FAILED(host_CreateDepthStencilSurface(g_shadow, w, h, D3DFMT_D24S8,
+                                                  &g_depths[i].surface)))
+            return g_depths[i].surface = NULL;
+        g_depths[i].width = w;
+        g_depths[i].height = h;
+        return g_depths[i].surface;
+    }
+    return NULL;
+}
+
+static void shadow_set_render_target(uint32_t rt, uint32_t zs)
+{
+    static struct { uint32_t va; int kind; } seen[32];
+    static int nseen;
+    static uint32_t current_rt;
+    IDirect3DTexture8 *texture = NULL;
+    IDirect3DSurface8 *depth = NULL;
+    UINT w, h, zw = 0, zh = 0;
+    uint32_t fmt, zfmt = 0, parent;
+    int kind, i;                         /* 0 back buffer, 1 texture, 2 scratch */
+
+    /* A NULL target keeps the current one; only the depth surface changes. */
+    if (!rt)
+        rt = current_rt;
+    current_rt = rt;
+    g_target_sets++;
+    if (!rt) {
+        kind = 0;
+        w = g_shadow_width;
+        h = g_shadow_height;
+    } else {
+        surface_measure(rt, &w, &h, &fmt);
+        parent = HLE_MEM32(rt + SURFACE_PARENT);
+        if (parent && HLE_MEM32(parent + 4) == HLE_MEM32(rt + 4) &&
+            !(HLE_MEM32(parent + 12) & 0x4)) {           /* level 0, not a cube */
+            texture = hle_d3d8_render_texture(g_shadow, parent);
+            kind = texture ? 1 : 2;
+        } else if (g_backbuffer_va ? rt == g_backbuffer_va
+                                   : (!parent && w == g_shadow_width && h == g_shadow_height)) {
+            kind = 0;
+        } else {
+            kind = 2;
+        }
+        if (kind == 2) {
+            texture = scratch_target(w, h);
+            g_target_scratch++;
+        }
+        for (i = 0; i < nseen && (seen[i].va != rt || seen[i].kind != kind); i++)
+            ;
+        if (i == nseen && nseen < (int)(sizeof seen / sizeof seen[0])) {
+            seen[nseen].va = rt;
+            seen[nseen++].kind = kind;
+            fprintf(stderr, "[HLE-D3D8] shadow render target 0x%08X: %ux%u format 0x%02X, "
+                    "parent 0x%08X (format 0x%08X) -> %s\n", rt, w, h, fmt, parent,
+                    parent ? HLE_MEM32(parent + 12) : 0,
+                    kind == 0 ? "back buffer" : kind == 1 ? "render target texture"
+                                                          : "scratch target");
+        }
+        if (kind == 2 && !texture) {
+            g_target_failed++;
+            kind = 0;
+            w = g_shadow_width;
+            h = g_shadow_height;
+        }
+    }
+
+    if (zs) {
+        int own;
+
+        surface_measure(zs, &zw, &zh, &zfmt);
+        g_z_scale = xbox_depth_z_scale(zfmt);
+        own = g_autodepth_va ? zs == g_autodepth_va : (zw == w && zh == h);
+        depth = (kind == 0 && own && g_device_depth) ? g_device_depth : depth_surface(w, h);
+    } else {
+        g_z_scale = 1.0f;
+    }
+
+    if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : texture, 0, depth))) {
+        /* The host keeps its old targets; go to the back buffer instead, so
+         * the sizes below describe what is drawn into. */
+        g_target_failed++;
+        kind = 0;
+        w = g_shadow_width;
+        h = g_shadow_height;
+        depth = zs ? g_device_depth : NULL;
+        host_SetRenderTarget(g_shadow, NULL, 0, depth);
+    }
+    g_target_width = w;
+    g_target_height = h;
+
+    /* The Xbox resets the viewport to the whole new target. */
+    g_title_viewport.X = 0;
+    g_title_viewport.Y = 0;
+    g_title_viewport.Width = w;
+    g_title_viewport.Height = h;
+    g_title_viewport.MinZ = 0.0f;
+    g_title_viewport.MaxZ = 1.0f;
+    g_title_viewport_set = 1;
+    g_host_viewport_mode = -1;
+    shadow_viewport_constants(&g_title_viewport);
+}
+#endif /* _WIN32 */
+
+/* void D3DDevice_SetRenderTarget(D3DSurface *pRenderTarget,
+ *     D3DSurface *pNewZStencil)                                             */
+HLE_EXPORT(D3DDevice_SetRenderTarget)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t rt = HLE_ARG(0), zs = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_SetRenderTarget", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetRenderTarget, "D3DDevice_SetRenderTarget"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetRenderTarget);
+#ifdef _WIN32
+    if (g_in_create_device && rt) {
+        g_backbuffer_va = rt;
+        g_autodepth_va = zs;
+        fprintf(stderr, "[HLE-D3D8] CreateDevice set target 0x%08X, depth 0x%08X: "
+                "the frame buffer and the device's depth\n", rt, zs);
+    }
+    if (g_shadow)
+        shadow_set_render_target(rt, zs);
 #endif
 }
 

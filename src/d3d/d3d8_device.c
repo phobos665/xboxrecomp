@@ -84,6 +84,9 @@ static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 /* Bound offscreen render target / depth stencil (NULL = default) */
 static D3D8Surface *g_cur_rt = NULL;
 static D3D8Surface *g_cur_ds = NULL;
+/* The device's own depth buffer as a surface object, so SetRenderTarget can
+ * name it: a NULL depth surface means no depth, as in D3D8. */
+static D3D8Surface *g_auto_ds = NULL;
 
 /* Palettized texture palettes (256 ARGB entries per stage) */
 #define D3D8_PALETTE_ENTRIES 256
@@ -382,6 +385,9 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
 
         /* Cleanup D3D11 resources */
         D3D8DeviceState *s = &g_device_state;
+        if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
+        if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
+        if (g_auto_ds) { IDirect3DSurface8_Release(&g_auto_ds->iface); g_auto_ds = NULL; }
         if (s->default_dsv) { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
         if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
         if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
@@ -520,9 +526,10 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
     (void)self; (void)Count; (void)pRects; (void)Stencil;
     g_d3d_clear_count++;
 
-    /* Clear the currently bound targets (default if none set) */
+    /* Clear the currently bound targets. With no depth surface bound there
+     * is no depth to clear (SetRenderTarget). */
     ID3D11RenderTargetView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.default_rtv;
-    ID3D11DepthStencilView *dsv = g_cur_ds ? g_cur_ds->dsv : g_device_state.default_dsv;
+    ID3D11DepthStencilView *dsv = g_cur_ds ? g_cur_ds->dsv : NULL;
 
     if ((Flags & D3DCLEAR_TARGET) && rtv) {
         float clear_color[4] = {
@@ -1202,35 +1209,40 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
     (void)self;
     ID3D11RenderTargetView *rtv;
     ID3D11DepthStencilView *dsv = NULL;
+    D3D8Surface *rt = (D3D8Surface *)pRenderTarget;
+    D3D8Surface *ds = (D3D8Surface *)pZStencilSurface;
 
-    if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
-    if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
-
-    if (pRenderTarget) {
-        g_cur_rt = (D3D8Surface *)pRenderTarget;
-        if (!g_cur_rt->rtv) {
-            g_cur_rt = NULL;
-            fprintf(stderr, "D3D8: SetRenderTarget on non-renderable surface\n");
-            return E_INVALIDARG;
-        }
-        rtv = g_cur_rt->rtv;
-        IDirect3DSurface8_AddRef(pRenderTarget);
-    } else {
-        rtv = g_device_state.default_rtv;
+    /* Refused before anything changes, so a bad call leaves the old targets
+     * bound on both sides. NULL is the back buffer (not D3D8, which refuses
+     * it); a NULL depth surface is no depth, as in D3D8 -- the device's own
+     * is the surface GetDepthStencilSurface returns at creation. */
+    if (rt && !rt->rtv) {
+        fprintf(stderr, "D3D8: SetRenderTarget on non-renderable surface\n");
+        return E_INVALIDARG;
     }
-
-    if (pZStencilSurface) {
-        g_cur_ds = (D3D8Surface *)pZStencilSurface;
-        if (!g_cur_ds->dsv) {
-            g_cur_ds = NULL;
-            fprintf(stderr, "D3D8: SetRenderTarget with non-depth stencil surface\n");
-        } else {
-            dsv = g_cur_ds->dsv;
-            IDirect3DSurface8_AddRef(pZStencilSurface);
-        }
+    if (ds && !ds->dsv) {
+        fprintf(stderr, "D3D8: SetRenderTarget with non-depth stencil surface\n");
+        return E_INVALIDARG;
     }
+    /* D3D11 ignores a binding whose depth is not the target's size, which
+     * would leave draws going to the previous target. */
+    if (ds && (ds->width  != (rt ? rt->width  : g_device_state.width) ||
+               ds->height != (rt ? rt->height : g_device_state.height))) {
+        fprintf(stderr, "D3D8: SetRenderTarget with depth %ux%u for a %ux%u target\n",
+                ds->width, ds->height,
+                rt ? rt->width : g_device_state.width,
+                rt ? rt->height : g_device_state.height);
+        return E_INVALIDARG;
+    }
+    if (rt) IDirect3DSurface8_AddRef(pRenderTarget);
+    if (ds) IDirect3DSurface8_AddRef(pZStencilSurface);
+    if (g_cur_rt) IDirect3DSurface8_Release(&g_cur_rt->iface);
+    if (g_cur_ds) IDirect3DSurface8_Release(&g_cur_ds->iface);
+    g_cur_rt = rt;
+    g_cur_ds = ds;
 
-    if (!dsv) dsv = g_device_state.default_dsv;
+    rtv = rt ? rt->rtv : g_device_state.default_rtv;
+    dsv = ds ? ds->dsv : NULL;
     ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1,
                                             &rtv, dsv);
     return S_OK;
@@ -1565,6 +1577,27 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
 
     hr = d3d11_create_render_targets(&g_device_state);
     if (FAILED(hr)) return hr;
+
+    /* The device's own depth buffer, bound as the current depth surface.
+     * Anything a previous device left behind goes first. */
+    if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
+    if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
+    if (g_auto_ds) { IDirect3DSurface8_Release(&g_auto_ds->iface); g_auto_ds = NULL; }
+    g_auto_ds = (D3D8Surface *)d3d8_surface_create(g_device_state.default_depth, 0, 0,
+                                                   g_device_state.width,
+                                                   g_device_state.height,
+                                                   D3DFMT_D24S8, D3DPOOL_DEFAULT,
+                                                   D3DUSAGE_DEPTHSTENCIL,
+                                                   D3DMULTISAMPLE_NONE, NULL, 0);
+    if (!g_auto_ds || !g_auto_ds->dsv) {
+        fprintf(stderr, "D3D8: device depth surface could not be wrapped\n");
+        if (g_auto_ds) { IDirect3DSurface8_Release(&g_auto_ds->iface); g_auto_ds = NULL; }
+        return E_FAIL;
+    }
+    g_cur_ds = g_auto_ds;
+    IDirect3DSurface8_AddRef(&g_auto_ds->iface);
+    ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1,
+                                            &g_device_state.default_rtv, g_auto_ds->dsv);
 
     d3d8_init_default_states(&g_device_state);
 

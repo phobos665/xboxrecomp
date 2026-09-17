@@ -19,7 +19,7 @@
  *    - Samples textures based on tex_mode per stage
  *    - Walks each active general combiner stage performing AB*CD math
  *    - Executes the final combiner (lerp + add)
- *    - Handles alpha test and fog
+ *    - Handles alpha test (fog is the final combiner's own)
  *
  * 3. SHADER CACHE
  *    We hash the full NV2ACombinerState and maintain a fixed-size cache
@@ -348,10 +348,10 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
  *   6. main():
  *      a. Initialize register file from inputs
  *      b. Execute each general combiner stage
- *      c. Execute final combiner
- *      d. Apply fog
- *      e. Apply alpha test
- *      f. Return result
+ *      c. Execute final combiner (fog is its A/B/C inputs; the NV2A has no
+ *         fog stage after it)
+ *      d. Apply alpha test
+ *      e. Return result
  * ================================================================ */
 
 /**
@@ -582,8 +582,13 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * factor in alpha. Taking alpha from the fog colour instead made the
      * final combiner's usual lerp -- A = fog alpha, B = shaded colour,
      * C = fog colour -- constant across the frame, which washed the whole
-     * image in fog colour or saturated it to white. */
-    EMIT("    float4 r_fog  = float4(fog_color.rgb, input.fog);\n");
+     * image in fog colour or saturated it to white.
+     *
+     * With fog disabled the factor reads 1 (no fog): the XDK leaves the fog
+     * lerp in the final combiner either way, so taking the interpolated value
+     * regardless let a vertex stage that writes no fog blank the whole draw to
+     * the fog colour -- Burnout 2's menus came out black that way. */
+    EMIT("    float4 r_fog  = float4(fog_color.rgb, fog_enable ? input.fog : 1.0);\n");
 
     /* Vertex colors: Xbox D3DCOLOR is BGRA in memory, the vertex shader
      * should have already swizzled to RGBA. */
@@ -812,10 +817,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     }
 
     /* ---- Fog ---- */
-    EMIT("    /* Fog application */\n");
-    EMIT("    if (fog_enable) {\n");
-    EMIT("        result.rgb = lerp(fog_color.rgb, result.rgb, r_fog.a);\n");
-    EMIT("    }\n\n");
+    /* No fog after the final combiner. The NV2A has no fog stage of its own:
+     * the XDK puts fog into the final combiner (A = fog alpha, B = r0,
+     * C = fog colour), and that has already run. Blending again here fogged
+     * every pixel twice. */
 
     /* ---- Alpha test ---- */
     EMIT("    /* Alpha test */\n");
@@ -832,9 +837,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    }\n\n");
 
     {
-        /* Debug switch, RECOMP_D3D8_PS_SHOW=v0|v1|t0|t1|r0|r1:
-         * replaces the result with one register, so a frame shows what the
-         * combiners were actually handed rather than what they made of it. */
+        /* Debug switch, RECOMP_D3D8_PS_SHOW=v0|v1|t0|t1|r0|r1: replaces
+         * the result with one register, so a frame shows what the combiners
+         * were actually handed rather than what they made of it. Also foga
+         * (the fog factor), fogon (white where fog is enabled), tc0 (stage 0
+         * coordinates, wrapped) and tc0raw (their size, /16). */
         static const char *show = (const char *)-1;
         static const char *names[] = { "v0", "v1", "t0", "t1", "r0", "r1" };
         size_t n;
@@ -847,6 +854,19 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                 EMIT("    result.a = 1.0;\n");
                 break;
             }
+        }
+        if (show && strcmp(show, "foga") == 0) {     /* the fog factor */
+            EMIT("    result.rgb = r_fog.aaa;\n");
+            EMIT("    result.a = 1.0;\n");
+        } else if (show && strcmp(show, "tc0") == 0) {    /* stage 0 coordinates */
+            EMIT("    result.rgb = float3(frac(input.tc0.xy), saturate(input.tc0.z));\n");
+            EMIT("    result.a = 1.0;\n");
+        } else if (show && strcmp(show, "tc0raw") == 0) { /* coordinate size */
+            EMIT("    result.rgb = saturate(abs(input.tc0.xyz) / 16.0);\n");
+            EMIT("    result.a = 1.0;\n");
+        } else if (show && strcmp(show, "fogon") == 0) {  /* fog enabled: white */
+            EMIT("    result.rgb = fog_enable ? 1.0 : 0.0;\n");
+            EMIT("    result.a = 1.0;\n");
         }
     }
 

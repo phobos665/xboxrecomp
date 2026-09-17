@@ -1,5 +1,5 @@
 /*
- * d3d8_capture -- round-trip the frame capture container (format version 2).
+ * d3d8_capture -- round-trip the frame capture container (format version 3).
  *
  * Writes a synthetic host-level capture -- a snapshot and a frame, using every
  * chunk kind -- reads it back, and asserts every field and every payload byte
@@ -68,6 +68,9 @@ enum {
 #define PROGRAM   0x10000u      /* d3d8_vsh.c hands out slot + 0x10000 */
 #define SCRATCH   0x10001u      /* created and deleted inside the frame */
 #define CLEAR_COLOR 0xFF203060u
+#define TARGET_COLOR 0xFF00FF00u
+#define USAGE_RENDERTARGET 0x1u
+#define FMT_D24S8 0x2Au
 
 /* ---------------------------------------------------------------- microcode
  *
@@ -260,8 +263,8 @@ static const float IDENTITY[16] = {
 
 /* How many chunks write_capture emits, for the read-back and truncation
  * checks. */
-#define SNAPSHOT_CHUNKS 26
-#define FRAME_CHUNKS    13
+#define SNAPSHOT_CHUNKS 27
+#define FRAME_CHUNKS    19
 
 static int write_capture(const char *path)
 {
@@ -275,6 +278,12 @@ static int write_capture(const char *path)
     D3D8CapLevel scratch_level = { 4, 1, 4 };
     static const uint8_t scratch_texel[4] = { 1, 2, 3, 4 };
     D3D8CapTextureLevel refill = { 1, 0, 16, 4, 64 };
+    D3D8CapTexture target_tex = { 3, FMT_LIN_A8R8G8B8, 1, 1, 1, USAGE_RENDERTARGET };
+    D3D8CapDepthSurface depth = { 1, 1, 1, FMT_D24S8 };
+    D3D8CapSetRenderTarget to_target = { 3, 0, 1 };
+    D3D8CapSetRenderTarget to_back = { 0, 0, 0 };
+    D3D8CapVsVertexData vdata = { 3, { 0.25f, 0.5f, 0.75f, 1.0f } };
+    D3D8CapClear target_clear = { 0, CLEAR_TARGET | CLEAR_ZBUFFER, TARGET_COLOR, 1.0f, 0 };
     D3D8CapTransform xf;
     D3D8CapViewport vp = { 0, 0, 640, 480, 0.0f, 1.0f };
     D3D8CapClear clear = { 0, CLEAR_TARGET | CLEAR_ZBUFFER, CLEAR_COLOR, 1.0f, 0 };
@@ -294,7 +303,9 @@ static int write_capture(const char *path)
     mov_input_to_output(g_microcode + 0, 0, 0, 0);     /* MOV oPos, v0 */
     mov_input_to_output(g_microcode + 4, 2, 3, 1);     /* MOV oD0, v2  */
 
-    /* ---- snapshot: 26 chunks, in the writer's documented order */
+    /* ---- snapshot: 27 chunks, in the writer's documented order, less the
+     * sixteen input current values the real writer puts after the
+     * screen-space chunk (the frame below carries one) */
     w_vs_create(w, PROGRAM, g_microcode, 2);                                 /* 1 */
     d3d8cap_chunk(w, D3D8CAP_VS_DECLARATION, &decl, sizeof decl,
                   DECL, sizeof DECL, NULL, 0);                               /* 2 */
@@ -309,48 +320,67 @@ static int write_capture(const char *path)
     w_set_texture(w, 0, 1);                                                  /* 8 */
     for (i = 1; i < 4; i++)
         w_set_texture(w, i, 0);                                              /* 9-11 */
+    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_back, sizeof to_back,
+                  NULL, 0, NULL, 0);                                         /* 12 */
     memcpy(xf.m, IDENTITY, sizeof xf.m);
     for (i = 0; i < 3; i++) {
         xf.state = transforms[i];
-        d3d8cap_chunk(w, D3D8CAP_TRANSFORM, &xf, sizeof xf, NULL, 0, NULL, 0); /* 12-14 */
+        d3d8cap_chunk(w, D3D8CAP_TRANSFORM, &xf, sizeof xf, NULL, 0, NULL, 0); /* 13-15 */
     }
-    d3d8cap_chunk(w, D3D8CAP_VIEWPORT, &vp, sizeof vp, NULL, 0, NULL, 0);   /* 15 */
-    w_render_state(w, RS_ZENABLE, 0);                                        /* 16 */
-    w_render_state(w, RS_CULLMODE, CULL_NONE);                               /* 17 */
-    w_render_state(w, RS_LIGHTING, 0);                                       /* 18 */
-    w_render_state(w, RS_ALPHABLENDENABLE, 0);                               /* 19 */
+    d3d8cap_chunk(w, D3D8CAP_VIEWPORT, &vp, sizeof vp, NULL, 0, NULL, 0);   /* 16 */
+    w_render_state(w, RS_ZENABLE, 0);                                        /* 17 */
+    w_render_state(w, RS_CULLMODE, CULL_NONE);                               /* 18 */
+    w_render_state(w, RS_LIGHTING, 0);                                       /* 19 */
+    w_render_state(w, RS_ALPHABLENDENABLE, 0);                               /* 20 */
     /* One combiner stage writing nothing; the final combiner's D is the
      * diffuse colour (register 4) and G its alpha (0x14: register 4, alpha
      * replicate), which is how the program draw gets its colour
      * (d3d8_combiners.c, from_render_states: first input in the top byte). */
-    w_render_state(w, RS_PSCOMBINERCOUNT, 1);                                /* 20 */
-    w_render_state(w, RS_PSFINALCOMBINERINPUTSABCD, 0x00000004u);            /* 21 */
-    w_render_state(w, RS_PSFINALCOMBINERINPUTSEFG, 0x00001400u);             /* 22 */
-    w_stage_state(w, 0, TSS_COLOROP, TOP_MODULATE);                          /* 23 */
-    w_stage_state(w, 0, TSS_COLORARG1, TA_TEXTURE);                          /* 24 */
-    w_stage_state(w, 0, TSS_COLORARG2, TA_DIFFUSE);                          /* 25 */
-    d3d8cap_chunk(w, D3D8CAP_FRAME_START, NULL, 0, NULL, 0, NULL, 0);        /* 26 */
+    w_render_state(w, RS_PSCOMBINERCOUNT, 1);                                /* 21 */
+    w_render_state(w, RS_PSFINALCOMBINERINPUTSABCD, 0x00000004u);            /* 22 */
+    w_render_state(w, RS_PSFINALCOMBINERINPUTSEFG, 0x00001400u);             /* 23 */
+    w_stage_state(w, 0, TSS_COLOROP, TOP_MODULATE);                          /* 24 */
+    w_stage_state(w, 0, TSS_COLORARG1, TA_TEXTURE);                          /* 25 */
+    w_stage_state(w, 0, TSS_COLORARG2, TA_DIFFUSE);                          /* 26 */
+    d3d8cap_chunk(w, D3D8CAP_FRAME_START, NULL, 0, NULL, 0, NULL, 0);        /* 27 */
 
-    /* ---- frame: 13 chunks */
+    /* ---- frame: 19 chunks. The offscreen pass (2-6) clears a 1x1 target
+     * green and goes back to the back buffer, so a replay that forgot the
+     * switch shows a green screen instead of the two quads. */
     d3d8cap_chunk(w, D3D8CAP_CLEAR, &clear, sizeof clear, NULL, 0, NULL, 0); /* 1 */
-    w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 2 */
+    d3d8cap_chunk(w, D3D8CAP_TEXTURE, &target_tex, sizeof target_tex,
+                  &scratch_level, sizeof scratch_level,
+                  scratch_texel, sizeof scratch_texel);                      /* 2 */
+    d3d8cap_chunk(w, D3D8CAP_DEPTH_SURFACE, &depth, sizeof depth,
+                  NULL, 0, NULL, 0);                                         /* 3 */
+    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_target, sizeof to_target,
+                  NULL, 0, NULL, 0);                                         /* 4 */
+    d3d8cap_chunk(w, D3D8CAP_CLEAR, &target_clear, sizeof target_clear,
+                  NULL, 0, NULL, 0);                                         /* 5 */
+    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_back, sizeof to_back,
+                  NULL, 0, NULL, 0);                                         /* 6 */
+    w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 7 */
     d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
-                  g_fvf_quad, sizeof g_fvf_quad, NULL, 0);                   /* 3 */
+                  g_fvf_quad, sizeof g_fvf_quad, NULL, 0);                   /* 8 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE_LEVEL, &refill, sizeof refill,
-                  g_refill, sizeof g_refill, NULL, 0);                       /* 4 */
+                  g_refill, sizeof g_refill, NULL, 0);                       /* 9 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE, &scratch_tex, sizeof scratch_tex,
                   &scratch_level, sizeof scratch_level,
-                  scratch_texel, sizeof scratch_texel);                      /* 5 */
-    w_u32(w, D3D8CAP_TEXTURE_RELEASE, 2);                                    /* 6 */
-    w_vs_create(w, SCRATCH, g_microcode, 2);                                 /* 7 */
-    w_u32(w, D3D8CAP_VS_DELETE, SCRATCH);                                    /* 8 */
-    w_u32(w, D3D8CAP_PS_TOKEN, 1);                                           /* 9 */
-    w_u32(w, D3D8CAP_SET_VERTEX_SHADER, PROGRAM);                            /* 10 */
+                  scratch_texel, sizeof scratch_texel);                      /* 10 */
+    w_u32(w, D3D8CAP_TEXTURE_RELEASE, 2);                                    /* 11 */
+    w_vs_create(w, SCRATCH, g_microcode, 2);                                 /* 12 */
+    w_u32(w, D3D8CAP_VS_DELETE, SCRATCH);                                    /* 13 */
+    /* v3's current value; the program reads only v0 and v2, so it changes
+     * nothing a replay draws. */
+    d3d8cap_chunk(w, D3D8CAP_VS_VERTEX_DATA, &vdata, sizeof vdata,
+                  NULL, 0, NULL, 0);                                         /* 14 */
+    w_u32(w, D3D8CAP_PS_TOKEN, 1);                                           /* 15 */
+    w_u32(w, D3D8CAP_SET_VERTEX_SHADER, PROGRAM);                            /* 16 */
     d3d8cap_chunk(w, D3D8CAP_DRAW_INDEXED_UP, &iup, sizeof iup,
                   QUAD_INDICES, sizeof QUAD_INDICES,
-                  g_program_quad, sizeof g_program_quad);                    /* 11 */
-    w_u32(w, D3D8CAP_PS_TOKEN, 0);                                           /* 12 */
-    w_u32(w, D3D8CAP_SET_VERTEX_SHADER, FVF_XYZRHW_DIFFUSE_TEX1);            /* 13 */
+                  g_program_quad, sizeof g_program_quad);                    /* 17 */
+    w_u32(w, D3D8CAP_PS_TOKEN, 0);                                           /* 18 */
+    w_u32(w, D3D8CAP_SET_VERTEX_SHADER, FVF_XYZRHW_DIFFUSE_TEX1);            /* 19 */
 
     if (d3d8cap_chunk_count(w) != SNAPSHOT_CHUNKS + FRAME_CHUNKS)
         printf("FAIL: wrote %u chunks, expected %d\n", d3d8cap_chunk_count(w),
@@ -382,7 +412,7 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 2 && D3D8CAP_VERSION == 2, "the version is 2");
+    check(h->version == 3 && D3D8CAP_VERSION == 3, "the version is 3");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 
@@ -441,6 +471,11 @@ static void read_capture(void)
             const D3D8CapSetTexture *p = c.data;
             check(p->stage == (uint32_t)i && p->texture_id == (i ? 0u : 1u), "stage bindings");
         }
+    if (next_of(r, &c, D3D8CAP_SET_RENDER_TARGET, "render target in the snapshot")) {
+        const D3D8CapSetRenderTarget *p = c.data;
+        check(c.bytes == sizeof *p && p->texture_id == 0 && p->level == 0 &&
+              p->depth_id == 0, "the snapshot names the back buffer");
+    }
     for (i = 0; i < 3; i++)
         if (next_of(r, &c, D3D8CAP_TRANSFORM, "transform")) {
             const D3D8CapTransform *p = c.data;
@@ -467,6 +502,27 @@ static void read_capture(void)
         check(p->rect_count == 0 && p->flags == 3 && p->color == CLEAR_COLOR &&
               p->z == 1.0f, "clear fields");
     }
+    if (next_of(r, &c, D3D8CAP_TEXTURE, "render target texture")) {
+        const D3D8CapTexture *t = c.data;
+        check(t->id == 3 && t->usage == USAGE_RENDERTARGET && t->levels == 1,
+              "render target texture fields");
+    }
+    if (next_of(r, &c, D3D8CAP_DEPTH_SURFACE, "depth_surface")) {
+        const D3D8CapDepthSurface *p = c.data;
+        check(c.bytes == sizeof *p && p->id == 1 && p->width == 1 && p->height == 1 &&
+              p->format == FMT_D24S8, "depth surface fields");
+    }
+    if (next_of(r, &c, D3D8CAP_SET_RENDER_TARGET, "set_render_target")) {
+        const D3D8CapSetRenderTarget *p = c.data;
+        check(p->texture_id == 3 && p->level == 0 && p->depth_id == 1,
+              "offscreen target fields");
+    }
+    if (next_of(r, &c, D3D8CAP_CLEAR, "offscreen clear"))
+        check(((const D3D8CapClear *)c.data)->color == TARGET_COLOR, "offscreen clear colour");
+    if (next_of(r, &c, D3D8CAP_SET_RENDER_TARGET, "back to the back buffer")) {
+        const D3D8CapSetRenderTarget *p = c.data;
+        check(p->texture_id == 0 && p->depth_id == 0, "back buffer fields");
+    }
     next_of(r, &c, D3D8CAP_TEXTURE_STAGE_STATE, "in-frame stage state");
     if (next_of(r, &c, D3D8CAP_DRAW_UP, "draw_up")) {
         const D3D8CapDrawUp *d = c.data;
@@ -488,6 +544,11 @@ static void read_capture(void)
         check(((const D3D8CapVsCreate *)c.data)->handle == SCRATCH, "scratch handle");
     if (next_of(r, &c, D3D8CAP_VS_DELETE, "vs_delete"))
         check(((const D3D8CapVsHandle *)c.data)->handle == SCRATCH, "deleted handle");
+    if (next_of(r, &c, D3D8CAP_VS_VERTEX_DATA, "vs_vertex_data")) {
+        const D3D8CapVsVertexData *p = c.data;
+        check(c.bytes == sizeof *p && p->reg == 3 && p->value[0] == 0.25f &&
+              p->value[2] == 0.75f && p->value[3] == 1.0f, "vertex data fields");
+    }
     if (next_of(r, &c, D3D8CAP_PS_TOKEN, "ps_token in frame"))
         check(((const D3D8CapPsToken *)c.data)->token == 1, "token 1");
     if (next_of(r, &c, D3D8CAP_SET_VERTEX_SHADER, "program select"))

@@ -10,6 +10,12 @@
  * and the capture would be of an empty screen. 120 swaps is far enough in to
  * have textures and a real draw list, and still inside the first minute.
  *
+ * RECOMP_D3D8_CAPTURE_EVERY=<n> (n >= 2) keeps capturing: after the frame
+ * at the requested swap, one more every n swaps, each to <path>_<swap> with
+ * the capture extension, at most CAPTURE_MAX_FILES files. A title never
+ * reaches the same moment at the same swap twice, so one long run captured
+ * throughout is how to get the frame wanted; the files are picked afterwards.
+ *
  * Frame boundaries: recording starts when the swap counter reaches the
  * requested swap and stops at the next one, so the file holds the host calls
  * between one Swap and the next. Most of the state those calls draw with was
@@ -46,6 +52,7 @@ IDirect3DDevice8 *hle_d3d8_shadow_device(void);
 
 #define CAPTURE_DEFAULT_SWAP    120
 #define CAPTURE_MAX_TEXTURES    1024
+#define CAPTURE_MAX_FILES       24   /* as RECOMP_HLE_D3D8_DUMP */
 #define CAPTURE_MAX_LEVELS      16
 #define CAPTURE_STAGES          4    /* d3d8_device.c MAX_TEXTURE_STAGES */
 #define CAPTURE_RENDER_STATES   256  /* d3d8_device.c MAX_RENDER_STATES */
@@ -56,6 +63,10 @@ static int            g_configured;
 static const char    *g_path;
 static unsigned long  g_target_swap;
 static unsigned long  g_frame;
+static unsigned long  g_every;       /* RECOMP_D3D8_CAPTURE_EVERY, 0 = once */
+static unsigned long  g_min_draws;   /* RECOMP_D3D8_CAPTURE_MINDRAWS, 0 = any */
+static unsigned       g_files;
+static char           g_file[1024];  /* the file being written */
 
 /* Host texture objects whose contents are in this capture, and their ids. */
 static struct {
@@ -65,7 +76,27 @@ static struct {
 static int      g_texture_count;
 static uint32_t g_next_texture_id;
 
+/* Host depth surfaces a SET_RENDER_TARGET in this capture has named. Shadow
+ * mode keeps its depth surfaces for the life of the process (hle_d3d8.c,
+ * depth_surface), so a pointer never comes back as a different surface. */
+#define CAPTURE_MAX_DEPTHS 16
+static IDirect3DSurface8 *g_depth_objects[CAPTURE_MAX_DEPTHS];
+static int                g_depth_count;
+static IDirect3DSurface8 *g_device_depth;   /* host_DeviceDepthSurface */
+
+/* The render target the wrappers last set, for the snapshot. Kept here
+ * because the host's surface for a texture level does not lead back to the
+ * texture; host_SetRenderTarget is the only place the target changes, so
+ * this is the host's own. g_target_lost: the snapshot cannot name the
+ * target -- the bound texture was released (the host still draws into it
+ * through its surface), or the host refused the last switch. */
+static IDirect3DTexture8 *g_target_texture;
+static UINT               g_target_level;
+static IDirect3DSurface8 *g_target_depth;
+static int                g_target_lost;
+
 static unsigned long g_draws, g_texture_writes, g_level_writes, g_unrecorded_binds;
+static unsigned long g_unrecorded_targets;
 static uint64_t      g_texture_bytes;
 
 int hle_d3d8_capture_active(void)
@@ -274,12 +305,69 @@ static void rec_vs_screenspace(int enabled, const float scale[4], const float of
     chunk(D3D8CAP_VS_SCREENSPACE, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
+static void rec_vs_vertex_data(int reg, const float value[4])
+{
+    D3D8CapVsVertexData c;
+
+    if (reg < 0 || reg >= NV2A_VS_MAX_INPUTS)
+        return;                          /* the host ignores it too */
+    c.reg = (uint32_t)reg;
+    memcpy(c.value, value, sizeof c.value);
+    chunk(D3D8CAP_VS_VERTEX_DATA, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
 static void rec_ps_token(DWORD token)
 {
     D3D8CapPsToken c;
 
     c.token = token;
     chunk(D3D8CAP_PS_TOKEN, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+/* The capture id for a depth surface, writing it first if needed. 0 for
+ * NULL, and for one that cannot be recorded (the caller counts it). */
+static uint32_t depth_id(IDirect3DSurface8 *object)
+{
+    D3DSURFACE_DESC desc;
+    D3D8CapDepthSurface c;
+    int i;
+
+    if (!object)
+        return 0;
+    if (object == g_device_depth)
+        return D3D8CAP_DEPTH_DEVICE;
+    for (i = 0; i < g_depth_count; i++)
+        if (g_depth_objects[i] == object)
+            return (uint32_t)i + 1;
+    if (g_depth_count >= CAPTURE_MAX_DEPTHS ||
+        FAILED(object->lpVtbl->GetDesc(object, &desc)))
+        return 0;
+    g_depth_objects[g_depth_count++] = object;
+    c.id     = (uint32_t)g_depth_count;
+    c.width  = desc.Width;
+    c.height = desc.Height;
+    c.format = (uint32_t)desc.Format;
+    chunk(D3D8CAP_DEPTH_SURFACE, &c, sizeof c, NULL, 0, NULL, 0);
+    return c.id;
+}
+
+/* A target the capture cannot name is recorded as the back buffer, which is
+ * where replay would draw without it anyway, and counted. */
+static void rec_set_render_target(IDirect3DTexture8 *texture, UINT level,
+                                  IDirect3DSurface8 *depth, int lost)
+{
+    D3D8CapSetRenderTarget c;
+    unsigned long binds = g_unrecorded_binds;
+
+    /* texture_id counts a failure as a texture bind; this one is counted
+     * below, as a target. */
+    c.texture_id = texture_id((IDirect3DBaseTexture8 *)texture);
+    g_unrecorded_binds = binds;
+    c.level      = c.texture_id ? level : 0;
+    c.depth_id   = depth_id(depth);
+    if (lost || (texture && !c.texture_id) || (depth && !c.depth_id))
+        g_unrecorded_targets++;
+    chunk(D3D8CAP_SET_RENDER_TARGET, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
 /* ---------------------------------------------------------------- snapshot */
@@ -317,12 +405,20 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
         rec_vs_constants(0, constants, NV2A_VS_MAX_CONSTANTS);
     d3d8_vsh_get_screenspace(scale, offset, &enabled);
     rec_vs_screenspace(enabled, scale, offset);
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
+        float value[4];
+
+        d3d8_vsh_get_vertex_data(i, value);
+        rec_vs_vertex_data(i, value);
+    }
     rec_ps_token(d3d8_combiners_get_pixel_shader());
 
     dev->lpVtbl->GetVertexShader(dev, &vs);
     rec_set_vertex_shader(vs);
     for (s = 0; s < CAPTURE_STAGES; s++)
         rec_set_texture(s, d3d8_GetStageTexture(s));
+    rec_set_render_target(g_target_texture, g_target_level, g_target_depth,
+                          g_target_lost);
 
     for (i = 0; i < (int)(sizeof transforms / sizeof transforms[0]); i++) {
         const D3DMATRIX *m = d3d8_GetTransform((D3DTRANSFORMSTATETYPE)transforms[i]);
@@ -347,7 +443,7 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
 
 static void capture_configure(void)
 {
-    const char *swap;
+    const char *swap, *every, *min_draws;
 
     g_configured = 1;
     g_path = getenv("RECOMP_D3D8_CAPTURE");
@@ -355,9 +451,18 @@ static void capture_configure(void)
     swap = getenv("RECOMP_D3D8_CAPTURE_SWAP");
     if (swap && atol(swap) > 0)
         g_target_swap = (unsigned long)atol(swap);
+    every = getenv("RECOMP_D3D8_CAPTURE_EVERY");
+    if (every && atol(every) >= 2)
+        g_every = (unsigned long)atol(every);
+    min_draws = getenv("RECOMP_D3D8_CAPTURE_MINDRAWS");
+    if (min_draws && atol(min_draws) > 0)
+        g_min_draws = (unsigned long)atol(min_draws);
     if (g_path && *g_path)
-        fprintf(stderr, "[HLE-D3D8] capture armed: swap %lu -> %s (host calls, "
-                "format v%u)\n", g_target_swap, g_path, D3D8CAP_VERSION);
+        fprintf(stderr, "[HLE-D3D8] capture armed: swap %lu%s%s -> %s (host calls, "
+                "format v%u)\n", g_target_swap,
+                g_min_draws ? " or the first frame after it with enough draws" : "",
+                g_every ? ", then every RECOMP_D3D8_CAPTURE_EVERY swaps" : "",
+                g_path, D3D8CAP_VERSION);
 }
 
 void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
@@ -376,19 +481,35 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
 
         g_cap = NULL;                    /* stop recording before closing */
         ok = d3d8cap_close(w) == 0;
+        if (g_min_draws && g_draws < g_min_draws) {
+            /* Too few draws: dropped, and this swap starts the next try. */
+            remove(g_file);
+            g_unrecorded_targets = g_unrecorded_binds = 0;
+            g_target_swap = swaps;
+            goto start;
+        }
         fprintf(stderr, "[HLE-D3D8] capture: frame %lu written to %s -- %u chunks, "
                 "%lu draws, %lu textures (%llu bytes), %lu level refills%s\n",
-                g_frame, g_path, chunks, g_draws, g_texture_writes,
+                g_frame, g_file, chunks, g_draws, g_texture_writes,
                 (unsigned long long)g_texture_bytes, g_level_writes,
                 ok ? "" : " (INCOMPLETE: write failed)");
+        if (g_unrecorded_targets)
+            fprintf(stderr, "[HLE-D3D8] capture: %lu render target switches recorded "
+                    "as the back buffer (target released or refused, or table full)\n",
+                    g_unrecorded_targets);
         if (g_unrecorded_binds)
             fprintf(stderr, "[HLE-D3D8] capture: %lu texture binds recorded as "
                     "nothing bound (not a 2D texture, or table full)\n",
                     g_unrecorded_binds);
         fflush(stderr);
-        g_path = NULL;                   /* one frame per run */
+        g_files++;
+        if (g_every && g_files < CAPTURE_MAX_FILES)
+            g_target_swap = g_frame + g_every;
+        else
+            g_path = NULL;               /* done: one frame, or the file cap */
         return;
     }
+start:
     if (swaps != g_target_swap)
         return;
     dev = hle_d3d8_shadow_device();
@@ -398,11 +519,24 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
     g_frame = swaps;
     g_texture_count = 0;
     g_next_texture_id = 1;
+    g_depth_count = 0;
     g_draws = g_texture_writes = g_level_writes = g_unrecorded_binds = 0;
+    g_unrecorded_targets = 0;
     g_texture_bytes = 0;
-    g_cap = d3d8cap_create(g_path, (uint32_t)swaps, width, height);
+    if (g_every) {
+        /* <path>_<swap><extension>, with the extension moved to the end. */
+        size_t n = strlen(g_path), e = strlen(D3D8CAP_EXTENSION);
+
+        if (n >= e && strcmp(g_path + n - e, D3D8CAP_EXTENSION) == 0)
+            n -= e;
+        snprintf(g_file, sizeof g_file, "%.*s_%05lu%s", (int)n, g_path, swaps,
+                 D3D8CAP_EXTENSION);
+    } else {
+        snprintf(g_file, sizeof g_file, "%s", g_path);
+    }
+    g_cap = d3d8cap_create(g_file, (uint32_t)swaps, width, height);
     if (!g_cap) {
-        fprintf(stderr, "[HLE-D3D8] capture: cannot write %s; capture off\n", g_path);
+        fprintf(stderr, "[HLE-D3D8] capture: cannot write %s; capture off\n", g_file);
         g_path = NULL;                   /* one attempt, not one per swap */
         return;
     }
@@ -583,6 +717,10 @@ ULONG host_ReleaseTexture(IDirect3DTexture8 *texture)
     int i;
 
     /* Only the pointer is used from here on, as a key: the object may be gone. */
+    if (left == 0 && texture == g_target_texture) {
+        g_target_texture = NULL;
+        g_target_lost = 1;
+    }
     if (g_cap && left == 0 && (i = texture_find(object)) >= 0) {
         D3D8CapTextureId c;
 
@@ -591,6 +729,52 @@ ULONG host_ReleaseTexture(IDirect3DTexture8 *texture)
         g_textures[i] = g_textures[--g_texture_count];
     }
     return left;
+}
+
+/* ------------------------------------------------------- render targets */
+
+HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DTexture8 *texture,
+                             UINT level, IDirect3DSurface8 *depth)
+{
+    IDirect3DSurface8 *surface = NULL;
+    HRESULT hr;
+
+    if (texture) {
+        hr = texture->lpVtbl->GetSurfaceLevel(texture, level, &surface);
+        if (FAILED(hr) || !surface)
+            return FAILED(hr) ? hr : E_FAIL;
+    }
+    hr = dev->lpVtbl->SetRenderTarget(dev, surface, depth);
+    if (surface)
+        surface->lpVtbl->Release(surface);   /* the device holds its own reference */
+    /* The call is recorded as made either way: replay repeats it, and a
+     * refusal with it. */
+    g_target_texture = texture;
+    g_target_level   = level;
+    g_target_depth   = depth;
+    g_target_lost    = FAILED(hr);
+    if (g_cap)
+        rec_set_render_target(texture, level, depth, 0);
+    return hr;
+}
+
+IDirect3DSurface8 *host_DeviceDepthSurface(IDirect3DDevice8 *dev)
+{
+    IDirect3DSurface8 *s = NULL;
+
+    if (!g_device_depth && SUCCEEDED(dev->lpVtbl->GetDepthStencilSurface(dev, &s)) && s) {
+        g_device_depth = s;
+        g_target_depth = s;              /* what the device starts with */
+        s->lpVtbl->Release(s);           /* the device keeps it alive */
+    }
+    return g_device_depth;
+}
+
+HRESULT host_CreateDepthStencilSurface(IDirect3DDevice8 *dev, UINT width, UINT height,
+                                       D3DFORMAT format, IDirect3DSurface8 **surface)
+{
+    return dev->lpVtbl->CreateDepthStencilSurface(dev, width, height, format,
+                                                  D3DMULTISAMPLE_NONE, surface);
 }
 
 /* -------------------------------------------- vertex programs, combiners */
@@ -639,6 +823,13 @@ void host_vsh_set_screenspace(const float scale[4], const float offset[4])
     if (g_cap && scale && offset)
         rec_vs_screenspace(1, scale, offset);
     d3d8_vsh_set_screenspace(scale, offset);
+}
+
+void host_vsh_set_vertex_data(int reg, const float value[4])
+{
+    if (g_cap && value)
+        rec_vs_vertex_data(reg, value);
+    d3d8_vsh_set_vertex_data(reg, value);
 }
 
 void host_combiners_set_pixel_shader(DWORD token)

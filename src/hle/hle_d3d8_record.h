@@ -19,6 +19,13 @@
  *
  *   RECOMP_D3D8_CAPTURE=<path>     where to write; capture is off without it
  *   RECOMP_D3D8_CAPTURE_SWAP=<n>   which swap to record (default 120)
+ *   RECOMP_D3D8_CAPTURE_EVERY=<n>  then one more every n swaps (n >= 2), to
+ *                                  <path>_<swap>.d3dcap, at most 24 files
+ *   RECOMP_D3D8_CAPTURE_MINDRAWS=<n>  keep a frame only if it drew at least n
+ *                                  times; otherwise try the next swap. Every
+ *                                  frame is recorded (a full snapshot each)
+ *                                  and deleted while it looks, so it is slow,
+ *                                  but it finds a title's rare 3D frames
  *
  * Threads: guest threads are host threads, and the wrappers take no lock.
  * That is no worse than the host renderer itself, which takes none either;
@@ -83,6 +90,23 @@ HRESULT host_LockRect(IDirect3DTexture8 *texture, UINT level,
 HRESULT host_UnlockRect(IDirect3DTexture8 *texture, UINT level);
 ULONG   host_ReleaseTexture(IDirect3DTexture8 *texture);
 
+/* Render targets. texture NULL is the back buffer; otherwise level `level` of
+ * a texture created with D3DUSAGE_RENDERTARGET (src/d3d, dev_SetRenderTarget).
+ * The level's surface object is taken and
+ * released inside. depth NULL is no depth; the device's own depth buffer is
+ * host_DeviceDepthSurface. A switch is recorded with the texture and depth
+ * surface it names, each written the first time; the depth surface is not
+ * recorded at creation. */
+HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DTexture8 *texture,
+                             UINT level, IDirect3DSurface8 *depth);
+HRESULT host_CreateDepthStencilSurface(IDirect3DDevice8 *dev, UINT width, UINT height,
+                                       D3DFORMAT format, IDirect3DSurface8 **surface);
+/* The device's own depth surface, read once while it is still the one bound
+ * (call right after creating the device). A capture names it with
+ * D3D8CAP_DEPTH_DEVICE rather than as a depth surface of its own. Not a
+ * reference the caller owns. */
+IDirect3DSurface8 *host_DeviceDepthSurface(IDirect3DDevice8 *dev);
+
 /* -------------------------------------------- vertex programs, combiners */
 
 HRESULT host_vsh_create_shader(const DWORD *microcode, int insn_count, DWORD *handle);
@@ -90,6 +114,7 @@ HRESULT host_vsh_delete_shader(DWORD handle);
 void    host_vsh_set_constant(int first_reg, const float *data, int count);
 HRESULT host_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count);
 void    host_vsh_set_screenspace(const float scale[4], const float offset[4]);
+void    host_vsh_set_vertex_data(int reg, const float value[4]);
 void    host_combiners_set_pixel_shader(DWORD token);
 
 #endif /* _WIN32 */

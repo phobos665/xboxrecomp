@@ -51,8 +51,10 @@
  *   2. every host call shadow mode made until the next Swap, in call order.
  * The snapshot uses the same chunk types as the calls, so replay has one path
  * for both. Its order is fixed by the writer: programs and their
- * declarations, constants, screen-space, combiner token, vertex shader,
- * textures, transforms, viewport, render states, texture stage states. The
+ * declarations, constants, screen-space, input current values, combiner
+ * token, vertex shader,
+ * textures, render target, transforms, viewport, render states, texture
+ * stage states. The
  * stage states come after the textures because the host's SetTexture
  * rewrites D3DTSS_COLOROP (d3d8_device.c, dev_SetTexture).
  *
@@ -69,8 +71,12 @@
  *     bypasses every replacement, so shadow mode never draws those, and
  *     neither does a replay.
  *   - host state src/hle never sets: lights, material, palettes, stream
- *     sources, render targets, the device's own pixel shader handle. A replay
- *     leaves them at the device's defaults, as the live run does.
+ *     sources, the device's own pixel shader handle. A replay leaves them at
+ *     the device's defaults, as the live run does.
+ *   - what a render target held before the frame. Its TEXTURE chunk carries
+ *     the host's system-memory copy, which rendering never writes, so a
+ *     target drawn in an earlier frame and only sampled in this one replays
+ *     as zeros.
  *   - cube and volume textures, which shadow mode does not create. One bound
  *     on a stage would be recorded as nothing bound.
  *   - anything time-varying: no timestamps, no frame pacing.
@@ -92,8 +98,8 @@ extern "C" {
 /* Bumped on any change to a payload struct or chunk meaning. The reader
  * refuses anything else rather than guessing: captures are cheap to retake.
  * Version 1 was the title-level format; its chunk numbers mean different
- * things here. */
-#define D3D8CAP_VERSION      2u
+ * things here. Version 3 added render targets and input current values. */
+#define D3D8CAP_VERSION      3u
 
 /* The conventional extension. .gitignore has it: a capture contains the
  * title's own textures and vertices, so it is game content and must never be
@@ -121,7 +127,10 @@ enum {
     D3D8CAP_VS_CONSTANTS        = 17, /* D3D8CapVsConstants + float[count * 4] */
     D3D8CAP_VS_SCREENSPACE      = 18, /* D3D8CapVsScreenspace */
     D3D8CAP_PS_TOKEN            = 19, /* D3D8CapPsToken */
-    D3D8CAP_CHUNK_KINDS         = 20  /* one past the last, for per-kind counters */
+    D3D8CAP_DEPTH_SURFACE       = 20, /* D3D8CapDepthSurface */
+    D3D8CAP_SET_RENDER_TARGET   = 21, /* D3D8CapSetRenderTarget */
+    D3D8CAP_VS_VERTEX_DATA      = 22, /* D3D8CapVsVertexData */
+    D3D8CAP_CHUNK_KINDS         = 23  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -208,8 +217,24 @@ typedef struct { uint32_t first_reg, count; } D3D8CapVsConstants;
  * snapshot taken before anything turned it on. */
 typedef struct { uint32_t enabled; float scale[4], offset[4]; } D3D8CapVsScreenspace;
 
+/* d3d8_vsh_set_vertex_data: input register reg (0-15)'s current value. The
+ * snapshot carries all 16. */
+typedef struct { uint32_t reg; float value[4]; } D3D8CapVsVertexData;
+
 /* d3d8_combiners_set_pixel_shader. */
 typedef struct { uint32_t token; } D3D8CapPsToken;
+
+/* CreateDepthStencilSurface with these arguments (no multisampling). Ids are
+ * numbered by the capture, separately from texture ids, from 1, the first
+ * time a SET_RENDER_TARGET names the surface. */
+typedef struct { uint32_t id, width, height, format; } D3D8CapDepthSurface;
+
+/* SetRenderTarget. texture_id 0 is the back buffer; otherwise level `level`
+ * of that texture, which was created with D3DUSAGE_RENDERTARGET. depth_id 0
+ * is no depth, D3D8CAP_DEPTH_DEVICE the device's own depth buffer, and
+ * anything else a DEPTH_SURFACE chunk's id. */
+#define D3D8CAP_DEPTH_DEVICE 0xFFFFFFFFu
+typedef struct { uint32_t texture_id, level, depth_id; } D3D8CapSetRenderTarget;
 
 /* A short name for a chunk type ("draw_up"), or "unknown", for logs. */
 const char *d3d8cap_chunk_name(uint32_t type);

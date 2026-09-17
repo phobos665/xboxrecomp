@@ -145,7 +145,7 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
  * Constants arrive a few registers at a time and are never read back by the
  * renderer, so nothing needed this until frame capture: a capture has to be
  * self-contained, and the frame it records draws with constants set before it
- * began (src/hle/hle_d3d8_capture.c). Read-only; the pointer stays valid for
+ * began (src/hle/hle_d3d8_record.c). Read-only; the pointer stays valid for
  * the life of the process.
  */
 const float *d3d8_vsh_constants(void);
@@ -194,6 +194,17 @@ void d3d8_vsh_get_screenspace(float scale[4], float offset[4], int *enabled);
  * every loop.
  */
 void d3d8_vsh_clear_screenspace(void);
+
+/**
+ * The current value of input register reg (0-15): what a program reads from
+ * a register its declaration does not feed, as the NV2A does with the value
+ * the SetVertexData* calls last set (src/hle forwards SetVertexDataColor and
+ * SetVertexData2f; the other variants are not yet). Starts at (1,1,1,1) for v3, the
+ * diffuse colour, and (0,0,0,1) for the rest. The getter is for frame
+ * capture's snapshot.
+ */
+void d3d8_vsh_set_vertex_data(int reg, const float value[4]);
+void d3d8_vsh_get_vertex_data(int reg, float value[4]);
 
 /**
  * One stored program, by slot index (0 .. NV2A_VS_MAX_SLOTS-1): its handle,

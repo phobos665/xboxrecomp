@@ -13,6 +13,7 @@
  *
  * The generated HLSL uses:
  *   - cbuffer at b1: 192 float4 constants (c0-c191)
+ *   - cbuffer at b2: the screen-space undo; at b3: input current values
  *   - Input semantics: ATTR0-ATTR15 mapped to v0-v15
  *   - Output semantics: SV_POSITION, COLOR0/1, TEXCOORD0-3, FOG, PSIZE
  */
@@ -23,6 +24,7 @@
 #include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <math.h>
 
@@ -47,6 +49,21 @@ typedef struct {
 static VshScreenspace g_vsh_screen;
 static ID3D11Buffer  *g_vsh_screen_cb;
 static BOOL           g_vsh_screen_dirty;
+
+/* The NV2A's current value of each input register, at register(b3). A
+ * program that reads a register its vertex does not carry reads this
+ * instead: the value SetVertexData4f / SetVertexDataColor last set, as on
+ * the hardware. fed[r / 4][r % 4] is 1 for a register the bound layout reads
+ * from the vertex. 320 bytes: a multiple of 16. */
+typedef struct {
+    float value[NV2A_VS_MAX_INPUTS][4];
+    float fed[4][4];
+} VshVertexData;
+
+static VshVertexData  g_vsh_vdata;
+static ID3D11Buffer  *g_vsh_vdata_cb;
+static BOOL           g_vsh_vdata_dirty;
+static uint16_t       g_vsh_vdata_fed;     /* the mask g_vsh_vdata.fed holds */
 
 /* Constant registers (192 float4) */
 static NV2AVSConstants g_vsh_constants;
@@ -552,7 +569,12 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 xboxScreenspaceOffset;\n"
         "    float4 xboxScreenspaceEnable;\n"
         "};\n"
-        "\n", NV2A_VS_MAX_CONSTANTS);
+        "\n"
+        "cbuffer VSH_VertexData : register(b3) {\n"
+        "    float4 xboxVertexData[%d];\n"
+        "    float4 xboxVertexFed[4];\n"
+        "};\n"
+        "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_INPUTS);
 
     /* Input structure - only declare used inputs */
     sb_append(&sb, "struct VS_IN {\n");
@@ -597,11 +619,13 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     /* Address register */
     sb_append(&sb, "    int a0 = 0;\n\n");
 
-    /* Alias input registers for readability */
-    sb_append(&sb, "    /* Input register aliases */\n");
+    /* Input registers: from the vertex when the layout feeds them, otherwise
+     * the register's current value (VSH_VertexData). */
+    sb_append(&sb, "    /* Input registers */\n");
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         if (inputs & (1u << i)) {
-            sb_append(&sb, "    float4 v%d = input.v%d;\n", i, i);
+            sb_append(&sb, "    float4 v%d = xboxVertexFed[%d][%d] != 0 ? input.v%d : "
+                      "xboxVertexData[%d];\n", i, i / 4, i % 4, i, i);
         }
     }
     sb_append(&sb, "\n");
@@ -901,7 +925,10 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
                                       uint32_t hash)
 {
     NV2AVshProgram program;
-    char hlsl_buf[16384];  /* 16KB should be enough for any VS */
+    /* A 136-instruction program runs to about 30 KB of source. Heap, not
+     * stack: this runs on whichever guest thread draws. */
+    enum { HLSL_BUF = 65536 };
+    char *hlsl_buf = (char *)malloc(HLSL_BUF);
     int hlsl_len;
     ID3DBlob *code = NULL, *errors = NULL;
     HRESULT hr;
@@ -910,11 +937,27 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     /* Parse microcode */
     nv2a_vsh_parse((const uint32_t *)microcode, num_insns, &program);
 
-    /* Generate HLSL */
-    hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, sizeof(hlsl_buf));
-    if (hlsl_len <= 0) {
-        fprintf(stderr, "D3D8 VSH: HLSL generation failed\n");
+    /* Generate HLSL. A source that fills the buffer was cut off. */
+    if (!hlsl_buf)
         return NULL;
+    hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, HLSL_BUF);
+    if (hlsl_len <= 0 || hlsl_len >= HLSL_BUF - 1) {
+        fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d bytes)\n", hlsl_len);
+        free(hlsl_buf);
+        return NULL;
+    }
+
+    /* Debug switch, RECOMP_D3D8_VS_DUMP=1: print every program's generated
+     * source, tagged with its microcode hash. Otherwise the source is only
+     * printed when the compile fails. */
+    {
+        static int dump = -1;
+
+        if (dump < 0)
+            dump = getenv("RECOMP_D3D8_VS_DUMP") != NULL;
+        if (dump)
+            fprintf(stderr, "--- VS HLSL hash 0x%08X, %d instructions ---\n%s\n"
+                    "--- End VS HLSL ---\n", hash, num_insns, hlsl_buf);
     }
 
     /* Compile HLSL to bytecode */
@@ -927,9 +970,11 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
                 errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
         fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End ---\n", hlsl_buf);
         if (errors) ID3D10Blob_Release(errors);
+        free(hlsl_buf);
         return NULL;
     }
     if (errors) ID3D10Blob_Release(errors);
+    free(hlsl_buf);
 
     /* Insert into cache */
     entry = cache_insert(hash);
@@ -964,9 +1009,9 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
 /* The layout a program's declaration describes: each register it reads at the
  * declared format and offset in the stream 0 vertex. A register the program
- * reads that the declaration does not feed has no data on the Xbox either;
- * D3D11 still requires every shader input bound, so it reads the vertex's
- * first byte (normalised). */
+ * reads that the declaration does not feed takes its current value
+ * (VSH_VertexData) in the shader; D3D11 still requires every shader input
+ * bound, so the layout gives it the vertex's first byte, which is unused. */
 static ID3D11InputLayout *create_vsh_input_layout_decl(
     uint16_t inputs_read, const NV2AVshSlot *vsh, ID3DBlob *vs_blob)
 {
@@ -989,7 +1034,7 @@ static ID3D11InputLayout *create_vsh_input_layout_decl(
         }
         if (!in)
             fprintf(stderr, "D3D8 VSH: a program reads v%d, which its declaration "
-                    "does not feed; it reads the vertex's first byte instead\n", i);
+                    "does not feed; it reads the register's current value\n", i);
         elems[elem_count].SemanticName         = "ATTR";
         elems[elem_count].SemanticIndex        = (UINT)i;
         elems[elem_count].Format               = in ? in->format : DXGI_FORMAT_R8_UNORM;
@@ -1104,6 +1149,25 @@ HRESULT d3d8_vsh_init(void)
     }
     g_vsh_screen_dirty = FALSE;
 
+    /* Current values start as the D3D defaults: diffuse white, everything
+     * else (0, 0, 0, 1). */
+    memset(&g_vsh_vdata, 0, sizeof(g_vsh_vdata));
+    for (int r = 0; r < NV2A_VS_MAX_INPUTS; r++)
+        g_vsh_vdata.value[r][3] = 1.0f;
+    for (int k = 0; k < 3; k++)
+        g_vsh_vdata.value[3][k] = 1.0f;
+    g_vsh_vdata_fed = 0;
+    cbd.ByteWidth = sizeof(VshVertexData);
+    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vsh_vdata_cb);
+    if (FAILED(hr)) {
+        /* Without it every program would read every input as zero, so
+         * prepare_draw refuses programs instead. */
+        fprintf(stderr, "D3D8 VSH: Failed to create vertex data buffer: 0x%08lX\n", hr);
+        g_vsh_vdata_cb = NULL;
+        return hr;
+    }
+    g_vsh_vdata_dirty = TRUE;
+
     fprintf(stderr, "D3D8 VSH: Vertex shader translator initialized\n");
     return S_OK;
 }
@@ -1136,6 +1200,10 @@ void d3d8_vsh_shutdown(void)
     if (g_vsh_screen_cb) {
         ID3D11Buffer_Release(g_vsh_screen_cb);
         g_vsh_screen_cb = NULL;
+    }
+    if (g_vsh_vdata_cb) {
+        ID3D11Buffer_Release(g_vsh_vdata_cb);
+        g_vsh_vdata_cb = NULL;
     }
 
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
@@ -1276,6 +1344,22 @@ void d3d8_vsh_get_screenspace(float scale[4], float offset[4], int *enabled)
         *enabled = g_vsh_screen.enable[0] != 0.0f;
 }
 
+void d3d8_vsh_set_vertex_data(int reg, const float value[4])
+{
+    if (!value || reg < 0 || reg >= NV2A_VS_MAX_INPUTS)
+        return;
+    if (memcmp(g_vsh_vdata.value[reg], value, sizeof(g_vsh_vdata.value[reg])) == 0)
+        return;
+    memcpy(g_vsh_vdata.value[reg], value, sizeof(g_vsh_vdata.value[reg]));
+    g_vsh_vdata_dirty = TRUE;
+}
+
+void d3d8_vsh_get_vertex_data(int reg, float value[4])
+{
+    if (value && reg >= 0 && reg < NV2A_VS_MAX_INPUTS)
+        memcpy(value, g_vsh_vdata.value[reg], sizeof(g_vsh_vdata.value[reg]));
+}
+
 void d3d8_vsh_clear_screenspace(void)
 {
     memset(&g_vsh_screen, 0, sizeof(g_vsh_screen));
@@ -1313,8 +1397,9 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     ID3D11InputLayout *layout;
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr;
+    uint16_t fed;
 
-    if (!d3d8_vsh_is_programmable(handle))
+    if (!d3d8_vsh_is_programmable(handle) || !g_vsh_cb || !g_vsh_vdata_cb)
         return FALSE;
 
     ctx = d3d8_GetD3D11Context();
@@ -1352,10 +1437,23 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
          * nothing. */
         layout = get_cached_layout_decl(entry, vsh);
         ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+        fed = 0;
+        for (int j = 0; j < vsh->decl_count; j++)
+            if (vsh->decl[j].reg >= 0 && vsh->decl[j].reg < NV2A_VS_MAX_INPUTS)
+                fed |= (uint16_t)(1u << vsh->decl[j].reg);
     } else {
+        /* The FVF layout gives every register it reads a place in the
+         * vertex, so all count as fed, as before current values existed. */
         layout = get_cached_layout(entry, d3d8_GetCurrentFVF());
         if (layout)
             ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+        fed = 0xFFFF;
+    }
+    if (fed != g_vsh_vdata_fed) {
+        for (int r = 0; r < NV2A_VS_MAX_INPUTS; r++)
+            g_vsh_vdata.fed[r / 4][r % 4] = (fed & (1u << r)) ? 1.0f : 0.0f;
+        g_vsh_vdata_fed = fed;
+        g_vsh_vdata_dirty = TRUE;
     }
 
     /* Update constant buffer if dirty */
@@ -1384,6 +1482,20 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
             }
         }
         ID3D11DeviceContext_VSSetConstantBuffers(ctx, 2, 1, &g_vsh_screen_cb);
+    }
+
+    /* And the current input values to b3 */
+    if (g_vsh_vdata_cb) {
+        if (g_vsh_vdata_dirty) {
+            hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_vdata_cb,
+                                         0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (SUCCEEDED(hr)) {
+                memcpy(mapped.pData, &g_vsh_vdata, sizeof(g_vsh_vdata));
+                ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_vdata_cb, 0);
+                g_vsh_vdata_dirty = FALSE;
+            }
+        }
+        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 3, 1, &g_vsh_vdata_cb);
     }
 
     return TRUE;

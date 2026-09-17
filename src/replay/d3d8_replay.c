@@ -21,8 +21,14 @@
  *                    frame that is not idempotent shows itself.
  *   --hold           leave the window up until it is closed.
  *   --quiet          only errors.
+ *   --no-combiners   draw with the fixed-function pixel path whatever the
+ *                    capture's combiner token says.
+ *   --draws <n>      execute only the first n draws (state still applied;
+ *                    clears after the nth draw are skipped too).
+ *   --skip-draw <n>  leave out draw n (0-based).
+ *   --list-draws     print every draw with the state it runs under.
  *
- * A player, not an emulator. A version 2 capture holds the calls shadow mode
+ * A player, not an emulator. A capture holds the calls shadow mode
  * made on the host renderer after all of its Xbox conversion (d3d8_capture.h),
  * so this file has no Xbox knowledge at all: each chunk is one call into
  * src/d3d with the recorded arguments. The only translation is of handles --
@@ -35,8 +41,9 @@
  * D3D8 layer (src/d3d) directly and creates the device the same way
  * hle_d3d8.c's shadow_create does.
  *
- * Between loops every program and texture this tool created is deleted, so
- * each loop starts from the capture's snapshot alone. What the snapshot does
+ * Between loops every program, texture and depth surface this tool created
+ * is deleted and the back buffer is made the target again, so each loop
+ * starts from the capture's snapshot alone. What the snapshot does
  * not carry (d3d8_capture.h, "Not in the format") stays as the device left
  * it, which is the device's default because nothing here sets it either.
  */
@@ -53,8 +60,67 @@
 
 #define REPLAY_MAX_PROGRAMS 256
 #define REPLAY_STAGES       4
+#define REPLAY_MAX_DEPTHS   16   /* hle_d3d8_record.c CAPTURE_MAX_DEPTHS */
 
 static int g_quiet;
+/* --no-combiners: ignore the recorded combiner token, so the frame draws with
+ * the host's fixed-function pixel path. A capture taken with the title's pixel
+ * shaders forwarded (RECOMP_HLE_D3D8_PS=1) holds both the combiner states and
+ * the token, so one frame can be drawn both ways and compared -- which runs of
+ * the title cannot do, since no two land on the same moment. */
+static int g_no_combiners;
+/* Draw-level bisection: --draws N executes only the first N draws, --skip-draw
+ * N leaves out draw N (0-based), --list-draws prints each draw with the state
+ * it runs under. State chunks always run, so a draw left out changes nothing
+ * but its own pixels. */
+static long g_max_draws = -1;
+static long g_skip_draw = -1;
+static int  g_list_draws;
+static long g_draw_index;           /* draws seen in this loop */
+static DWORD g_cur_vs, g_cur_token;
+#define LIST_TEX_IDS 8192
+static struct { uint32_t format, width, height; } g_tex_info[LIST_TEX_IDS];
+static uint32_t g_stage_tex[2];
+
+static void tex_desc(char *buf, size_t n, uint32_t id)
+{
+    if (!id)
+        snprintf(buf, n, "-");
+    else if (id < LIST_TEX_IDS)
+        snprintf(buf, n, "%u(%ux%u f%02X)", id, g_tex_info[id].width,
+                 g_tex_info[id].height, g_tex_info[id].format);
+    else
+        snprintf(buf, n, "%u", id);
+}
+
+/* 1 if this draw should run, after listing it if asked. */
+static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t stride)
+{
+    long n = g_draw_index++;
+
+    if (g_list_draws) {
+        const DWORD *rs = d3d8_GetRenderStates();
+        char t0[48], t1[48];
+
+        tex_desc(t0, sizeof t0, g_stage_tex[0]);
+        tex_desc(t1, sizeof t1, g_stage_tex[1]);
+        fprintf(stderr, "[draw %4ld] tex %s %s\n", n, t0, t1);
+        fprintf(stderr, "[draw %4ld] %-8s prim %u x%-5u stride %2u  vs 0x%05lX  ps %lu  "
+                "blend %lu %lu>%lu  atest %lu ref %lu  z %lu/%lu  fog %lu  cull %lu%s%s\n",
+                n, kind, prim, count, stride, (unsigned long)g_cur_vs,
+                (unsigned long)(g_no_combiners ? 0 : g_cur_token),
+                (unsigned long)rs[D3DRS_ALPHABLENDENABLE], (unsigned long)rs[D3DRS_SRCBLEND],
+                (unsigned long)rs[D3DRS_DESTBLEND], (unsigned long)rs[D3DRS_ALPHATESTENABLE],
+                (unsigned long)rs[D3DRS_ALPHAREF], (unsigned long)rs[D3DRS_ZENABLE],
+                (unsigned long)rs[D3DRS_ZWRITEENABLE], (unsigned long)rs[D3DRS_FOGENABLE],
+                (unsigned long)rs[D3DRS_CULLMODE],
+                (g_max_draws >= 0 && n >= g_max_draws) ? "  (not drawn: --draws)" : "",
+                n == g_skip_draw ? "  (not drawn: --skip-draw)" : "");
+    }
+    if (g_max_draws >= 0 && n >= g_max_draws)
+        return 0;
+    return n != g_skip_draw;
+}
 
 static void note(const char *fmt, ...)
 {
@@ -182,6 +248,10 @@ typedef struct {
     struct { DWORD recorded, ours; } programs[REPLAY_MAX_PROGRAMS];
     int                 program_count;
 
+    /* Capture depth surface id - 1 -> this process's surface. */
+    IDirect3DSurface8  *depths[REPLAY_MAX_DEPTHS];
+    IDirect3DSurface8  *device_depth;      /* the device's own, not owned */
+
     unsigned long       kinds[D3D8CAP_CHUNK_KINDS];
     unsigned long       unknown, malformed, failed, unmapped;
 } Replay;
@@ -249,6 +319,11 @@ static void do_texture(Replay *r, const D3D8CapChunk *c)
     if (!levels) {
         r->malformed++;
         return;
+    }
+    if (t->id < LIST_TEX_IDS) {
+        g_tex_info[t->id].format = t->format;
+        g_tex_info[t->id].width = t->width;
+        g_tex_info[t->id].height = t->height;
     }
     for (l = 0; l < t->levels; l++) {
         if ((uint64_t)levels[l].pitch * levels[l].rows != levels[l].bytes) {
@@ -320,6 +395,70 @@ static void do_texture_release(Replay *r, const D3D8CapChunk *c)
     }
     (*slot)->lpVtbl->Release(*slot);
     *slot = NULL;
+}
+
+static void do_depth_surface(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapDepthSurface *d = c->data;
+    IDirect3DSurface8 **slot;
+
+    if (c->bytes < sizeof *d || d->id == 0 || d->id > REPLAY_MAX_DEPTHS) {
+        r->malformed++;
+        return;
+    }
+    slot = &r->depths[d->id - 1];
+    if (*slot) {
+        (*slot)->lpVtbl->Release(*slot);
+        *slot = NULL;
+    }
+    if (FAILED(r->dev->lpVtbl->CreateDepthStencilSurface(r->dev, d->width, d->height,
+                                                         (D3DFORMAT)d->format,
+                                                         D3DMULTISAMPLE_NONE, slot))) {
+        *slot = NULL;
+        r->failed++;
+    }
+}
+
+static void do_set_render_target(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapSetRenderTarget *t = c->data;
+    IDirect3DSurface8 *surface = NULL, *depth = NULL;
+    IDirect3DTexture8 **slot;
+
+    if (c->bytes < sizeof *t ||
+        (t->depth_id > REPLAY_MAX_DEPTHS && t->depth_id != D3D8CAP_DEPTH_DEVICE)) {
+        r->malformed++;
+        return;
+    }
+    if (t->depth_id == D3D8CAP_DEPTH_DEVICE) {
+        depth = r->device_depth;
+    } else if (t->depth_id) {
+        depth = r->depths[t->depth_id - 1];
+        if (!depth)
+            r->unmapped++;
+    }
+    /* A target that cannot be made here is drawn to the back buffer, as the
+     * writer records a target it cannot name. */
+    if (t->texture_id) {
+        slot = texture_slot(r, t->texture_id, 0);
+        if (!slot || !*slot)
+            r->unmapped++;
+        else if (FAILED((*slot)->lpVtbl->GetSurfaceLevel(*slot, t->level, &surface)))
+            surface = NULL;
+        if (slot && *slot && !surface)
+            r->failed++;
+        /* Depth goes with the target it was made for: the back buffer gets
+         * the device's own, as live shadow mode falls back. */
+        if (!surface && depth)
+            depth = r->device_depth;
+    }
+    if (g_list_draws)
+        fprintf(stderr, "[target after %ld draws] texture %u level %u depth %u\n",
+                g_draw_index, t->texture_id, t->level, t->depth_id);
+    if (FAILED(r->dev->lpVtbl->SetRenderTarget(r->dev, surface, depth)))
+        r->failed++;
+    if (surface)
+        surface->lpVtbl->Release(surface);
 }
 
 static int program_find(const Replay *r, DWORD recorded)
@@ -434,6 +573,7 @@ static void do_set_vertex_shader(Replay *r, const D3D8CapChunk *c)
         }
         handle = r->programs[i].ours;
     }
+    g_cur_vs = p->handle;
     r->dev->lpVtbl->SetVertexShader(r->dev, handle);
 }
 
@@ -455,6 +595,8 @@ static void do_draw_up(Replay *r, const D3D8CapChunk *c)
         r->malformed++;
         return;
     }
+    if (!draw_gate("up", d->prim_type, d->prim_count, d->stride))
+        return;
     if (FAILED(r->dev->lpVtbl->DrawPrimitiveUP(r->dev, (D3DPRIMITIVETYPE)d->prim_type,
                                                d->prim_count, verts, d->stride)))
         r->failed++;
@@ -479,6 +621,8 @@ static void do_draw_indexed_up(Replay *r, const D3D8CapChunk *c)
         r->malformed++;
         return;
     }
+    if (!draw_gate("indexed", d->prim_type, d->prim_count, d->stride))
+        return;
     if (FAILED(r->dev->lpVtbl->DrawIndexedPrimitiveUP(
             r->dev, (D3DPRIMITIVETYPE)d->prim_type, d->min_index, d->num_vertices,
             d->prim_count, idx, (D3DFORMAT)d->index_format, verts, d->stride)))
@@ -515,6 +659,14 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             out[i].x2 = rects[i].x2;
             out[i].y2 = rects[i].y2;
         }
+        /* A clear after the --draws limit would wipe the draws kept before
+         * it, so it counts as drawing. */
+        if (g_list_draws)
+            fprintf(stderr, "[clear after %ld draws] flags 0x%X color 0x%08X z %g%s\n",
+                    g_draw_index, p->flags, p->color, p->z,
+                    (g_max_draws >= 0 && g_draw_index >= g_max_draws) ? "  (skipped)" : "");
+        if (g_max_draws >= 0 && g_draw_index >= g_max_draws)
+            break;
         r->dev->lpVtbl->Clear(r->dev, p->rect_count, p->rect_count ? out : NULL,
                               p->flags, p->color, p->z, p->stencil);
         break;
@@ -577,6 +729,8 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
+        if (p->stage < 2)
+            g_stage_tex[p->stage] = p->texture_id;
         slot = texture_slot(r, p->texture_id, 0);
         if (p->texture_id && (!slot || !*slot))
             r->unmapped++;               /* its TEXTURE chunk failed: bind nothing */
@@ -636,6 +790,22 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             d3d8_vsh_clear_screenspace();
         break;
     }
+    case D3D8CAP_VS_VERTEX_DATA: {
+        const D3D8CapVsVertexData *p = c->data;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        d3d8_vsh_set_vertex_data((int)p->reg, p->value);
+        break;
+    }
+    case D3D8CAP_DEPTH_SURFACE:
+        do_depth_surface(r, c);
+        break;
+    case D3D8CAP_SET_RENDER_TARGET:
+        do_set_render_target(r, c);
+        break;
     case D3D8CAP_PS_TOKEN: {
         const D3D8CapPsToken *p = c->data;
 
@@ -643,7 +813,8 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
-        d3d8_combiners_set_pixel_shader(p->token);
+        g_cur_token = p->token;
+        d3d8_combiners_set_pixel_shader(g_no_combiners ? 0 : p->token);
         break;
     }
     default:
@@ -661,6 +832,12 @@ static void end_loop(Replay *r)
 
     for (i = 0; i < REPLAY_STAGES; i++)
         r->dev->lpVtbl->SetTexture(r->dev, i, NULL);
+    r->dev->lpVtbl->SetRenderTarget(r->dev, NULL, r->device_depth);
+    for (i = 0; i < REPLAY_MAX_DEPTHS; i++)
+        if (r->depths[i]) {
+            r->depths[i]->lpVtbl->Release(r->depths[i]);
+            r->depths[i] = NULL;
+        }
     for (i = 1; i < r->texture_slots; i++)
         if (r->textures[i]) {
             r->textures[i]->lpVtbl->Release(r->textures[i]);
@@ -693,7 +870,9 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: d3d8_replay <capture%s> [--out <prefix>] [--loops <n>]\n"
-        "                   [--dump-every] [--hold] [--quiet]\n",
+        "                   [--dump-every] [--hold] [--quiet]\n"
+        "                   [--no-combiners] [--draws <n>] [--skip-draw <n>]\n"
+        "                   [--list-draws]\n",
         D3D8CAP_EXTENSION);
 }
 
@@ -721,6 +900,14 @@ int main(int argc, char **argv)
             hold = 1;
         else if (!strcmp(argv[i], "--quiet"))
             g_quiet = 1;
+        else if (!strcmp(argv[i], "--no-combiners"))
+            g_no_combiners = 1;
+        else if (!strcmp(argv[i], "--draws") && i + 1 < argc)
+            g_max_draws = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--skip-draw") && i + 1 < argc)
+            g_skip_draw = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--list-draws"))
+            g_list_draws = 1;
         else if (argv[i][0] == '-') {
             usage();
             return 2;
@@ -771,6 +958,9 @@ int main(int argc, char **argv)
         return 1;
     }
     xbox_D3D8SetPresentInterval(0);      /* never wait for vblank: this is a tool */
+    if (SUCCEEDED(r.dev->lpVtbl->GetDepthStencilSurface(r.dev, &r.device_depth)) &&
+        r.device_depth)
+        r.device_depth->lpVtbl->Release(r.device_depth);   /* the device keeps it */
 
     for (loop = 0; loop < loops; loop++) {
         D3D8CapChunk c;
@@ -778,6 +968,7 @@ int main(int argc, char **argv)
         memset(r.kinds, 0, sizeof r.kinds);
         r.unknown = r.malformed = r.failed = r.unmapped = 0;
         d3d8cap_rewind(cap);
+        g_draw_index = 0;
         while (d3d8cap_next(cap, &c))
             replay_chunk(&r, &c);
         if (!r.kinds[D3D8CAP_FRAME_START])
