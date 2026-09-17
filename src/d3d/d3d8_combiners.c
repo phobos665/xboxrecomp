@@ -426,13 +426,23 @@ static void emit_mapped_input(char *buf, int bufsize, int *off,
         snprintf(base_expr, sizeof(base_expr), "%s", rn);
     }
 
-    /* Determine swizzle based on alpha replicate and target channel */
+    /* Determine swizzle based on alpha replicate and target channel.
+     *
+     * The bit selects the channel, and what "not alpha" means depends on the
+     * portion: in the RGB portion it is rgb, in the ALPHA portion it is the
+     * register's BLUE component, not its alpha (NV_register_combiners, and
+     * Cxbx-Reloaded XbPixelShader.cpp, which emits .b there). Reading alpha
+     * for those inputs collapsed Burnout 2's alpha chains to zero, so its
+     * car, HUD and fade -- every blended draw -- disappeared with the
+     * combiners on. */
     if (input->alpha_rep) {
-        /* Alpha replicate: use .aaaa for RGB, .a for alpha */
+        /* Alpha replicate: use .aaa for RGB, .a for alpha */
         if (strcmp(suffix, ".a") == 0)
             snprintf(swizzle, sizeof(swizzle), ".a");
         else
             snprintf(swizzle, sizeof(swizzle), ".aaa");
+    } else if (strcmp(suffix, ".a") == 0) {
+        snprintf(swizzle, sizeof(swizzle), ".b");
     } else {
         snprintf(swizzle, sizeof(swizzle), "%s", suffix);
     }
@@ -854,6 +864,20 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                 EMIT("    result.a = 1.0;\n");
                 break;
             }
+        }
+        if (show && n < sizeof names / sizeof names[0]) {
+            /* nothing: one of the register views above matched */
+        } else if (show && strlen(show) == 3 && show[2] == 'a') {
+            /* r0a, v0a, t0a ...: that register's alpha as grey, which is
+             * what a blended draw is multiplied by. */
+            char reg[3] = { show[0], show[1], 0 };
+
+            for (n = 0; n < sizeof names / sizeof names[0]; n++)
+                if (strcmp(reg, names[n]) == 0) {
+                    EMIT("    result.rgb = r_%s.aaa;\n", names[n]);
+                    EMIT("    result.a = 1.0;\n");
+                    break;
+                }
         }
         if (show && strcmp(show, "foga") == 0) {     /* the fog factor */
             EMIT("    result.rgb = r_fog.aaa;\n");
