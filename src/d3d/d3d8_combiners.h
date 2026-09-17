@@ -73,9 +73,12 @@ typedef enum NV2ACombinerRegister {
     NV2A_REG_T3         = 11,  /* Texture 3 sample result */
     NV2A_REG_R0         = 12,  /* Temporary register 0 (also SPARE0) */
     NV2A_REG_R1         = 13,  /* Temporary register 1 (also SPARE1) */
-    /* Final combiner only: */
-    NV2A_REG_EF_PROD    = 14,  /* E*F product (final combiner) */
-    NV2A_REG_V1R0_SUM   = 15,  /* V1+R0 sum (final combiner) */
+    /* Final combiner only. The order is the Xbox's: PS_REGISTER_V1R0_SUM is
+     * 0x0E and PS_REGISTER_EF_PROD is 0x0F (Cxbx-Reloaded, XbPixelShader.h).
+     * These two were the other way round here, so a final combiner asking for
+     * one got the other -- the rest of the register numbering is correct. */
+    NV2A_REG_V1R0_SUM   = 14,  /* V1+R0 sum (final combiner) */
+    NV2A_REG_EF_PROD    = 15,  /* E*F product (final combiner) */
     NV2A_REG_COUNT       = 16,
 } NV2ACombinerRegister;
 
@@ -119,14 +122,23 @@ typedef enum NV2AInputMapping {
  * Applied to the stage output (AB+CD or AB.CD) before writing
  * to the destination register.
  */
+/* The Xbox constants are these times eight -- IDENTITY 0x00, BIAS 0x08,
+ * SHIFTLEFT_1 0x10, SHIFTLEFT_1_BIAS 0x18, SHIFTLEFT_2 0x20,
+ * SHIFTLEFT_2_BIAS 0x28, SHIFTRIGHT_1 0x30, SHIFTRIGHT_1_BIAS 0x38
+ * (Cxbx-Reloaded, XbPixelShader.h) -- and they sit in bits 15-17 of the
+ * output DWORD. The two _BIAS forms at 5 and 7 were missing here, which put
+ * SHIFTRIGHT_1 at 5: a stage asking to halve its result was multiplied by
+ * four instead. */
 typedef enum NV2AOutputMapping {
     NV2A_OUT_IDENTITY           = 0,  /* x */
     NV2A_OUT_BIAS               = 1,  /* x - 0.5 */
     NV2A_OUT_SHIFTLEFT_1        = 2,  /* x * 2 */
     NV2A_OUT_SHIFTLEFT_1_BIAS   = 3,  /* (x - 0.5) * 2 */
     NV2A_OUT_SHIFTLEFT_2        = 4,  /* x * 4 */
-    NV2A_OUT_SHIFTRIGHT_1       = 5,  /* x / 2 */
-    NV2A_OUT_COUNT              = 6,
+    NV2A_OUT_SHIFTLEFT_2_BIAS   = 5,  /* (x - 0.5) * 4 */
+    NV2A_OUT_SHIFTRIGHT_1       = 6,  /* x / 2 */
+    NV2A_OUT_SHIFTRIGHT_1_BIAS  = 7,  /* (x - 0.5) / 2 */
+    NV2A_OUT_COUNT              = 8,
 } NV2AOutputMapping;
 
 /**
@@ -346,6 +358,12 @@ void d3d8_combiners_mark_dirty(void);
  * Pass 0 to disable combiner shaders and revert to fixed-function.
  */
 void d3d8_combiners_set_pixel_shader(DWORD token);
+
+/**
+ * The token last passed to d3d8_combiners_set_pixel_shader (0 if none), for
+ * frame capture's opening snapshot (src/hle/hle_d3d8_record.c).
+ */
+DWORD d3d8_combiners_get_pixel_shader(void);
 
 /**
  * Get whether a combiner pixel shader is currently active.

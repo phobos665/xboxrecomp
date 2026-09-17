@@ -34,11 +34,15 @@
  * below are Cxbx-Reloaded's EmuXB2PC_* conversions (XbConvert.h). A value
  * with no host equivalent is replaced by the nearest one and logged once.
  *
+ * Pixel shader states (0-56, and PSTextureModes at 136) are forwarded to the
+ * host's register combiners; RECOMP_HLE_D3D8_PS=0 turns that off and leaves
+ * the host on its fixed-function pixel path. The setup comes from the shader
+ * object D3DDevice_SetPixelShader selects, not from the render states.
+ *
  * Forwarded but not yet used by the host: SHADEMODE, DITHERENABLE,
  * COLORVERTEX, NORMALIZENORMALS, RESULTARG, BUMPENVMAT*, MIPMAPLODBIAS,
  * MAXMIPLEVEL, BORDERCOLOR. Not forwarded: LIGHTING (lights and material are
- * not forwarded, so it stays off), pixel shader states (0-56; pixel shaders
- * are not replayed yet), WRAP0-3, VERTEXBLEND, LOCALVIEWER, ZBIAS,
+ * not forwarded, so it stays off), WRAP0-3, VERTEXBLEND, LOCALVIEWER, ZBIAS,
  * EDGEANTIALIAS, BLENDCOLOR, the back-face material and two-sided lighting
  * states, point sprite, material source and multisample states, and the
  * texture stage states ADDRESSW, TEXTURETRANSFORMFLAGS, BUMPENVLSCALE/LOFFSET,
@@ -47,6 +51,7 @@
  */
 #include "platform/xbox_winnt.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "hle.h"
 
@@ -57,6 +62,7 @@ HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 
 #ifdef _WIN32
 #include "d3d8_xbox.h"
+#include "hle_d3d8_record.h"
 
 #define XRS_COUNT        167         /* X_D3DRS_DONOTCULLUNCOMPRESSED + 1 */
 #define XRS_REMOVED      154         /* X_D3DRS_MULTISAMPLETYPE */
@@ -390,25 +396,335 @@ static DWORD ts_to_host(uint8_t kind, uint32_t v)
     return v;
 }
 
+/* ------------------------------------------------ pixel shader (combiners) */
+
+/* The Xbox's pixel shader is not a program handed to D3D: the XDK writes the
+ * NV2A register combiner setup into the first 57 render states, and the
+ * texture modes into the first complex one (Cxbx-Reloaded, XbD3D8Types.h,
+ * X_D3DRS_PS*; XbSymbolDatabase puts D3DRS_PSTextureModes at the start of
+ * D3D_g_ComplexRenderState). The host renderer already turns exactly these
+ * into an HLSL pixel shader (d3d8_combiners.c), under its own numbering from
+ * 200, as soon as a non-zero token is set.
+ *
+ * Until they are forwarded every draw is coloured by the texture stage states
+ * instead, which modulate by a diffuse colour the title's own pixel shader
+ * ignores -- so geometry whose vertex program leaves oD0 at zero draws black,
+ * which is what Burnout 2's road does.
+ *
+ * The two numberings run in different orders, hence the groups. Xbox
+ * PSCOMPAREMODE (42) and PSFINALCOMBINERCONSTANT0/1 (43, 44) have no host
+ * state and are not forwarded. */
+static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = {
+    {  0, 200, 8 },      /* PSALPHAINPUTS0-7                   */
+    {  8, 208, 2 },      /* PSFINALCOMBINERINPUTSABCD, ...EFG  */
+    { 10, 235, 8 },      /* PSCONSTANT0_0-7                    */
+    { 18, 243, 8 },      /* PSCONSTANT1_0-7                    */
+    { 26, 226, 8 },      /* PSALPHAOUTPUTS0-7                  */
+    { 34, 210, 8 },      /* PSRGBINPUTS0-7                     */
+    { 45, 218, 8 },      /* PSRGBOUTPUTS0-7                    */
+    { 53, 234, 1 },      /* PSCOMBINERCOUNT                    */
+    { 55, 252, 2 },      /* PSDOTMAPPING, PSINPUTTEXTURE       */
+};
+
+/* PSTextureModes holds one mode per texture stage, 5 bits each over 4 stages
+ * (Cxbx-Reloaded, XbPixelShader.cpp: (PSTextureModes >> (i * 5)) & 0x1F,
+ * checked against ~0x000FFFFF). The values are the NV2A's, 0x00 to 0x12
+ * (xboxdevwiki, NV2A/Pixel Combiner).
+ *
+ * The host does not model the NV2A's addressing modes. It keeps only which
+ * kind of texture a stage samples -- 0 2D, 1 volume, 2 cube, 3 none
+ * (d3d8_combiners.h, NV2ATextureMode) -- packed 4 bits per stage in its own
+ * PSTEXTUREMODES. So each mode is reduced to the kind it samples, and the
+ * addressing itself (bump mapping, dot product and dependent reads) is not
+ * reproduced yet; anything past the four plain modes is logged once. */
+static uint32_t host_texture_modes(uint32_t xbox_modes)
+{
+    static const uint8_t kind[0x13] = {
+        3, 0, 1, 2,      /* NONE, PROJECT2D, PROJECT3D, CUBEMAP            */
+        0, 0, 0, 0,      /* PASSTHRU, CLIPPLANE, BUMPENVMAP, ..._LUM       */
+        1, 0, 0, 2,      /* BRDF, DOT_ST, DOT_ZW, DOT_RFLCT_DIFF           */
+        2, 1, 2, 0,      /* DOT_RFLCT_SPEC, DOT_STR_3D, DOT_STR_CUBE, DPNDNT_AR */
+        0, 0, 2          /* DPNDNT_GB, DOTPRODUCT, DOT_RFLCT_SPEC_CONST    */
+    };
+    uint32_t host = 0, i;
+
+    for (i = 0; i < 4u; i++) {
+        uint32_t mode = (xbox_modes >> (i * 5u)) & 0x1Fu;
+
+        if (mode > 0x04u)
+            unmapped("PS texture mode", mode);
+        host |= (uint32_t)(mode < 0x13u ? kind[mode] : 3u) << (i * 4u);
+    }
+    return host;
+}
+
+/* The pixel shader the title selected, as a D3DPIXELSHADERDEF.
+ *
+ * D3DDevice_SetPixelShader takes a handle to a shader object that carries the
+ * definition at +0x0C (measured on Burnout 2, XDK 4627: the object's third
+ * DWORD is a pointer to that address, and the fields below land on values a
+ * frame capture independently shows -- PSCombinerCount 0x00011104,
+ * PSTextureModes 0x00000001, final inputs 0x130C0300 / 0x00001C80).
+ *
+ * This matters because the deferred render states do NOT follow it. In one
+ * captured race frame the car, the HUD, the text and the fade quad all read
+ * back the same combiner state, which no title would write: the states hold
+ * whichever shader last went through them, while the draws use whatever
+ * SetPixelShader selected. Structure therefore comes from the definition.
+ * The constants stay with the render states, which is where the title's own
+ * SetPixelShaderConstant calls land at run time.
+ *
+ * The field order is the Xbox render state order, which is why one offset
+ * table serves both paths. */
+#define PSDEF_SELF_PTR    0x08
+#define PSDEF_AT_HANDLE   0x0C
+#define PSDEF_MODES       0xD8
+
+static uint32_t g_ps_def;            /* guest VA of the definition, 0 = none */
+static uint32_t g_ps_handle;         /* the object it came out of */
+static int      g_ps_def_seen, g_ps_dirty;
+/* Set once a shader object has been read successfully. From then on
+ * SetPixelShader is the authority: handle 0 means no pixel shader, and the
+ * host goes back to fixed function whatever the render states still hold.
+ * Until then nothing here is trusted, because a title whose objects are laid
+ * out differently would otherwise have every draw quietly demoted. */
+static int      g_ps_def_ok;
+
+/* A guest heap pointer, roughly: inside the console's RAM, aligned, not a
+ * small integer. HLE_MEM32 has no mapped-page check, so a handle that is a
+ * token rather than a pointer would fault on the read below. */
+static int plausible_va(uint32_t va)
+{
+    return va >= 0x10000u && va < 0x08000000u && (va & 3u) == 0u;
+}
+
+void hle_d3d8_pixel_shader_selected(uint32_t handle)
+{
+    uint32_t def = 0;
+
+    /* The object carries a pointer to its own definition just in front of it
+     * (+0x08). Without that, this is a layout this code has not seen: say so
+     * once, and leave the combiners alone rather than guessing. */
+    if (handle) {
+        if (!plausible_va(handle) ||
+            HLE_MEM32(handle + PSDEF_SELF_PTR) != handle + PSDEF_AT_HANDLE) {
+            static int warned;
+
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[HLE-D3D8] shadow pixel shader: SetPixelShader(0x%08X) "
+                        "is not a shader object with a definition at +0x%02X; pixel "
+                        "shaders are left off (RECOMP_HLE_D3D8_PS=1 forwards the "
+                        "render states instead)\n", handle, PSDEF_AT_HANDLE);
+            }
+            return;
+        }
+        def = handle + PSDEF_AT_HANDLE;
+    }
+    if (def && !g_ps_def_seen) {
+        g_ps_def_seen = 1;
+        fprintf(stderr, "[HLE-D3D8] shadow pixel shader: definitions read from the "
+                "shader object (+0x%02X); count 0x%08X, texture modes 0x%08X\n",
+                PSDEF_AT_HANDLE, HLE_MEM32(def + 0xD4), HLE_MEM32(def + PSDEF_MODES));
+    }
+    g_ps_handle = handle;
+    g_ps_def = def;
+    g_ps_def_ok = 1;
+    g_ps_dirty = 1;                  /* re-forward this shader's own states */
+}
+
+/* One Xbox pixel shader state, from the selected definition where it carries
+ * it. Constants (10-25) always come from the render states. */
+static uint32_t ps_state(uint32_t xbox)
+{
+    uint32_t off;
+
+    if (!g_ps_def || (xbox >= 10 && xbox <= 25))
+        return guest_rs(xbox);
+    if (xbox <= 7)        off = 0x00 + 4 * xbox;
+    else if (xbox <= 9)   off = 0x20 + 4 * (xbox - 8);
+    else if (xbox <= 33)  off = 0x68 + 4 * (xbox - 26);
+    else if (xbox <= 41)  off = 0x88 + 4 * (xbox - 34);
+    else if (xbox <= 44)  off = 0xA8 + 4 * (xbox - 42);
+    else if (xbox <= 52)  off = 0xB4 + 4 * (xbox - 45);
+    else if (xbox == 53)  off = 0xD4;
+    else if (xbox == 54)  off = PSDEF_MODES;      /* PSTextureModes */
+    else if (xbox == 55)  off = 0xDC;
+    else if (xbox == 56)  off = 0xE0;
+    else                  return guest_rs(xbox);
+    return HLE_MEM32(g_ps_def + off);
+}
+
+/* How many draws run the title's combiners, and how many go to the host's
+ * fixed-function pixel path instead -- either because the title has no pixel
+ * shader selected, or because its combiner count is zero. */
+static void ps_count_draw(uint32_t token)
+{
+    static unsigned long with, without;
+    static DWORD last;
+    DWORD now;
+
+    if (token)
+        with++;
+    else
+        without++;
+    now = GetTickCount();
+    if (!last) {
+        last = now;
+    } else if (now - last >= 5000) {
+        fprintf(stderr, "[HLE-D3D8] shadow pixel shader: %lu draws with a "
+                "combiner, %lu without\n", with, without);
+        fflush(stderr);
+        last = now;
+    }
+}
+
+/* Slots 0-56 and the complex slot 136 are outside g_rs_map, so they share
+ * g_prev_rs with it without colliding -- g_prev_rs holds what was last sent
+ * to the host, whichever source the value came from. */
+static void forward_pixel_shader(IDirect3DDevice8 *dev)
+{
+    /* On by default; RECOMP_HLE_D3D8_PS=0 keeps the host's fixed-function
+     * pixel path instead.
+     *
+     * This was opt-in while the combiner path lost content: Burnout 2's car,
+     * HUD and text drew nothing with it on. Both causes are fixed -- an alpha
+     * input without the alpha bit reads blue (d3d8_combiners.c), and the
+     * combiner setup comes from the shader object rather than the render
+     * states (above) -- and the two paths now agree on a replayed race frame.
+     * With it on, the title's own shaders draw its logos, title screen,
+     * loading screens, pause menu, HUD text and race. */
+    static int setting = -1;
+    uint32_t modes, count, token;
+    size_t g;
+    int i;
+
+    if (setting < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_PS");
+        setting = v ? v[0] : 0;
+    }
+    if (setting == '0')
+        return;
+    /* Without a shader object this code understands, the only source left is
+     * the render state array -- and that array does not follow what the title
+     * draws with, so it is opt-in (RECOMP_HLE_D3D8_PS=1) rather than the
+     * default. */
+    if (!g_ps_def_ok && setting != '1')
+        return;
+
+    /* The object can be deleted while selected (DeletePixelShader is not
+     * replaced), and the guest allocator may hand the block to something
+     * else. Re-check it rather than compiling a shader out of whatever is
+     * there now. */
+    if (g_ps_def && HLE_MEM32(g_ps_handle + PSDEF_SELF_PTR) != g_ps_def) {
+        static int warned;
+
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[HLE-D3D8] shadow pixel shader: the selected shader "
+                    "object 0x%08X no longer holds its definition; drawing fixed "
+                    "function until the title selects another\n", g_ps_handle);
+        }
+        g_ps_def = 0;
+    }
+
+    if (g_ps_def_ok && !g_ps_def) {
+        /* The title turned its pixel shader off. */
+        host_combiners_set_pixel_shader(0);
+        ps_count_draw(0);
+        return;
+    }
+    modes = ps_state(54);                         /* PSTextureModes      */
+    count = ps_state(53);                         /* PSCOMBINERCOUNT     */
+
+    if (g_ps_def) {
+        /* Structure comes from the definition, constants from the render
+         * states, where SetPixelShaderConstant is assumed to land. Say so
+         * once if the definition's own first constant disagrees: that is the
+         * signal the assumption is wrong. */
+        static int checked;
+
+        if (!checked && HLE_MEM32(g_ps_def + 0x28) != guest_rs(10)) {
+            checked = 1;
+            fprintf(stderr, "[HLE-D3D8] shadow pixel shader: the definition's C0 "
+                    "(0x%08X) and the render state's (0x%08X) differ; constants are "
+                    "taken from the render states\n",
+                    HLE_MEM32(g_ps_def + 0x28), guest_rs(10));
+        }
+    }
+
+    for (g = 0; g < sizeof g_ps_map / sizeof g_ps_map[0]; g++) {
+        for (i = 0; i < (int)g_ps_map[g].count; i++) {
+            uint32_t x = (uint32_t)g_ps_map[g].xbox + (uint32_t)i;
+            uint32_t v = ps_state(x);
+
+            if (g_prev_valid && !g_ps_dirty && g_prev_rs[x] == v)
+                continue;
+            g_prev_rs[x] = v;
+            host_SetRenderState(dev, (D3DRENDERSTATETYPE)(g_ps_map[g].host + i), v);
+        }
+    }
+    if (!g_prev_valid || g_ps_dirty || g_prev_rs[XRS_COMPLEX] != modes) {
+        g_prev_rs[XRS_COMPLEX] = modes;
+        host_SetRenderState(dev, (D3DRENDERSTATETYPE)D3DRS_PSTEXTUREMODES,
+                            host_texture_modes(modes));
+    }
+
+    /* The token's low four bits are the combiner count; its texture mode bits
+     * stay clear so the host reads the state set above instead
+     * (d3d8_combiners.c, parse_token then from_render_states). A token of 0
+     * leaves the host on its fixed-function path, which is what a title with
+     * no pixel shader configured should get.
+     *
+     * Only a real combiner count turns the combiners on. An earlier version
+     * also made a token up whenever the texture modes were non-zero, which
+     * switched the combiner path on over a combiner state of all zeros: with
+     * no stage sampling anything, every model came out a flat white
+     * silhouette. */
+    token = count & 0xFu;
+    g_ps_dirty = 0;
+    host_combiners_set_pixel_shader(token);
+
+    ps_count_draw(token);
+
+    {
+        /* Each distinct setup, not just the first: the first draw of a run is
+         * the boot screen, whose combiners say nothing about what a race
+         * uses. */
+        static uint32_t last_count = 0xFFFFFFFFu, last_modes = 0xFFFFFFFFu;
+        static int lines;
+
+        if (lines < 12 && (count != last_count || modes != last_modes)) {
+            last_count = count;
+            last_modes = modes;
+            lines++;
+            fprintf(stderr, "[HLE-D3D8] shadow pixel shader: combiner count 0x%X, "
+                    "texture modes 0x%05X -> host 0x%04X, stage 0 rgb inputs "
+                    "0x%08X outputs 0x%08X, final ABCD 0x%08X EFG 0x%08X\n",
+                    count, modes, host_texture_modes(modes), ps_state(34),
+                    ps_state(45), ps_state(8), ps_state(9));
+        }
+    }
+}
+
 void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
 {
-    const IDirect3DDevice8Vtbl *vt;
     size_t i;
     int s;
 
     if (!dev || !state_ready())
         return;
-    vt = dev->lpVtbl;
 
     for (i = 0; i < sizeof g_rs_map / sizeof g_rs_map[0]; i++) {
         uint32_t x = g_rs_map[i].xbox;
         uint32_t v = guest_rs(x);
+        DWORD host_value;
 
         if (g_prev_valid && g_prev_rs[x] == v)
             continue;
         g_prev_rs[x] = v;
-        vt->SetRenderState(dev, (D3DRENDERSTATETYPE)g_rs_map[i].host,
-                           rs_to_host(g_rs_map[i].kind, v));
+        host_value = rs_to_host(g_rs_map[i].kind, v);
+        host_SetRenderState(dev, (D3DRENDERSTATETYPE)g_rs_map[i].host, host_value);
     }
 
     for (s = 0; s < STAGES; s++) {
@@ -417,17 +733,20 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
         for (i = 0; i < sizeof g_ts_map / sizeof g_ts_map[0]; i++) {
             uint32_t x = g_ts_map[i].xbox;
             uint32_t v = HLE_MEM32(base + 4 * x);
+            DWORD host_value;
 
             /* The host's SetTexture rewrites COLOROP whenever a texture is
              * bound or unbound, so the operations are set on every draw. */
             if (g_prev_valid && g_prev_tss[s][x] == v && g_ts_map[i].kind != TS_OP)
                 continue;
             g_prev_tss[s][x] = v;
-            vt->SetTextureStageState(dev, (DWORD)s,
-                                     (D3DTEXTURESTAGESTATETYPE)g_ts_map[i].host,
-                                     ts_to_host(g_ts_map[i].kind, v));
+            host_value = ts_to_host(g_ts_map[i].kind, v);
+            host_SetTextureStageState(dev, (DWORD)s,
+                                      (D3DTEXTURESTAGESTATETYPE)g_ts_map[i].host,
+                                      host_value);
         }
     }
+    forward_pixel_shader(dev);
     g_prev_valid = 1;
 }
 #endif /* _WIN32 */

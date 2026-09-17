@@ -55,10 +55,26 @@ extern "C" {
  * The microcode is stored as raw DWORDs; parsing and compilation
  * are deferred until the shader is first used in a draw call.
  */
+/**
+ * One vertex register a program reads, laid out as the title's vertex
+ * declaration says: the DXGI format of the bytes stored in the vertex and
+ * their offset from the start of a stream 0 vertex.
+ */
+typedef struct D3D8VshInput {
+    int         reg;        /* v0..v15 */
+    DXGI_FORMAT format;
+    UINT        offset;
+} D3D8VshInput;
+
 typedef struct NV2AVshSlot {
     DWORD   microcode[NV2A_VS_MAX_INSTRUCTIONS * 4]; /* Raw 128-bit instructions */
     int     length;         /* Number of instructions */
     int     in_use;         /* 1 if this slot is allocated */
+    /* The vertex declaration, when one was given (d3d8_vsh_set_declaration).
+     * Without it the input layout is guessed from the registers read. */
+    D3D8VshInput decl[NV2A_VS_MAX_INPUTS];
+    int          decl_count;
+    uint32_t     decl_hash;
 } NV2AVshSlot;
 
 /* ================================================================
@@ -123,12 +139,82 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
 
 /**
+ * The whole constant bank, as NV2A_VS_MAX_CONSTANTS float4 registers laid out
+ * back to back (NV2AVSConstants).
+ *
+ * Constants arrive a few registers at a time and are never read back by the
+ * renderer, so nothing needed this until frame capture: a capture has to be
+ * self-contained, and the frame it records draws with constants set before it
+ * began (src/hle/hle_d3d8_record.c). Read-only; the pointer stays valid for
+ * the life of the process.
+ */
+const float *d3d8_vsh_constants(void);
+
+/**
  * Check if a shader handle refers to a programmable vertex shader
  * (as opposed to an FVF code).
  *
  * On Xbox, handles > 0xFFFF are shader handles.
  */
 BOOL d3d8_vsh_is_programmable(DWORD handle);
+
+/**
+ * Give a program the vertex layout its declaration describes. Registers the
+ * program reads are bound at these formats and offsets instead of being
+ * packed one after another at default formats.
+ *
+ * @param handle  The shader handle from d3d8_vsh_create_shader
+ * @param inputs  One entry per declared register (stream 0)
+ * @param count   Number of entries, at most NV2A_VS_MAX_INPUTS; 0 clears it
+ */
+HRESULT d3d8_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count);
+
+/**
+ * Xbox vertex programs write oPos in render-target pixels. With a scale and
+ * offset set, every program undoes that before the rasteriser:
+ *   oPos = (oPos - offset) / scale;  if (w == 0) w = 1;  xyz *= w
+ * (Cxbx-Reloaded, CxbxVertexShaderTemplate.hlsl). Until this is called the
+ * programs leave oPos as they wrote it.
+ *
+ * @param scale   (width / 2, -height / 2, depth-buffer Z scale, 1)
+ * @param offset  (width / 2, height / 2, 0, 0)
+ */
+void d3d8_vsh_set_screenspace(const float scale[4], const float offset[4]);
+
+/**
+ * What d3d8_vsh_set_screenspace last set, and whether it is on. Frame capture
+ * (src/hle/hle_d3d8_record.c) reads it into a capture's opening snapshot.
+ */
+void d3d8_vsh_get_screenspace(float scale[4], float offset[4], int *enabled);
+
+/**
+ * Turn the screen-space undo off again, as it is before the first
+ * d3d8_vsh_set_screenspace. Nothing in a live run needs this; the replay tool
+ * does, to put a capture that begins with it off back into that state on
+ * every loop.
+ */
+void d3d8_vsh_clear_screenspace(void);
+
+/**
+ * The current value of input register reg (0-15): what a program reads from
+ * a register its declaration does not feed, as the NV2A does with the value
+ * the SetVertexData* calls last set (src/hle forwards SetVertexDataColor and
+ * SetVertexData2f; the other variants are not yet). Starts at (1,1,1,1) for v3, the
+ * diffuse colour, and (0,0,0,1) for the rest. The getter is for frame
+ * capture's snapshot.
+ */
+void d3d8_vsh_set_vertex_data(int reg, const float value[4]);
+void d3d8_vsh_get_vertex_data(int reg, float value[4]);
+
+/**
+ * One stored program, by slot index (0 .. NV2A_VS_MAX_SLOTS-1): its handle,
+ * microcode (length instructions of 4 DWORDs) and declaration. FALSE for a
+ * free slot. The pointers stay valid until the slot is deleted. For frame
+ * capture, which has to carry every program a frame may select, including
+ * those created long before it.
+ */
+BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
+                       int *length, const D3D8VshInput **decl, int *decl_count);
 
 /**
  * Prepare for a draw call using a programmable vertex shader.

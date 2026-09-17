@@ -38,6 +38,7 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
+#include "hle_d3d8_record.h"
 
 /* From hle_d3d8.c: the shadow device, or NULL, and its swap count. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
@@ -57,11 +58,18 @@ typedef struct {
     IDirect3DTexture8 *host;
     uint32_t           checksum;
     unsigned long      checked_swap, used_swap;
+    /* The title renders into this texture (hle_d3d8_render_texture): the
+     * host texture is a render target, and what shadow mode drew into it is
+     * the content -- the guest's bytes are not, since nothing on the guest
+     * side draws them, so it is never re-uploaded. */
+    int                rendered;
 } texture_entry;
 
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
+
+static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev);
 
 static unsigned long g_bound_count, g_uploads, g_reuploads, g_skip_type,
                      g_skip_cube, g_skip_format, g_skip_range, g_skip_create;
@@ -168,7 +176,7 @@ static void upload(IDirect3DTexture8 *host, const texture_layout *t)
         uint32_t rows = level_rows(t->fmt, h);
         D3DLOCKED_RECT lr;
 
-        if (FAILED(host->lpVtbl->LockRect(host, l, &lr, NULL, 0)))
+        if (FAILED(host_LockRect(host, l, &lr, NULL, 0)))
             return;
         if (t->linear) {             /* guest rows are padded to 64 bytes */
             for (y = 0; y < rows; y++)
@@ -178,7 +186,7 @@ static void upload(IDirect3DTexture8 *host, const texture_layout *t)
             memcpy(lr.pBits, src, (size_t)pitch * rows);
             src += (size_t)pitch * rows;
         }
-        host->lpVtbl->UnlockRect(host, l);
+        host_UnlockRect(host, l);
     }
 }
 
@@ -220,7 +228,7 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
         return NULL;
     (void)dev;
     if (victim->host)
-        victim->host->lpVtbl->Release(victim->host);
+        host_ReleaseTexture(victim->host);
     memset(victim, 0, sizeof *victim);
     return victim;
 }
@@ -242,7 +250,7 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     }
     if (e) {
         e->used_swap = now;
-        if (e->checked_swap != now) {
+        if (!e->rendered && e->checked_swap != now) {
             e->checked_swap = now;
             if (read_layout(va, &t)) {
                 uint32_t sum = level0_checksum(&t);
@@ -262,8 +270,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e = cache_slot(dev, now);
     if (!e)
         return NULL;
-    if (FAILED(dev->lpVtbl->CreateTexture(dev, t.width, t.height, t.levels, 0,
-                                          (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &e->host)) ||
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, 0,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &e->host)) ||
         !e->host) {
         memset(e, 0, sizeof *e);
         g_skip_create++;
@@ -280,6 +288,68 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     return e->host;
 }
 
+/* The host render target for a 2D guest texture the title renders into, for
+ * hle_d3d8.c's SetRenderTarget. The same cache entry SetTexture finds, so a
+ * texture drawn into and then bound samples what was drawn. A texture already
+ * cached as an ordinary one is recreated as a render target. NULL (counted)
+ * if the texture is not one this file can mirror. */
+IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    texture_entry *e = NULL;
+    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->va == va && c->data == data && c->format == format && c->size == size) {
+            e = c;
+            break;
+        }
+    }
+    if (e && e->rendered) {
+        e->used_swap = now;
+        return e->host;
+    }
+    if (!read_layout(va, &t))
+        return NULL;
+    if (!e) {
+        e = cache_slot(dev, now);
+        if (!e)
+            return NULL;
+    } else {
+        int s;
+        /* The host device keeps a plain pointer to each bound texture, so a
+         * stage holding this one is moved off it before it is released. It
+         * gets white, as an unmirrored texture does, until the title binds
+         * again. */
+        for (s = 0; s < MAX_STAGES; s++)
+            if (g_bound[s] == e->host) {
+                g_bound[s] = NULL;
+                host_SetTexture(dev, (DWORD)s, (IDirect3DBaseTexture8 *)white_texture(dev));
+            }
+        host_ReleaseTexture(e->host);
+        memset(e, 0, sizeof *e);
+    }
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, D3DUSAGE_RENDERTARGET,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT, &e->host)) ||
+        !e->host) {
+        memset(e, 0, sizeof *e);
+        g_skip_create++;
+        return NULL;
+    }
+    e->va = va;
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->rendered = 1;
+    e->checked_swap = e->used_swap = now;
+    fprintf(stderr, "[HLE-D3D8] shadow render target texture 0x%08X: format 0x%02X "
+            "%ux%u, %u level(s)\n", va, t.fmt, t.width, t.height, t.levels);
+    return e->host;
+}
+
 /* 1x1 opaque white, created once, never evicted. */
 static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev)
 {
@@ -290,14 +360,14 @@ static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev)
     if (white || tried)
         return white;
     tried = 1;
-    if (FAILED(dev->lpVtbl->CreateTexture(dev, 1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8,
-                                          D3DPOOL_MANAGED, &white)) || !white) {
+    if (FAILED(host_CreateTexture(dev, 1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8,
+                                  D3DPOOL_MANAGED, &white)) || !white) {
         white = NULL;
         return NULL;
     }
-    if (SUCCEEDED(white->lpVtbl->LockRect(white, 0, &lr, NULL, 0))) {
+    if (SUCCEEDED(host_LockRect(white, 0, &lr, NULL, 0))) {
         memset(lr.pBits, 0xFF, 4);
-        white->lpVtbl->UnlockRect(white, 0);
+        host_UnlockRect(white, 0);
     }
     return white;
 }
@@ -356,8 +426,8 @@ HLE_EXPORT(D3DDevice_SetTexture)
          * title's own texture operations are forwarded. It gets opaque white
          * instead. That a missing Xbox texture contributes white is assumed,
          * not verified against hardware. */
-        dev->lpVtbl->SetTexture(dev, stage,
-                                (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
+        host_SetTexture(dev, stage,
+                        (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
         g_bound_count++;
         report();
     }

@@ -52,19 +52,35 @@ handles cube and volume textures, and bakes P8 through the stage palette;
 is the renderer. The generalisation blocker is not the texture layer.
 
 **The real blocker was that `src/hle` could not see `src/d3d`.** It can now (Sep 2026):
-`xbox_hle` links `xbox_d3d8` on Windows, and `hle_d3d8.c` replaces `CreateDevice`, `Clear`
-and `Swap` by name. Each runs the title's own body first (`HLE_ORIGINAL`), and with
-`RECOMP_HLE_D3D8=shadow` repeats the call on a host device in a second window. Nothing is
-drawn there yet; drawing through it, and a path for titles that fill push buffers through
-`BeginPush`, are the next pieces of work.
+`xbox_hle` links `xbox_d3d8` on Windows, and `hle_d3d8.c` replaces 40 XDK functions by
+name. Each runs the title's own body first (`HLE_ORIGINAL`), and with
+`RECOMP_HLE_D3D8=shadow` repeats the call on a host device in a second window.
+
+**Shadow mode draws the title** (Sep 2026): Burnout 2's logos, menus, loading screens, HUD
+and race, with its own vertex programs and register combiners. See
+`docs/technical/shadow-mode.md` for what reaches the host and from where, the switches, and
+the gaps that remain (cube render targets, `CopyRects`, lighting). A path for titles that
+fill push buffers through `BeginPush` is still the next piece of work: those draws reach no
+replacement at all.
+
+Two things that cost days and are worth knowing before touching this code. The title's
+**deferred render state arrays do not follow its pixel shader** — `SetPixelShader` selects
+an object carrying a `D3DPIXELSHADERDEF`, and the arrays hold whichever shader last went
+through them. And an Xbox surface says what it is through its **parent**: without
+forwarding `SetRenderTarget`, an offscreen pass's clear wipes the screen, which is what
+kept Burnout 2's world black.
 
 **Backend decision (Sep 2026): Vulkan**, for portability — Linux, Steam Deck, Android.
 The shader generators stay as they are: `d3d8_combiners.c`, `d3d8_vsh.c` and
 `d3d8_shaders.c` emit HLSL, and DXC compiles HLSL to SPIR-V, so ~4k lines of translation
 survive the move. Do **not** rewrite them to GLSL. Vulkan's costs here are the Y-flip and
 front-face winding inversion (a negative viewport height; note `d3d8_states.c` already
-carries one hand-annotated winding fix, so do not stack a second) and the absence of any
-D3D11On12-style bridge for A/B comparison against the existing D3D11 backend.
+carries one hand-annotated winding fix, so do not stack a second).
+
+The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
+`src/replay`) records one frame's host calls and plays them back with no game running, so
+one frame can be drawn by two backends and compared. That is the bring-up loop for a Vulkan
+backend, and it needs no D3D11On12-style bridge.
 
 ---
 
