@@ -457,6 +457,102 @@ static uint32_t host_texture_modes(uint32_t xbox_modes)
     return host;
 }
 
+/* The pixel shader the title selected, as a D3DPIXELSHADERDEF.
+ *
+ * D3DDevice_SetPixelShader takes a handle to a shader object that carries the
+ * definition at +0x0C (measured on Burnout 2, XDK 4627: the object's third
+ * DWORD is a pointer to that address, and the fields below land on values a
+ * frame capture independently shows -- PSCombinerCount 0x00011104,
+ * PSTextureModes 0x00000001, final inputs 0x130C0300 / 0x00001C80).
+ *
+ * This matters because the deferred render states do NOT follow it. In one
+ * captured race frame the car, the HUD, the text and the fade quad all read
+ * back the same combiner state, which no title would write: the states hold
+ * whichever shader last went through them, while the draws use whatever
+ * SetPixelShader selected. Structure therefore comes from the definition.
+ * The constants stay with the render states, which is where the title's own
+ * SetPixelShaderConstant calls land at run time.
+ *
+ * The field order is the Xbox render state order, which is why one offset
+ * table serves both paths. */
+#define PSDEF_SELF_PTR    0x08
+#define PSDEF_AT_HANDLE   0x0C
+#define PSDEF_MODES       0xD8
+
+static uint32_t g_ps_def;            /* guest VA of the definition, 0 = none */
+static int      g_ps_def_seen, g_ps_dirty;
+/* Set once the title has selected a shader through SetPixelShader. From then
+ * on this call is the authority: a handle of 0 means no pixel shader, and the
+ * host goes back to fixed function whatever the render states still hold. */
+static int      g_ps_selects;
+
+void hle_d3d8_pixel_shader_selected(uint32_t handle)
+{
+    uint32_t def = handle ? handle + PSDEF_AT_HANDLE : 0;
+
+    /* The object carries a pointer to its own definition just in front of it
+     * (+0x08). Anything else is a layout this code has not seen, and the
+     * render states stay in charge. */
+    if (handle && HLE_MEM32(handle + PSDEF_SELF_PTR) != def)
+        def = 0;
+    if (def && !g_ps_def_seen) {
+        g_ps_def_seen = 1;
+        fprintf(stderr, "[HLE-D3D8] shadow pixel shader: definitions read from the "
+                "shader object (+0x%02X); count 0x%08X, texture modes 0x%08X\n",
+                PSDEF_AT_HANDLE, HLE_MEM32(def + 0xD4), HLE_MEM32(def + PSDEF_MODES));
+    }
+    g_ps_def = def;
+    g_ps_selects = 1;
+    g_ps_dirty = 1;                  /* re-forward this shader's own states */
+}
+
+/* One Xbox pixel shader state, from the selected definition where it carries
+ * it. Constants (10-25) always come from the render states. */
+static uint32_t ps_state(uint32_t xbox)
+{
+    uint32_t off;
+
+    if (!g_ps_def || (xbox >= 10 && xbox <= 25))
+        return guest_rs(xbox);
+    if (xbox <= 7)        off = 0x00 + 4 * xbox;
+    else if (xbox <= 9)   off = 0x20 + 4 * (xbox - 8);
+    else if (xbox <= 33)  off = 0x68 + 4 * (xbox - 26);
+    else if (xbox <= 41)  off = 0x88 + 4 * (xbox - 34);
+    else if (xbox <= 44)  off = 0xA8 + 4 * (xbox - 42);
+    else if (xbox <= 52)  off = 0xB4 + 4 * (xbox - 45);
+    else if (xbox == 53)  off = 0xD4;
+    else if (xbox == 55)  off = 0xDC;
+    else if (xbox == 56)  off = 0xE0;
+    else                  return guest_rs(xbox);
+    return HLE_MEM32(g_ps_def + off);
+}
+
+/* How many draws actually have a pixel shader configured. A draw with no
+ * combiner falls back to the host's fixed function, which modulates by a
+ * diffuse colour the title's own shader may never write -- so a large
+ * "without" count on a frame that renders black says the black is not the
+ * combiners' fault. */
+static void ps_count_draw(uint32_t token)
+{
+    static unsigned long with, without;
+    static DWORD last;
+    DWORD now;
+
+    if (token)
+        with++;
+    else
+        without++;
+    now = GetTickCount();
+    if (!last) {
+        last = now;
+    } else if (now - last >= 5000) {
+        fprintf(stderr, "[HLE-D3D8] shadow pixel shader: %lu draws with a "
+                "combiner, %lu without\n", with, without);
+        fflush(stderr);
+        last = now;
+    }
+}
+
 /* Slots 0-56 and the complex slot 136 are outside g_rs_map, so they share
  * g_prev_rs with it without colliding. */
 static void forward_pixel_shader(IDirect3DDevice8 *dev)
@@ -479,21 +575,27 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
     if (!enabled)
         return;
 
-    modes = guest_rs(XRS_COMPLEX);                /* PSTextureModes      */
-    count = guest_rs(53);                         /* PSCOMBINERCOUNT     */
+    if (g_ps_selects && !g_ps_def) {
+        /* The title turned its pixel shader off. */
+        host_combiners_set_pixel_shader(0);
+        ps_count_draw(0);
+        return;
+    }
+    modes = g_ps_def ? HLE_MEM32(g_ps_def + PSDEF_MODES) : guest_rs(XRS_COMPLEX);
+    count = ps_state(53);                         /* PSCOMBINERCOUNT     */
 
     for (g = 0; g < sizeof g_ps_map / sizeof g_ps_map[0]; g++) {
         for (i = 0; i < (int)g_ps_map[g].count; i++) {
             uint32_t x = (uint32_t)g_ps_map[g].xbox + (uint32_t)i;
-            uint32_t v = guest_rs(x);
+            uint32_t v = ps_state(x);
 
-            if (g_prev_valid && g_prev_rs[x] == v)
+            if (g_prev_valid && !g_ps_dirty && g_prev_rs[x] == v)
                 continue;
             g_prev_rs[x] = v;
             host_SetRenderState(dev, (D3DRENDERSTATETYPE)(g_ps_map[g].host + i), v);
         }
     }
-    if (!g_prev_valid || g_prev_rs[XRS_COMPLEX] != modes) {
+    if (!g_prev_valid || g_ps_dirty || g_prev_rs[XRS_COMPLEX] != modes) {
         g_prev_rs[XRS_COMPLEX] = modes;
         host_SetRenderState(dev, (D3DRENDERSTATETYPE)D3DRS_PSTEXTUREMODES,
                             host_texture_modes(modes));
@@ -511,32 +613,10 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
      * no stage sampling anything, every model came out a flat white
      * silhouette. */
     token = count & 0xFu;
+    g_ps_dirty = 0;
     host_combiners_set_pixel_shader(token);
 
-    {
-        /* How many draws actually have a pixel shader configured. A draw with
-         * no combiner falls back to the host's fixed function, which modulates
-         * by a diffuse colour the title's own shader may never write -- so a
-         * large "without" count on a frame that renders black says the black
-         * is not the combiners' fault. */
-        static unsigned long with, without;
-        static DWORD last;
-        DWORD now;
-
-        if (token)
-            with++;
-        else
-            without++;
-        now = GetTickCount();
-        if (!last) {
-            last = now;
-        } else if (now - last >= 5000) {
-            fprintf(stderr, "[HLE-D3D8] shadow pixel shader: %lu draws with a "
-                    "combiner, %lu without\n", with, without);
-            fflush(stderr);
-            last = now;
-        }
-    }
+    ps_count_draw(token);
 
     {
         /* Each distinct setup, not just the first: the first draw of a run is
@@ -552,8 +632,8 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
             fprintf(stderr, "[HLE-D3D8] shadow pixel shader: combiner count 0x%X, "
                     "texture modes 0x%05X -> host 0x%04X, stage 0 rgb inputs "
                     "0x%08X outputs 0x%08X, final ABCD 0x%08X EFG 0x%08X\n",
-                    count, modes, host_texture_modes(modes), guest_rs(34),
-                    guest_rs(45), guest_rs(8), guest_rs(9));
+                    count, modes, host_texture_modes(modes), ps_state(34),
+                    ps_state(45), ps_state(8), ps_state(9));
         }
     }
 }

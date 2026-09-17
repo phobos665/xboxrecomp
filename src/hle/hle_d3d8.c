@@ -474,6 +474,7 @@ static UINT fvf_stride(DWORD fvf)
 }
 
 /* hle_d3d8_state.c */
+void hle_d3d8_pixel_shader_selected(uint32_t handle);
 void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev);
 
 static unsigned long g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
@@ -634,6 +635,7 @@ HLE_ORIGINAL(D3DDevice_SelectVertexShader);
 HLE_ORIGINAL(D3DDevice_SetTransform);
 HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
+HLE_ORIGINAL(D3DDevice_SetPixelShader);
 HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
 HLE_ORIGINAL(D3DDevice_SetVertexData2f);
 HLE_ORIGINAL(D3DDevice_DrawVerticesUP);
@@ -993,6 +995,43 @@ HLE_EXPORT(D3DDevice_SelectVertexShader)
 #ifdef _WIN32
     if (g_shadow && handle)
         shadow_select_vertex_shader(handle);
+#endif
+}
+
+/* void D3DDevice_SetPixelShader(DWORD Handle)
+ * Handle is a shader object carrying a D3DPIXELSHADERDEF; hle_d3d8_state.c
+ * reads the combiner setup out of it, because the deferred render states do
+ * not follow what this call selects. Handle 0 goes back to fixed function.
+ * RECOMP_HLE_D3D8_PS_PROBE=1 dumps the first few objects, which is how the
+ * definition's offset was found. */
+HLE_EXPORT(D3DDevice_SetPixelShader)
+{
+    static int seen, dumped;
+#ifdef _WIN32
+    uint32_t handle = HLE_ARG(0);
+#endif
+
+    first_call(&seen, "D3DDevice_SetPixelShader", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetPixelShader,
+                         "D3DDevice_SetPixelShader"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetPixelShader);
+#ifdef _WIN32
+    if (g_shadow)
+        hle_d3d8_pixel_shader_selected(handle);
+    if (handle && dumped < 6 && getenv("RECOMP_HLE_D3D8_PS_PROBE")) {
+        int i;
+
+        dumped++;
+        fprintf(stderr, "[HLE-D3D8] SetPixelShader(0x%08X):", handle);
+        for (i = 0; i < 64; i++) {
+            if ((i % 8) == 0)
+                fprintf(stderr, "\n  +0x%02X:", i * 4);
+            fprintf(stderr, " %08X", HLE_MEM32(handle + (uint32_t)i * 4));
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 #endif
 }
 
