@@ -153,12 +153,29 @@ cutscene's characters appear), and the music plays: it goes through DirectSound
 *streams*, which `src/hle/hle_dsound_stream.c` now replaces by name the way
 the buffers were. Heard in the menus, the level and its cutscenes.
 
-1. **Lighting and vertex colour.** The campaign's opening cutscene is black on
-   screen and the level is very dark; the frame dumps show the geometry is
-   there but barely lit. Compare a frame with xemu; `docs/technical/shadow-mode.md`
-   lists lighting as a gap. Related one-line fix from the resolution design
-   (`docs/technical/resolution-and-framerate.md`): pre-transformed 2D geometry
-   is divided by the host back-buffer size instead of the guest's.
+*And since then:* the story intro was black for a reason worth writing down.
+The scene was there and animating; draw 104 of 105, a pre-transformed quad
+with a 1x1 white texture, covered it -- the cinematic's fade from black. The
+game lifts that fade once its music stream reports playing, testing
+`(status & 0x30000) == 0x10000`, and the stream replacement reported
+PLAYING as 0x2: the XDK's stream status keeps READY in bit 0 and the stream
+flags in the high word. Three tools found it in order: `d3d8_replay --draws N`
+showed the scene under the first 60 draws, `--skip-draw 104` showed the quad
+was the cover, and the replacement logging its own callers led to the poll
+loop at 0x001B8980. The vertex program's `.wxyz` on the quad's colour is not a
+decoder fault: this title stores vertex colours as RGBA bytes and rotates them
+itself. Two more fixes fell out: the "simple" render states (blend, depth) the
+title sets through `SetRenderState_Simple` now reach the shadow, and a
+`FILE_CREATE` on an existing directory is a collision, as on the console --
+which is why a scripted menu path only repeats if the profile folders under
+`UDATA/4553000a/` are cleared first.
+
+1. **Lighting and vertex colour.** The level is very dark; the frame dumps
+   show the geometry is there but barely lit. Compare a frame with xemu;
+   `docs/technical/shadow-mode.md` lists lighting as a gap. Related one-line
+   fix from the resolution design (`docs/technical/resolution-and-framerate.md`):
+   pre-transformed 2D geometry is divided by the host back-buffer size instead
+   of the guest's.
 2. **Frame pacing.** See item 3 below and the flip gate in the design doc.
 3. **Frame pacing.** In-level the title presents at 85-145 fps because `Swap`'s
    fence completes immediately. Making it wait for the next vblank gives
