@@ -206,8 +206,9 @@ def main() -> int:
                          "often a running total is printed; this reads the "
                          "highest. Keep it small while a title dies early -- a "
                          "run that faults before the first report leaves none, "
-                         "and a crash never reaches atexit. Raise it once the "
-                         "title runs long enough to make the lines a nuisance.")
+                         "and a crash never reaches atexit. The runtime caps "
+                         "reports at one per second regardless, so a small "
+                         "interval no longer slows the title.")
     ap.add_argument("--kernel-log", type=int, default=None, metavar="N",
                     help="How many kernel calls to log (RECOMP_KERNEL_LOG_BUDGET). "
                          "The default of 200 is a budget, not a limit on the "
