@@ -22,6 +22,8 @@ set(KERNEL_SOURCES
     xbox_memory_layout.c
     icall_feedback.c
     recomp_trace.c
+    recomp_fps.c
+    recomp_sample.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
     nv2a_vsh.c
@@ -41,7 +43,9 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    # winmm for timeBeginPeriod (the vblank clock's fallback timer), dbghelp
+    # and psapi for the sampling profiler's symbol and module lookups.
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt winmm dbghelp psapi)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
