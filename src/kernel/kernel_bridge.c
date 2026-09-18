@@ -2558,7 +2558,7 @@ typedef struct {
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
-static int g_timer_started;
+static volatile LONG g_timer_started;   /* 0 none, 1 starting, 2 running */
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -2668,10 +2668,19 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
+    /* Exactly one timer thread. Two guest threads setting their first timer
+     * at the same moment both saw "not started" here and each started one,
+     * and the two then delivered the vblank in turn -- 80-odd Hz through a
+     * 16 ms deadline -- and ran the title's ISR and DPC chain concurrently on
+     * state that is single-threaded by design. 1 marks "being started", so a
+     * second caller waits for the lock to exist rather than creating its own. */
+    if (InterlockedCompareExchange(&g_timer_started, 1, 0) == 0) {
         InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+        InterlockedExchange(&g_timer_started, 2);
+    } else {
+        while (InterlockedCompareExchange(&g_timer_started, 0, 0) != 2)
+            Sleep(0);
     }
 
     EnterCriticalSection(&g_timer_lock);
@@ -2716,7 +2725,7 @@ int xbox_kernel_cancel_timer(uint32_t timer_va)
 {
     int i, was_set = 0;
 
-    if (!g_timer_started)
+    if (InterlockedCompareExchange(&g_timer_started, 0, 0) != 2)
         return 0;
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++)

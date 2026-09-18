@@ -321,10 +321,15 @@ static int categorise(const ResolvedAddr *r)
         || _stricmp(m, "kernel32.dll") == 0 || _stricmp(m, "win32u.dll") == 0) {
         if (strstr(n, "Wait") || strstr(n, "Delay") || strstr(n, "Sleep")
             || strstr(n, "Yield") || strstr(n, "RemoveIoCompletion")
-            || strstr(n, "SignalAndWait"))
+            || strstr(n, "SignalAndWait") || strstr(n, "GetMessage")
+            || strstr(n, "ReplyWaitReceive") || strstr(n, "AlertByThreadId"))
             return CAT_WAIT;
         return CAT_OS;
     }
+    /* A message loop parked in the window manager is a wait too. */
+    if (_stricmp(m, "user32.dll") == 0 && (strstr(n, "GetMessage")
+                                            || strstr(n, "MsgWait")))
+        return CAT_WAIT;
     if (starts(m, "d3d11") || starts(m, "dxgi") || starts(m, "D3DCompiler")
         || starts(m, "nvwgf") || starts(m, "nvldumd") || starts(m, "igd")
         || starts(m, "amdxc") || starts(m, "atid") || starts(m, "D3DSCache")
