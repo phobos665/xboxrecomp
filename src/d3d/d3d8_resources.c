@@ -1942,6 +1942,22 @@ static const IDirect3DCubeTexture8Vtbl g_cube_vtbl = {
     cube_GetLevelDesc, cube_GetCubeMapSurface, cube_LockRect, cube_UnlockRect,
 };
 
+/* The same for a cube texture, and the type test that tells the two apart.
+ * Contents are not exposed: shadow mode mirrors only the cubes a title
+ * renders into, whose texels live on the GPU and never in sys_mem. */
+BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info)
+{
+    const D3D8CubeTexture *cube = (const D3D8CubeTexture *)texture;
+
+    if (!cube || !info || cube->iface.lpVtbl != &g_cube_vtbl)
+        return FALSE;
+    info->format = cube->d3d8_format;
+    info->edge   = cube->width;
+    info->levels = cube->levels;
+    info->usage  = cube->usage;
+    return TRUE;
+}
+
 HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DCubeTexture8 **ppTex)
 {
     D3D8CubeTexture *cube;

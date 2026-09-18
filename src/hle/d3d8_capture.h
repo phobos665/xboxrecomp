@@ -98,8 +98,9 @@ extern "C" {
 /* Bumped on any change to a payload struct or chunk meaning. The reader
  * refuses anything else rather than guessing: captures are cheap to retake.
  * Version 1 was the title-level format; its chunk numbers mean different
- * things here. Version 3 added render targets and input current values. */
-#define D3D8CAP_VERSION      3u
+ * things here. Version 3 added render targets and input current values,
+ * version 4 cube textures and the face a render target names. */
+#define D3D8CAP_VERSION      4u
 
 /* The conventional extension. .gitignore has it: a capture contains the
  * title's own textures and vertices, so it is game content and must never be
@@ -130,7 +131,8 @@ enum {
     D3D8CAP_DEPTH_SURFACE       = 20, /* D3D8CapDepthSurface */
     D3D8CAP_SET_RENDER_TARGET   = 21, /* D3D8CapSetRenderTarget */
     D3D8CAP_VS_VERTEX_DATA      = 22, /* D3D8CapVsVertexData */
-    D3D8CAP_CHUNK_KINDS         = 23  /* one past the last, for per-kind counters */
+    D3D8CAP_CUBE_TEXTURE        = 23, /* D3D8CapCubeTexture */
+    D3D8CAP_CHUNK_KINDS         = 24  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -229,12 +231,18 @@ typedef struct { uint32_t token; } D3D8CapPsToken;
  * time a SET_RENDER_TARGET names the surface. */
 typedef struct { uint32_t id, width, height, format; } D3D8CapDepthSurface;
 
+/* A cube texture's creation: CreateCubeTexture with these arguments. No
+ * contents -- shadow mode mirrors only the cubes a title renders into, and
+ * what it draws there is drawn again on replay. */
+typedef struct { uint32_t id, format, edge, levels, usage; } D3D8CapCubeTexture;
+
 /* SetRenderTarget. texture_id 0 is the back buffer; otherwise level `level`
- * of that texture, which was created with D3DUSAGE_RENDERTARGET. depth_id 0
- * is no depth, D3D8CAP_DEPTH_DEVICE the device's own depth buffer, and
- * anything else a DEPTH_SURFACE chunk's id. */
+ * of that texture, which was created with D3DUSAGE_RENDERTARGET. `face` is
+ * 0 for a 2D texture and the cube face (0-5) when the id names a cube.
+ * depth_id 0 is no depth, D3D8CAP_DEPTH_DEVICE the device's own depth
+ * buffer, and anything else a DEPTH_SURFACE chunk's id. */
 #define D3D8CAP_DEPTH_DEVICE 0xFFFFFFFFu
-typedef struct { uint32_t texture_id, level, depth_id; } D3D8CapSetRenderTarget;
+typedef struct { uint32_t texture_id, level, face, depth_id; } D3D8CapSetRenderTarget;
 
 /* A short name for a chunk type ("draw_up"), or "unknown", for logs. */
 const char *d3d8cap_chunk_name(uint32_t type);

@@ -72,6 +72,15 @@ typedef struct D3D8TextureInfo {
     DWORD     usage;
 } D3D8TextureInfo;
 BOOL d3d8_texture_info(IDirect3DBaseTexture8 *texture, D3D8TextureInfo *info);
+
+/* A cube texture's shape, for frame capture. TRUE only for a cube, so this
+ * doubles as the type test against d3d8_texture_info. */
+typedef struct D3D8CubeInfo {
+    D3DFORMAT format;
+    UINT      edge, levels;
+    DWORD     usage;
+} D3D8CubeInfo;
+BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info);
 BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
                         const BYTE **bits, UINT *pitch, UINT *rows);
 

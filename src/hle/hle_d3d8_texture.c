@@ -288,6 +288,91 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     return e->host;
 }
 
+/* Cube textures a title renders into: its environment map. Only rendered
+ * cubes are mirrored -- a cube the title uploads from guest memory still
+ * binds white -- so the entries carry no contents and are never re-uploaded.
+ * Kept apart from the 2D cache above, which is keyed and evicted by texel
+ * checksums that mean nothing here. */
+#define CUBE_CACHE 8
+
+static struct {
+    uint32_t va, data, format;
+    IDirect3DCubeTexture8 *host;
+} g_cubes[CUBE_CACHE];
+static int g_cube_count;
+static unsigned long g_cube_binds;
+
+/* Which face of a cube container a surface is. The Xbox lays the six faces
+ * out one after another in the container's data, each holding that face's
+ * whole mip chain, so the distance between the surface's data pointer and the
+ * container's says which one this is. Measured on Burnout 2's 128x128 R5G6B5
+ * environment cube: the six deltas come out 0, 32768, 65536 ... with a face
+ * exactly 32768 bytes, so there is no padding between them. -1 when the
+ * delta is not a whole number of faces. */
+int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va)
+{
+    uint32_t format = HLE_MEM32(parent_va + 12);
+    uint32_t fmt    = (format >> 8) & 0xFF;
+    uint32_t levels = (format >> 16) & 0xF;
+    uint32_t w      = 1u << ((format >> 20) & 0xF);
+    uint32_t h      = 1u << ((format >> 24) & 0xF);
+    uint32_t delta  = HLE_MEM32(surface_va + 4) - HLE_MEM32(parent_va + 4);
+    uint32_t bytes  = 0, l;
+
+    for (l = 0; l < levels; l++)
+        bytes += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(w, l)) *
+                 level_rows(fmt, level_dim(h, l));
+    if (!bytes || delta % bytes)
+        return -1;
+    return delta / bytes < 6u ? (int)(delta / bytes) : -1;
+}
+
+/* The host cube for a guest cube container, created on first use. NULL if
+ * there is no room or the host refuses it. */
+IDirect3DCubeTexture8 *hle_d3d8_render_cube(IDirect3DDevice8 *dev, uint32_t va)
+{
+    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12);
+    uint32_t edge = 1u << ((format >> 20) & 0xF);
+    uint32_t levels = (format >> 16) & 0xF;
+    uint32_t fmt = (format >> 8) & 0xFF;
+    int i;
+
+    for (i = 0; i < g_cube_count; i++)
+        if (g_cubes[i].host && g_cubes[i].va == va && g_cubes[i].data == data &&
+            g_cubes[i].format == format)
+            return g_cubes[i].host;
+    if (g_cube_count >= CUBE_CACHE || !levels)
+        return NULL;
+    if (FAILED(host_CreateCubeTexture(dev, edge, levels, D3DUSAGE_RENDERTARGET,
+                                      (D3DFORMAT)fmt, D3DPOOL_DEFAULT,
+                                      &g_cubes[g_cube_count].host)) ||
+        !g_cubes[g_cube_count].host) {
+        g_cubes[g_cube_count].host = NULL;
+        g_skip_create++;
+        return NULL;
+    }
+    g_cubes[g_cube_count].va = va;
+    g_cubes[g_cube_count].data = data;
+    g_cubes[g_cube_count].format = format;
+    fprintf(stderr, "[HLE-D3D8] shadow render target cube 0x%08X: format 0x%02X "
+            "%ux%u, %u level(s)\n", va, fmt, edge, edge, levels);
+    return g_cubes[g_cube_count++].host;
+}
+
+/* The host cube for a guest container the title is binding, if one was
+ * rendered into. NULL means "not a cube this file mirrors". */
+static IDirect3DCubeTexture8 *bound_cube(uint32_t va)
+{
+    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12);
+    int i;
+
+    for (i = 0; i < g_cube_count; i++)
+        if (g_cubes[i].host && g_cubes[i].va == va && g_cubes[i].data == data &&
+            g_cubes[i].format == format)
+            return g_cubes[i].host;
+    return NULL;
+}
+
 /* The host render target for a 2D guest texture the title renders into, for
  * hle_d3d8.c's SetRenderTarget. The same cache entry SetTexture finds, so a
  * texture drawn into and then bound samples what was drawn. A texture already
@@ -385,6 +470,8 @@ static void report(void)
                 "%lu out of range, %lu create failed\n",
                 g_bound_count, g_texture_count, g_uploads, g_reuploads, g_skip_type,
                 g_skip_cube, g_skip_format, g_skip_range, g_skip_create);
+        fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds\n",
+                g_cube_count, g_cube_binds);
         last = now;
     }
 }
@@ -417,8 +504,22 @@ HLE_EXPORT(D3DDevice_SetTexture)
 
         if (!dev || stage >= MAX_STAGES)
             return;
-        if (texture)
+        if (texture) {
+            /* A cube the title rendered into is bound as itself; every other
+             * cube is one this file does not mirror, and falls through to the
+             * white texture below. */
+            IDirect3DCubeTexture8 *cube = bound_cube(texture);
+
+            if (cube) {
+                g_bound[stage] = NULL;
+                g_cube_binds++;
+                host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)cube);
+                g_bound_count++;
+                report();
+                return;
+            }
             host = host_texture(dev, texture);
+        }
         g_bound[stage] = host;
         /* The host pixel shader samples every stage whatever its operation
          * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a

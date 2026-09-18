@@ -1,5 +1,5 @@
 /*
- * d3d8_capture -- round-trip the frame capture container (format version 3).
+ * d3d8_capture -- round-trip the frame capture container (format version 4).
  *
  * Writes a synthetic host-level capture -- a snapshot and a frame, using every
  * chunk kind -- reads it back, and asserts every field and every payload byte
@@ -264,7 +264,7 @@ static const float IDENTITY[16] = {
 /* How many chunks write_capture emits, for the read-back and truncation
  * checks. */
 #define SNAPSHOT_CHUNKS 27
-#define FRAME_CHUNKS    19
+#define FRAME_CHUNKS    22
 
 static int write_capture(const char *path)
 {
@@ -280,8 +280,11 @@ static int write_capture(const char *path)
     D3D8CapTextureLevel refill = { 1, 0, 16, 4, 64 };
     D3D8CapTexture target_tex = { 3, FMT_LIN_A8R8G8B8, 1, 1, 1, USAGE_RENDERTARGET };
     D3D8CapDepthSurface depth = { 1, 1, 1, FMT_D24S8 };
-    D3D8CapSetRenderTarget to_target = { 3, 0, 1 };
-    D3D8CapSetRenderTarget to_back = { 0, 0, 0 };
+    D3D8CapSetRenderTarget to_target = { 3, 0, 0, 1 };
+    D3D8CapSetRenderTarget to_back = { 0, 0, 0, 0 };
+    D3D8CapSetRenderTarget to_face = { 4, 0, 2, 1 };   /* cube face 2 */
+    D3D8CapCubeTexture cube = { 4, FMT_LIN_A8R8G8B8, 1, 1, USAGE_RENDERTARGET };
+    D3D8CapClear face_clear = { 0, CLEAR_TARGET, 0xFF0000FFu, 1.0f, 0 };
     D3D8CapVsVertexData vdata = { 3, { 0.25f, 0.5f, 0.75f, 1.0f } };
     D3D8CapClear target_clear = { 0, CLEAR_TARGET | CLEAR_ZBUFFER, TARGET_COLOR, 1.0f, 0 };
     D3D8CapTransform xf;
@@ -344,9 +347,10 @@ static int write_capture(const char *path)
     w_stage_state(w, 0, TSS_COLORARG2, TA_DIFFUSE);                          /* 26 */
     d3d8cap_chunk(w, D3D8CAP_FRAME_START, NULL, 0, NULL, 0, NULL, 0);        /* 27 */
 
-    /* ---- frame: 19 chunks. The offscreen pass (2-6) clears a 1x1 target
-     * green and goes back to the back buffer, so a replay that forgot the
-     * switch shows a green screen instead of the two quads. */
+    /* ---- frame: 22 chunks. The offscreen passes (2-9) clear a 1x1 target
+     * green and one cube face blue, then go back to the back buffer, so a
+     * replay that forgot either switch shows that colour instead of the two
+     * quads. */
     d3d8cap_chunk(w, D3D8CAP_CLEAR, &clear, sizeof clear, NULL, 0, NULL, 0); /* 1 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE, &target_tex, sizeof target_tex,
                   &scratch_level, sizeof scratch_level,
@@ -357,9 +361,15 @@ static int write_capture(const char *path)
                   NULL, 0, NULL, 0);                                         /* 4 */
     d3d8cap_chunk(w, D3D8CAP_CLEAR, &target_clear, sizeof target_clear,
                   NULL, 0, NULL, 0);                                         /* 5 */
-    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_back, sizeof to_back,
+    d3d8cap_chunk(w, D3D8CAP_CUBE_TEXTURE, &cube, sizeof cube,
                   NULL, 0, NULL, 0);                                         /* 6 */
-    w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 7 */
+    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_face, sizeof to_face,
+                  NULL, 0, NULL, 0);                                         /* 7 */
+    d3d8cap_chunk(w, D3D8CAP_CLEAR, &face_clear, sizeof face_clear,
+                  NULL, 0, NULL, 0);                                         /* 8 */
+    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_back, sizeof to_back,
+                  NULL, 0, NULL, 0);                                         /* 9 */
+    w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 10 */
     d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
                   g_fvf_quad, sizeof g_fvf_quad, NULL, 0);                   /* 8 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE_LEVEL, &refill, sizeof refill,
@@ -412,7 +422,7 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 3 && D3D8CAP_VERSION == 3, "the version is 3");
+    check(h->version == 4 && D3D8CAP_VERSION == 4, "the version is 4");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 
@@ -514,11 +524,22 @@ static void read_capture(void)
     }
     if (next_of(r, &c, D3D8CAP_SET_RENDER_TARGET, "set_render_target")) {
         const D3D8CapSetRenderTarget *p = c.data;
-        check(p->texture_id == 3 && p->level == 0 && p->depth_id == 1,
+        check(p->texture_id == 3 && p->level == 0 && p->face == 0 && p->depth_id == 1,
               "offscreen target fields");
     }
     if (next_of(r, &c, D3D8CAP_CLEAR, "offscreen clear"))
         check(((const D3D8CapClear *)c.data)->color == TARGET_COLOR, "offscreen clear colour");
+    if (next_of(r, &c, D3D8CAP_CUBE_TEXTURE, "cube_texture")) {
+        const D3D8CapCubeTexture *p = c.data;
+        check(c.bytes == sizeof *p && p->id == 4 && p->edge == 1 && p->levels == 1 &&
+              p->usage == USAGE_RENDERTARGET, "cube texture fields");
+    }
+    if (next_of(r, &c, D3D8CAP_SET_RENDER_TARGET, "cube face target")) {
+        const D3D8CapSetRenderTarget *p = c.data;
+        check(p->texture_id == 4 && p->face == 2 && p->depth_id == 1,
+              "cube face fields");
+    }
+    next_of(r, &c, D3D8CAP_CLEAR, "cube face clear");
     if (next_of(r, &c, D3D8CAP_SET_RENDER_TARGET, "back to the back buffer")) {
         const D3D8CapSetRenderTarget *p = c.data;
         check(p->texture_id == 0 && p->depth_id == 0, "back buffer fields");

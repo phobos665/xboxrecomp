@@ -85,20 +85,28 @@ HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type
 HRESULT host_CreateTexture(IDirect3DDevice8 *dev, UINT width, UINT height,
                            UINT levels, DWORD usage, D3DFORMAT format,
                            D3DPOOL pool, IDirect3DTexture8 **texture);
+/* A cube texture. Only the cubes a title renders into are mirrored, so a
+ * capture records the creation and not the contents: what is drawn into a
+ * face is drawn again on replay. */
+HRESULT host_CreateCubeTexture(IDirect3DDevice8 *dev, UINT edge, UINT levels,
+                               DWORD usage, D3DFORMAT format, D3DPOOL pool,
+                               IDirect3DCubeTexture8 **texture);
 HRESULT host_LockRect(IDirect3DTexture8 *texture, UINT level,
                       D3DLOCKED_RECT *locked, const RECT *rect, DWORD flags);
 HRESULT host_UnlockRect(IDirect3DTexture8 *texture, UINT level);
 ULONG   host_ReleaseTexture(IDirect3DTexture8 *texture);
 
 /* Render targets. texture NULL is the back buffer; otherwise level `level` of
- * a texture created with D3DUSAGE_RENDERTARGET (src/d3d, dev_SetRenderTarget).
- * The level's surface object is taken and
- * released inside. depth NULL is no depth; the device's own depth buffer is
+ * a texture created with D3DUSAGE_RENDERTARGET (src/d3d, dev_SetRenderTarget),
+ * and `face` names the cube face when that texture is a cube. The surface
+ * object for the level or face is taken and released inside.
+ *
+ * depth NULL is no depth; the device's own depth buffer is
  * host_DeviceDepthSurface. A switch is recorded with the texture and depth
  * surface it names, each written the first time; the depth surface is not
  * recorded at creation. */
-HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DTexture8 *texture,
-                             UINT level, IDirect3DSurface8 *depth);
+HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DBaseTexture8 *texture,
+                             UINT level, UINT face, IDirect3DSurface8 *depth);
 HRESULT host_CreateDepthStencilSurface(IDirect3DDevice8 *dev, UINT width, UINT height,
                                        D3DFORMAT format, IDirect3DSurface8 **surface);
 /* The device's own depth surface, read once while it is still the one bound
