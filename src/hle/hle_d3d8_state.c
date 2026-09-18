@@ -502,24 +502,39 @@ void hle_d3d8_pixel_shader_selected(uint32_t handle)
 {
     uint32_t def = 0;
 
-    /* The object carries a pointer to its own definition just in front of it
-     * (+0x08). Without that, this is a layout this code has not seen: say so
-     * once, and leave the combiners alone rather than guessing. */
+    /* The object carries a pointer to its definition at +0x08. A shader made
+     * by CreatePixelShader (Burnout 2, XDK 5344) embeds the definition and the
+     * pointer is to its own +0x0C. XDK 4721's SetPixelShaderProgram(pPSDef)
+     * makes no copy: it fills a static three-word object in the device,
+     * {1, 0, pPSDef}, and selects that, so the pointer leads outside the
+     * object to the title's own D3DPIXELSHADERDEF. Both are the same
+     * definition layout, a public XDK structure. Anything else is a layout
+     * this code has not seen: say so once, and leave the combiners alone. */
     if (handle) {
-        if (!plausible_va(handle) ||
-            HLE_MEM32(handle + PSDEF_SELF_PTR) != handle + PSDEF_AT_HANDLE) {
+        uint32_t ptr = plausible_va(handle) ? HLE_MEM32(handle + PSDEF_SELF_PTR) : 0;
+
+        if (ptr == handle + PSDEF_AT_HANDLE) {
+            def = ptr;
+        } else if (plausible_va(ptr)) {
+            static int said;
+            def = ptr;
+            if (!said++)
+                fprintf(stderr, "[HLE-D3D8] shadow pixel shader: SetPixelShader(0x%08X) "
+                        "points at a definition outside the object (0x%08X), the "
+                        "SetPixelShaderProgram form\n", handle, ptr);
+        } else {
             static int warned;
 
             if (!warned) {
                 warned = 1;
                 fprintf(stderr, "[HLE-D3D8] shadow pixel shader: SetPixelShader(0x%08X) "
-                        "is not a shader object with a definition at +0x%02X; pixel "
-                        "shaders are left off (RECOMP_HLE_D3D8_PS=1 forwards the "
-                        "render states instead)\n", handle, PSDEF_AT_HANDLE);
+                        "is not a shader object with a definition at +0x%02X or a "
+                        "pointer to one; pixel shaders are left off "
+                        "(RECOMP_HLE_D3D8_PS=1 forwards the render states instead)\n",
+                        handle, PSDEF_AT_HANDLE);
             }
             return;
         }
-        def = handle + PSDEF_AT_HANDLE;
     }
     if (def && !g_ps_def_seen) {
         g_ps_def_seen = 1;

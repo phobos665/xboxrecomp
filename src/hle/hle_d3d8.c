@@ -393,6 +393,7 @@ struct shadow_program {
     uint32_t guest;
     DWORD    host;
     int      kind;
+    int      from_slot;                  /* host belongs to g_slot_host, not this entry */
     /* From the declaration (shadow_read_declaration), host programs only. */
     int      has_declaration;            /* the host has its vertex layout */
     UINT     extent;                     /* bytes of a vertex it reads */
@@ -420,7 +421,27 @@ static int shadow_program_find(uint32_t guest)
     return -1;
 }
 
-static void shadow_select_vertex_shader(uint32_t handle)
+/* Programs loaded by slot rather than created by handle.
+ *
+ * The NV2A holds 136 transform-program instruction slots. Two XDK paths fill
+ * them: CreateVertexShader keeps the microcode in a shader object and
+ * LoadVertexShader copies it in when the object is selected -- the path
+ * Burnout 2 (5344) takes, tracked in g_programs by the object's handle --
+ * and LoadVertexShaderProgram(pFunction, Address), which copies microcode
+ * straight into slot Address with no object at all. TimeSplitters 2 (4721)
+ * takes the second: four programs loaded once, then
+ * SelectVertexShaderDirect(pVAF, Address) copies the vertex declaration into
+ * one static object in the D3D section and selects that object's handle with
+ * the slot number. Keyed by handle alone, every one of its draws was
+ * "unknown shader". So the slot number is tracked too, and a selected handle
+ * with no created program borrows the program loaded at its slot. */
+#define SHADOW_PROGRAM_SLOTS 136
+static DWORD g_slot_host[SHADOW_PROGRAM_SLOTS];
+static int   g_slot_loaded[SHADOW_PROGRAM_SLOTS];
+
+static void shadow_read_declaration(int slot, uint32_t handle);
+
+static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
     int i;
 
@@ -433,6 +454,27 @@ static void shadow_select_vertex_shader(uint32_t handle)
         return;
     }
     i = shadow_program_find(handle);
+    if ((i < 0 || g_programs[i].from_slot) &&
+        address < SHADOW_PROGRAM_SLOTS && g_slot_loaded[address]) {
+        /* A handle whose program came from a slot: the object holds only the
+         * declaration, and SelectVertexShaderDirect rewrites it on every
+         * call, so the layout is re-read each time it is selected. */
+        if (i < 0 && g_program_count < SHADOW_MAX_PROGRAMS) {
+            i = g_program_count++;
+            g_programs[i].guest = handle;
+        }
+        if (i >= 0) {
+            static int said;
+            g_programs[i].host = g_slot_host[address];
+            g_programs[i].kind = SHADER_HOST_PROGRAM;
+            g_programs[i].from_slot = 1;
+            shadow_read_declaration(i, handle);
+            if (said++ < 4)
+                fprintf(stderr, "[HLE-D3D8] shadow vertex shader 0x%08X: program from "
+                                "slot %u%s\n", handle, address,
+                        g_programs[i].has_declaration ? "" : " (no host layout)");
+        }
+    }
     g_shadow_vs_slot = i;
     g_shadow_vs_kind = i >= 0 ? g_programs[i].kind : -1;
     if (g_shadow_vs_kind == SHADER_HOST_PROGRAM)
@@ -632,6 +674,7 @@ HLE_ORIGINAL(D3DDevice_Swap);
 HLE_ORIGINAL(D3DDevice_CreateVertexShader);
 HLE_ORIGINAL(D3DDevice_SetVertexShader);
 HLE_ORIGINAL(D3DDevice_SelectVertexShader);
+HLE_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
 HLE_ORIGINAL(D3DDevice_SetTransform);
 HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
@@ -1005,8 +1048,9 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
         int kind;
 
         if (slot >= 0) {                 /* handle reused: drop the old program */
-            if (g_programs[slot].kind == SHADER_HOST_PROGRAM)
+            if (g_programs[slot].kind == SHADER_HOST_PROGRAM && !g_programs[slot].from_slot)
                 host_vsh_delete_shader(g_programs[slot].host);
+            g_programs[slot].from_slot = 0;
         } else if (g_program_count < SHADOW_MAX_PROGRAMS) {
             slot = g_program_count++;
         }
@@ -1042,6 +1086,44 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
 #endif
 }
 
+/* void D3DDevice_LoadVertexShaderProgram(const DWORD *pFunction, DWORD Address)
+ * Xbox-only: copy a compiled program (the same X_VSH_SHADER_HEADER form
+ * CreateVertexShader takes) into transform-program slot Address, with no
+ * shader object. Selected later by SelectVertexShader(handle, Address). */
+HLE_EXPORT(D3DDevice_LoadVertexShaderProgram)
+{
+    static int seen;
+    uint32_t function = HLE_ARG(0);
+#ifdef _WIN32
+    uint32_t address = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_LoadVertexShaderProgram", function);
+    if (original_missing(hle_original_D3DDevice_LoadVertexShaderProgram,
+                         "D3DDevice_LoadVertexShaderProgram"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
+#ifdef _WIN32
+    if (g_shadow && function && address < SHADOW_PROGRAM_SLOTS) {
+        uint32_t header = HLE_MEM32(function);
+        DWORD host = 0;
+        HRESULT hr = E_FAIL;
+
+        if ((header & 0xFFFF) == 0x2078 && (header >> 16) != 0 &&
+            (header >> 16) <= SHADOW_PROGRAM_SLOTS - address)
+            hr = host_vsh_create_shader((const DWORD *)HLE_PTR(function + 4),
+                                        (int)(header >> 16), &host);
+        if (g_slot_loaded[address])
+            host_vsh_delete_shader(g_slot_host[address]);
+        g_slot_loaded[address] = SUCCEEDED(hr);
+        g_slot_host[address] = SUCCEEDED(hr) ? host : 0;
+        fprintf(stderr, "[HLE-D3D8] shadow vertex program at slot %u: %u instructions, %s\n",
+                address, header >> 16,
+                SUCCEEDED(hr) ? "host program" : "not replayed");
+    }
+#endif
+}
+
 /* HRESULT D3DDevice_SetVertexShader(DWORD Handle)                            */
 HLE_EXPORT(D3DDevice_SetVertexShader)
 {
@@ -1054,7 +1136,7 @@ HLE_EXPORT(D3DDevice_SetVertexShader)
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShader);
 #ifdef _WIN32
     if (g_shadow)
-        shadow_select_vertex_shader(handle);
+        shadow_select_vertex_shader(handle, SHADOW_PROGRAM_SLOTS);
 #endif
 }
 
@@ -1074,7 +1156,7 @@ HLE_EXPORT(D3DDevice_SelectVertexShader)
     HLE_CALL_ORIGINAL(D3DDevice_SelectVertexShader);
 #ifdef _WIN32
     if (g_shadow && handle)
-        shadow_select_vertex_shader(handle);
+        shadow_select_vertex_shader(handle, HLE_ARG(1));
 #endif
 }
 
