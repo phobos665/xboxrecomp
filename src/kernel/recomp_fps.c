@@ -37,7 +37,7 @@ static DWORD WINAPI fps_reporter(LPVOID param)
 {
     double secs = *(double *)param;
     LARGE_INTEGER qpf, t0, prev, now;
-    LONG64 prev_swaps, prev_vblanks;
+    LONG64 prev_swaps, prev_vblanks, base_vblanks;
     HANDLE timer;
 
     free(param);
@@ -45,7 +45,11 @@ static DWORD WINAPI fps_reporter(LPVOID param)
     QueryPerformanceCounter(&t0);
     prev = t0;
     prev_swaps = InterlockedCompareExchange64(&s_swaps, 0, 0);
-    prev_vblanks = InterlockedCompareExchange64(&s_vblanks, 0, 0);
+    /* Vblanks start before the first swap. Counting the ones delivered
+     * during the boot against the time since the first swap read as a pump
+     * running at 62-67 Hz in the first windows' run mean, when every window
+     * measured 60.0; the run mean counts from here too. */
+    prev_vblanks = base_vblanks = InterlockedCompareExchange64(&s_vblanks, 0, 0);
 
     /* Sleep is only a wake-up call here; the window is measured, not assumed. */
     timer = CreateWaitableTimerW(NULL, TRUE, NULL);
@@ -75,7 +79,8 @@ static DWORD WINAPI fps_reporter(LPVOID param)
                 elapsed,
                 (double)(swaps - prev_swaps) / window, swaps - prev_swaps,
                 (double)(vblanks - prev_vblanks) / window,
-                (double)swaps / elapsed, (double)vblanks / elapsed, elapsed);
+                (double)swaps / elapsed,
+                (double)(vblanks - base_vblanks) / elapsed, elapsed);
         fflush(stderr);
         prev = now;
         prev_swaps = swaps;
