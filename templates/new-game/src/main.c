@@ -395,7 +395,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
          * device rather than storing it: left unassigned, every APU register
          * access was declined and reported as a crash reading 0xFE801100
          * (NV_PAPU_FECTL), the first register DirectSound touches. */
-        g_apu_state = mcpx_apu_init_standalone((uint8_t *)g_xbox_mem_offset);
+        /* The APU addresses guest memory physically, and in this runtime
+         * physical page P lives in the contiguous window at
+         * XBOX_CONTIG_BASE + P, not at guest VA P: the low 64 MB of VA is
+         * the image and the heap, a different mapping. Handing it VA 0 made
+         * every DirectSound buffer and DSP page table read the wrong bytes;
+         * TimeSplitters 2's scatter-gather tables all read as empty. */
+        g_apu_state = mcpx_apu_init_standalone(
+            (uint8_t *)g_xbox_mem_offset + XBOX_CONTIG_BASE);
         if (!g_apu_state)
             fprintf(stderr, "[BOOT] APU init failed; APU register accesses "
                             "will fault\n");

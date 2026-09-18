@@ -14,7 +14,13 @@ extern "C" {
 typedef struct MCPXAPUState MCPXAPUState;
 
 /* Initialize the APU emulation.
- * ram_ptr: pointer to the base of Xbox physical RAM (64MB).
+ * ram_ptr: pointer to the base of Xbox physical RAM (64MB). Every address the
+ * APU is handed -- voice buffers, DSP scatter-gather tables -- is physical,
+ * and it reads them as ram_ptr + (addr & 0x03FFFFFF). In this runtime the
+ * physical pages are the contiguous window, so pass the host address of guest
+ * VA XBOX_CONTIG_BASE (0x80000000), not of VA 0: the low 64 MB of guest VA is
+ * the image and heap, a different mapping, and reading it here returned zeros
+ * for every page table.
  * Returns the APU state, or NULL on failure. */
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 
