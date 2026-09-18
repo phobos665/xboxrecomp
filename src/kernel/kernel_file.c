@@ -232,16 +232,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * build that decision was invisible. */
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                  "NtCreateFile FAILED: %S (err=%u)", win_path, err);
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
-            IoStatusBlock->Information = 0;
-        }
-        switch (err) {
-            case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-            case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-            case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
-            case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
-            default:                   return STATUS_UNSUCCESSFUL;
+        {
+            NTSTATUS status;
+            switch (err) {
+                case ERROR_FILE_NOT_FOUND: status = STATUS_OBJECT_NAME_NOT_FOUND; break;
+                case ERROR_PATH_NOT_FOUND: status = STATUS_OBJECT_PATH_NOT_FOUND; break;
+                case ERROR_ACCESS_DENIED:  status = STATUS_ACCESS_DENIED; break;
+                /* CREATE_NEW on an existing file is ERROR_FILE_EXISTS (80);
+                 * CreateDirectory on an existing one is ERROR_ALREADY_EXISTS
+                 * (183). Both are the same NT answer, and a title that saves
+                 * over an old profile checks for exactly that answer:
+                 * TimeSplitters 2 retried its save four times against
+                 * STATUS_UNSUCCESSFUL and then said the hard disk had failed. */
+                case ERROR_FILE_EXISTS:
+                case ERROR_ALREADY_EXISTS: status = STATUS_OBJECT_NAME_COLLISION; break;
+                default:                   status = STATUS_UNSUCCESSFUL; break;
+            }
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = status;
+                IoStatusBlock->Information = 0;
+            }
+            return status;
         }
     }
 
