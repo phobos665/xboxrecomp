@@ -47,3 +47,6 @@ game/
 # OS
 Thumbs.db
 .DS_Store
+
+# Build and run logs written beside the project
+*.log
