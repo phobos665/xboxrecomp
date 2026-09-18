@@ -25,6 +25,13 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#ifdef _WIN32
+/* timeBeginPeriod, for the frame clock in kernel_timer_thread. Declared here
+ * rather than through <timeapi.h>: this file's Win32 vocabulary comes from
+ * platform/xbox_winnt.h, and the multimedia headers do not agree with it.
+ * winmm is linked in src/kernel/CMakeLists.txt. */
+__declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int period);
+#endif
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
@@ -2145,21 +2152,114 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* The frame clock, on the performance counter rather than GetTickCount64.
+ *
+ * GetTickCount64 advances in system timer ticks -- 15.6 ms by default -- so a
+ * deadline of "now + 16 ms" read through it cannot land before two of them,
+ * and the vblank the title paces on arrived at 40 Hz measured, never 60. A
+ * title that waits whole frames then quantises to 40, 20, 13.3 fps, which is
+ * exactly the spread this project was seeing.
+ *
+ * QueryPerformanceCounter has sub-microsecond resolution, and the pump thread
+ * asks the OS for a 1 ms timer so its sleep can land near the deadline
+ * (kernel_timer_thread). The deadline advances by a fixed period rather than
+ * from "now", so a late tick does not push the whole schedule out; more than
+ * two frames late, it resynchronises rather than trying to catch up. */
+#define VBLANK_HZ 60
+
+static LARGE_INTEGER g_vblank_freq, g_vblank_next;
+
+/* RECOMP_VBLANK_HZ overrides the frame clock's rate. 60 is what the console
+ * does and is the default. It is a switch because the rate is not free: every
+ * tick runs the title's own ISR and DPC chain, and while the recompiled title
+ * is slower than the clock, a lower rate measurably costs less -- 40 Hz was
+ * this project's accidental rate for a long time and ran about 1 fps faster
+ * than 60 does today. Once the guest side keeps up, 60 is the answer. */
+static int vblank_hz(void)
+{
+    static int hz = -1;
+
+    if (hz < 0) {
+        const char *v = getenv("RECOMP_VBLANK_HZ");
+        hz = v ? atoi(v) : VBLANK_HZ;
+        if (hz < 1 || hz > 1000)
+            hz = VBLANK_HZ;
+    }
+    return hz;
+}
+
+/* Milliseconds until the next frame is due, for the pump thread's sleep.
+ * Sleeping a fixed millisecond would wake this thread a thousand times a
+ * second to deliver sixty frames, and those wakeups are guest CPU time. */
+static DWORD kernel_vblank_sleep_ms(void)
+{
+    LARGE_INTEGER now;
+    long long left;
+
+    if (!g_vblank_freq.QuadPart)
+        return 1;
+    QueryPerformanceCounter(&now);
+    left = g_vblank_next.QuadPart - now.QuadPart;
+    if (left <= 0)
+        return 0;
+    left = left * 1000 / g_vblank_freq.QuadPart;
+    if (left > 10)
+        left = 10;                  /* timers and DPCs still want a look in */
+    return (DWORD)left;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    LARGE_INTEGER now_qpc;
+    long long period, now;
 
     if (enabled < 0)
         enabled = getenv("RECOMP_VBLANK") != NULL;
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    if (!g_vblank_freq.QuadPart) {
+        QueryPerformanceFrequency(&g_vblank_freq);
+        if (!g_vblank_freq.QuadPart)
+            return;
+        QueryPerformanceCounter(&g_vblank_next);
+    }
+    period = g_vblank_freq.QuadPart / vblank_hz();
+    QueryPerformanceCounter(&now_qpc);
+    if (now_qpc.QuadPart < g_vblank_next.QuadPart)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    g_vblank_next.QuadPart += period;
+    if (g_vblank_next.QuadPart < now_qpc.QuadPart - period)
+        g_vblank_next.QuadPart = now_qpc.QuadPart + period;   /* far behind: resync */
+    now = (long long)GetTickCount64();
+
+    /* What the title's frame clock actually runs at. RECOMP_FPS turns it on,
+     * because it is the same question: a title paced on vblank cannot present
+     * faster than this arrives, however fast everything else is. */
+    {
+        static int report = -1;
+        static long long window_start;
+        static unsigned long ticks;
+
+        if (report < 0) {
+            const char *v = getenv("RECOMP_FPS");
+            report = v ? atoi(v) : 0;
+        }
+        if (report > 0) {
+            ticks++;
+            if (!window_start) {
+                window_start = now;
+            } else if (now - window_start >= (long long)report * 1000) {
+                fprintf(stderr, "[VBLANK] %.1f Hz delivered over %.0f s\n",
+                        ticks * 1000.0 / (double)(now - window_start),
+                        (now - window_start) / 1000.0);
+                fflush(stderr);
+                window_start = now;
+                ticks = 0;
+            }
+        }
+    }
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -2500,11 +2600,16 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    /* A 1 ms system timer for as long as this thread runs. Without it Sleep
+     * rounds up to the default 15.6 ms tick, which is coarser than the frame
+     * period this thread exists to keep. */
+    timeBeginPeriod(1);
+
     for (;;) {
         long long now;
         int i;
 
-        Sleep(10);
+        Sleep(kernel_vblank_sleep_ms());
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
         kernel_drain_dpcs();   /* deferred work, before due timers */

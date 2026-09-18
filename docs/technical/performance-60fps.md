@@ -5,8 +5,9 @@ is the starting point for that work: what is already measured, what the
 suspects are, how to tell them apart, and which mistakes make a number mean
 nothing.
 
-Nothing here has been profiled yet. Everything below is either a counted fact
-or a named hypothesis, and each one says which it is.
+Everything below is either a counted fact or a named hypothesis, and each one
+says which it is. The first round of measurement is done — see **What the
+measurements settled** — and it removed the two biggest suspects.
 
 ---
 
@@ -36,6 +37,58 @@ so the loss is ours: CPU, the HLE boundary, or the host renderer.
 - Over 240 s: 38,289 `DrawPrimitiveUP` + 278 indexed UP + 360,186 indexed
   buffer draws. The indexed-buffer path dominates.
 - 0 draws skipped, 0 failed, 0 off the swapping thread.
+
+---
+
+## What the measurements settled
+
+*18 September 2026. Every row uses the same instrument: `RECOMP_FPS=<seconds>`
+counts the title's own `Swap` before anything else in the replacement runs, so
+it means the same thing whatever else is switched on. 200 s runs, Release.*
+
+### The renderer is not the bottleneck
+
+| Configuration | fps (mean of 10 s windows) |
+|---|---|
+| shadow on, push buffer on (as shipped) | 15.1 |
+| shadow on, push buffer **off** | 15.5 |
+| shadow **off**, push buffer on | 15.5 |
+| shadow **off**, push buffer **off** | 15.0 |
+
+Turning off *all* host drawing and *all* push-buffer work changes nothing.
+**Suspects 1, 2 and 3 below are ruled out as the current limiter** — the
+per-draw state scan, the per-draw hashing and allocation, and the executor
+running alongside shadow mode are all real inefficiencies, and none of them is
+what is costing the frame rate today. Fixing them first would have been wasted
+work, which is what this table bought.
+
+### The frame clock was capping everything at 40 Hz
+
+`kernel_vblank_tick` scheduled the next frame at `GetTickCount64() + 16`.
+That counter advances in system timer ticks — 15.6 ms by default — so the
+deadline could not be met before two of them. **Measured: 40.0 Hz delivered,
+never 60.** A title that waits whole frames then quantises to 40, 20, 13.3 fps,
+which is exactly the spread this project was seeing (13.1, 13.3, 12.6 …).
+
+Fixed: the clock now runs off `QueryPerformanceCounter`, the pump thread asks
+for a 1 ms system timer and sleeps to the deadline rather than a fixed
+millisecond. **Measured: 60.0 Hz delivered.**
+
+**It does not raise the frame rate today, and it slightly lowers it** — 14.2
+mean against 15.1 at 40 Hz, because each tick runs the title's own ISR and DPC
+chain, and there are now half as many again of them. The ceiling is gone; the
+floor is elsewhere. `RECOMP_VBLANK_HZ` sets the rate for A/B without a
+rebuild.
+
+### So the cost is the guest side
+
+What is left after the renderer, the push buffer and the clock: the lifted CPU
+code, the kernel bridge, and memory. That is suspects 4 and 5, and neither has
+been profiled yet.
+
+**The next measurement**, and the one this document should be updated with:
+`RECOMP_TRACE_PROFILE` over a race, read with `scripts/stall_report.py`, to
+find where guest time goes. Its blind spot is in the Method section below.
 
 ---
 
@@ -95,7 +148,7 @@ of 2+3 in situ.
 Ordered by expected size. Each is a hypothesis with a stated reason, not a
 finding.
 
-### 1. The push-buffer executor runs alongside shadow mode
+### 1. The push-buffer executor runs alongside shadow mode — RULED OUT
 
 `RECOMP_PB_EXEC=1` executes the title's push buffer in the LLE path *while*
 shadow mode draws the same frame through D3D11. If shadow mode now renders
@@ -106,7 +159,7 @@ everything the title asks for, the executor may be duplicated work.
 does not forward — `BeginPush` traffic reaches no replacement, per
 `docs/technical/shadow-mode.md`. Compare frames, not just the swap rate.
 
-### 2. Per-draw state scanning
+### 2. Per-draw state scanning — RULED OUT as the current limiter
 
 `src/hle/hle_d3d8_state.c` reads the title's own state arrays on **every
 draw** — up to 167 render states plus 4 × 32 texture stage states — and
@@ -117,7 +170,7 @@ that is ~270,000 guest memory reads per frame before anything is forwarded.
 If it is a handful, the scan is the cost and a dirty-bit or a change counter
 on the guest side would replace it.
 
-### 3. Work repeated per draw in the host layer
+### 3. Work repeated per draw in the host layer — RULED OUT as the current limiter
 
 - `d3d8_vsh_prepare_draw` hashes the **whole vertex program microcode**
   (FNV-1a) on every draw to look up the shader cache.
@@ -130,7 +183,7 @@ on the guest side would replace it.
 All three are per-draw allocations or O(size) passes where a cached handle or
 a reused scratch buffer would do.
 
-### 4. The register model
+### 4. The register model — still open, now the leading suspect
 
 `CLAUDE.md` plans this already: lifted code keeps guest registers in globals
 (`g_eax` and friends) plus a simulated stack in a guest memory array. That
@@ -139,7 +192,7 @@ body, which is the standing reason naive lifted output loses to a JIT. It is
 also the most invasive change here, and it gets baked into generated code —
 so measure before deciding it is the problem.
 
-### 5. Logging that survives into a "clean" run
+### 5. Logging that survives into a "clean" run — still open
 
 `RECOMP_TRACE_BUDGET=0` silences `[TRACE]`, but the kernel log, the `[PATH]`
 and `[READ]` file lines and the D3D8 first-call lines are separate. An earlier
@@ -170,8 +223,14 @@ dropping the run to ~45 swaps/s on logging alone.
   frame.
 - **The shadow window pumps on its own thread** and present interval is
   already 0, so neither vsync nor window pumping is the limiter.
-- **Check the swap counter, not wall-clock feel.** The shadow report line at
-  exit carries swaps, clears and per-path draw counts.
+- **Check the swap counter, not wall-clock feel.** `RECOMP_FPS=10` prints the
+  title's own present rate every ten seconds, and the vblank rate beside it.
+  The shadow report line at exit carries swaps, clears and per-path draw
+  counts, but it needs shadow mode, so it cannot compare configurations.
+- **Frame rate swings with what is on screen** — a loading screen, a fade and
+  a race are different workloads, and a 10 s window catches whichever it
+  lands on. Compare means over a whole run, and treat a single window as
+  noise.
 
 ## Where the ceiling actually is
 
