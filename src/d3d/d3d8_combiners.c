@@ -299,6 +299,21 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
          * COMPLEMENT_V1 0x40, COMPLEMENT_R0 0x20), which is not applied yet: a
          * title relying on those flags gets the uncomplemented, unclamped
          * value. */
+        /* A shader that never programs the final combiner leaves both words
+         * zero, and every one of TimeSplitters 2's front-end shaders does
+         * (count 0x11101, one stage writing r0). Read literally that is
+         * A = B = C = D = ZERO and G = ZERO: out = 0 + 0*0 + 1*0 = black with
+         * alpha 0, which is what the shadow renderer drew -- a black frame
+         * over a progress bar the fixed-function path showed plainly. The
+         * console's D3D gives an unprogrammed final combiner the pass-through
+         * the shader assembler documents as its default, `xfc r0.a, zero,
+         * zero, zero, zero, zero, r0`: colour D = r0, alpha G = r0.a. Do the
+         * same. A title that wants black writes ZERO into D explicitly, which
+         * is a different word from "nothing written". */
+        if (abcd == 0 && efg == 0) {
+            abcd = 0x0000000Cu;              /* D = R0 */
+            efg  = 0x00001C00u;              /* G = R0 alpha */
+        }
         parse_combiner_input((abcd >> 24) & 0xFF, &state->final_input[0]); /* A */
         parse_combiner_input((abcd >> 16) & 0xFF, &state->final_input[1]); /* B */
         parse_combiner_input((abcd >>  8) & 0xFF, &state->final_input[2]); /* C */
