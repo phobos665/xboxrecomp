@@ -251,10 +251,16 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     if (e) {
         e->used_swap = now;
         if (!e->rendered && e->checked_swap != now) {
+            /* RECOMP_HLE_D3D8_TEX_REFRESH=1: upload every bound texture once
+             * a frame regardless of the checksum, to tell a stale cache from
+             * a wrong draw. */
+            static int refresh = -1;
+            if (refresh < 0)
+                refresh = getenv("RECOMP_HLE_D3D8_TEX_REFRESH") ? 1 : 0;
             e->checked_swap = now;
             if (read_layout(va, &t)) {
                 uint32_t sum = level0_checksum(&t);
-                if (sum != e->checksum) {
+                if (sum != e->checksum || refresh) {
                     e->checksum = sum;
                     upload(e->host, &t);
                     g_reuploads++;

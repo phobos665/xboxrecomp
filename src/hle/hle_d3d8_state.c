@@ -816,10 +816,17 @@ HLE_EXPORT(D3DDevice_SetRenderState_Simple)
     };
     uint32_t method = g_ecx & 0x1FFCu, value = g_edx;
     size_t i;
+    /* RECOMP_HLE_D3D8_RS_SIMPLE=0 leaves the array stale, as before this
+     * replacement, to tell a wrong state apart from a wrong draw. */
+    static int store = -1;
 
     if (hle_original_D3DDevice_SetRenderState_Simple)
         HLE_CALL_ORIGINAL(D3DDevice_SetRenderState_Simple);
-    if (!hle_var_D3D_g_RenderState)
+    if (store < 0) {
+        const char *e = getenv("RECOMP_HLE_D3D8_RS_SIMPLE");
+        store = !(e && *e == '0');
+    }
+    if (!hle_var_D3D_g_RenderState || !store)
         return;
     for (i = 0; i < sizeof map / sizeof map[0]; i++) {
         if (map[i].method == method) {

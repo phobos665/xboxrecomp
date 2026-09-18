@@ -193,8 +193,30 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
-            CreateDirectoryW(win_path, NULL);
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            if (!CreateDirectoryW(win_path, NULL) &&
+                GetLastError() == ERROR_ALREADY_EXISTS &&
+                CreateDisposition == XBOX_FILE_CREATE) {
+                /* FILE_CREATE on a directory that exists is a collision on
+                 * the console, and a title's save path depends on hearing
+                 * it. TimeSplitters 2 names its save folder from the profile
+                 * (XCreateSaveGame), asks to create it, and on "collision"
+                 * takes its overwrite path. Opening the old folder here
+                 * instead let it believe the folder was fresh: it wrote its
+                 * metadata files (overwrite dispositions), then created its
+                 * signature file with FILE_CREATE, found last run's there,
+                 * and reported the hard disk had failed. */
+                g_xbox_last_file_error = ERROR_ALREADY_EXISTS;
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                         "NtCreateFile: FILE_CREATE on existing directory %S -> collision",
+                         win_path);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = STATUS_OBJECT_NAME_COLLISION;
+                    IoStatusBlock->Information = 0;
+                }
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -506,9 +528,19 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
-            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                         "SetFileDispositionInfo failed: err=%u", GetLastError());
+            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi))) {
+                /* stderr, like the unhandled-class case below: a delete that
+                 * did not happen is how a title's next save finds its own old
+                 * file in the way and reports the disk has failed. */
+                DWORD err = GetLastError();
+                fprintf(stderr, "  [FILE] delete-on-close for handle %p refused "
+                                "(win32 err=%u)\n", FileHandle, err);
+                fflush(stderr);
+                IoStatusBlock->Status = err == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
+                                                                    : STATUS_UNSUCCESSFUL;
+                return IoStatusBlock->Status;
+            }
+            fprintf(stderr, "  [FILE] delete-on-close set for handle %p\n", FileHandle);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }

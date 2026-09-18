@@ -54,11 +54,14 @@ enum {
     TAG_PCM   = 0x0001u,
     TAG_ADPCM = 0x0069u,
 
-    /* dsound.h */
-    DSSTREAMSTATUS_READY   = 0x1u,
-    DSSTREAMSTATUS_PLAYING = 0x2u,
-    DSSTREAMSTATUS_PAUSED  = 0x4u,
-    DSSTREAMSTATUS_STARVED = 0x8u,
+    /* dsound.h. READY is XMO_STATUSF_ACCEPT_INPUT_DATA; the stream's own
+     * flags sit in the high word. TimeSplitters 2's intro tests
+     * (status & 0x30000) == 0x10000 before it lifts its fade from black, and
+     * with PLAYING reported as 0x2 it waited forever behind an opaque quad. */
+    DSSTREAMSTATUS_READY   = 0x00000001u,
+    DSSTREAMSTATUS_PLAYING = 0x00010000u,
+    DSSTREAMSTATUS_PAUSED  = 0x00020000u,
+    DSSTREAMSTATUS_STARVED = 0x00040000u,
     DSSTREAMPAUSE_RESUME = 0u, DSSTREAMPAUSE_PAUSE = 1u, DSSTREAMPAUSE_SYNCHPLAYBACK = 2u,
 
     LEAD_MS  = 400,                  /* how far ahead of the clock the host is fed */
@@ -96,6 +99,12 @@ typedef struct Stream {
     uint64_t sent;                   /* decoded bytes submitted to the host */
 } Stream;
 
+/* What the title asks of its streams, reported every five seconds while any
+ * stream exists: a cutscene clocked off its music shows up here as a
+ * GetStatus or Process count that stops moving. */
+static unsigned long g_calls_process, g_calls_status, g_calls_pause, g_calls_flush,
+                     g_packets_done;
+
 static Stream g_streams[MAX_STREAMS];
 static CRITICAL_SECTION g_lock;
 static INIT_ONCE g_lock_once = INIT_ONCE_STATIC_INIT;
@@ -113,6 +122,26 @@ static void lock(void)
 }
 static void unlock(void) { LeaveCriticalSection(&g_lock); }
 static uint64_t now_ms(void) { return GetTickCount64(); }
+
+/* Name the first few call sites of a replaced stream method, once each: a
+ * title that waits on a status this file reports differently from the console
+ * is found by reading the caller. */
+static void note_caller(const char *what)
+{
+    static uint32_t seen[12];
+    static int n;
+    uint32_t ret = HLE_MEM32(g_esp);
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (seen[i] == ret)
+            return;
+    if (n < 12) {
+        seen[n++] = ret;
+        fprintf(stderr, "[DSOUND] stream %s called from 0x%08X\n", what, ret);
+    }
+}
+
 
 static int guest_readable(uint32_t va, uint32_t bytes)
 {
@@ -208,6 +237,7 @@ static Stream *find_by_object(uint32_t object)
  * return address, as kernel_run_dpc relies on for DPCs. */
 static void complete(Stream *s, const Packet *p, uint32_t status, uint32_t size)
 {
+    g_packets_done++;
     if (p->status_va && guest_readable(p->status_va, 4u))
         HLE_MEM32(p->status_va) = status;
     if (p->completed_va && guest_readable(p->completed_va, 4u))
@@ -330,11 +360,28 @@ static void tick(Stream *s, uint64_t now)
 
 void hle_dsound_stream_tick(uint64_t now)
 {
-    int i;
+    static uint64_t last_report;
+    int i, any = 0;
     lock();
     for (i = 0; i < MAX_STREAMS; i++)
-        if (g_streams[i].iface)
+        if (g_streams[i].iface) {
             tick(&g_streams[i], now);
+            any = 1;
+        }
+    if (any && now - last_report >= 5000u) {
+        last_report = now;
+        for (i = 0; i < MAX_STREAMS; i++) {
+            Stream *s = &g_streams[i];
+            if (!s->iface) continue;
+            fprintf(stderr, "[DSOUND] stream %08X: %d queued, consumed %llu of %llu, %s; "
+                    "calls: process %lu status %lu pause %lu flush %lu, %lu packets done\n",
+                    s->iface, s->count, (unsigned long long)consumed(s, now),
+                    (unsigned long long)s->queued, s->paused ? "paused" : "running",
+                    g_calls_process, g_calls_status, g_calls_pause, g_calls_flush,
+                    g_packets_done);
+        }
+        fflush(stderr);
+    }
     unlock();
 }
 
@@ -436,6 +483,8 @@ HLE_EXPORT(CDirectSound_CreateSoundStream)
  *               +10 hCompletionEvent / pContext  +14 prtTimestamp */
 HLE_EXPORT(CDirectSoundStream_Process)
 {
+    g_calls_process++;
+    note_caller("Process");
     uint32_t object = HLE_ARG(0), packet = HLE_ARG(1);
     uint64_t now = now_ms();
     Stream *s;
@@ -485,6 +534,8 @@ HLE_EXPORT(CDirectSoundStream_Process)
  * flushed, and the clock moves to the end of the data. */
 HLE_EXPORT(CDirectSoundStream_Flush)
 {
+    g_calls_flush++;
+    note_caller("Flush");
     uint64_t now = now_ms();
     Stream *s;
 
@@ -520,6 +571,8 @@ HLE_EXPORT(CDirectSoundStream_Discontinuity)
 /* HRESULT CDirectSoundStream::Pause(this, DWORD dwPause) */
 HLE_EXPORT(CDirectSoundStream_Pause)
 {
+    g_calls_pause++;
+    note_caller("Pause");
     uint32_t mode = HLE_ARG(1);
     uint64_t now = now_ms();
     Stream *s;
@@ -552,6 +605,8 @@ HLE_EXPORT(CDirectSoundStream_Pause)
 /* HRESULT CDirectSoundStream::GetStatus(this, DWORD *pdwStatus) */
 HLE_EXPORT(CDirectSoundStream_GetStatus__r2)
 {
+    g_calls_status++;
+    note_caller("GetStatus");
     uint32_t out = HLE_ARG(1), status = 0u;
     uint64_t now = now_ms();
     Stream *s;
