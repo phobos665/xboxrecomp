@@ -20,7 +20,9 @@
 
 namespace {
 
-constexpr uint32_t kVoiceCount = 256;
+/* 0..255 are DirectSound buffers (hle_dsound.c), 256..271 streams
+ * (hle_dsound_stream.c). */
+constexpr uint32_t kVoiceCount = 256 + 16;
 constexpr uint32_t kQueueSize = 4;
 constexpr uint32_t kMaxBufferBytes = 160000;
 

@@ -23,7 +23,8 @@ void recomp_audio_output_shutdown(void);
 void recomp_audio_output_reset_voice(uint32_t slot);
 
 /* Copies PCM before returning; never retains a guest-memory pointer.
-   Slots: 0..255. PCM: 1000..200000 Hz, mono/stereo, unsigned 8 or signed 16 bit.
+   Slots: 0..255 for buffers, 256..271 for streams. PCM: 1000..200000 Hz,
+   mono/stereo, unsigned 8 or signed 16 bit.
    Each submission is frame-aligned and at most 160000 bytes. A full queue
    drops the incoming chunk without waiting. */
 void recomp_audio_output_submit(
