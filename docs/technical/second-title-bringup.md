@@ -116,35 +116,74 @@ builds, `RECOMP_VBLANK=1 RECOMP_AC97_READY=1`, no input:
 | after | 29,900 functions, still climbing at 60 s, 14 files, front end reached | 1,137 functions, 20 files (front-end paks), menu music streaming, swaps at 60 Hz |
 | overrides in `recomp_manual.c` | 0 | 0 |
 
-TimeSplitters 2 settles at 1,137 functions with no input; it is presumably at
-its title screen waiting for a button.
+**Later the same day, TimeSplitters 2 reached gameplay.** With a scripted menu
+path (`RECOMP_INPUT_SEQ`, below) it goes splash, profile save, story level
+select, difficulty select, "Loading...", and into the Siberia level's opening
+cutscene in about 80 s, then runs there at 85-145 fps. The front end renders in
+full 3D (the time-portal room). The level is dark and about 15% of its draws
+are skipped, so it is not yet *playable*, but everything before that point --
+CRT start-up, disc check, DirectSound, the 4721 shader API, the menus -- works
+with zero overrides. Three more things stood in the way after the first
+version of this document, and two of them were not the title:
+
+- **The profiler was the "hang".** After the Start press the title drew but
+  presented once every twenty seconds. `RECOMP_SAMPLE` showed 85% of the main
+  thread in `prof_report`: `run_and_report.py --profile` defaults to a report
+  every 100 calls, each rewriting the whole dump file. A build lifted with
+  `--trace-all-entries` also prints a `[TRACE]` line per entry until its
+  budget runs out. Reports are capped at one per second now, and the debug
+  table in `CLAUDE.md` says to turn both off before believing a title is stuck.
+- **A switch the disassembler lost.** The front end then span forever on an
+  indirect call to 0x000DDD84, which is one arm of a `switch` in
+  sub_000DDD70: the sweep reached that function out of phase, the
+  `jmp [eax*4 + table]` was only decoded when the call target was realigned,
+  and `resync_jump_tables()` had already run. The table was never measured,
+  the five case bodies were never decoded, and the lifted jump went to an
+  "unknown target" that returned without doing anything. The resync now runs
+  before every function rebuild, decodes the case bodies, and answers by the
+  displacement the dispatch names (`tools/disasm/test_jump_tables.py`).
+- **Two indirect-call targets** (0x0005B300, 0x00073D40) that discovery never
+  found, added to `config/seeds/4553000A.json` by `tools.seed_from_log`.
 
 ## What is next, in order
 
-1. **Vertex programs through the direct API (HLE).** TimeSplitters 2 draws
-   through `DrawVertices` from stream 0 (752 calls in 60 s), and the shadow
-   renderer skips every one as "unknown shader". Its XDK loads shader
-   microcode with `D3DDevice_LoadVertexShaderProgram` (4 calls) and selects
-   it with `D3DDevice_SelectVertexShaderDirect` (160 calls) plus
-   `SelectVertexShader`, never `CreateVertexShader`, so `src/hle` never
-   learns the program. The handles it selects (`0x001EC3D1`) point at static
-   shader objects in the D3D section's BSS, filled at runtime. Replacing
-   `LoadVertexShaderProgram` (microcode at a slot) and
-   `SelectVertexShaderDirect` (declaration plus slot) by name is the general
-   fix; both are named in the 4721 symbols.
-2. **Pixel shaders.** `SetPixelShader(0x001E9BCC)` "is not a shader object
-   with a definition at +0x0C": the 4721 object layout differs from 5344's.
-   `RECOMP_HLE_D3D8_PS_PROBE=1` dumps the object.
-3. **Input.** Nothing has pressed a button yet; XAPI input is replaced by name
-   and reports a pad on port 0, so the next run should drive the menu
-   (`RECOMP_FAKE_INPUT`).
-4. **Junk in the lift.** 1,124 unimplemented-instruction comments in the
+1. **Draws skipped as "program without layout".** 297,810 of 1.9 million
+   in-level draws in a two-minute run: a vertex program is selected but the
+   shadow has no input layout for it. The level is very dark and probably
+   missing surfaces because of it. The counter is `g_draws_program` in
+   `hle_d3d8.c`.
+2. **Lighting and vertex colour.** Once every draw reaches the host, compare
+   a frame with xemu; `docs/technical/shadow-mode.md` lists lighting as a gap.
+3. **Frame pacing.** In-level the title presents at 85-145 fps because `Swap`'s
+   fence completes immediately. Making it wait for the next vblank gives
+   console timing; `docs/technical/performance-60fps.md` has the plan, and a
+   design for user-selectable resolution and frame-rate cap is in progress.
+4. **Play it.** Keyboard and XInput are mapped in `src/hle/input_host.c`; the
+   title has only been driven by scripts so far.
+5. **One unresolved indirect call**, 0x001D35E4 (119 calls). The seed is
+   rejected as landing inside a decoded instruction, so it is probably another
+   misdecode like the switch above.
+6. **Junk in the lift.** 1,124 unimplemented-instruction comments in the
    TimeSplitters lift, 1,010 of them inside XGRPH, are data the disassembler
    took for code (`outsd`, `insb`, `popal`, `arpl`). Harmless unless executed;
    the function-discovery item in `CLAUDE.md`.
-5. **Seeds.** `config/seeds/4553000A.json` holds the thread starts and
-   indirect-call targets the first runs observed; `tools.seed_from_log`
-   maintains it.
+
+### Driving the menus without a controller
+
+`RECOMP_FAKE_INPUT=start,a` cycles through its buttons forever, which is right
+for "Press START" and wrong for a menu. `RECOMP_INPUT_SEQ` is a one-shot timed
+script, `<ms>:<button>[+<button>][:<hold ms>],...`, clocked from the first pad
+read. The path that reaches Siberia:
+
+```text
+RECOMP_INPUT_SEQ="12000:start,16000:start,20000:start,24000:start,28000:a,34000:a,40000:a,46000:a,52000:a,58000:a,64000:a,70000:a"
+```
+
+The repeated Start presses cover the splash's loading time; the A presses walk
+profile save, story, level, difficulty. There is no save state to restore a
+native process to (lifted code is mid-flight on real threads with host GPU
+objects behind it), so the script is the save state. Frame dumps
+(`RECOMP_HLE_D3D8_DUMP`, `_MINDRAWS=1`, `_EVERY=300`) show where it got to.
 
 ## Working on two titles
 

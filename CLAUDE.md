@@ -74,6 +74,17 @@ known. Both titles need `RECOMP_VBLANK=1 RECOMP_AC97_READY=1` to pace and to get
 audio init; the DSP doorbell is found from the scratch page table, so `RECOMP_APU_DSP_ACK`
 is only an override now.
 
+**Update, 18 Sep 2026 evening:** the 4721 shader paths are replaced (`LoadVertexShaderProgram`,
+`SelectVertexShaderDirect`, pointer-form pixel shaders), and with a scripted menu path
+(`RECOMP_INPUT_SEQ`, see the bring-up doc) TimeSplitters 2 loads the Siberia level and renders
+its opening cutscene, at 85-145 fps uncapped. Not yet playable: the level is dark and ~15% of
+in-level draws are skipped as "program without layout". Two of the three blockers on the way
+were not the title: the entry profiler at a 100-call interval (now capped at one report a
+second) and a switch table the disassembler never measured (`resync_jump_tables()` now runs
+before every function rebuild). When a title "hangs" after drawing, suspect the diagnostics
+first, and when it spins on an `[ICALL] unknown target` a few bytes past a function end, look
+for a `jmp [reg*4 + table]` just before it.
+
 Two things that cost days and are worth knowing before touching this code. The title's
 **deferred render state arrays do not follow its pixel shader** — `SetPixelShader` selects
 an object carrying a `D3DPIXELSHADERDEF`, and the arrays hold whichever shader last went
