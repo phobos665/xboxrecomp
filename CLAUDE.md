@@ -63,6 +63,17 @@ the gaps that remain (cube render targets, `CopyRects`, lighting). A path for ti
 fill push buffers through `BeginPush` is still the next piece of work: those draws reach no
 replacement at all.
 
+**Second title (Sep 2026): TimeSplitters 2, XDK 4721.** Boots through XAPI start-up,
+DirectSound and its first frames with **no overrides**; see
+`docs/technical/second-title-bringup.md` for the six things it proved were wrongly
+universal (retail disc check, GPU time fence offsets, DSP doorbell, the APU's physical
+view, two template gaps) and what is next. Its draws reach the shadow renderer and are
+skipped: 4721 loads vertex programs through `LoadVertexShaderProgram` /
+`SelectVertexShaderDirect`, which `src/hle` does not replace yet, so no program is ever
+known. Both titles need `RECOMP_VBLANK=1 RECOMP_AC97_READY=1` to pace and to get through
+audio init; the DSP doorbell is found from the scratch page table, so `RECOMP_APU_DSP_ACK`
+is only an override now.
+
 Two things that cost days and are worth knowing before touching this code. The title's
 **deferred render state arrays do not follow its pixel shader** — `SetPixelShader` selects
 an object carrying a `D3DPIXELSHADERDEF`, and the arrays hold whichever shader last went
@@ -174,6 +185,21 @@ it. Keep it beside the XBE.
 Use `--game-only` when bringing up a new title. Lifting CRT and XDK code you intend to HLE away
 wastes compile time and debugging attention. Switch to `--all` only when needed.
 
+**Two titles at once (this fork):** every stage defaults to one shared `tools/*/output`,
+and the recompiler's title guard compares file names only, so two `default.xbe`s overwrite
+each other silently. Give each title its own outputs and project:
+
+```bash
+py -3 scripts/recompile.py "games/<title>/default.xbe" \
+    --work-dir games/_pipeline/<name>/out --project titles/<name> --trace-all-entries
+```
+
+Projects live in `titles/<name>/` (committed: CMakeLists, `main.c`, `recomp_manual.c`),
+game data in `games/<title>/` and stage output in `games/_pipeline/<name>/out` (both
+ignored). Regenerate a title's `main.c` from the template with
+`scripts/regen_title_main.py` rather than editing the copy. On this machine CMake is the
+one bundled with VS 2019 Build Tools; there is no VS 2022 and none is needed.
+
 ---
 
 ## Debug loop
@@ -190,6 +216,9 @@ lives here.
 | Infinite loop | Waiting on hardware state — stub the wait or fake the state |
 | Stack overflow | Wrong ESP at entry, or runaway recursion |
 | **Subtly wrong physics or RNG, no crash** | **x87 precision divergence — suspect this first when behaviour differs from xemu without a fault** |
+| Exits via `HalReturnToFirmware` after ~15 kernel calls | XAPI's retail disc check failed (certificate `AllowedMedia` is DVD-X2 only). The kernel answers it since Sep 2026; if it recurs, look at the mode-sense reply in `kernel_bridge.c` |
+| Main thread stops entering new functions right after the first `Swap`; ISR keeps ticking | `D3D_BlockOnTime` waiting for the GPU time fence. The HLE mirrors it from `D3D_BlockOnTime`'s prologue; a "not mirrored" line in the log means this XDK's prologue differs |
+| Stops in DirectSound start-up, watchdog shows `ebx = <block>+0x810` | The DSP doorbell. Found from `GPSADDR`/`EPSADDR` under `RECOMP_AC97_READY`; without that switch DirectSound never gets this far and the title dereferences a half-built sound object instead |
 
 Overrides live in `recomp_manual.c` and are checked before the auto-generated table, so they
 always win. `manual_scan.py` parses that file to decide what not to generate, so keep them
