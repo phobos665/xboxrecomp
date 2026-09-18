@@ -288,6 +288,39 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     return e->host;
 }
 
+/* The host texture a guest 2D texture samples as, for a caller outside this
+ * file that needs one without claiming the title renders into it --
+ * D3DDevice_CopyRects, whose two surfaces may be anything. It is
+ * hle_d3d8_render_texture's counterpart and does none of its damage: an
+ * entry that already exists is returned as it is, and a new one is created
+ * and filled from guest memory exactly as SetTexture would.
+ *
+ * NULL for a texture this file cannot mirror. */
+IDirect3DTexture8 *hle_d3d8_sample_texture(IDirect3DDevice8 *dev, uint32_t va)
+{
+    return host_texture(dev, va);
+}
+
+/* Stops a texture being re-uploaded from guest memory, because the host's
+ * copy is now the only place its contents exist. CopyRects calls this on its
+ * destination once the copy has actually been made -- the guest memory behind
+ * that surface never sees it, so a later checksum would put the old texels
+ * back over what was copied in.
+ *
+ * Returns 0 for a texture not in the cache, which the caller counts. */
+int hle_d3d8_texture_host_owned(uint32_t va)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        if (g_textures[i].host && g_textures[i].va == va) {
+            g_textures[i].rendered = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Cube textures a title renders into: its environment map. Only rendered
  * cubes are mirrored -- a cube the title uploads from guest memory still
  * binds white -- so the entries carry no contents and are never re-uploaded.

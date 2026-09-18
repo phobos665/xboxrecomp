@@ -110,12 +110,31 @@ push buffers through `BeginPush`, whose draws no replacement ever sees.
 - A cube the title uploads from guest memory binds white. Only the cubes it
   renders into are mirrored, and the cache holds eight of them; past that the
   run log says so.
-- `CopyRects` is not handled.
 - `SetVertexData4f` / `SetVertexData4ub` are not replaced; `SetVertexDataColor`
   and `SetVertexData2f` are.
 - A render target texture replays as zeros: its contents are drawn, never in
   the guest's memory, so a capture that samples one without drawing into it
   first shows nothing.
-- Lights and material are not forwarded, so lighting stays off.
+- Lights, the material and `CopyRects` are forwarded, but no title here has
+  ever called them. Burnout 2 lights its world inside its own vertex
+  programs, and a 200 s run reaching a race enters none of the four
+  replacements, so the path is covered only by the synthetic capture the
+  round-trip test writes (`tests/d3d8_capture`, replayed with
+  `d3d8_replay`). Expect the first title that uses them to find something.
+- A `CopyRects` whose two sides do not share a host format, or whose source or
+  destination shadow mode holds no mirror of, is dropped and counted in the
+  run log. D3D11 cannot convert inside a copy, and a copy put anywhere but its
+  destination would draw over the frame. Rectangles are clipped to both
+  surfaces; a copy where every rectangle clips away counts as refused, since
+  D3D11 would otherwise drop it silently and the capture would record one that
+  never happened.
+- **Every replacement reads its arguments off the guest stack.** Nothing in
+  `hle_d3d8.c` reads `g_ecx` or `g_edx`. On a D3D8LTCG build the small
+  functions are the ones the linker converts to register arguments --
+  `D3DDevice_SetMaterial` takes one pointer, which is the classic shape --
+  and there a replacement would read stack garbage. `guest_ptr_ok` turns most
+  of that into a silent no-op, so the signature is a first-call line with a
+  counter that never moves. Burnout 2 is a plain D3D8 build, so nothing here
+  has met this yet.
 - Only the XDK 4627+ render state layout is read; anything else turns state
   forwarding off and says so.

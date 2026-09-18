@@ -71,6 +71,25 @@ HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport);
 HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage,
                         IDirect3DBaseTexture8 *texture);
 HRESULT host_SetVertexShader(IDirect3DDevice8 *dev, DWORD handle);
+
+/* Fixed-function lighting. The Xbox D3DLIGHT8 and D3DMATERIAL8 have the same
+ * fields in the same order as the host's, so shadow mode copies them across
+ * without reordering; the host lights in its own vertex shader
+ * (d3d8_shaders.c), so a title with its own vertex program is unaffected. */
+HRESULT host_SetLight(IDirect3DDevice8 *dev, DWORD index, const D3DLIGHT8 *light);
+HRESULT host_LightEnable(IDirect3DDevice8 *dev, DWORD index, BOOL enabled);
+HRESULT host_SetMaterial(IDirect3DDevice8 *dev, const D3DMATERIAL8 *material);
+
+/* CopyRects between host surfaces, named the way host_SetRenderTarget names
+ * them: NULL is the back buffer, otherwise `level` and `face` of a texture.
+ * rect_count 0 copies the whole source level. Returns E_INVALIDARG when the
+ * two sides do not share a format -- see d3d8_copy_rects -- and the caller
+ * counts that rather than the capture recording a copy that never happened. */
+HRESULT host_CopyRects(IDirect3DDevice8 *dev,
+                       IDirect3DBaseTexture8 *src, UINT src_level, UINT src_face,
+                       const RECT *rects, UINT rect_count,
+                       IDirect3DBaseTexture8 *dst, UINT dst_level, UINT dst_face,
+                       const POINT *points);
 HRESULT host_DrawPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,
                              UINT prims, const void *vertices, UINT stride);
 HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,

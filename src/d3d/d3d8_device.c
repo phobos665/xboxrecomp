@@ -317,6 +317,27 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     state->render_states[D3DRS_STENCILENABLE]     = FALSE;
     state->render_states[D3DRS_COLORWRITEENABLE]  = 0x0F;
 
+    /* The default material: diffuse white, everything else zero. Without this
+     * a title that turns lighting on and sets lights but no material of its
+     * own would light every vertex against a zeroed material and draw black.
+     * No light is enabled by default, which is also what D3D does -- lighting
+     * with no lights is emissive plus ambient, and on a fresh device that is
+     * black, exactly as on the Xbox.
+     *
+     * The diffuse ALPHA is the one value here not confirmed against hardware:
+     * wined3d's default material uses 0, this uses 1. It only shows on a
+     * title that enables lighting and alpha blending without ever calling
+     * SetMaterial, where 1 draws opaque and 0 draws invisible. Opaque is the
+     * more visible wrong answer, which is why it is this way round. Settle it
+     * against xemu before a title depends on it. */
+    memset(&state->material, 0, sizeof(state->material));
+    state->material.Diffuse.r = 1.0f;
+    state->material.Diffuse.g = 1.0f;
+    state->material.Diffuse.b = 1.0f;
+    state->material.Diffuse.a = 1.0f;
+    memset(state->lights, 0, sizeof(state->lights));
+    memset(state->light_enable, 0, sizeof(state->light_enable));
+
     /* Default viewport */
     state->viewport.X = 0;
     state->viewport.Y = 0;
@@ -1685,4 +1706,164 @@ IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion)
     g_d3d8.lpVtbl = &g_d3d8_vtbl;
     g_d3d8_ref = 1;
     return &g_d3d8;
+}
+
+/* ================================================================
+ * CopyRects
+ * ================================================================ */
+
+/* The D3D11 texture behind a base texture, and how many mip levels it has.
+ * A NULL base texture is the swap chain's back buffer, which is returned
+ * with a reference the caller releases (*owned is set); everything else is
+ * borrowed. Returns NULL when the resource cannot be reached. */
+static ID3D11Texture2D *copy_target(IDirect3DBaseTexture8 *texture, UINT *levels,
+                                    BOOL *owned)
+{
+    ID3D11Texture2D *tex = NULL;
+    D3D8CubeInfo cube;
+    D3D8TextureInfo info;
+
+    *owned = FALSE;
+    *levels = 1;
+    if (!texture) {
+        IDXGISwapChain *swap = d3d8_GetSwapChain();
+
+        if (!swap || FAILED(IDXGISwapChain_GetBuffer(swap, 0, &IID_ID3D11Texture2D,
+                                                     (void **)&tex)))
+            return NULL;
+        *owned = TRUE;
+        return tex;
+    }
+    if (d3d8_cube_info(texture, &cube))
+        *levels = cube.levels;
+    else if (d3d8_texture_info(texture, &info))
+        *levels = info.levels;
+    {
+        ID3D11Resource *res = d3d8_base_resource(texture);
+
+        /* NULL for a wrapper whose creation failed, and for a volume
+         * texture, whose resource is a Texture3D and refuses the cast. */
+        if (!res || FAILED(ID3D11Resource_QueryInterface(res, &IID_ID3D11Texture2D,
+                                                         (void **)&tex)))
+            return NULL;
+    }
+    ID3D11Texture2D_Release(tex);        /* QueryInterface's reference; the
+                                          * texture owns the object */
+    return tex;
+}
+
+/* One rectangle, clipped to both surfaces, then copied. D3D11's
+ * CopySubresourceRegion does not clip: a box past the source's extent or a
+ * destination point that puts it past the destination's is a silent no-op
+ * (and a debug-layer error in a debug build), so a caller that trusted its
+ * own return value would count copies that never happened. Clipping here
+ * makes a partly off-surface copy do what D3D8 does -- copy the part that
+ * fits.
+ *
+ * Returns 1 if anything was copied, 0 if the rectangle clipped away. */
+static int copy_one_rect(ID3D11DeviceContext *ctx,
+                         ID3D11Texture2D *dst_tex, UINT dst_sub, UINT dst_w, UINT dst_h,
+                         UINT x, UINT y,
+                         ID3D11Texture2D *src_tex, UINT src_sub, UINT src_w, UINT src_h,
+                         UINT left, UINT top, UINT right, UINT bottom)
+{
+    D3D11_BOX box;
+
+    if (left >= src_w || top >= src_h || right <= left || bottom <= top)
+        return 0;
+    if (x >= dst_w || y >= dst_h)
+        return 0;
+    if (right > src_w)  right = src_w;
+    if (bottom > src_h) bottom = src_h;
+    if (x + (right - left) > dst_w)  right = left + (dst_w - x);
+    if (y + (bottom - top) > dst_h)  bottom = top + (dst_h - y);
+    if (right <= left || bottom <= top)
+        return 0;
+
+    box.left = left; box.top = top; box.front = 0;
+    box.right = right; box.bottom = bottom; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)dst_tex, dst_sub,
+                                              x, y, 0,
+                                              (ID3D11Resource *)src_tex, src_sub, &box);
+    return 1;
+}
+
+HRESULT d3d8_copy_rects(IDirect3DBaseTexture8 *src, UINT src_level, UINT src_face,
+                        const RECT *src_rects, UINT rect_count,
+                        IDirect3DBaseTexture8 *dst, UINT dst_level, UINT dst_face,
+                        const POINT *dst_points)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    ID3D11Texture2D *src_tex, *dst_tex;
+    D3D11_TEXTURE2D_DESC sd, dd;
+    UINT src_levels, dst_levels, src_sub, dst_sub, i;
+    UINT src_w, src_h, dst_w, dst_h, copied = 0, wanted = 0;
+    BOOL src_owned, dst_owned;
+    HRESULT hr = S_OK;
+
+    if (!ctx)
+        return E_FAIL;
+    src_tex = copy_target(src, &src_levels, &src_owned);
+    dst_tex = copy_target(dst, &dst_levels, &dst_owned);
+    if (!src_tex || !dst_tex) {
+        if (src_tex && src_owned) ID3D11Texture2D_Release(src_tex);
+        if (dst_tex && dst_owned) ID3D11Texture2D_Release(dst_tex);
+        return E_FAIL;
+    }
+    ID3D11Texture2D_GetDesc(src_tex, &sd);
+    ID3D11Texture2D_GetDesc(dst_tex, &dd);
+
+    /* CopySubresourceRegion needs one format and one sample count. A
+     * mismatch would need a draw, which this does not do -- the caller
+     * counts the refusal rather than copying something wrong. */
+    if (sd.Format != dd.Format || sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
+        hr = E_INVALIDARG;
+
+    if (SUCCEEDED(hr)) {
+        if (src_level >= src_levels) src_level = src_levels - 1;
+        if (dst_level >= dst_levels) dst_level = dst_levels - 1;
+        src_sub = src_face * src_levels + src_level;
+        dst_sub = dst_face * dst_levels + dst_level;
+        src_w = (sd.Width  >> src_level) ? (sd.Width  >> src_level) : 1;
+        src_h = (sd.Height >> src_level) ? (sd.Height >> src_level) : 1;
+        dst_w = (dd.Width  >> dst_level) ? (dd.Width  >> dst_level) : 1;
+        dst_h = (dd.Height >> dst_level) ? (dd.Height >> dst_level) : 1;
+
+        if (src_sub >= sd.ArraySize * sd.MipLevels ||
+            dst_sub >= dd.ArraySize * dd.MipLevels) {
+            hr = E_INVALIDARG;
+        } else if (!rect_count || !src_rects) {
+            /* The whole source level, at the destination point. */
+            wanted = 1;
+            copied = copy_one_rect(ctx, dst_tex, dst_sub, dst_w, dst_h,
+                                   dst_points ? (UINT)dst_points[0].x : 0,
+                                   dst_points ? (UINT)dst_points[0].y : 0,
+                                   src_tex, src_sub, src_w, src_h,
+                                   0, 0, src_w, src_h);
+        } else {
+            for (i = 0; i < rect_count; i++) {
+                if (src_rects[i].left < 0 || src_rects[i].top < 0 ||
+                    src_rects[i].right <= src_rects[i].left ||
+                    src_rects[i].bottom <= src_rects[i].top)
+                    continue;
+                if (dst_points && (dst_points[i].x < 0 || dst_points[i].y < 0))
+                    continue;
+                wanted++;
+                copied += copy_one_rect(ctx, dst_tex, dst_sub, dst_w, dst_h,
+                        dst_points ? (UINT)dst_points[i].x : (UINT)src_rects[i].left,
+                        dst_points ? (UINT)dst_points[i].y : (UINT)src_rects[i].top,
+                        src_tex, src_sub, src_w, src_h,
+                        (UINT)src_rects[i].left, (UINT)src_rects[i].top,
+                        (UINT)src_rects[i].right, (UINT)src_rects[i].bottom);
+            }
+        }
+        /* Every rectangle clipped away is the same as no copy at all, and
+         * the caller counts it rather than recording one it never made. */
+        if (SUCCEEDED(hr) && wanted && !copied)
+            hr = E_INVALIDARG;
+    }
+
+    if (src_owned) ID3D11Texture2D_Release(src_tex);
+    if (dst_owned) ID3D11Texture2D_Release(dst_tex);
+    return hr;
 }

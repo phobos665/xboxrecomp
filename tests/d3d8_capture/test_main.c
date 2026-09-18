@@ -1,5 +1,5 @@
 /*
- * d3d8_capture -- round-trip the frame capture container (format version 4).
+ * d3d8_capture -- round-trip the frame capture container (format version 5).
  *
  * Writes a synthetic host-level capture -- a snapshot and a frame, using every
  * chunk kind -- reads it back, and asserts every field and every payload byte
@@ -16,7 +16,13 @@
  * fixed-function quad on the left, and on the right a quad drawn by an NV2A
  * vertex program with a declaration, whose colour comes from a NORMPACKED3
  * normal expanded exactly as shadow mode expands it, under the screen-space
- * undo and a register combiner token. Every value is a host value, as shadow
+ * undo and a register combiner token. One directional light and a material
+ * travel in the snapshot with lighting off, so they change nothing drawn, and
+ * the frame copies the offscreen target's green texel over the corner of the
+ * sampled texture, and again over its far corner through a rectangle larger
+ * than the source, which a replay shows as two green texels in the left quad
+ * -- the second only if the copy clips to the source rather than being
+ * dropped whole. Every value is a host value, as shadow
  * mode hands them to src/d3d; the numbers written out below are the host's
  * enumerations from src/d3d/d3d8_xbox.h, repeated here because this test
  * builds without any Direct3D header.
@@ -71,6 +77,7 @@ enum {
 #define TARGET_COLOR 0xFF00FF00u
 #define USAGE_RENDERTARGET 0x1u
 #define FMT_D24S8 0x2Au
+#define LIGHT_DIRECTIONAL 3u          /* D3DLIGHT_DIRECTIONAL */
 
 /* ---------------------------------------------------------------- microcode
  *
@@ -263,8 +270,8 @@ static const float IDENTITY[16] = {
 
 /* How many chunks write_capture emits, for the read-back and truncation
  * checks. */
-#define SNAPSHOT_CHUNKS 27
-#define FRAME_CHUNKS    22
+#define SNAPSHOT_CHUNKS 30
+#define FRAME_CHUNKS    24
 
 static int write_capture(const char *path)
 {
@@ -286,6 +293,30 @@ static int write_capture(const char *path)
     D3D8CapCubeTexture cube = { 4, FMT_LIN_A8R8G8B8, 1, 1, USAGE_RENDERTARGET };
     D3D8CapClear face_clear = { 0, CLEAR_TARGET, 0xFF0000FFu, 1.0f, 0 };
     D3D8CapVsVertexData vdata = { 3, { 0.25f, 0.5f, 0.75f, 1.0f } };
+    D3D8CapMaterial material = {
+        { 1.0f, 1.0f, 1.0f, 1.0f }, { 0.2f, 0.2f, 0.2f, 1.0f },
+        { 0.5f, 0.5f, 0.5f, 1.0f }, { 0.0f, 0.0f, 0.0f, 1.0f }, 16.0f
+    };
+    D3D8CapLight light = {
+        0, LIGHT_DIRECTIONAL,
+        { 1.0f, 1.0f, 0.9f, 1.0f },        /* diffuse  */
+        { 1.0f, 1.0f, 1.0f, 1.0f },        /* specular */
+        { 0.1f, 0.1f, 0.1f, 1.0f },        /* ambient  */
+        { 0.0f, 0.0f, 0.0f },              /* position, unused by a directional */
+        { 0.0f, -1.0f, 0.25f },            /* direction */
+        1000.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f
+    };
+    D3D8CapLightEnable light_on = { 0, 1 };
+    /* The offscreen target's one texel over the sampled texture's corner.
+     * Both are LIN_A8R8G8B8, which is what the host needs to copy at all. */
+    D3D8CapCopyRects copy = { 3, 0, 0,  1, 0, 0,  1 };
+    D3D8CapCopyRect copy_rect = { 0, 0, 1, 1, 0, 0 };
+    /* The same one-texel source through a 4x4 rectangle, to the texture's far
+     * corner: it has to clip to the source's extent. D3D11 drops an
+     * over-large box silently, so a replay that does not clip leaves texel
+     * (3,3) as it was. */
+    D3D8CapCopyRects clip = { 3, 0, 0,  1, 0, 0,  1 };
+    D3D8CapCopyRect clip_rect = { 0, 0, 4, 4, 3, 3 };
     D3D8CapClear target_clear = { 0, CLEAR_TARGET | CLEAR_ZBUFFER, TARGET_COLOR, 1.0f, 0 };
     D3D8CapTransform xf;
     D3D8CapViewport vp = { 0, 0, 640, 480, 0.0f, 1.0f };
@@ -331,23 +362,28 @@ static int write_capture(const char *path)
         d3d8cap_chunk(w, D3D8CAP_TRANSFORM, &xf, sizeof xf, NULL, 0, NULL, 0); /* 13-15 */
     }
     d3d8cap_chunk(w, D3D8CAP_VIEWPORT, &vp, sizeof vp, NULL, 0, NULL, 0);   /* 16 */
-    w_render_state(w, RS_ZENABLE, 0);                                        /* 17 */
-    w_render_state(w, RS_CULLMODE, CULL_NONE);                               /* 18 */
-    w_render_state(w, RS_LIGHTING, 0);                                       /* 19 */
-    w_render_state(w, RS_ALPHABLENDENABLE, 0);                               /* 20 */
+    d3d8cap_chunk(w, D3D8CAP_MATERIAL, &material, sizeof material,
+                  NULL, 0, NULL, 0);                                         /* 17 */
+    d3d8cap_chunk(w, D3D8CAP_LIGHT, &light, sizeof light, NULL, 0, NULL, 0); /* 18 */
+    d3d8cap_chunk(w, D3D8CAP_LIGHT_ENABLE, &light_on, sizeof light_on,
+                  NULL, 0, NULL, 0);                                         /* 19 */
+    w_render_state(w, RS_ZENABLE, 0);                                        /* 20 */
+    w_render_state(w, RS_CULLMODE, CULL_NONE);                               /* 21 */
+    w_render_state(w, RS_LIGHTING, 0);                                       /* 22 */
+    w_render_state(w, RS_ALPHABLENDENABLE, 0);                               /* 23 */
     /* One combiner stage writing nothing; the final combiner's D is the
      * diffuse colour (register 4) and G its alpha (0x14: register 4, alpha
      * replicate), which is how the program draw gets its colour
      * (d3d8_combiners.c, from_render_states: first input in the top byte). */
-    w_render_state(w, RS_PSCOMBINERCOUNT, 1);                                /* 21 */
-    w_render_state(w, RS_PSFINALCOMBINERINPUTSABCD, 0x00000004u);            /* 22 */
-    w_render_state(w, RS_PSFINALCOMBINERINPUTSEFG, 0x00001400u);             /* 23 */
-    w_stage_state(w, 0, TSS_COLOROP, TOP_MODULATE);                          /* 24 */
-    w_stage_state(w, 0, TSS_COLORARG1, TA_TEXTURE);                          /* 25 */
-    w_stage_state(w, 0, TSS_COLORARG2, TA_DIFFUSE);                          /* 26 */
-    d3d8cap_chunk(w, D3D8CAP_FRAME_START, NULL, 0, NULL, 0, NULL, 0);        /* 27 */
+    w_render_state(w, RS_PSCOMBINERCOUNT, 1);                                /* 24 */
+    w_render_state(w, RS_PSFINALCOMBINERINPUTSABCD, 0x00000004u);            /* 25 */
+    w_render_state(w, RS_PSFINALCOMBINERINPUTSEFG, 0x00001400u);             /* 26 */
+    w_stage_state(w, 0, TSS_COLOROP, TOP_MODULATE);                          /* 27 */
+    w_stage_state(w, 0, TSS_COLORARG1, TA_TEXTURE);                          /* 28 */
+    w_stage_state(w, 0, TSS_COLORARG2, TA_DIFFUSE);                          /* 29 */
+    d3d8cap_chunk(w, D3D8CAP_FRAME_START, NULL, 0, NULL, 0, NULL, 0);        /* 30 */
 
-    /* ---- frame: 22 chunks. The offscreen passes (2-9) clear a 1x1 target
+    /* ---- frame: 24 chunks. The offscreen passes (2-9) clear a 1x1 target
      * green and one cube face blue, then go back to the back buffer, so a
      * replay that forgot either switch shows that colour instead of the two
      * quads. */
@@ -369,7 +405,11 @@ static int write_capture(const char *path)
                   NULL, 0, NULL, 0);                                         /* 8 */
     d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_back, sizeof to_back,
                   NULL, 0, NULL, 0);                                         /* 9 */
-    w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 10 */
+    d3d8cap_chunk(w, D3D8CAP_COPY_RECTS, &copy, sizeof copy,
+                  &copy_rect, sizeof copy_rect, NULL, 0);                    /* 10 */
+    d3d8cap_chunk(w, D3D8CAP_COPY_RECTS, &clip, sizeof clip,
+                  &clip_rect, sizeof clip_rect, NULL, 0);                    /* 11 */
+    w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 12 */
     d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
                   g_fvf_quad, sizeof g_fvf_quad, NULL, 0);                   /* 8 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE_LEVEL, &refill, sizeof refill,
@@ -422,7 +462,7 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 4 && D3D8CAP_VERSION == 4, "the version is 4");
+    check(h->version == 5 && D3D8CAP_VERSION == 5, "the version is 5");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 
@@ -497,6 +537,22 @@ static void read_capture(void)
         const D3D8CapViewport *p = c.data;
         check(p->width == 640 && p->height == 480 && p->max_z == 1.0f, "viewport fields");
     }
+    if (next_of(r, &c, D3D8CAP_MATERIAL, "material")) {
+        const D3D8CapMaterial *p = c.data;
+        check(c.bytes == sizeof *p && p->power == 16.0f && p->diffuse[3] == 1.0f &&
+              p->ambient[0] == 0.2f && p->specular[2] == 0.5f, "material fields");
+    }
+    if (next_of(r, &c, D3D8CAP_LIGHT, "light")) {
+        const D3D8CapLight *p = c.data;
+        check(c.bytes == sizeof *p && p->index == 0 && p->type == LIGHT_DIRECTIONAL &&
+              p->direction[1] == -1.0f && p->direction[2] == 0.25f &&
+              p->diffuse[2] == 0.9f && p->range == 1000.0f, "light fields");
+    }
+    if (next_of(r, &c, D3D8CAP_LIGHT_ENABLE, "light_enable")) {
+        const D3D8CapLightEnable *p = c.data;
+        check(c.bytes == sizeof *p && p->index == 0 && p->enabled == 1,
+              "light_enable fields");
+    }
     for (i = 0; i < 7; i++)
         if (next_of(r, &c, D3D8CAP_RENDER_STATE, "render states"))
             check(c.bytes == sizeof(D3D8CapRenderState), "render state length");
@@ -543,6 +599,20 @@ static void read_capture(void)
     if (next_of(r, &c, D3D8CAP_SET_RENDER_TARGET, "back to the back buffer")) {
         const D3D8CapSetRenderTarget *p = c.data;
         check(p->texture_id == 0 && p->depth_id == 0, "back buffer fields");
+    }
+    if (next_of(r, &c, D3D8CAP_COPY_RECTS, "copy_rects")) {
+        const D3D8CapCopyRects *p = c.data;
+        const D3D8CapCopyRect *q = d3d8cap_tail(&c, sizeof *p, sizeof *q);
+        check(c.bytes == sizeof *p + sizeof *q && p->src_id == 3 && p->dst_id == 1 &&
+              p->rect_count == 1, "copy_rects fields");
+        check(q && q->right == 1 && q->bottom == 1 && q->x == 0 && q->y == 0,
+              "copy rectangle");
+    }
+    if (next_of(r, &c, D3D8CAP_COPY_RECTS, "copy_rects that clips")) {
+        const D3D8CapCopyRects *p = c.data;
+        const D3D8CapCopyRect *q = d3d8cap_tail(&c, sizeof *p, sizeof *q);
+        check(q && q->right == 4 && q->bottom == 4 && q->x == 3 && q->y == 3,
+              "over-large copy rectangle");
     }
     next_of(r, &c, D3D8CAP_TEXTURE_STAGE_STATE, "in-frame stage state");
     if (next_of(r, &c, D3D8CAP_DRAW_UP, "draw_up")) {

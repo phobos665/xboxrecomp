@@ -41,8 +41,7 @@
  *
  * Forwarded but not yet used by the host: SHADEMODE, DITHERENABLE,
  * COLORVERTEX, NORMALIZENORMALS, RESULTARG, BUMPENVMAT*, MIPMAPLODBIAS,
- * MAXMIPLEVEL, BORDERCOLOR. Not forwarded: LIGHTING (lights and material are
- * not forwarded, so it stays off), WRAP0-3, VERTEXBLEND, LOCALVIEWER, ZBIAS,
+ * MAXMIPLEVEL, BORDERCOLOR. Not forwarded: WRAP0-3, VERTEXBLEND, LOCALVIEWER, ZBIAS,
  * EDGEANTIALIAS, BLENDCOLOR, the back-face material and two-sided lighting
  * states, point sprite, material source and multisample states, and the
  * texture stage states ADDRESSW, TEXTURETRANSFORMFLAGS, BUMPENVLSCALE/LOFFSET,
@@ -309,8 +308,11 @@ static const struct {
     {  95, D3DRS_FOGEND,           AS_IS },
     {  96, D3DRS_FOGDENSITY,       AS_IS },
     {  97, D3DRS_RANGEFOGENABLE,   AS_IS },
-    /* D3DRS_LIGHTING (102) is held off: lights and the material are not
-     * forwarded, and the host would light every vertex with none -- black. */
+    /* Forwarded since D3DDevice_SetLight, LightEnable and SetMaterial are
+     * (hle_d3d8.c). A title that sets none still lights correctly: the host
+     * holds a white material and no enabled lights, which is what the Xbox
+     * would also draw. */
+    { 102, D3DRS_LIGHTING,         AS_IS },
     { 103, D3DRS_SPECULARENABLE,   AS_IS },
     { 105, D3DRS_COLORVERTEX,      AS_IS },
     { 115, D3DRS_AMBIENT,          AS_IS },
