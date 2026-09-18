@@ -1,9 +1,5 @@
 [
  {
-  "start": "0x000DDDD4",
-  "note": "Indirect-call target observed at runtime; decodes as a function body."
- },
- {
   "start": "0x001B8A80",
   "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
  },
@@ -25,14 +21,6 @@
  },
  {
   "start": "0x00073D40",
-  "note": "Indirect-call target observed at runtime; decodes as a function body."
- },
- {
-  "start": "0x000DDD84",
-  "note": "Indirect-call target observed at runtime; decodes as a function body."
- },
- {
-  "start": "0x000DDD9D",
   "note": "Indirect-call target observed at runtime; decodes as a function body."
  }
 ]
