@@ -275,6 +275,7 @@ HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format,
  * volume). All three implementations keep the SRV at the same offset
  * as D3D8Texture. */
 ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
+ID3D11Resource *d3d8_base_resource(IDirect3DBaseTexture8 *texture);
 
 /* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);

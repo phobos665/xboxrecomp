@@ -293,38 +293,72 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
  * binds white -- so the entries carry no contents and are never re-uploaded.
  * Kept apart from the 2D cache above, which is keyed and evicted by texel
  * checksums that mean nothing here. */
-#define CUBE_CACHE 8
+#define CUBE_CACHE      8
+#define CUBE_FACE_ALIGN 128u        /* nv2a_regs.h NV2A_CUBEMAP_FACE_ALIGNMENT */
 
 static struct {
     uint32_t va, data, format;
-    IDirect3DCubeTexture8 *host;
+    IDirect3DCubeTexture8 *host;    /* NULL with tried set: the host refused it */
+    int      tried;
 } g_cubes[CUBE_CACHE];
 static int g_cube_count;
+static unsigned long g_cube_full, g_cube_failed;
 static unsigned long g_cube_binds;
 
-/* Which face of a cube container a surface is. The Xbox lays the six faces
- * out one after another in the container's data, each holding that face's
- * whole mip chain, so the distance between the surface's data pointer and the
- * container's says which one this is. Measured on Burnout 2's 128x128 R5G6B5
- * environment cube: the six deltas come out 0, 32768, 65536 ... with a face
- * exactly 32768 bytes, so there is no padding between them. -1 when the
- * delta is not a whole number of faces. */
-int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va)
+/* Which face and level of a cube container a surface is. The Xbox lays the
+ * six faces out one after another in the container's data, each holding that
+ * face's whole mip chain, and each face starts on a 128-byte boundary
+ * (src/nv2a/nv2a_regs.h, NV2A_CUBEMAP_FACE_ALIGNMENT). So the distance
+ * between the surface's data pointer and the container's says which face and
+ * which level this is.
+ *
+ * Burnout 2's cube cannot show the padding: one 128x128 R5G6B5 face is 32768
+ * bytes, which is already a multiple of 128, so its deltas look the same
+ * either way. The alignment is taken from the register header rather than
+ * from that measurement. A mipped cube is where the two differ -- 8 levels of
+ * 128x128 R5G6B5 is 43690 bytes, padded to 43776.
+ *
+ * 0 on success with *face and *level filled, -1 for a surface this does not
+ * describe. */
+int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
+                       uint32_t *face, uint32_t *level)
 {
     uint32_t format = HLE_MEM32(parent_va + 12);
+    uint32_t size   = HLE_MEM32(parent_va + 16);
     uint32_t fmt    = (format >> 8) & 0xFF;
     uint32_t levels = (format >> 16) & 0xF;
     uint32_t w      = 1u << ((format >> 20) & 0xF);
     uint32_t h      = 1u << ((format >> 24) & 0xF);
-    uint32_t delta  = HLE_MEM32(surface_va + 4) - HLE_MEM32(parent_va + 4);
-    uint32_t bytes  = 0, l;
+    uint32_t pdata  = HLE_MEM32(parent_va + 4);
+    uint32_t sdata  = HLE_MEM32(surface_va + 4);
+    uint32_t chain = 0, stride, offset, delta, l;
 
-    for (l = 0; l < levels; l++)
-        bytes += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(w, l)) *
-                 level_rows(fmt, level_dim(h, l));
-    if (!bytes || delta % bytes)
+    /* A linear container keeps its size in Size, not in the format's log2
+     * fields; reading those would size every face 1x1. */
+    if (size || !levels || sdata < pdata)
         return -1;
-    return delta / bytes < 6u ? (int)(delta / bytes) : -1;
+    for (l = 0; l < levels; l++)
+        chain += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(w, l)) *
+                 level_rows(fmt, level_dim(h, l));
+    if (!chain)
+        return -1;
+    stride = (chain + (CUBE_FACE_ALIGN - 1u)) & ~(CUBE_FACE_ALIGN - 1u);
+    delta  = sdata - pdata;
+    if (delta / stride >= 6u)
+        return -1;
+    *face  = delta / stride;
+    offset = delta % stride;
+
+    /* The remainder names a level: the start of one of the face's mips. */
+    for (l = 0, chain = 0; l < levels; l++) {
+        if (offset == chain) {
+            *level = l;
+            return 0;
+        }
+        chain += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(w, l)) *
+                 level_rows(fmt, level_dim(h, l));
+    }
+    return -1;
 }
 
 /* The host cube for a guest cube container, created on first use. NULL if
@@ -338,22 +372,36 @@ IDirect3DCubeTexture8 *hle_d3d8_render_cube(IDirect3DDevice8 *dev, uint32_t va)
     int i;
 
     for (i = 0; i < g_cube_count; i++)
-        if (g_cubes[i].host && g_cubes[i].va == va && g_cubes[i].data == data &&
+        if (g_cubes[i].va == va && g_cubes[i].data == data &&
             g_cubes[i].format == format)
-            return g_cubes[i].host;
-    if (g_cube_count >= CUBE_CACHE || !levels)
+            return g_cubes[i].host;      /* NULL if the host refused it before */
+    if (!levels || HLE_MEM32(va + 16)) {
+        g_skip_cube++;                   /* no levels, or a linear container */
         return NULL;
+    }
+    if (g_cube_count >= CUBE_CACHE) {
+        if (!g_cube_full++)
+            fprintf(stderr, "[HLE-D3D8] shadow cubes: the cache holds %d and this "
+                    "title wants more; 0x%08X and any after it draw to a scratch "
+                    "target and sample white\n", CUBE_CACHE, va);
+        return NULL;
+    }
+    /* The entry is kept whatever happens: a format the host refuses would
+     * otherwise be retried on every face of every frame. */
+    g_cubes[g_cube_count].va = va;
+    g_cubes[g_cube_count].data = data;
+    g_cubes[g_cube_count].format = format;
+    g_cubes[g_cube_count].tried = 1;
     if (FAILED(host_CreateCubeTexture(dev, edge, levels, D3DUSAGE_RENDERTARGET,
                                       (D3DFORMAT)fmt, D3DPOOL_DEFAULT,
                                       &g_cubes[g_cube_count].host)) ||
         !g_cubes[g_cube_count].host) {
         g_cubes[g_cube_count].host = NULL;
+        g_cube_count++;
         g_skip_create++;
+        g_cube_failed++;
         return NULL;
     }
-    g_cubes[g_cube_count].va = va;
-    g_cubes[g_cube_count].data = data;
-    g_cubes[g_cube_count].format = format;
     fprintf(stderr, "[HLE-D3D8] shadow render target cube 0x%08X: format 0x%02X "
             "%ux%u, %u level(s)\n", va, fmt, edge, edge, levels);
     return g_cubes[g_cube_count++].host;
@@ -363,9 +411,16 @@ IDirect3DCubeTexture8 *hle_d3d8_render_cube(IDirect3DDevice8 *dev, uint32_t va)
  * rendered into. NULL means "not a cube this file mirrors". */
 static IDirect3DCubeTexture8 *bound_cube(uint32_t va)
 {
-    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12);
+    uint32_t common = HLE_MEM32(va + 0), data = HLE_MEM32(va + 4);
+    uint32_t format = HLE_MEM32(va + 12);
     int i;
 
+    /* The container still has to read as a cube texture: after the guest
+     * frees this one, whatever lands at the address could otherwise match on
+     * data and format alone and be handed a stale cube. */
+    if ((common & COMMON_TYPE_MASK) != COMMON_TYPE_TEXTURE ||
+        !(format & FORMAT_CUBEMAP))
+        return NULL;
     for (i = 0; i < g_cube_count; i++)
         if (g_cubes[i].host && g_cubes[i].va == va && g_cubes[i].data == data &&
             g_cubes[i].format == format)
@@ -470,8 +525,9 @@ static void report(void)
                 "%lu out of range, %lu create failed\n",
                 g_bound_count, g_texture_count, g_uploads, g_reuploads, g_skip_type,
                 g_skip_cube, g_skip_format, g_skip_range, g_skip_create);
-        fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds\n",
-                g_cube_count, g_cube_binds);
+        fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds, "
+                "%lu refused by the host, %lu past the cache\n",
+                g_cube_count, g_cube_binds, g_cube_failed, g_cube_full);
         last = now;
     }
 }
