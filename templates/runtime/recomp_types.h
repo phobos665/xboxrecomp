@@ -247,6 +247,16 @@ extern RECOMP_TLS int g_df;
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
+extern RECOMP_TLS uint16_t g_fp_cc;
+#define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
+/* Values in the existing double-backed stack are all representable as normal
+ * x87 extended values, including binary64 subnormals. Empty stack tags and
+ * unsupported extended encodings are not represented by this stack model. */
+static inline uint16_t recomp_fxam(double value) {
+    return (uint16_t)((signbit(value) ? 0x0200u : 0u) |
+        (isnan(value) ? 0x0100u : isinf(value) ? 0x0500u :
+         value == 0.0 ? 0x4000u : 0x0400u));
+}
 
 /* Result of an x87 compare, in the shape the status word wants:
  *   -1 less, 0 equal, 1 greater, 2 unordered (either operand is NaN).
@@ -254,6 +264,26 @@ extern RECOMP_TLS int g_fp_cmp;
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+/* x87 integer stores use the guest RC bits, independently of host rounding.
+ * Masked invalid conversions store the signed integer-indefinite value. */
+static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+    double rounded;
+    switch((control>>10)&3) {
+    case 1: rounded=floor(value); break;
+    case 2: rounded=ceil(value); break;
+    case 3: rounded=trunc(value); break;
+    default: {
+        double lo=floor(value), fraction=value-lo;
+        rounded=lo;
+        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
+        break;
+    }
+    }
+    double limit=ldexp(1.0,(int)bits-1);
+    if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
+        return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
+    return (int64_t)rounded;
+}
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)

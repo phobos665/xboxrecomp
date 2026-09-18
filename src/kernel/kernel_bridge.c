@@ -236,9 +236,16 @@ static void kernel_data_init(void)
      * "no video mode reported", which titles treat as auto-detect. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
 
-    /* IdexChannelObject (ordinal 357) - IDE channel object. Opaque; only ever
-     * passed back to Io* routines we stub, so a recognisable non-null is enough. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL) = XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+    /* IdexChannelObject is a structure, not an opaque pointer. Guest file-close
+     * code walks DeviceQueue.DeviceListHead at +0x28. Host-backed synchronous
+     * I/O does not enqueue guest IRPs, so this must be an empty circular list.
+     * Reserve separate storage: the old 16-byte slot overlapped the key exports. */
+    {
+        uint32_t channel=XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+        memset(XBOX_TO_NATIVE(channel),0,0x200);
+        BRIDGE_MEM32(channel+0x28)=channel+0x28;
+        BRIDGE_MEM32(channel+0x2C)=channel+0x28;
+    }
 
     /* HalDiskCachePartitionCount (ordinal 40) - number of cache partitions.
      * Retail consoles report 3 (X, Y, Z). Titles size a partition array from
@@ -2804,7 +2811,14 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     if (!ansi_str_va) return NULL;
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
-    return (const char*)XBOX_TO_NATIVE(buf_va);
+    /* XDK directory searches pass a counted prefix of "directory\\*".
+     * The byte after Length need not be NUL or part of the object name. */
+    static RECOMP_TLS char path[65536];
+    uint16_t length=BRIDGE_MEM16(ansi_str_va);
+    if(length>BRIDGE_MEM16(ansi_str_va+2)) return NULL;
+    memcpy(path,XBOX_TO_NATIVE(buf_va),length);
+    path[length]='\0';
+    return path;
 }
 
 /* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
@@ -2912,7 +2926,9 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     name->Buffer        = (PCHAR)path;
     name->Length        = path ? (USHORT)strlen(path) : 0;
     name->MaximumLength = (USHORT)(name->Length + 1);
-    oa->RootDirectory = NULL;
+    uint32_t root = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va) : 0;
+    /* -3 is the XDK DOS-device namespace, not a file handle. */
+    oa->RootDirectory = root && root != 0xFFFFFFFDu ? bridge_resolve_handle(root) : NULL;
     oa->ObjectName    = name;
     oa->Attributes    = 0;
 }
@@ -3720,15 +3736,16 @@ static void bridge_NtDeleteFile(void)
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
-/* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
+/* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─ */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
-    uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
-    uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
+    uint32_t info_class  = STACK_ARG(7);
+    uint32_t filename_va = STACK_ARG(8);  /* PXBOX_ANSI_STRING */
+    uint32_t restart     = STACK_ARG(9);  /* BOOLEAN */
     XBOX_IO_STATUS_BLOCK ios;
     XBOX_ANSI_STRING     fn;
     PXBOX_ANSI_STRING    pfn = NULL;
@@ -3743,7 +3760,8 @@ static void bridge_NtQueryDirectoryFile(void)
         if (fn.Buffer) pfn = &fn;
     }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(info_va), length, pfn, (BOOLEAN)restart);
+                XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
+                pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -8458,7 +8476,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 204: return 16;  /* NtProtectVirtualMemory (4) */
     case 205: return  8;  /* NtPulseEvent (2) */
     case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 36;  /* NtQueryDirectoryFile (9) */
+    case 207: return 40;  /* NtQueryDirectoryFile (10) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
@@ -9342,7 +9360,7 @@ static void kernel_watch_arm_once(void)
 }
 
 /* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {
