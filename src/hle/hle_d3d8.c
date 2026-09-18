@@ -641,6 +641,83 @@ HLE_ORIGINAL(D3DDevice_SetVertexData2f);
 HLE_ORIGINAL(D3DDevice_DrawVerticesUP);
 HLE_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
 
+/* The GPU "time" fence.
+ *
+ * D3D8 stamps the push buffer with a rising fence value and keeps the value
+ * the GPU has reached in a word of guest memory the device points at; the
+ * GPU's interrupt writes it. D3D_BlockOnTime(time) spins until that word
+ * catches up, and D3D_KickOffAndWaitForIdle, BlockOnFence, BlockOnResource
+ * and Swap all wait through it. Nothing here raises that interrupt, so the
+ * word never moves and the first wait is the last thing the title does:
+ * TimeSplitters 2 stopped after its first Swap, 270 functions in, with the
+ * ISR still ticking.
+ *
+ * The kernel's fence mirror is the answer -- it copies the device's
+ * submitted value onto the completed word every poll, the same
+ * acknowledgement DMA_GET = DMA_PUT makes for the FIFO. It needs the two
+ * device offsets, and those move between XDK builds (5344: +0x2C submitted,
+ * +0x30 pointer to completed; 4721: +0x30 and +0x34). Rather than a table by
+ * XDK version, read them from D3D_BlockOnTime's own prologue, which is the
+ * one place they are certainly right for this title:
+ *
+ *     56                push esi
+ *     8B 35 <g_pDevice> mov  esi, [D3D_g_pDevice]
+ *     8B 46 <A>         mov  eax, [esi + A]     ; pointer to the completed word
+ *     8B 08             mov  ecx, [eax]
+ *     8B 46 <B>         mov  eax, [esi + B]     ; last submitted value
+ *
+ * Identical in both builds seen so far apart from A and B. A build whose
+ * compiler laid it out differently gets a line saying so and no mirror,
+ * which is the hang this replaces, not a wrong write.
+ */
+HLE_IMPORT_VAR(D3D_g_pDevice);
+HLE_IMPORT_VAR(D3D_BlockOnTime);
+
+static void mirror_gpu_time_fence(void)
+{
+    static int done;
+    const uint8_t *code;
+    uint32_t get_ptr_off, put_off;
+
+    if (done)
+        return;
+    done = 1;
+    if (!hle_var_D3D_g_pDevice || !hle_var_D3D_BlockOnTime) {
+        fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: %s not named in "
+                        "this XBE\n",
+                hle_var_D3D_g_pDevice ? "D3D_BlockOnTime" : "D3D_g_pDevice");
+        return;
+    }
+    code = (const uint8_t *)HLE_PTR(hle_var_D3D_BlockOnTime);
+    if (!(code[0] == 0x56 && code[1] == 0x8B && code[2] == 0x35 &&
+          code[7] == 0x8B && code[8] == 0x46 &&
+          code[10] == 0x8B && code[11] == 0x08 &&
+          code[12] == 0x8B && code[13] == 0x46)) {
+        fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: D3D_BlockOnTime "
+                        "at 0x%08X does not start as expected (%02X %02X %02X .. "
+                        "%02X %02X)\n", hle_var_D3D_BlockOnTime,
+                code[0], code[1], code[2], code[7], code[8]);
+        return;
+    }
+    {
+        uint32_t device_global;
+        memcpy(&device_global, code + 3, 4);
+        if (device_global != hle_var_D3D_g_pDevice) {
+            fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
+                            "D3D_BlockOnTime reads the device from 0x%08X, the "
+                            "symbols say 0x%08X\n",
+                    device_global, hle_var_D3D_g_pDevice);
+            return;
+        }
+    }
+    get_ptr_off = code[9];
+    put_off = code[14];
+    if (xbox_Nv2aMirrorFence(hle_var_D3D_g_pDevice, put_off, get_ptr_off) == 0)
+        fprintf(stderr, "[HLE-D3D8] GPU time fence mirrored: device +0x%02X -> "
+                        "*(device +0x%02X), offsets read from D3D_BlockOnTime\n",
+                put_off, get_ptr_off);
+}
+
 /* tools.recomp keeps the original whenever it replaces one of these names and
  * lifts its body, so a missing one means a build/lift mismatch or a body this
  * lift left out. Returning without running it would turn the call into a
@@ -669,6 +746,9 @@ HLE_EXPORT(Direct3D_CreateDevice)
     g_in_create_device = 1;
 #endif
     HLE_CALL_ORIGINAL(Direct3D_CreateDevice);
+    /* Only beside a guest device that exists: the original's HRESULT. */
+    if ((int32_t)g_eax >= 0)
+        mirror_gpu_time_fence();
 #ifdef _WIN32
     g_in_create_device = 0;
     if (!g_backbuffer_va)

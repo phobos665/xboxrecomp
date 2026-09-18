@@ -79,16 +79,23 @@ def load_variables(path):
     return [s for s in data.get("symbols", []) if s.get("kind") == "variable"]
 
 
-def resolve_variables(names, variables):
+def resolve_variables(names, symbols):
     """Map each imported name to its address, or 0 when it cannot be named.
 
-    The database can list one variable twice at the same address; that is one
+    `symbols` may hold variables and functions alike: an implementation that
+    needs to know where an XDK *function* sits in the title -- to read its
+    code, not to call it -- imports it the same way. The D3D replacement reads
+    the device-struct offsets out of D3D_BlockOnTime's prologue this way,
+    because they move between XDK builds and the bytes are the one place they
+    are written down.
+
+    The database can list one symbol twice at the same address; that is one
     answer. Two different addresses for a name would be a guess, so it gets 0
     and a note. Returns (values, notes); every name is in `values`, so the
     generated file always defines what the implementations declare.
     """
     by_name = {}
-    for s in variables:
+    for s in symbols:
         by_name.setdefault(s["name"], set()).add(s["address"])
     values, notes = {}, []
     for name in sorted(names):
@@ -97,7 +104,7 @@ def resolve_variables(names, variables):
             values[name] = next(iter(addrs))
             continue
         values[name] = 0
-        notes.append(f"variable {name}: " + (
+        notes.append(f"import {name}: " + (
             "not found in this XBE" if not addrs else
             f"{len(addrs)} different addresses, left 0"))
     return values, notes
