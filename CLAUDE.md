@@ -219,6 +219,7 @@ lives here.
 | Exits via `HalReturnToFirmware` after ~15 kernel calls | XAPI's retail disc check failed (certificate `AllowedMedia` is DVD-X2 only). The kernel answers it since Sep 2026; if it recurs, look at the mode-sense reply in `kernel_bridge.c` |
 | Main thread stops entering new functions right after the first `Swap`; ISR keeps ticking | `D3D_BlockOnTime` waiting for the GPU time fence. The HLE mirrors it from `D3D_BlockOnTime`'s prologue; a "not mirrored" line in the log means this XDK's prologue differs |
 | Stops in DirectSound start-up, watchdog shows `ebx = <block>+0x810` | The DSP doorbell. Found from `GPSADDR`/`EPSADDR` under `RECOMP_AC97_READY`; without that switch DirectSound never gets this far and the title dereferences a half-built sound object instead |
+| Draws keep coming but `Swap` slows to one every many seconds, no crash, `[FPS]` near 0 | Look at your own switches first. `--profile` (entry profiler) and a `--trace-all-entries` build printing `[TRACE]` lines both cost more per function entry than the title does; `RECOMP_SAMPLE=500` shows it as `NtWriteFile`/`prof_report`. Rerun with `RECOMP_TRACE_BUDGET=0` and no `--profile` before believing the title is stuck |
 
 Overrides live in `recomp_manual.c` and are checked before the auto-generated table, so they
 always win. `manual_scan.py` parses that file to decide what not to generate, so keep them
