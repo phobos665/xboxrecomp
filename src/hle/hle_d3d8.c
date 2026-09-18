@@ -710,6 +710,49 @@ HLE_EXPORT(D3DDevice_Clear)
 }
 
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */
+/* RECOMP_FPS=<seconds>: how fast the title is actually presenting.
+ *
+ * The counters this project already prints are per subsystem -- shadow mode's
+ * swap count needs shadow mode, the [GPU] lines need the push-buffer path --
+ * so no two configurations could be compared on frame rate, which is the one
+ * number the 60 fps work is about (docs/technical/performance-60fps.md).
+ *
+ * This counts the title's own Swap, before anything else in the replacement
+ * runs, so it means the same thing whatever else is switched on or off.
+ * Cost when the switch is absent: one comparison per frame. */
+static void fps_report(void)
+{
+    static int interval = -1;
+    static unsigned long frames, window;
+    static DWORD started;
+    DWORD now;
+
+    if (interval < 0) {
+        const char *v = getenv("RECOMP_FPS");
+        interval = v ? atoi(v) : 0;
+        if (interval < 0)
+            interval = 0;
+    }
+    if (!interval)
+        return;
+    frames++;
+    window++;
+    now = GetTickCount();
+    if (!started) {
+        started = now;
+        return;
+    }
+    if ((now - started) >= (DWORD)interval * 1000u) {
+        double secs = (now - started) / 1000.0;
+
+        fprintf(stderr, "[FPS] %.1f over the last %.0f s (%lu frames; %lu since "
+                "the first report)\n", window / secs, secs, window, frames);
+        fflush(stderr);
+        started = now;
+        window = 0;
+    }
+}
+
 HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
@@ -717,6 +760,9 @@ HLE_EXPORT(D3DDevice_Swap)
     first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
         HLE_RETURN(0x80004005u);
+#ifdef _WIN32
+    fps_report();
+#endif
     HLE_CALL_ORIGINAL(D3DDevice_Swap);
 #ifdef _WIN32
     if (g_shadow) {
