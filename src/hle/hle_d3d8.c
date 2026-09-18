@@ -837,6 +837,9 @@ HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
 
+    /* Counted before anything else here runs, so RECOMP_FPS means the same
+     * thing whatever is switched on below. */
+    xbox_FpsCountSwap();
     first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
         HLE_RETURN(0x80004005u);

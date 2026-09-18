@@ -221,6 +221,19 @@ void xbox_ProtectMirrorsForDebug(void);
  * does nothing unless that variable is set. */
 void xbox_WatchdogStart(void);
 
+/* Frame rate at the HLE boundary (recomp_fps.c). RECOMP_FPS=<seconds> prints
+ * swaps and delivered vblanks per window; the counts cost an interlocked
+ * increment each and nothing when it is off. */
+void xbox_FpsCountSwap(void);
+void xbox_FpsCountVblank(void);
+
+/* Sampling profiler (recomp_sample.c). RECOMP_SAMPLE=<hz> samples every
+ * thread's instruction pointer and reports by symbol and category. Call from
+ * the guest's main thread, which is then named as such. */
+void xbox_SamplerStart(void);
+/* Name the calling runtime thread in the sampler's report. */
+void xbox_NameCurrentThread(const wchar_t *name);
+
 /* ================================================================
  * Xbox stack for recompiled code
  * ================================================================ */

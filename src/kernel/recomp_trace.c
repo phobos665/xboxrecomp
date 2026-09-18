@@ -285,16 +285,25 @@ static void watch_check(const char *name)
 static void dump_va_once(void)
 {
     static int done;
-    const char *spec;
+    static const char *spec = (const char *)-1;
     const uint8_t *mem;
     uint32_t va, n, i;
     char *colon;
 
     if (done)
         return;
-    spec = getenv("RECOMP_DUMP_VA");
-    if (!spec || !*spec)
+    /* Read the switch once. This used to call getenv on every function entry
+     * of a --trace-all-entries build, and the CRT's getenv takes a lock and
+     * walks the environment block: sampled at 1 kHz, Burnout 2's main thread
+     * spent 83% of its time here, and the title ran at a third of the speed
+     * it does with the switch cached. The other getenv calls in this file are
+     * behind static caches or the trace budget already. */
+    if (spec == (const char *)-1)
+        spec = getenv("RECOMP_DUMP_VA");
+    if (!spec || !*spec) {
+        done = 1;
         return;
+    }
 
     va = (uint32_t)strtoul(spec, &colon, 0);
     n = (colon && *colon == ':') ? (uint32_t)strtoul(colon + 1, NULL, 0) : 16;

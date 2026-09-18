@@ -28,6 +28,9 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#ifdef _WIN32
+#include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
+#endif
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -421,6 +424,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    xbox_NameCurrentThread(L"guest worker");
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -2145,21 +2149,102 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* The frame clock.
+ *
+ * This used to schedule the next vblank as GetTickCount64() + 16. That counter
+ * advances once per scheduler tick -- 15.6 ms unless something in the process
+ * has asked for better -- so a deadline 16 ms out could not be met until two
+ * ticks had passed, and the clock delivered 32 to 40 Hz however fast the title
+ * ran. A title that waits whole vblanks off a 40 Hz clock presents at 40, 20
+ * or 13.3, never 60. Paced from QueryPerformanceCounter instead, with the
+ * timer thread sleeping to the deadline on a 1 ms timer.
+ *
+ *   RECOMP_VBLANK_HZ=<rate>    the rate to deliver (60, the console's)
+ *   RECOMP_VBLANK_CLOCK=tick   the old GetTickCount pacing, so the two can be
+ *                              compared in one binary; for measurement only
+ */
+static struct {
+    int      configured;
+    int      enabled;        /* RECOMP_VBLANK */
+    int      legacy;         /* RECOMP_VBLANK_CLOCK=tick */
+    double   hz;
+    LONGLONG period;         /* in QPC ticks */
+    LONGLONG next;           /* QPC deadline of the next vblank */
+    LONGLONG qpf;
+    long long next_ms;       /* legacy pacing */
+} s_vblank_clock;
+
+static void vblank_clock_configure(void)
+{
+    const char *hz = getenv("RECOMP_VBLANK_HZ");
+    const char *clock = getenv("RECOMP_VBLANK_CLOCK");
+    LARGE_INTEGER li;
+
+    s_vblank_clock.configured = 1;
+    s_vblank_clock.enabled = getenv("RECOMP_VBLANK") != NULL;
+    if (!s_vblank_clock.enabled)
+        return;
+    s_vblank_clock.legacy = clock && strcmp(clock, "tick") == 0;
+    s_vblank_clock.hz = hz ? atof(hz) : 60.0;
+    if (s_vblank_clock.hz < 1.0 || s_vblank_clock.hz > 1000.0)
+        s_vblank_clock.hz = 60.0;
+    QueryPerformanceFrequency(&li);
+    s_vblank_clock.qpf = li.QuadPart;
+    s_vblank_clock.period = (LONGLONG)((double)li.QuadPart / s_vblank_clock.hz);
+    QueryPerformanceCounter(&li);
+    s_vblank_clock.next = li.QuadPart + s_vblank_clock.period;
+    fprintf(stderr, "  [NV2A] vblank clock: %s\n",
+            s_vblank_clock.legacy
+                ? "GetTickCount64() + 16 (legacy; RECOMP_VBLANK_CLOCK=tick)"
+                : "QueryPerformanceCounter, sleep to deadline");
+    if (!s_vblank_clock.legacy)
+        fprintf(stderr, "  [NV2A] vblank rate: %.2f Hz (RECOMP_VBLANK_HZ)\n",
+                s_vblank_clock.hz);
+    fflush(stderr);
+}
+
+/* How long the timer thread may sleep before the next vblank is due, in
+ * microseconds; 0 when it is due now, and "forever" when the clock is off or
+ * running on the legacy pacing, whose loop sleeps a fixed 10 ms. */
+static LONGLONG vblank_clock_wait_us(void)
+{
+    LARGE_INTEGER now;
+
+    if (!s_vblank_clock.configured)
+        vblank_clock_configure();
+    if (!s_vblank_clock.enabled || s_vblank_clock.legacy)
+        return -1;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart >= s_vblank_clock.next)
+        return 0;
+    return (s_vblank_clock.next - now.QuadPart) * 1000000 / s_vblank_clock.qpf;
+}
+
 static void kernel_vblank_tick(void)
 {
-    static int enabled = -1;
-    static long long next_ms;
-    long long now;
-
-    if (enabled < 0)
-        enabled = getenv("RECOMP_VBLANK") != NULL;
-    if (!enabled)
+    if (!s_vblank_clock.configured)
+        vblank_clock_configure();
+    if (!s_vblank_clock.enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    if (s_vblank_clock.legacy) {
+        long long now = (long long)GetTickCount64();
+        if (now < s_vblank_clock.next_ms)
+            return;
+        s_vblank_clock.next_ms = now + 16;                       /* ~60 Hz */
+    } else {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart < s_vblank_clock.next)
+            return;
+        /* Advance from the deadline, not from now, so late wake-ups do not
+         * accumulate into a slower clock. A thread that fell more than a
+         * whole period behind -- a long ISR, a debugger -- resynchronises
+         * rather than delivering a burst. */
+        s_vblank_clock.next += s_vblank_clock.period;
+        if (s_vblank_clock.next <= now.QuadPart)
+            s_vblank_clock.next = now.QuadPart + s_vblank_clock.period;
+    }
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -2192,11 +2277,13 @@ static void kernel_vblank_tick(void)
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-        if (n++ < 3)
+        xbox_FpsCountVblank();
+        if (n++ < 3) {
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
-        fflush(stderr);
+            fflush(stderr);
+        }
     }
 
 }
@@ -2471,7 +2558,7 @@ typedef struct {
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
-static int g_timer_started;
+static volatile LONG g_timer_started;   /* 0 none, 1 starting, 2 running */
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -2499,12 +2586,41 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
         g_fs_base = tib;
     }
+    xbox_NameCurrentThread(L"xbox timer/vblank");
 
-    for (;;) {
-        long long now;
-        int i;
+    /* Sleeping to the vblank deadline needs a timer that fires when asked.
+     * The scheduler tick is 15.6 ms by default, and a Sleep(10) on it wakes
+     * in 15.6 or 31.2; the high-resolution waitable timer (Windows 10 1803+)
+     * fires within about 0.5 ms. Where it is unavailable, timeBeginPeriod(1)
+     * gets Sleep close to 1 ms at the cost of a system-wide 1 kHz tick. */
+    {
+        HANDLE hires = CreateWaitableTimerExW(NULL, NULL,
+                                              0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                              TIMER_ALL_ACCESS);
+        if (!hires && vblank_clock_wait_us() >= 0)
+            timeBeginPeriod(1);
 
-        Sleep(10);
+        for (;;) {
+            long long now;
+            int i;
+            LONGLONG wait_us = vblank_clock_wait_us();
+
+            if (wait_us < 0) {
+                Sleep(10);                        /* legacy pacing, or no vblank */
+            } else if (wait_us > 0) {
+                /* Deferred work and KeSetTimer timers keep their 10 ms
+                 * granularity: never sleep longer than that. */
+                if (wait_us > 10000)
+                    wait_us = 10000;
+                if (hires) {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(wait_us * 10);
+                    SetWaitableTimer(hires, &due, 0, NULL, NULL, FALSE);
+                    WaitForSingleObject(hires, INFINITE);
+                } else {
+                    Sleep((DWORD)((wait_us + 999) / 1000));
+                }
+            }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
         kernel_drain_dpcs();   /* deferred work, before due timers */
@@ -2540,6 +2656,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        }
     }
 }
 
@@ -2551,10 +2668,19 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
+    /* Exactly one timer thread. Two guest threads setting their first timer
+     * at the same moment both saw "not started" here and each started one,
+     * and the two then delivered the vblank in turn -- 80-odd Hz through a
+     * 16 ms deadline -- and ran the title's ISR and DPC chain concurrently on
+     * state that is single-threaded by design. 1 marks "being started", so a
+     * second caller waits for the lock to exist rather than creating its own. */
+    if (InterlockedCompareExchange(&g_timer_started, 1, 0) == 0) {
         InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+        InterlockedExchange(&g_timer_started, 2);
+    } else {
+        while (InterlockedCompareExchange(&g_timer_started, 0, 0) != 2)
+            Sleep(0);
     }
 
     EnterCriticalSection(&g_timer_lock);
@@ -2599,7 +2725,7 @@ int xbox_kernel_cancel_timer(uint32_t timer_va)
 {
     int i, was_set = 0;
 
-    if (!g_timer_started)
+    if (InterlockedCompareExchange(&g_timer_started, 0, 0) != 2)
         return 0;
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++)
@@ -9487,6 +9613,10 @@ void xbox_kernel_bridge_init(void)
     int bridged = 0;
     int unbridged = 0;
     DWORD old_protect;
+
+    /* Runs on the thread that will run the guest's main thread, which is the
+     * one the sampling profiler (RECOMP_SAMPLE) needs to be told about. */
+    xbox_SamplerStart();
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
