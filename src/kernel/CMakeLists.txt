@@ -53,7 +53,11 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- $<$<NOT:$<CONFIG:Debug>>:/O2> /GS- /Gy)
+    # /Zi in every configuration: the title links with /DEBUG, so the PDB then
+    # names this library's static functions too, and a sampled profile
+    # (RECOMP_SAMPLE) attributes time to nv2a_ack_thread rather than to whatever
+    # public symbol happens to precede it. No effect on the generated code.
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- $<$<NOT:$<CONFIG:Debug>>:/O2> /GS- /Gy /Zi)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)

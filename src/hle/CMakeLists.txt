@@ -7,6 +7,12 @@
 # The DirectSound replacement (hle_dsound.c and the files it uses) is adapted
 # from doaxbv-re (https://github.com/NoRain211/doaxbv-re), GPL-3.0.
 
+if(MSVC)
+    # /Zi so the PDB names this library's static functions in a sampled
+    # profile (RECOMP_SAMPLE); see src/kernel/CMakeLists.txt.
+    add_compile_options(/Zi)
+endif()
+
 add_library(xbox_hle STATIC
     hle_d3d8.c
     hle_d3d8_state.c

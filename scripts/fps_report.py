@@ -79,13 +79,73 @@ def summarise(err: Path, keep_first: bool) -> dict:
     return out
 
 
+PATHLINE = re.compile(r"^\s*\[PATH\] (\S+)", re.M)
+SHADOW_FULL = re.compile(
+    r"^\[HLE-D3D8\] shadow: (\d+) swaps, (\d+) clears.*?draws: (\d+) UP \+ (\d+) indexed UP"
+    r" \+ (\d+) buffer \+ (\d+) indexed buffer drawn", re.M)
+SAMPLE_MAIN = re.compile(
+    r"^\[SAMPLE\] report after (\d+)s.*?\n  \[guest main[^\n]*\n((?:      .*\n)+?)      leaf",
+    re.M)
+
+
+def phases(err: Path) -> None:
+    """One line per window: what the title was doing while it ran at that rate.
+
+    Frame rate means nothing without the screen it was measured on. The
+    shadow renderer's five-second stats give draws per frame, the [PATH]
+    lines say what was being loaded, and the sampler's report (when on) says
+    where the guest thread's time went in that window.
+    """
+    text = err.read_text(encoding="utf-8", errors="replace")
+    # Split the log at each [FPS] line; the text before a window's line is
+    # what happened during it.
+    parts = re.split(r"^(\[FPS\][^\n]*)$", text, flags=re.M)
+    prev_shadow = None
+    print(f"{'t':>6} {'fps':>6} {'vblank':>6} {'draws/frame':>11}  loaded during the window")
+    for i in range(1, len(parts), 2):
+        line, body = parts[i], parts[i - 1]
+        m = WINDOW.match(line)
+        if not m:
+            continue
+        t, fps, swaps, hz = float(m.group(1)), float(m.group(2)), int(m.group(3)), float(m.group(4))
+        shadows = SHADOW_FULL.findall(body)
+        draws = ""
+        if shadows:
+            last = tuple(int(x) for x in shadows[-1])
+            if prev_shadow is not None and last[0] > prev_shadow[0]:
+                d = sum(last[2:]) - sum(prev_shadow[2:])
+                draws = f"{d / (last[0] - prev_shadow[0]):.1f}"
+            prev_shadow = last
+        files = PATHLINE.findall(body)
+        names = sorted(set(p.rsplit("\\", 1)[-1] or p for p in files))
+        loaded = ", ".join(names[:6]) + (f" (+{len(names) - 6})" if len(names) > 6 else "")
+        if len(files) > 3 * max(1, len(names)):
+            loaded += f"  [{len(files)} opens]"
+        sample = SAMPLE_MAIN.search(body)
+        if sample:
+            cats = re.findall(r"([0-9.]+)% of on-CPU\s+(.*)", sample.group(2))
+            top = sorted(cats, key=lambda c: -float(c[0]))[:3]
+            loaded += "  | guest main: " + ", ".join(f"{c[1]} {c[0]}%" for c in top)
+        print(f"{t:>6.0f} {fps:>6.1f} {hz:>6.1f} {draws:>11}  {loaded}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("err", nargs="+", type=Path)
     ap.add_argument("--keep-first", action="store_true",
                     help="keep the first window (the boot's first frames)")
+    ap.add_argument("--phases", action="store_true",
+                    help="per window, what the title was doing: draws per frame "
+                         "from the shadow stats, files opened, and the sampler's "
+                         "split of the guest thread when RECOMP_SAMPLE was on")
     args = ap.parse_args()
+
+    if args.phases:
+        for err in args.err:
+            print(f"== {err.stem}")
+            phases(err)
+        return 0
 
     print(f"{'run':<28} {'win':>3} {'mean':>6} {'median':>6} {'best':>6} "
           f"{'worst':>6} {'vblank':>7}  switches")

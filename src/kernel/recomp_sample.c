@@ -453,8 +453,12 @@ static void report(int final)
         running = t->samples - cats[CAT_WAIT];
         total_running += running;
 
-        /* Threads that only ever wait are not worth a paragraph. */
-        if (running * 100u < t->samples && cpu_s < 0.5)
+        /* Anonymous threads that only ever wait are not worth a paragraph.
+         * The runtime's own threads are always shown: "the timer thread used
+         * 0.3 s of CPU" is an answer about the ISR chain's cost, and its
+         * absence would read as the thread not existing. */
+        if (running * 100u < t->samples && cpu_s < 0.5
+            && strncmp(t->name, "thread ", 7) == 0)
             continue;
 
         fprintf(stderr, "  [%-22s tid %-6lu] %7u samples, %5.1f%% on-CPU, %.1fs CPU time\n",
