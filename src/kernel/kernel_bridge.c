@@ -3711,6 +3711,61 @@ static void bridge_IoCreateFile(void)
  */
 #define IOCTL_DISK_GET_DRIVE_GEOMETRY 0x00070000u
 #define IOCTL_DISK_GET_PARTITION_INFO 0x00074004u
+#define IOCTL_SCSI_PASS_THROUGH_DIRECT 0x0004D014u
+
+/* The DVD drive's security page, as XAPI's start-up disc check reads it.
+ *
+ * A title whose certificate allows only DVD-X2 media (TimeSplitters 2) has
+ * XAPI open \Device\CdRom0 before main and send MODE SENSE(10) for page 0x3E
+ * through IOCTL_SCSI_PASS_THROUGH_DIRECT, up to five times. It accepts the
+ * disc when the page says partition selected, CDF valid and authenticated;
+ * anything else, including the IOCTL failing, is XLaunchNewImage(NULL) --
+ * the title returns to the dashboard with nothing in its own log to say why.
+ * On a console the kernel has already run the challenge/response with the
+ * drive by the time a title boots, so "already authenticated" is the state
+ * hardware presents, and the one Cxbx-Reloaded and xemu present too.
+ *
+ * Layout after the 8-byte mode parameter header, from xboxdevwiki's DVD
+ * Drive page: page code, length (18), partition (1 = game), CDF valid (must
+ * be 1), authenticated (1), book type (0xD for an Xbox disc), then challenge
+ * fields this never runs. The SCSI_PASS_THROUGH_DIRECT block is the 32-bit
+ * Windows one: DataTransferLength at +0x0C, DataBuffer at +0x14, Cdb at
+ * +0x1C. */
+#define SPTD_SCSI_STATUS      0x02u
+#define SPTD_DATA_LENGTH      0x0Cu
+#define SPTD_DATA_BUFFER      0x14u
+#define SPTD_CDB              0x1Cu
+#define SCSI_MODE_SENSE10     0x5Au
+#define MODE_PAGE_XBOX_DVD    0x3Eu
+
+static int bridge_scsi_mode_sense_security(uint32_t sptd_va)
+{
+    uint32_t buf_va = BRIDGE_MEM32(sptd_va + SPTD_DATA_BUFFER);
+    uint32_t len    = BRIDGE_MEM32(sptd_va + SPTD_DATA_LENGTH);
+    uint8_t page[8 + 20];
+    uint32_t i;
+
+    if (!buf_va || len == 0)
+        return 0;
+
+    memset(page, 0, sizeof(page));
+    /* Mode parameter header (10): data length that follows, big-endian. */
+    page[0] = 0;
+    page[1] = (uint8_t)(sizeof(page) - 2);
+    page[8]  = MODE_PAGE_XBOX_DVD;
+    page[9]  = 18;                 /* page length */
+    page[10] = 1;                  /* partition: Xbox game partition */
+    page[11] = 1;                  /* CDF valid */
+    page[12] = 1;                  /* authenticated */
+    page[13] = 0x0D;               /* book type: Xbox game disc */
+
+    if (len > sizeof(page))
+        len = sizeof(page);
+    for (i = 0; i < len; i++)
+        BRIDGE_MEM8(buf_va + i) = page[i];
+    BRIDGE_MEM8(sptd_va + SPTD_SCSI_STATUS) = 0;   /* SCSISTAT_GOOD */
+    return 1;
+}
 
 /* The retail hard disk, in the units DISK_GEOMETRY reports. Deliberately the
  * same geometry kernel_path.c writes into the partition table it synthesises,
@@ -3726,6 +3781,36 @@ static void bridge_NtDeviceIoControlFile(void)
     uint32_t ioctl   = STACK_ARG(5);
     uint32_t out_va  = STACK_ARG(8);
     uint32_t out_len = STACK_ARG(9);
+
+    if (ioctl == IOCTL_SCSI_PASS_THROUGH_DIRECT) {
+        uint32_t in_va  = STACK_ARG(6);
+        uint32_t in_len = STACK_ARG(7);
+        uint8_t opcode, pagecode;
+
+        if (!in_va || in_len < SPTD_CDB + 16) {
+            bridge_write_iostatus(ios_va, 0xC000000Du, 0); /* INVALID_PARAMETER */
+            g_eax = 0xC000000Du;
+            return;
+        }
+        opcode   = BRIDGE_MEM8(in_va + SPTD_CDB);
+        pagecode = BRIDGE_MEM8(in_va + SPTD_CDB + 2) & 0x3Fu;
+        if (opcode == SCSI_MODE_SENSE10 && pagecode == MODE_PAGE_XBOX_DVD &&
+            bridge_scsi_mode_sense_security(in_va)) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [FILE] DVD security page read: "
+                                "reporting an authenticated Xbox disc\n");
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+        fprintf(stderr, "  [FILE] NtDeviceIoControlFile: SCSI pass-through "
+                        "opcode 0x%02X (page 0x%02X) - unhandled\n",
+                opcode, pagecode);
+        bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
+        g_eax = 0xC00000BBu;
+        return;
+    }
 
     if (ioctl == IOCTL_DISK_GET_DRIVE_GEOMETRY) {
         /* DISK_GEOMETRY: Cylinders (LARGE_INTEGER), MediaType,

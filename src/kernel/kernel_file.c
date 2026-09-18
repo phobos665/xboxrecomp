@@ -160,6 +160,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    /* A device opened as itself.
+     *
+     * "\Device\CdRom0" with nothing after it translates to the game
+     * directory. The caller did not ask for a directory -- XAPI's disc check
+     * opens the drive with FILE_SYNCHRONOUS_IO_NONALERT alone and then talks
+     * to it with NtDeviceIoControlFile -- but a directory is what the host
+     * has there, and CreateFileW refuses one without
+     * FILE_FLAG_BACKUP_SEMANTICS. So when the translated path is an existing
+     * directory, open it as one: the handle is valid for exactly what a
+     * device handle gets used for here, which is IOCTLs and volume queries. */
+    {
+        DWORD attrs = GetFileAttributesW(win_path);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(CreateOptions & XBOX_FILE_DIRECTORY_FILE)) {
+            CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                     "NtCreateFile: %S is a directory, opened as a device handle",
+                     win_path);
+        }
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
