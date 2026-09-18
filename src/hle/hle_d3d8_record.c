@@ -80,6 +80,10 @@ static uint32_t g_next_texture_id;
  * mode keeps its depth surfaces for the life of the process (hle_d3d8.c,
  * depth_surface), so a pointer never comes back as a different surface. */
 #define CAPTURE_MAX_DEPTHS 16
+/* Rectangles carried by one CopyRects chunk. D3D8's own limit is the caller's
+ * array, and a title copying more than this in one call has the rest dropped
+ * and counted rather than the chunk growing without bound. */
+#define CAPTURE_MAX_COPY_RECTS 64
 static IDirect3DSurface8 *g_depth_objects[CAPTURE_MAX_DEPTHS];
 static int                g_depth_count;
 static IDirect3DSurface8 *g_device_depth;   /* host_DeviceDepthSurface */
@@ -96,7 +100,7 @@ static IDirect3DSurface8 *g_target_depth;
 static int                g_target_lost;
 
 static unsigned long g_draws, g_texture_writes, g_level_writes, g_unrecorded_binds;
-static unsigned long g_unrecorded_targets;
+static unsigned long g_unrecorded_targets, g_unrecorded_copies;
 static uint64_t      g_texture_bytes;
 
 int hle_d3d8_capture_active(void)
@@ -391,6 +395,103 @@ static void rec_set_render_target(IDirect3DBaseTexture8 *texture, UINT level,
     chunk(D3D8CAP_SET_RENDER_TARGET, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
+static void rec_light(DWORD index, const D3DLIGHT8 *l)
+{
+    D3D8CapLight c;
+
+    c.index = index;
+    c.type  = l->Type;
+    memcpy(c.diffuse,  &l->Diffuse,  sizeof c.diffuse);
+    memcpy(c.specular, &l->Specular, sizeof c.specular);
+    memcpy(c.ambient,  &l->Ambient,  sizeof c.ambient);
+    memcpy(c.position, &l->Position, sizeof c.position);
+    memcpy(c.direction, &l->Direction, sizeof c.direction);
+    c.range   = l->Range;
+    c.falloff = l->Falloff;
+    c.atten0  = l->Attenuation0;
+    c.atten1  = l->Attenuation1;
+    c.atten2  = l->Attenuation2;
+    c.theta   = l->Theta;
+    c.phi     = l->Phi;
+    chunk(D3D8CAP_LIGHT, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+static void rec_light_enable(DWORD index, BOOL enabled)
+{
+    D3D8CapLightEnable c;
+
+    c.index   = index;
+    c.enabled = enabled ? 1u : 0u;
+    chunk(D3D8CAP_LIGHT_ENABLE, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+static void rec_material(const D3DMATERIAL8 *m)
+{
+    D3D8CapMaterial c;
+
+    memcpy(c.diffuse,  &m->Diffuse,  sizeof c.diffuse);
+    memcpy(c.ambient,  &m->Ambient,  sizeof c.ambient);
+    memcpy(c.specular, &m->Specular, sizeof c.specular);
+    memcpy(c.emissive, &m->Emissive, sizeof c.emissive);
+    c.power = m->Power;
+    chunk(D3D8CAP_MATERIAL, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+/* A copy the capture cannot name on either side is dropped rather than
+ * recorded against the back buffer: a copy has a destination, and writing it
+ * to the wrong one would draw over the frame on replay. */
+static void rec_copy_rects(IDirect3DBaseTexture8 *src, UINT src_level, UINT src_face,
+                           const RECT *rects, UINT rect_count,
+                           IDirect3DBaseTexture8 *dst, UINT dst_level, UINT dst_face,
+                           const POINT *points)
+{
+    D3D8CapCopyRects c;
+    D3D8CapCopyRect out[CAPTURE_MAX_COPY_RECTS];
+    unsigned long binds = g_unrecorded_binds;
+    UINT i, n;
+
+    /* texture_id counts a failure as a texture bind; this one is counted as
+     * a copy instead, so the two reports do not describe it twice. */
+    c.src_id = texture_id(src);
+    c.dst_id = texture_id(dst);
+    g_unrecorded_binds = binds;
+    if ((src && !c.src_id) || (dst && !c.dst_id)) {
+        g_unrecorded_copies++;
+        return;
+    }
+    c.src_level = src_level;
+    c.src_face  = src_face;
+    c.dst_level = dst_level;
+    c.dst_face  = dst_face;
+
+    n = (!rects || !rect_count) ? 0 : rect_count;
+    if (n > CAPTURE_MAX_COPY_RECTS) {
+        n = CAPTURE_MAX_COPY_RECTS;
+        g_unrecorded_copies++;
+    }
+    for (i = 0; i < n; i++) {
+        out[i].left   = rects[i].left;
+        out[i].top    = rects[i].top;
+        out[i].right  = rects[i].right;
+        out[i].bottom = rects[i].bottom;
+        out[i].x      = points ? points[i].x : rects[i].left;
+        out[i].y      = points ? points[i].y : rects[i].top;
+    }
+    /* No rectangles is the whole level, and then the destination point
+     * travels in a single entry so replay has somewhere to put it. */
+    if (!n && points) {
+        out[0].left = out[0].top = out[0].right = out[0].bottom = 0;
+        out[0].x = points[0].x;
+        out[0].y = points[0].y;
+        n = 1;
+        c.rect_count = 0;
+        chunk(D3D8CAP_COPY_RECTS, &c, sizeof c, out, sizeof out[0], NULL, 0);
+        return;
+    }
+    c.rect_count = n;
+    chunk(D3D8CAP_COPY_RECTS, &c, sizeof c, out, n * sizeof out[0], NULL, 0);
+}
+
 /* ---------------------------------------------------------------- snapshot */
 
 /* Everything the frame draws with that was set before it began, read from the
@@ -449,6 +550,28 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
     dev->lpVtbl->GetViewport(dev, &vp);
     rec_viewport(&vp);
 
+    {
+        const D3DMATERIAL8 *mat = d3d8_GetMaterial();
+        UINT lights = d3d8_GetNumLights();
+
+        if (mat)
+            rec_material(mat);
+        /* Only the lights the title has actually set. A slot it never touched
+         * holds a zeroed D3DLIGHT8, whose Type 0 is not a D3DLIGHTTYPE at
+         * all, and replay's device starts with the same zeroed, disabled
+         * slots -- so writing them would be eight chunks a frame saying
+         * nothing. */
+        for (s = 0; s < lights; s++) {
+            const D3DLIGHT8 *l = d3d8_GetLight(s);
+            BOOL on = d3d8_GetLightEnable(s);
+
+            if (l && l->Type)
+                rec_light(s, l);
+            if (on)
+                rec_light_enable(s, on);
+        }
+    }
+
     for (s = 0; rs && s < CAPTURE_RENDER_STATES; s++)
         rec_render_state(s, rs[s]);
     for (s = 0; s < CAPTURE_STAGES; s++) {
@@ -505,7 +628,7 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
         if (g_min_draws && g_draws < g_min_draws) {
             /* Too few draws: dropped, and this swap starts the next try. */
             remove(g_file);
-            g_unrecorded_targets = g_unrecorded_binds = 0;
+            g_unrecorded_targets = g_unrecorded_binds = g_unrecorded_copies = 0;
             g_target_swap = swaps;
             goto start;
         }
@@ -522,6 +645,10 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
             fprintf(stderr, "[HLE-D3D8] capture: %lu texture binds recorded as "
                     "nothing bound (not a 2D texture, or table full)\n",
                     g_unrecorded_binds);
+        if (g_unrecorded_copies)
+            fprintf(stderr, "[HLE-D3D8] capture: %lu surface copies dropped "
+                    "(a side the capture cannot name, or too many rectangles)\n",
+                    g_unrecorded_copies);
         fflush(stderr);
         g_files++;
         if (g_every && g_files < CAPTURE_MAX_FILES)
@@ -542,7 +669,7 @@ start:
     g_next_texture_id = 1;
     g_depth_count = 0;
     g_draws = g_texture_writes = g_level_writes = g_unrecorded_binds = 0;
-    g_unrecorded_targets = 0;
+    g_unrecorded_targets = g_unrecorded_copies = 0;
     g_texture_bytes = 0;
     if (g_every) {
         /* <path>_<swap><extension>, with the extension moved to the end. */
@@ -625,6 +752,50 @@ HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport)
     if (g_cap && viewport)
         rec_viewport(viewport);
     return dev->lpVtbl->SetViewport(dev, viewport);
+}
+
+HRESULT host_SetLight(IDirect3DDevice8 *dev, DWORD index, const D3DLIGHT8 *light)
+{
+    if (!light)
+        return E_INVALIDARG;
+    if (g_cap)
+        rec_light(index, light);
+    return dev->lpVtbl->SetLight(dev, index, light);
+}
+
+HRESULT host_LightEnable(IDirect3DDevice8 *dev, DWORD index, BOOL enabled)
+{
+    if (g_cap)
+        rec_light_enable(index, enabled);
+    return dev->lpVtbl->LightEnable(dev, index, enabled);
+}
+
+HRESULT host_SetMaterial(IDirect3DDevice8 *dev, const D3DMATERIAL8 *material)
+{
+    if (!material)
+        return E_INVALIDARG;
+    if (g_cap)
+        rec_material(material);
+    return dev->lpVtbl->SetMaterial(dev, material);
+}
+
+HRESULT host_CopyRects(IDirect3DDevice8 *dev,
+                       IDirect3DBaseTexture8 *src, UINT src_level, UINT src_face,
+                       const RECT *rects, UINT rect_count,
+                       IDirect3DBaseTexture8 *dst, UINT dst_level, UINT dst_face,
+                       const POINT *points)
+{
+    HRESULT hr;
+
+    (void)dev;
+    hr = d3d8_copy_rects(src, src_level, src_face, rects, rect_count,
+                         dst, dst_level, dst_face, points);
+    /* Recorded only when it happened, so a replay does not copy what the run
+     * refused. */
+    if (g_cap && SUCCEEDED(hr))
+        rec_copy_rects(src, src_level, src_face, rects, rect_count,
+                       dst, dst_level, dst_face, points);
+    return hr;
 }
 
 HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage, IDirect3DBaseTexture8 *texture)

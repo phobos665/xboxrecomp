@@ -112,6 +112,8 @@ static UINT               g_shadow_width, g_shadow_height;
  * screen-space undo are relative to it. */
 static UINT               g_target_width, g_target_height;
 static unsigned long      g_target_sets, g_target_scratch, g_target_failed;
+static unsigned long      g_lights_set, g_materials_set;
+static unsigned long      g_copies, g_copies_dropped, g_copies_failed;
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
 static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
@@ -635,6 +637,10 @@ HLE_ORIGINAL(D3DDevice_SelectVertexShader);
 HLE_ORIGINAL(D3DDevice_SetTransform);
 HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
+HLE_ORIGINAL(D3DDevice_SetLight);
+HLE_ORIGINAL(D3DDevice_LightEnable);
+HLE_ORIGINAL(D3DDevice_SetMaterial);
+HLE_ORIGINAL(D3DDevice_CopyRects);
 HLE_ORIGINAL(D3DDevice_SetPixelShader);
 HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
 HLE_ORIGINAL(D3DDevice_SetVertexData2f);
@@ -803,6 +809,14 @@ HLE_EXPORT(D3DDevice_Swap)
                 fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
                         "scratch target, %lu failed\n", g_target_sets,
                         g_target_scratch, g_target_failed);
+            if (g_lights_set || g_materials_set)
+                fprintf(stderr, "[HLE-D3D8] shadow lighting: %lu light calls, "
+                        "%lu material calls\n", g_lights_set, g_materials_set);
+            if (g_copies || g_copies_dropped || g_copies_failed)
+                fprintf(stderr, "[HLE-D3D8] shadow surface copies: %lu copied, %lu "
+                        "dropped (a side with no host mirror), %lu refused by the "
+                        "host (format or sample count)\n",
+                        g_copies, g_copies_dropped, g_copies_failed);
             fflush(stderr);
             g_shadow_last_report = now;
         }
@@ -1236,6 +1250,8 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va);
 IDirect3DCubeTexture8 *hle_d3d8_render_cube(IDirect3DDevice8 *dev, uint32_t va);
 int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
                        uint32_t *face, uint32_t *level);
+IDirect3DTexture8 *hle_d3d8_sample_texture(IDirect3DDevice8 *dev, uint32_t va);
+int hle_d3d8_texture_host_owned(uint32_t va);
 
 #define SHADOW_SCRATCH 8
 #define SURFACE_PARENT 20
@@ -1448,6 +1464,313 @@ HLE_EXPORT(D3DDevice_SetRenderTarget)
     }
     if (g_shadow)
         shadow_set_render_target(rt, zs);
+#endif
+}
+
+
+#ifdef _WIN32
+/* A guest heap pointer, roughly: inside the console's RAM, aligned, and not a
+ * small integer. HLE_MEM32 does not check that the page is mapped, so a
+ * handle that is a token rather than a pointer would fault on the read. */
+static int guest_ptr_ok(uint32_t va)
+{
+    return va >= 0x10000u && va < 0x08000000u && (va & 3u) == 0u;
+}
+
+static float guest_f32(uint32_t va)
+{
+    union { uint32_t u; float f; } v;
+
+    v.u = HLE_MEM32(va);
+    return v.f;
+}
+
+/* An Xbox D3DLIGHT8 out of guest memory. Its layout is the PC one, which is
+ * also the host's (d3d8_xbox.h), so the two could be memcpy'd -- the fields
+ * are read at their Xbox offsets and assigned by name instead, so the copy
+ * stays right if either struct is ever reordered. */
+static void read_light(uint32_t va, D3DLIGHT8 *out)
+{
+    out->Type          = HLE_MEM32(va + 0);
+    out->Diffuse.r     = guest_f32(va + 4);
+    out->Diffuse.g     = guest_f32(va + 8);
+    out->Diffuse.b     = guest_f32(va + 12);
+    out->Diffuse.a     = guest_f32(va + 16);
+    out->Specular.r    = guest_f32(va + 20);
+    out->Specular.g    = guest_f32(va + 24);
+    out->Specular.b    = guest_f32(va + 28);
+    out->Specular.a    = guest_f32(va + 32);
+    out->Ambient.r     = guest_f32(va + 36);
+    out->Ambient.g     = guest_f32(va + 40);
+    out->Ambient.b     = guest_f32(va + 44);
+    out->Ambient.a     = guest_f32(va + 48);
+    out->Position.x    = guest_f32(va + 52);
+    out->Position.y    = guest_f32(va + 56);
+    out->Position.z    = guest_f32(va + 60);
+    out->Direction.x   = guest_f32(va + 64);
+    out->Direction.y   = guest_f32(va + 68);
+    out->Direction.z   = guest_f32(va + 72);
+    out->Range         = guest_f32(va + 76);
+    out->Falloff       = guest_f32(va + 80);
+    out->Attenuation0  = guest_f32(va + 84);
+    out->Attenuation1  = guest_f32(va + 88);
+    out->Attenuation2  = guest_f32(va + 92);
+    out->Theta         = guest_f32(va + 96);
+    out->Phi           = guest_f32(va + 100);
+}
+
+/* An Xbox D3DMATERIAL8: four colours then the specular power, 68 bytes. */
+static void read_material(uint32_t va, D3DMATERIAL8 *out)
+{
+    out->Diffuse.r  = guest_f32(va + 0);
+    out->Diffuse.g  = guest_f32(va + 4);
+    out->Diffuse.b  = guest_f32(va + 8);
+    out->Diffuse.a  = guest_f32(va + 12);
+    out->Ambient.r  = guest_f32(va + 16);
+    out->Ambient.g  = guest_f32(va + 20);
+    out->Ambient.b  = guest_f32(va + 24);
+    out->Ambient.a  = guest_f32(va + 28);
+    out->Specular.r = guest_f32(va + 32);
+    out->Specular.g = guest_f32(va + 36);
+    out->Specular.b = guest_f32(va + 40);
+    out->Specular.a = guest_f32(va + 44);
+    out->Emissive.r = guest_f32(va + 48);
+    out->Emissive.g = guest_f32(va + 52);
+    out->Emissive.b = guest_f32(va + 56);
+    out->Emissive.a = guest_f32(va + 60);
+    out->Power      = guest_f32(va + 64);
+}
+#endif /* _WIN32 */
+
+/* void D3DDevice_SetLight(DWORD Index, const D3DLIGHT8 *pLight)            */
+HLE_EXPORT(D3DDevice_SetLight)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t index = HLE_ARG(0), va = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_SetLight", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetLight, "D3DDevice_SetLight"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetLight);
+#ifdef _WIN32
+    if (g_shadow && guest_ptr_ok(va)) {
+        D3DLIGHT8 light;
+
+        read_light(va, &light);
+        host_SetLight(g_shadow, index, &light);
+        g_lights_set++;
+    }
+#endif
+}
+
+/* void D3DDevice_LightEnable(DWORD Index, BOOL bEnable)                    */
+HLE_EXPORT(D3DDevice_LightEnable)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t index = HLE_ARG(0), enable = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_LightEnable", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_LightEnable, "D3DDevice_LightEnable"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_LightEnable);
+#ifdef _WIN32
+    if (g_shadow) {
+        host_LightEnable(g_shadow, index, enable ? TRUE : FALSE);
+        g_lights_set++;
+    }
+#endif
+}
+
+/* void D3DDevice_SetMaterial(const D3DMATERIAL8 *pMaterial)                */
+HLE_EXPORT(D3DDevice_SetMaterial)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t va = HLE_ARG(0);
+#endif
+
+    first_call(&seen, "D3DDevice_SetMaterial", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetMaterial, "D3DDevice_SetMaterial"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetMaterial);
+#ifdef _WIN32
+    if (g_shadow && guest_ptr_ok(va)) {
+        D3DMATERIAL8 material;
+
+        read_material(va, &material);
+        host_SetMaterial(g_shadow, &material);
+        g_materials_set++;
+    }
+#endif
+}
+
+#ifdef _WIN32
+/* A guest surface as something the host can copy to or from: the back buffer
+ * (0, with *texture NULL), a 2D texture (1), or a cube face (3). The kinds
+ * and the predicates are shadow_set_render_target's, and the mirrors are the
+ * same cache entries, so what is copied into a texture is what samples out
+ * of it. *owner is the guest texture the surface belongs to, or 0.
+ *
+ * Unlike SetRenderTarget this does not turn the texture into a render
+ * target. hle_d3d8_render_texture throws away an ordinary texture's texels
+ * to recreate it as one, which is right for a surface the title has just
+ * said it draws into and wrong for either side of a copy -- CopyRects says
+ * nothing about what its surfaces are, and a copy that is then refused would
+ * have destroyed a texture for nothing.
+ *
+ * -1 for a surface with no mirror: one the title only ever locks, say. The
+ * caller drops that copy rather than putting it somewhere else. */
+static int shadow_resolve_surface(uint32_t va, IDirect3DBaseTexture8 **texture,
+                                  UINT *level, UINT *face, uint32_t *owner)
+{
+    uint32_t parent, fmt;
+    UINT w, h;
+
+    *texture = NULL;
+    *level = 0;
+    *face = 0;
+    *owner = 0;
+    if (!guest_ptr_ok(va))
+        return -1;
+    surface_measure(va, &w, &h, &fmt);
+    parent = HLE_MEM32(va + SURFACE_PARENT);
+    if (parent && guest_ptr_ok(parent) && (HLE_MEM32(parent + 12) & 0x4)) {
+        uint32_t f = 0, lv = 0;
+        IDirect3DCubeTexture8 *cube;
+
+        if (hle_d3d8_cube_face(parent, va, &f, &lv) != 0)
+            return -1;
+        cube = hle_d3d8_render_cube(g_shadow, parent);
+        if (!cube)
+            return -1;
+        *texture = (IDirect3DBaseTexture8 *)cube;
+        *face = (UINT)f;
+        *level = (UINT)lv;
+        *owner = parent;
+        return 3;
+    }
+    if (parent && guest_ptr_ok(parent) && HLE_MEM32(parent + 4) == HLE_MEM32(va + 4)) {
+        IDirect3DTexture8 *tex = hle_d3d8_sample_texture(g_shadow, parent);
+
+        if (!tex)
+            return -1;
+        *texture = (IDirect3DBaseTexture8 *)tex;
+        *owner = parent;
+        return 1;                        /* level 0, as SetRenderTarget does */
+    }
+    if (g_backbuffer_va ? va == g_backbuffer_va
+                        : (!parent && w == g_shadow_width && h == g_shadow_height))
+        return 0;
+    return -1;
+}
+
+#define COPY_RECTS_BATCH 64
+/* A ceiling on the title's own cRects. HLE_MEM32 does not check that a page
+ * is mapped, so a wild count walks off the end of guest memory, and a count
+ * near 2^32 makes the batch counter wrap and the loop never end. No real
+ * CopyRects passes anything like this many. */
+#define COPY_RECTS_MAX   4096u
+#endif /* _WIN32 */
+
+#ifdef _WIN32
+/* A copy that reached the host. The destination's guest memory never sees
+ * it, so the texture cache is told to stop putting the guest's texels back
+ * over what was copied in. The back buffer (owner 0) needs nothing. */
+static void shadow_copy_landed(uint32_t dst_owner)
+{
+    g_copies++;
+    if (dst_owner)
+        hle_d3d8_texture_host_owned(dst_owner);
+}
+#endif /* _WIN32 */
+
+/* void D3DDevice_CopyRects(D3DSurface *pSourceSurface,
+ *     const RECT *pSourceRectsArray, UINT cRects,
+ *     D3DSurface *pDestinationSurface, const POINT *pDestPointsArray)       */
+HLE_EXPORT(D3DDevice_CopyRects)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t src_va = HLE_ARG(0), rects_va = HLE_ARG(1), count = HLE_ARG(2);
+    uint32_t dst_va = HLE_ARG(3), points_va = HLE_ARG(4);
+#endif
+
+    first_call(&seen, "D3DDevice_CopyRects", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_CopyRects, "D3DDevice_CopyRects"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_CopyRects);
+#ifdef _WIN32
+    if (g_shadow) {
+        IDirect3DBaseTexture8 *src = NULL, *dst = NULL;
+        UINT src_level, src_face, dst_level, dst_face;
+        uint32_t src_owner = 0, dst_owner = 0;
+
+        if (count > COPY_RECTS_MAX) {
+            fprintf(stderr, "[HLE-D3D8] CopyRects asked for %u rectangles; "
+                    "%u is the most this reads\n", count, COPY_RECTS_MAX);
+            count = COPY_RECTS_MAX;
+            g_copies_dropped++;
+        }
+        if (shadow_resolve_surface(src_va, &src, &src_level, &src_face, &src_owner) < 0 ||
+            shadow_resolve_surface(dst_va, &dst, &dst_level, &dst_face, &dst_owner) < 0) {
+            g_copies_dropped++;
+        } else if (!count || !guest_ptr_ok(rects_va)) {
+            /* The whole source level, at the destination point if there is
+             * one. D3D8 allows both arrays to be NULL, which is the whole
+             * surface to the same place. */
+            POINT at;
+            int have_point = guest_ptr_ok(points_va);
+
+            at.x = have_point ? (LONG)HLE_MEM32(points_va) : 0;
+            at.y = have_point ? (LONG)HLE_MEM32(points_va + 4) : 0;
+            if (FAILED(host_CopyRects(g_shadow, src, src_level, src_face, NULL, 0,
+                                      dst, dst_level, dst_face,
+                                      have_point ? &at : NULL)))
+                g_copies_failed++;
+            else
+                shadow_copy_landed(dst_owner);
+        } else {
+            RECT  r[COPY_RECTS_BATCH];
+            POINT pt[COPY_RECTS_BATCH];
+            uint32_t done;
+
+            /* More rectangles than one batch holds go out as several copies:
+             * the arrays are on this thread's stack, and a title may pass any
+             * number. */
+            for (done = 0; done < count; done += COPY_RECTS_BATCH) {
+                uint32_t n = count - done, i;
+
+                if (n > COPY_RECTS_BATCH)
+                    n = COPY_RECTS_BATCH;
+                for (i = 0; i < n; i++) {
+                    uint32_t ra = rects_va + (done + i) * 16u;
+
+                    r[i].left   = (LONG)HLE_MEM32(ra + 0);
+                    r[i].top    = (LONG)HLE_MEM32(ra + 4);
+                    r[i].right  = (LONG)HLE_MEM32(ra + 8);
+                    r[i].bottom = (LONG)HLE_MEM32(ra + 12);
+                    if (guest_ptr_ok(points_va)) {
+                        uint32_t pa = points_va + (done + i) * 8u;
+
+                        pt[i].x = (LONG)HLE_MEM32(pa + 0);
+                        pt[i].y = (LONG)HLE_MEM32(pa + 4);
+                    } else {
+                        pt[i].x = r[i].left;
+                        pt[i].y = r[i].top;
+                    }
+                }
+                if (FAILED(host_CopyRects(g_shadow, src, src_level, src_face, r, n,
+                                          dst, dst_level, dst_face, pt)))
+                    g_copies_failed++;
+                else
+                    shadow_copy_landed(dst_owner);
+            }
+        }
+    }
 #endif
 }
 

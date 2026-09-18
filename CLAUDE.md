@@ -52,14 +52,15 @@ handles cube and volume textures, and bakes P8 through the stage palette;
 is the renderer. The generalisation blocker is not the texture layer.
 
 **The real blocker was that `src/hle` could not see `src/d3d`.** It can now (Sep 2026):
-`xbox_hle` links `xbox_d3d8` on Windows, and `hle_d3d8.c` replaces 40 XDK functions by
+`xbox_hle` links `xbox_d3d8` on Windows, and `hle_d3d8.c` replaces 44 XDK functions by
 name. Each runs the title's own body first (`HLE_ORIGINAL`), and with
 `RECOMP_HLE_D3D8=shadow` repeats the call on a host device in a second window.
 
 **Shadow mode draws the title** (Sep 2026): Burnout 2's logos, menus, loading screens, HUD
 and race, with its own vertex programs and register combiners. See
 `docs/technical/shadow-mode.md` for what reaches the host and from where, the switches, and
-the gaps that remain (cube render targets, `CopyRects`, lighting). A path for titles that
+the gaps that remain. Lights, the material and `CopyRects` are forwarded as of
+Sep 2026, though no title here has yet called any of them. A path for titles that
 fill push buffers through `BeginPush` is still the next piece of work: those draws reach no
 replacement at all.
 

@@ -99,8 +99,9 @@ extern "C" {
  * refuses anything else rather than guessing: captures are cheap to retake.
  * Version 1 was the title-level format; its chunk numbers mean different
  * things here. Version 3 added render targets and input current values,
- * version 4 cube textures and the face a render target names. */
-#define D3D8CAP_VERSION      4u
+ * version 4 cube textures and the face a render target names, version 5
+ * lights, the material and surface copies. */
+#define D3D8CAP_VERSION      5u
 
 /* The conventional extension. .gitignore has it: a capture contains the
  * title's own textures and vertices, so it is game content and must never be
@@ -132,7 +133,11 @@ enum {
     D3D8CAP_SET_RENDER_TARGET   = 21, /* D3D8CapSetRenderTarget */
     D3D8CAP_VS_VERTEX_DATA      = 22, /* D3D8CapVsVertexData */
     D3D8CAP_CUBE_TEXTURE        = 23, /* D3D8CapCubeTexture */
-    D3D8CAP_CHUNK_KINDS         = 24  /* one past the last, for per-kind counters */
+    D3D8CAP_LIGHT               = 24, /* D3D8CapLight */
+    D3D8CAP_LIGHT_ENABLE        = 25, /* D3D8CapLightEnable */
+    D3D8CAP_MATERIAL            = 26, /* D3D8CapMaterial */
+    D3D8CAP_COPY_RECTS          = 27, /* D3D8CapCopyRects + D3D8CapCopyRect[] */
+    D3D8CAP_CHUNK_KINDS         = 28  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -243,6 +248,41 @@ typedef struct { uint32_t id, format, edge, levels, usage; } D3D8CapCubeTexture;
  * buffer, and anything else a DEPTH_SURFACE chunk's id. */
 #define D3D8CAP_DEPTH_DEVICE 0xFFFFFFFFu
 typedef struct { uint32_t texture_id, level, face, depth_id; } D3D8CapSetRenderTarget;
+
+/* SetLight. The floats are the host D3DLIGHT8 in its own field order --
+ * type, diffuse, specular, ambient, position, direction, then range,
+ * falloff, the three attenuations, theta and phi -- which is also the Xbox
+ * order, so shadow mode copies it across without reordering. The snapshot
+ * carries every light a title has set. */
+typedef struct {
+    uint32_t index, type;
+    float    diffuse[4], specular[4], ambient[4];
+    float    position[3], direction[3];
+    float    range, falloff, atten0, atten1, atten2, theta, phi;
+} D3D8CapLight;
+
+typedef struct { uint32_t index, enabled; } D3D8CapLightEnable;
+
+/* SetMaterial: the host D3DMATERIAL8. */
+typedef struct {
+    float diffuse[4], ambient[4], specular[4], emissive[4], power;
+} D3D8CapMaterial;
+
+/* CopyRects between two host surfaces. Each id is 0 for the back buffer or a
+ * TEXTURE / CUBE_TEXTURE chunk's id, with the level and face naming the
+ * subresource. Each rectangle carries its own destination point, so replay
+ * needs no second array.
+ *
+ * rect_count 0 is the whole source level, and then the tail is either empty
+ * (copied to the origin) or ONE rectangle whose bounds are all zero and whose
+ * x/y carry the destination point. So a reader cannot take the tail length
+ * from rect_count: with rect_count 0 it must look at the chunk's own size. */
+typedef struct {
+    uint32_t src_id, src_level, src_face;
+    uint32_t dst_id, dst_level, dst_face;
+    uint32_t rect_count;
+} D3D8CapCopyRects;
+typedef struct { int32_t left, top, right, bottom, x, y; } D3D8CapCopyRect;
 
 /* A short name for a chunk type ("draw_up"), or "unknown", for logs. */
 const char *d3d8cap_chunk_name(uint32_t type);

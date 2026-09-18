@@ -461,6 +461,106 @@ static void do_depth_surface(Replay *r, const D3D8CapChunk *c)
     }
 }
 
+static void do_light(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapLight *p = c->data;
+    D3DLIGHT8 light;
+
+    if (c->bytes < sizeof *p) {
+        r->malformed++;
+        return;
+    }
+    memset(&light, 0, sizeof light);
+    light.Type = p->type;
+    memcpy(&light.Diffuse,   p->diffuse,   sizeof p->diffuse);
+    memcpy(&light.Specular,  p->specular,  sizeof p->specular);
+    memcpy(&light.Ambient,   p->ambient,   sizeof p->ambient);
+    memcpy(&light.Position,  p->position,  sizeof p->position);
+    memcpy(&light.Direction, p->direction, sizeof p->direction);
+    light.Range        = p->range;
+    light.Falloff      = p->falloff;
+    light.Attenuation0 = p->atten0;
+    light.Attenuation1 = p->atten1;
+    light.Attenuation2 = p->atten2;
+    light.Theta        = p->theta;
+    light.Phi          = p->phi;
+    r->dev->lpVtbl->SetLight(r->dev, p->index, &light);
+}
+
+static void do_material(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapMaterial *p = c->data;
+    D3DMATERIAL8 m;
+
+    if (c->bytes < sizeof *p) {
+        r->malformed++;
+        return;
+    }
+    memset(&m, 0, sizeof m);
+    memcpy(&m.Diffuse,  p->diffuse,  sizeof p->diffuse);
+    memcpy(&m.Ambient,  p->ambient,  sizeof p->ambient);
+    memcpy(&m.Specular, p->specular, sizeof p->specular);
+    memcpy(&m.Emissive, p->emissive, sizeof p->emissive);
+    m.Power = p->power;
+    r->dev->lpVtbl->SetMaterial(r->dev, &m);
+}
+
+/* A copy whose source or destination the replay does not hold is counted and
+ * skipped: the run's copy had a destination, and putting it anywhere else
+ * would draw over the frame. */
+static void do_copy_rects(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapCopyRects *p = c->data;
+    const D3D8CapCopyRect *rects;
+    IDirect3DBaseTexture8 *src = NULL, *dst = NULL;
+    RECT  win[64];
+    POINT at[64];
+    uint32_t i, n;
+
+    if (c->bytes < sizeof *p) {
+        r->malformed++;
+        return;
+    }
+    n = p->rect_count ? p->rect_count : (c->bytes >= sizeof *p + sizeof *rects ? 1u : 0u);
+    if (n > (uint32_t)(sizeof win / sizeof win[0]) ||
+        c->bytes < sizeof *p + (size_t)n * sizeof *rects) {
+        r->malformed++;
+        return;
+    }
+    rects = (const D3D8CapCopyRect *)((const unsigned char *)c->data + sizeof *p);
+
+    if (p->src_id) {
+        ReplayTexture *slot = texture_slot(r, p->src_id, 0);
+
+        if (!slot || !slot->tex) {
+            r->unmapped++;
+            return;
+        }
+        src = slot->tex;
+    }
+    if (p->dst_id) {
+        ReplayTexture *slot = texture_slot(r, p->dst_id, 0);
+
+        if (!slot || !slot->tex) {
+            r->unmapped++;
+            return;
+        }
+        dst = slot->tex;
+    }
+    for (i = 0; i < n; i++) {
+        win[i].left   = rects[i].left;
+        win[i].top    = rects[i].top;
+        win[i].right  = rects[i].right;
+        win[i].bottom = rects[i].bottom;
+        at[i].x       = rects[i].x;
+        at[i].y       = rects[i].y;
+    }
+    if (FAILED(d3d8_copy_rects(src, p->src_level, p->src_face,
+                               p->rect_count ? win : NULL, p->rect_count,
+                               dst, p->dst_level, p->dst_face, n ? at : NULL)))
+        r->failed++;
+}
+
 static void do_set_render_target(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapSetRenderTarget *t = c->data;
@@ -859,6 +959,25 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         break;
     case D3D8CAP_SET_RENDER_TARGET:
         do_set_render_target(r, c);
+        break;
+    case D3D8CAP_LIGHT:
+        do_light(r, c);
+        break;
+    case D3D8CAP_LIGHT_ENABLE: {
+        const D3D8CapLightEnable *p = c->data;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        r->dev->lpVtbl->LightEnable(r->dev, p->index, p->enabled ? TRUE : FALSE);
+        break;
+    }
+    case D3D8CAP_MATERIAL:
+        do_material(r, c);
+        break;
+    case D3D8CAP_COPY_RECTS:
+        do_copy_rects(r, c);
         break;
     case D3D8CAP_PS_TOKEN: {
         const D3D8CapPsToken *p = c->data;

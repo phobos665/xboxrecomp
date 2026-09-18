@@ -84,6 +84,21 @@ BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info);
 BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
                         const BYTE **bits, UINT *pitch, UINT *rows);
 
+/* CopyRects between host resources (d3d8_device.c). A NULL texture is the
+ * swap chain's back buffer; otherwise `level` names the mip level and `face`
+ * the cube face (0 for a 2D texture). rect_count 0 copies the whole source
+ * level to dst_points[0], or to the origin when there are no points.
+ *
+ * Returns E_INVALIDARG when the two sides do not share a format or either is
+ * multisampled -- D3D11's CopySubresourceRegion cannot convert, and a draw to
+ * do it is not worth having before a title needs one -- and also when every
+ * rectangle clipped away, so a caller can tell a copy that happened from one
+ * that did not. */
+HRESULT d3d8_copy_rects(IDirect3DBaseTexture8 *src, UINT src_level, UINT src_face,
+                        const RECT *src_rects, UINT rect_count,
+                        IDirect3DBaseTexture8 *dst, UINT dst_level, UINT dst_face,
+                        const POINT *dst_points);
+
 /* ================================================================
  * Resource wrapper structures
  * ================================================================ */

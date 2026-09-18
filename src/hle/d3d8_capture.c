@@ -274,7 +274,8 @@ const char *d3d8cap_chunk_name(uint32_t type)
         "draw_indexed_up", "texture", "texture_level", "texture_release",
         "vs_create", "vs_delete", "vs_declaration", "vs_constants",
         "vs_screenspace", "ps_token", "depth_surface", "set_render_target",
-        "vs_vertex_data", "cube_texture"
+        "vs_vertex_data", "cube_texture", "light", "light_enable", "material",
+        "copy_rects"
     };
 
     return type < D3D8CAP_CHUNK_KINDS ? names[type] : "unknown";
