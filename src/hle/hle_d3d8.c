@@ -387,7 +387,7 @@ static void shadow_create(uint32_t pp_va)
 
 enum { SHADER_DECLARATION, SHADER_HOST_PROGRAM, SHADER_NOT_REPLAYED };
 
-#define SHADOW_MAX_PACKED 4              /* NORMPACKED3 registers per program */
+#define SHADOW_MAX_PACKED 8              /* registers expanded to floats per draw */
 
 struct shadow_program {
     uint32_t guest;
@@ -397,8 +397,14 @@ struct shadow_program {
     /* From the declaration (shadow_read_declaration), host programs only. */
     int      has_declaration;            /* the host has its vertex layout */
     UINT     extent;                     /* bytes of a vertex it reads */
-    int      packed_count;               /* NORMPACKED3 registers */
-    UINT     packed_offset[SHADOW_MAX_PACKED];
+    /* Registers in a format the host cannot read as it is (xbox_vsdt_expanded).
+     * Each draw copies its vertices with these unpacked to floats in a prefix
+     * of expanded_bytes; the rest of the vertex follows unchanged. */
+    int      packed_count;
+    UINT     packed_offset[SHADOW_MAX_PACKED];   /* in the guest vertex */
+    UINT     packed_out[SHADOW_MAX_PACKED];      /* in the prefix */
+    uint32_t packed_format[SHADOW_MAX_PACKED];   /* X_D3DVSDT */
+    UINT     expanded_bytes;
 };
 
 static struct shadow_program g_programs[SHADOW_MAX_PROGRAMS];
@@ -944,14 +950,38 @@ static int xbox_vsdt_to_dxgi(uint32_t format, DXGI_FORMAT *dxgi, UINT *size)
     }
 }
 
+/* An X_D3DVSDT format the host cannot read as it is, expanded to floats per
+ * draw (shadow_expand_vertices): how many floats it becomes, with *size the
+ * bytes it occupies in the guest vertex, or 0 for a format read directly.
+ * NORMPACKED3 has no DXGI format at all. The unnormalised shorts do (R16_SINT
+ * and friends) but those need an integer shader input, and the generated
+ * programs read floats; TimeSplitters 2's world geometry is SHORT2 texture
+ * coordinates and SHORT4 positions, 15% of its in-level draws. */
+static int xbox_vsdt_expanded(uint32_t format, UINT *size)
+{
+    switch (format) {
+    case 0x16: *size = 4; return 3;      /* NORMPACKED3, 11:11:10 signed */
+    case 0x15: *size = 2; return 1;      /* SHORT1 */
+    case 0x25: *size = 4; return 2;      /* SHORT2 */
+    case 0x35: *size = 6; return 3;      /* SHORT3 */
+    case 0x45: *size = 8; return 4;      /* SHORT4 */
+    default:   return 0;
+    }
+}
+
+static const DXGI_FORMAT FLOATN_FORMAT[5] = {
+    DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+};
+
 /* The host program's vertex layout, from the same slots: each register at its
- * declared offset in the stream 0 vertex. NORMPACKED3 (0x16, 11:11:10 signed
- * bits) has no DXGI format, so each draw copies the vertex behind its unpacked
- * normals (shadow_expand_vertices): those registers read float3s from the
- * front, and every other offset moves up by 12 bytes per packed register. A
- * declaration the host cannot take -- another stream, or a format with no
- * DXGI equivalent -- leaves has_declaration 0, and its draws are skipped and
- * counted. */
+ * declared offset in the stream 0 vertex. Registers in a format the host
+ * cannot read as it is (xbox_vsdt_expanded) are unpacked to floats per draw:
+ * each draw copies the vertex behind a prefix holding those floats
+ * (shadow_expand_vertices), so they read from the prefix and every other
+ * offset moves up by its size. A declaration the host cannot take -- another
+ * stream, or a format with no DXGI equivalent -- leaves has_declaration 0,
+ * and its draws are skipped and counted. */
 static void shadow_read_declaration(int slot, uint32_t handle)
 {
     static int notes;
@@ -959,20 +989,25 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     D3D8VshInput in[16];
     uint32_t object = handle & ~1u, i;
     uint32_t bad_reg = 0, bad_stream = 0, bad_format = 0;
-    UINT shift;
+    UINT shift = 0, out = 0;
     int n = 0, packed = 0, refused = 0;
 
     p->has_declaration = 0;
     p->extent = 0;
     p->packed_count = 0;
+    p->expanded_bytes = 0;
     if (!object)
         return;
-    for (i = 0; i < 16u; i++)
-        if (HLE_MEM32(object + 20u + i * 16u + 8u) == 0x16u)
+    for (i = 0; i < 16u; i++) {
+        UINT size;
+        int floats = xbox_vsdt_expanded(HLE_MEM32(object + 20u + i * 16u + 8u), &size);
+        if (floats) {
             packed++;
+            shift += (UINT)floats * 4u;
+        }
+    }
     if (packed > SHADOW_MAX_PACKED)
         return;
-    shift = (UINT)packed * 12u;
     packed = 0;
 
     for (i = 0; i < 16u; i++) {
@@ -981,16 +1016,20 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         uint32_t format = HLE_MEM32(attr + 8u);
         DXGI_FORMAT dxgi;
         UINT size;
+        int floats;
 
         if (format <= 0x02u)
             continue;
         if (stream != 0u || offset > 0xFFFFu) {
             refused = 1;
-        } else if (format == 0x16u) {
+        } else if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             p->packed_offset[packed] = offset;
-            in[n].format = DXGI_FORMAT_R32G32B32_FLOAT;
-            in[n].offset = 12u * (UINT)packed++;
-            size = 4;
+            p->packed_out[packed] = out;
+            p->packed_format[packed] = format;
+            packed++;
+            in[n].format = FLOATN_FORMAT[floats];
+            in[n].offset = out;
+            out += (UINT)floats * 4u;
         } else if (xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
             in[n].format = dxgi;
             in[n].offset = offset + shift;
@@ -1012,6 +1051,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     if (!refused && n > 0 && SUCCEEDED(host_vsh_set_declaration(p->host, in, n))) {
         p->has_declaration = 1;
         p->packed_count = packed;
+        p->expanded_bytes = shift;
     } else if (refused && notes++ < 16) {
         fprintf(stderr, "[HLE-D3D8] shadow declaration 0x%08X: v%u (stream %u, format "
                 "0x%02X) has no host layout; its draws are skipped\n",
@@ -1591,7 +1631,7 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     p = &g_programs[g_shadow_vs_slot];
     if (!p->packed_count)
         return NULL;
-    shift = (UINT)p->packed_count * 12u;
+    shift = p->expanded_bytes;
     out_stride = in_stride + shift;
     out = malloc((size_t)vertices * out_stride);
     if (!out) {
@@ -1603,14 +1643,26 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         uint8_t *dst = out + (size_t)v * out_stride;
 
         for (k = 0; k < p->packed_count; k++) {
-            uint32_t bits;
-            float n[3];
+            const uint8_t *at = src + p->packed_offset[k];
+            float n[4];
+            int c, count;
 
-            memcpy(&bits, src + p->packed_offset[k], sizeof bits);
-            n[0] = (float)((int32_t)(bits << 21) >> 21) / 1023.0f;
-            n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
-            n[2] = (float)((int32_t)bits >> 22) / 511.0f;
-            memcpy(dst + 12u * (UINT)k, n, sizeof n);
+            if (p->packed_format[k] == 0x16u) {      /* NORMPACKED3 */
+                uint32_t bits;
+                memcpy(&bits, at, sizeof bits);
+                n[0] = (float)((int32_t)(bits << 21) >> 21) / 1023.0f;
+                n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
+                n[2] = (float)((int32_t)bits >> 22) / 511.0f;
+                count = 3;
+            } else {                                 /* SHORTn: the value itself */
+                count = (int)(p->packed_format[k] >> 4);
+                for (c = 0; c < count; c++) {
+                    int16_t s;
+                    memcpy(&s, at + 2 * c, sizeof s);
+                    n[c] = (float)s;
+                }
+            }
+            memcpy(dst + p->packed_out[k], n, (size_t)count * sizeof n[0]);
         }
         memcpy(dst + shift, src, in_stride);
     }
