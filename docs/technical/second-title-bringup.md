@@ -147,13 +147,19 @@ version of this document, and two of them were not the title:
 
 ## What is next, in order
 
-1. **Draws skipped as "program without layout".** 297,810 of 1.9 million
-   in-level draws in a two-minute run: a vertex program is selected but the
-   shadow has no input layout for it. The level is very dark and probably
-   missing surfaces because of it. The counter is `g_draws_program` in
-   `hle_d3d8.c`.
-2. **Lighting and vertex colour.** Once every draw reaches the host, compare
-   a frame with xemu; `docs/technical/shadow-mode.md` lists lighting as a gap.
+*Done since:* the skipped draws were `SHORT2`/`SHORT4` vertex formats, now
+expanded to floats per draw like the packed normals (zero skipped; the
+cutscene's characters appear), and the music plays: it goes through DirectSound
+*streams*, which `src/hle/hle_dsound_stream.c` now replaces by name the way
+the buffers were. Heard in the menus, the level and its cutscenes.
+
+1. **Lighting and vertex colour.** The campaign's opening cutscene is black on
+   screen and the level is very dark; the frame dumps show the geometry is
+   there but barely lit. Compare a frame with xemu; `docs/technical/shadow-mode.md`
+   lists lighting as a gap. Related one-line fix from the resolution design
+   (`docs/technical/resolution-and-framerate.md`): pre-transformed 2D geometry
+   is divided by the host back-buffer size instead of the guest's.
+2. **Frame pacing.** See item 3 below and the flip gate in the design doc.
 3. **Frame pacing.** In-level the title presents at 85-145 fps because `Swap`'s
    fence completes immediately. Making it wait for the next vblank gives
    console timing; `docs/technical/performance-60fps.md` has the plan, and a
