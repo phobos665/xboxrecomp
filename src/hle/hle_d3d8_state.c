@@ -765,3 +765,66 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
     g_prev_valid = 1;
 }
 #endif /* _WIN32 */
+
+/* void __fastcall D3DDevice_SetRenderState_Simple(DWORD Method, DWORD Value)
+ *
+ * The XDK's inline SetRenderState for the "simple" states (57-91) writes the
+ * NV2A method and value into the push buffer and nothing else; the state
+ * array this file reads is written by SetRenderStateNotInline, which calls
+ * this and then stores the value. A title that calls the simple form directly
+ * -- TimeSplitters 2's renderer does, 1,384 times a minute, for z test, alpha
+ * blend, blend factors and z write -- leaves the array stale, and every draw
+ * reached the host with whatever blend and depth state the previous path
+ * left. Cxbx-Reloaded replaces this function for the same reason
+ * (EMUPATCH(D3DDevice_SetRenderState_Simple)).
+ *
+ * Run the title's own body, then store the value in the slot whose method
+ * this is. The method numbers are the hardware's (NV097_SET_*) and so the
+ * same in every XDK; the slots are the 4627+ layout the rest of this file
+ * assumes. The table is the one SetRenderStateNotInline itself indexes,
+ * read out of TimeSplitters 2's .rdata at 0x00222100. */
+HLE_ORIGINAL(D3DDevice_SetRenderState_Simple);
+
+HLE_EXPORT(D3DDevice_SetRenderState_Simple)
+{
+    static const struct { uint16_t method; uint8_t state; } map[] = {
+        { 0x0354, 57 },  /* ZFUNC              NV097_SET_DEPTH_FUNC */
+        { 0x033C, 58 },  /* ALPHAFUNC          NV097_SET_ALPHA_FUNC */
+        { 0x0304, 59 },  /* ALPHABLENDENABLE   NV097_SET_BLEND_ENABLE */
+        { 0x0300, 60 },  /* ALPHATESTENABLE    NV097_SET_ALPHA_TEST_ENABLE */
+        { 0x0340, 61 },  /* ALPHAREF           NV097_SET_ALPHA_REF */
+        { 0x0344, 62 },  /* SRCBLEND           NV097_SET_BLEND_FUNC_SFACTOR */
+        { 0x0348, 63 },  /* DESTBLEND          NV097_SET_BLEND_FUNC_DFACTOR */
+        { 0x035C, 64 },  /* ZWRITEENABLE       NV097_SET_DEPTH_MASK */
+        { 0x0310, 65 },  /* DITHERENABLE       NV097_SET_DITHER_ENABLE */
+        { 0x037C, 66 },  /* SHADEMODE          NV097_SET_SHADE_MODE */
+        { 0x0358, 67 },  /* COLORWRITEENABLE   NV097_SET_COLOR_MASK */
+        { 0x0374, 68 },  /* STENCILZFAIL       NV097_SET_STENCIL_OP_ZFAIL */
+        { 0x0378, 69 },  /* STENCILPASS        NV097_SET_STENCIL_OP_ZPASS */
+        { 0x0364, 70 },  /* STENCILFUNC        NV097_SET_STENCIL_FUNC */
+        { 0x0368, 71 },  /* STENCILREF         NV097_SET_STENCIL_FUNC_REF */
+        { 0x036C, 72 },  /* STENCILMASK        NV097_SET_STENCIL_FUNC_MASK */
+        { 0x0360, 73 },  /* STENCILWRITEMASK   NV097_SET_STENCIL_MASK */
+        { 0x0350, 74 },  /* BLENDOP            NV097_SET_BLEND_EQUATION */
+        { 0x034C, 75 },  /* BLENDCOLOR         NV097_SET_BLEND_COLOR */
+        { 0x09F8, 76 },  /* SWATHWIDTH         NV097_SET_SWATH_WIDTH */
+        { 0x0384, 77 },  /* POLYGONOFFSETZSLOPESCALE */
+        { 0x0388, 78 },  /* POLYGONOFFSETZOFFSET */
+        { 0x0330, 79 },  /* POINTOFFSETENABLE */
+        { 0x0334, 80 },  /* WIREFRAMEOFFSETENABLE */
+        { 0x0338, 81 },  /* SOLIDOFFSETENABLE */
+    };
+    uint32_t method = g_ecx & 0x1FFCu, value = g_edx;
+    size_t i;
+
+    if (hle_original_D3DDevice_SetRenderState_Simple)
+        HLE_CALL_ORIGINAL(D3DDevice_SetRenderState_Simple);
+    if (!hle_var_D3D_g_RenderState)
+        return;
+    for (i = 0; i < sizeof map / sizeof map[0]; i++) {
+        if (map[i].method == method) {
+            HLE_MEM32(hle_var_D3D_g_RenderState + 4u * map[i].state) = value;
+            return;
+        }
+    }
+}

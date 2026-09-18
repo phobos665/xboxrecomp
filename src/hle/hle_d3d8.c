@@ -599,7 +599,7 @@ static void shadow_dump_frame(void)
 {
     static const char *prefix;
     static int configured, every = 300, written;
-    static unsigned long min_draws, last_dump;
+    static unsigned long min_draws, last_dump, from_swap;
     IDirect3DSurface8 *surf = NULL;
     D3DLOCKED_RECT lr;
     char path[512];
@@ -620,8 +620,13 @@ static void shadow_dump_frame(void)
         e = getenv("RECOMP_HLE_D3D8_DUMP_MINDRAWS");
         if (e && atol(e) > 0)
             min_draws = (unsigned long)atol(e);
+        /* RECOMP_HLE_D3D8_DUMP_FROM=<swap>: nothing before this swap, so the
+         * 24 dumps can bracket a moment late in a run instead of its start. */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_FROM");
+        if (e && atol(e) > 0)
+            from_swap = (unsigned long)atol(e);
     }
-    if (!prefix || !*prefix || written >= 24)
+    if (!prefix || !*prefix || written >= 24 || g_shadow_swaps < from_swap)
         return;
     if (min_draws) {
         if (g_frame_draws < min_draws || (last_dump && g_shadow_swaps - last_dump < (unsigned long)every))
