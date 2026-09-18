@@ -96,10 +96,11 @@ void apu_mixer_stop(int slot);
 
 /* The emulated APU the fault handler serves from.
  *
- * NULL until mcpx_apu_init_standalone() runs, and apu_hook_handle_mmio()
- * declines every access while it is -- silently, which is why trapping the
- * aperture without creating the device turns each APU access into a crash
- * with no APU log line to explain it.
+ * NULL until the host program stores what mcpx_apu_init_standalone()
+ * returns here -- init does not assign it -- and apu_hook_handle_mmio()
+ * declines every access while it is NULL -- silently, which is why trapping
+ * the aperture without creating the device, or creating it and not storing
+ * it, turns each APU access into a crash with no APU log line to explain it.
  */
 extern MCPXAPUState *g_apu_state;
 

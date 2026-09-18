@@ -242,6 +242,17 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+        /* The faulting instruction's bytes. When the fault is in a trapped
+         * device page, this is the instruction form the runtime's decoder
+         * did not know, which is exactly what has to be added to it. */
+        {
+            const uint8_t *ip = (const uint8_t *)ep->ContextRecord->Rip;
+            int i;
+            fprintf(stderr, "  host instruction:");
+            for (i = 0; i < 12; i++)
+                fprintf(stderr, " %02X", ip[i]);
+            fprintf(stderr, "\n");
+        }
         print_guest_context((void *)ep->ContextRecord->Rip);
 
         /* Force the profile table out here, not at the next scheduled report.
@@ -380,7 +391,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * until the device exists. Create it under the same switch, and hand the
      * kernel its interrupt line so the timer thread can deliver it. */
     if (getenv("RECOMP_AC97_READY")) {
-        if (!mcpx_apu_init_standalone((uint8_t *)g_xbox_mem_offset))
+        /* The fault handler serves from g_apu_state, and init returns the
+         * device rather than storing it: left unassigned, every APU register
+         * access was declined and reported as a crash reading 0xFE801100
+         * (NV_PAPU_FECTL), the first register DirectSound touches. */
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)g_xbox_mem_offset);
+        if (!g_apu_state)
             fprintf(stderr, "[BOOT] APU init failed; APU register accesses "
                             "will fault\n");
         else
