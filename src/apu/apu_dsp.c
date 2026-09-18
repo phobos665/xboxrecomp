@@ -182,6 +182,8 @@ static void dsp_ack_discovered(MCPXAPUState *d)
                 slot_va, v, APU_DSP_DOORBELL_STABLE);
         fflush(stderr);
     }
+}
+
 /* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
  *
  * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
