@@ -1204,6 +1204,31 @@ static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, U
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
+/* D3D11 drops a shader resource view that aliases the render target being
+ * bound, and never puts it back. That matters as soon as a title renders into
+ * something it also samples -- an environment cube, rendered face by face
+ * with the cube itself bound on a stage -- because the stage would read zero
+ * for the rest of the frame. Every stage is re-applied around a target
+ * switch: the one that aliases the new target is cleared deliberately, and
+ * the others are restored.
+ *
+ * SetTexture is the only other place that binds these, so nothing else
+ * reinstates them per draw. */
+static void rebind_stage_srvs(ID3D11Resource *target)
+{
+    DWORD stage;
+
+    for (stage = 0; stage < MAX_TEXTURE_STAGES; stage++) {
+        ID3D11ShaderResourceView *srv = NULL;
+
+        if (g_cur_textures[stage] &&
+            d3d8_base_resource(g_cur_textures[stage]) != target)
+            srv = d3d8_base_srv(g_cur_textures[stage]);
+        ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context,
+                                                 stage, 1, &srv);
+    }
+}
+
 static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSurface8 *pRenderTarget, IDirect3DSurface8 *pZStencilSurface)
 {
     (void)self;
@@ -1245,6 +1270,7 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
     dsv = ds ? ds->dsv : NULL;
     ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1,
                                             &rtv, dsv);
+    rebind_stage_srvs(rt ? (ID3D11Resource *)rt->d3d11_texture : NULL);
     return S_OK;
 }
 

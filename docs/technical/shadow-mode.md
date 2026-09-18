@@ -39,7 +39,7 @@ reading the back buffer for frame dumps, which changes no state.
 | Textures | the guest pixel container, cached by VA + data + format + size |
 | **Pixel shaders** | the `D3DPIXELSHADERDEF` inside the object `SetPixelShader` selects (at +0x0C, with a pointer to it at +0x08) |
 | Combiner constants | the render state array (`SetPixelShaderConstant` is assumed to land there; a mismatch with the definition's own C0 is logged once) |
-| Render targets | the Xbox surface's parent: a texture's level 0 becomes a host render target texture, the frame buffer becomes the back buffer, anything else a scratch target |
+| Render targets | the Xbox surface's parent: a texture's level 0 becomes a host render target texture, a cube container's face becomes that face of a host cube, the frame buffer becomes the back buffer, anything else a scratch target |
 
 The frame buffer and the automatic depth buffer are recognised by identity:
 they are the surfaces the XDK itself passes to `SetRenderTarget` inside
@@ -107,8 +107,9 @@ push buffers through `BeginPush`, whose draws no replacement ever sees.
 
 ## Known gaps
 
-- Cube render targets go to scratch targets, and cube textures bind white. A
-  title's environment reflections are therefore missing.
+- A cube the title uploads from guest memory binds white. Only the cubes it
+  renders into are mirrored, and the cache holds eight of them; past that the
+  run log says so.
 - `CopyRects` is not handled.
 - `SetVertexData4f` / `SetVertexData4ub` are not replaced; `SetVertexDataColor`
   and `SetVertexData2f` are.

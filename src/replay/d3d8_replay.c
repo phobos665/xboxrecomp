@@ -236,13 +236,21 @@ static void dump_bmp(IDirect3DDevice8 *dev, const char *path, UINT w, UINT h)
 
 /* ------------------------------------------------------------ replay state */
 
+/* One capture texture id, as this process holds it. */
+typedef struct {
+    IDirect3DBaseTexture8 *tex;
+    int                    is_cube;
+} ReplayTexture;
+
 typedef struct {
     IDirect3DDevice8   *dev;
     UINT                width, height;
 
     /* Capture texture id -> this process's texture. Ids are handed out in
      * order by the writer, so a growable array indexed by id is enough. */
-    IDirect3DTexture8 **textures;
+    /* A slot holds a 2D texture or a cube; the capture numbers both in one
+     * id space, and only a cube can be bound face by face. */
+    ReplayTexture      *textures;
     uint32_t            texture_slots;
 
     /* Recorded program handle -> the handle d3d8_vsh_create_shader gave us. */
@@ -257,13 +265,22 @@ typedef struct {
     unsigned long       unknown, malformed, failed, unmapped;
 } Replay;
 
-static IDirect3DTexture8 **texture_slot(Replay *r, uint32_t id, int grow)
+static void release_slot(ReplayTexture *slot)
+{
+    if (slot && slot->tex) {
+        slot->tex->lpVtbl->Release(slot->tex);
+        slot->tex = NULL;
+        slot->is_cube = 0;
+    }
+}
+
+static ReplayTexture *texture_slot(Replay *r, uint32_t id, int grow)
 {
     if (id == 0)
         return NULL;
     if (id >= r->texture_slots) {
         uint32_t n = r->texture_slots ? r->texture_slots : 256;
-        IDirect3DTexture8 **t;
+        ReplayTexture *t;
 
         if (!grow || id > 0x00FFFFFFu)
             return NULL;
@@ -308,7 +325,8 @@ static void do_texture(Replay *r, const D3D8CapChunk *c)
     const D3D8CapTexture *t = c->data;
     const D3D8CapLevel *levels;
     const uint8_t *bytes;
-    IDirect3DTexture8 **slot, *tex;
+    ReplayTexture *slot;
+    IDirect3DTexture8 *tex;
     size_t total = 0, offset = 0;
     uint32_t l;
 
@@ -341,10 +359,7 @@ static void do_texture(Replay *r, const D3D8CapChunk *c)
 
     /* An id seen again is the same texture written again (a later loop, or a
      * writer that re-emits): replace it. */
-    if (*slot) {
-        (*slot)->lpVtbl->Release(*slot);
-        *slot = NULL;
-    }
+    release_slot(slot);
     tex = NULL;
     if (FAILED(r->dev->lpVtbl->CreateTexture(r->dev, t->width, t->height, t->levels,
                                              t->usage, (D3DFORMAT)t->format,
@@ -358,13 +373,14 @@ static void do_texture(Replay *r, const D3D8CapChunk *c)
         fill_level(r, tex, l, bytes + offset, levels[l].pitch, levels[l].rows);
         offset += levels[l].bytes;
     }
-    *slot = tex;
+    slot->tex = (IDirect3DBaseTexture8 *)tex;
+    slot->is_cube = 0;
 }
 
 static void do_texture_level(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapTextureLevel *t = c->data;
-    IDirect3DTexture8 **slot;
+    ReplayTexture *slot;
     const uint8_t *bytes;
 
     if (c->bytes < sizeof *t || (uint64_t)t->pitch * t->rows != t->bytes ||
@@ -373,29 +389,54 @@ static void do_texture_level(Replay *r, const D3D8CapChunk *c)
         return;
     }
     slot = texture_slot(r, t->id, 0);
-    if (!slot || !*slot) {
+    if (!slot || !slot->tex || slot->is_cube) {
         r->unmapped++;
         return;
     }
-    fill_level(r, *slot, t->level, bytes, t->pitch, t->rows);
+    fill_level(r, (IDirect3DTexture8 *)slot->tex, t->level, bytes, t->pitch, t->rows);
 }
 
 static void do_texture_release(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapTextureId *t = c->data;
-    IDirect3DTexture8 **slot;
+    ReplayTexture *slot;
 
     if (c->bytes < sizeof *t) {
         r->malformed++;
         return;
     }
     slot = texture_slot(r, t->id, 0);
-    if (!slot || !*slot) {
+    if (!slot || !slot->tex) {
         r->unmapped++;
         return;
     }
-    (*slot)->lpVtbl->Release(*slot);
-    *slot = NULL;
+    release_slot(slot);
+}
+
+/* A cube texture, created empty: the capture records only its shape, because
+ * shadow mode mirrors a cube only when the title renders into it, and those
+ * draws are in the capture too. */
+static void do_cube_texture(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapCubeTexture *t = c->data;
+    IDirect3DCubeTexture8 *cube = NULL;
+    ReplayTexture *slot;
+
+    if (c->bytes < sizeof *t || !(slot = texture_slot(r, t->id, 1))) {
+        r->malformed++;
+        return;
+    }
+    release_slot(slot);
+    if (FAILED(r->dev->lpVtbl->CreateCubeTexture(r->dev, t->edge, t->levels,
+                                                 t->usage, (D3DFORMAT)t->format,
+                                                 D3DPOOL_DEFAULT, &cube)) || !cube) {
+        note("[replay] cube texture %u (format 0x%02X edge %u) could not be created\n",
+             t->id, t->format, t->edge);
+        r->failed++;
+        return;
+    }
+    slot->tex = (IDirect3DBaseTexture8 *)cube;
+    slot->is_cube = 1;
 }
 
 static void do_depth_surface(Replay *r, const D3D8CapChunk *c)
@@ -424,7 +465,7 @@ static void do_set_render_target(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapSetRenderTarget *t = c->data;
     IDirect3DSurface8 *surface = NULL, *depth = NULL;
-    IDirect3DTexture8 **slot;
+    ReplayTexture *slot;
 
     if (c->bytes < sizeof *t ||
         (t->depth_id > REPLAY_MAX_DEPTHS && t->depth_id != D3D8CAP_DEPTH_DEVICE)) {
@@ -442,11 +483,21 @@ static void do_set_render_target(Replay *r, const D3D8CapChunk *c)
      * writer records a target it cannot name. */
     if (t->texture_id) {
         slot = texture_slot(r, t->texture_id, 0);
-        if (!slot || !*slot)
+        if (!slot || !slot->tex) {
             r->unmapped++;
-        else if (FAILED((*slot)->lpVtbl->GetSurfaceLevel(*slot, t->level, &surface)))
-            surface = NULL;
-        if (slot && *slot && !surface)
+        } else if (slot->is_cube) {
+            IDirect3DCubeTexture8 *cube = (IDirect3DCubeTexture8 *)slot->tex;
+
+            if (FAILED(cube->lpVtbl->GetCubeMapSurface(cube,
+                    (D3DCUBEMAP_FACES)t->face, t->level, &surface)))
+                surface = NULL;
+        } else {
+            IDirect3DTexture8 *tex = (IDirect3DTexture8 *)slot->tex;
+
+            if (FAILED(tex->lpVtbl->GetSurfaceLevel(tex, t->level, &surface)))
+                surface = NULL;
+        }
+        if (slot && slot->tex && !surface)
             r->failed++;
         /* Depth goes with the target it was made for: the back buffer gets
          * the device's own, as live shadow mode falls back. */
@@ -454,8 +505,8 @@ static void do_set_render_target(Replay *r, const D3D8CapChunk *c)
             depth = r->device_depth;
     }
     if (g_list_draws)
-        fprintf(stderr, "[target after %ld draws] texture %u level %u depth %u\n",
-                g_draw_index, t->texture_id, t->level, t->depth_id);
+        fprintf(stderr, "[target after %ld draws] texture %u level %u face %u depth %u\n",
+                g_draw_index, t->texture_id, t->level, t->face, t->depth_id);
     if (FAILED(r->dev->lpVtbl->SetRenderTarget(r->dev, surface, depth)))
         r->failed++;
     if (surface)
@@ -724,7 +775,7 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
     }
     case D3D8CAP_SET_TEXTURE: {
         const D3D8CapSetTexture *p = c->data;
-        IDirect3DTexture8 **slot;
+        ReplayTexture *slot;
 
         if (c->bytes < sizeof *p) {
             r->malformed++;
@@ -733,10 +784,9 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         if (p->stage < 2)
             g_stage_tex[p->stage] = p->texture_id;
         slot = texture_slot(r, p->texture_id, 0);
-        if (p->texture_id && (!slot || !*slot))
+        if (p->texture_id && (!slot || !slot->tex))
             r->unmapped++;               /* its TEXTURE chunk failed: bind nothing */
-        r->dev->lpVtbl->SetTexture(r->dev, p->stage,
-            (IDirect3DBaseTexture8 *)(slot ? *slot : NULL));
+        r->dev->lpVtbl->SetTexture(r->dev, p->stage, slot ? slot->tex : NULL);
         break;
     }
     case D3D8CAP_SET_VERTEX_SHADER:
@@ -801,6 +851,9 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         d3d8_vsh_set_vertex_data((int)p->reg, p->value);
         break;
     }
+    case D3D8CAP_CUBE_TEXTURE:
+        do_cube_texture(r, c);
+        break;
     case D3D8CAP_DEPTH_SURFACE:
         do_depth_surface(r, c);
         break;
@@ -840,10 +893,7 @@ static void end_loop(Replay *r)
             r->depths[i] = NULL;
         }
     for (i = 1; i < r->texture_slots; i++)
-        if (r->textures[i]) {
-            r->textures[i]->lpVtbl->Release(r->textures[i]);
-            r->textures[i] = NULL;
-        }
+        release_slot(&r->textures[i]);
     while (r->program_count > 0) {
         d3d8_vsh_delete_shader(r->programs[r->program_count - 1].ours);
         r->program_count--;

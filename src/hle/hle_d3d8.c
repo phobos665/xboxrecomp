@@ -1174,10 +1174,12 @@ HLE_EXPORT(D3DDevice_SetViewport)
  *   - level 0 of a host render target texture, for a 2D texture's surface --
  *     the same one SetTexture binds (hle_d3d8_render_texture), so what was
  *     drawn is what the title then samples;
- *   - a scratch target of the surface's size for anything else (cube map
- *     faces, other levels, parentless surfaces of another size), so those
- *     passes at least stop drawing over the screen. Their contents are not
- *     used yet.
+ *   - a face of a host cube texture, for a surface whose parent is a cube
+ *     container -- a title's environment map, which it renders each frame and
+ *     then samples;
+ *   - a scratch target of the surface's size for anything else (other levels,
+ *     parentless surfaces of another size), so those passes at least stop
+ *     drawing over the screen. Their contents are not used yet.
  * Depth: none when the title passes none. The CreateDevice depth surface with
  * the back buffer is the host device's own; any other request gets a host
  * depth surface of the target's size, since D3D11 accepts depth only at the
@@ -1185,6 +1187,9 @@ HLE_EXPORT(D3DDevice_SetViewport)
  * Xbox (Cxbx-Reloaded, CxbxImpl_SetRenderTarget), a new target resets the
  * viewport to all of it. */
 IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va);
+IDirect3DCubeTexture8 *hle_d3d8_render_cube(IDirect3DDevice8 *dev, uint32_t va);
+int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
+                       uint32_t *face, uint32_t *level);
 
 #define SHADOW_SCRATCH 8
 #define SURFACE_PARENT 20
@@ -1254,11 +1259,12 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     static struct { uint32_t va; int kind; } seen[32];
     static int nseen;
     static uint32_t current_rt;
+    IDirect3DBaseTexture8 *target = NULL;
     IDirect3DTexture8 *texture = NULL;
     IDirect3DSurface8 *depth = NULL;
-    UINT w, h, zw = 0, zh = 0;
+    UINT w, h, zw = 0, zh = 0, face = 0, level = 0;
     uint32_t fmt, zfmt = 0, parent;
-    int kind, i;                         /* 0 back buffer, 1 texture, 2 scratch */
+    int kind, i;                         /* 0 back buffer, 1 texture, 2 scratch, 3 cube */
 
     /* A NULL target keeps the current one; only the depth surface changes. */
     if (!rt)
@@ -1272,9 +1278,23 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     } else {
         surface_measure(rt, &w, &h, &fmt);
         parent = HLE_MEM32(rt + SURFACE_PARENT);
-        if (parent && HLE_MEM32(parent + 4) == HLE_MEM32(rt + 4) &&
-            !(HLE_MEM32(parent + 12) & 0x4)) {           /* level 0, not a cube */
-            texture = hle_d3d8_render_texture(g_shadow, parent);
+        if (parent && (HLE_MEM32(parent + 12) & 0x4)) {  /* a cube face */
+            uint32_t f = 0, lv = 0;
+            IDirect3DCubeTexture8 *cube =
+                hle_d3d8_cube_face(parent, rt, &f, &lv) == 0
+                    ? hle_d3d8_render_cube(g_shadow, parent) : NULL;
+
+            if (cube) {
+                target = (IDirect3DBaseTexture8 *)cube;
+                face = (UINT)f;
+                level = (UINT)lv;
+                kind = 3;
+            } else {
+                kind = 2;
+            }
+        } else if (parent && HLE_MEM32(parent + 4) == HLE_MEM32(rt + 4)) {
+            texture = hle_d3d8_render_texture(g_shadow, parent);   /* level 0 */
+            target = (IDirect3DBaseTexture8 *)texture;
             kind = texture ? 1 : 2;
         } else if (g_backbuffer_va ? rt == g_backbuffer_va
                                    : (!parent && w == g_shadow_width && h == g_shadow_height)) {
@@ -1284,6 +1304,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         }
         if (kind == 2) {
             texture = scratch_target(w, h);
+            target = (IDirect3DBaseTexture8 *)texture;
             g_target_scratch++;
         }
         for (i = 0; i < nseen && (seen[i].va != rt || seen[i].kind != kind); i++)
@@ -1295,11 +1316,27 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
                     "parent 0x%08X (format 0x%08X) -> %s\n", rt, w, h, fmt, parent,
                     parent ? HLE_MEM32(parent + 12) : 0,
                     kind == 0 ? "back buffer" : kind == 1 ? "render target texture"
-                                                          : "scratch target");
+                                  : kind == 3 ? "cube face" : "scratch target");
+            /* Where in its container this face sits, so a title whose cube
+             * this code reads wrongly can be told apart from one it cannot
+             * read at all. hle_d3d8_cube_face does the arithmetic; this
+             * prints what it was given and what it made of it. */
+            if (parent && (HLE_MEM32(parent + 12) & 0x4)) {
+                uint32_t pdata = HLE_MEM32(parent + 4), sdata = HLE_MEM32(rt + 4);
+                uint32_t f = 0, lv = 0;
+                int ok = hle_d3d8_cube_face(parent, rt, &f, &lv);
+
+                fprintf(stderr, "[HLE-D3D8]   cube: container data 0x%08X, surface data "
+                        "0x%08X, delta %d -> %s\n", pdata, sdata, (int)(sdata - pdata),
+                        ok == 0 ? "face/level below" : "not a face this reads");
+                if (ok == 0)
+                    fprintf(stderr, "[HLE-D3D8]   cube: face %u level %u\n", f, lv);
+            }
         }
         if (kind == 2 && !texture) {
             g_target_failed++;
             kind = 0;
+            target = NULL;
             w = g_shadow_width;
             h = g_shadow_height;
         }
@@ -1316,7 +1353,8 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         g_z_scale = 1.0f;
     }
 
-    if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : texture, 0, depth))) {
+    if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : target, level, face,
+                                    depth))) {
         /* The host keeps its old targets; go to the back buffer instead, so
          * the sizes below describe what is drawn into. */
         g_target_failed++;
@@ -1324,7 +1362,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         w = g_shadow_width;
         h = g_shadow_height;
         depth = zs ? g_device_depth : NULL;
-        host_SetRenderTarget(g_shadow, NULL, 0, depth);
+        host_SetRenderTarget(g_shadow, NULL, 0, 0, depth);
     }
     g_target_width = w;
     g_target_height = h;

@@ -90,8 +90,8 @@ static IDirect3DSurface8 *g_device_depth;   /* host_DeviceDepthSurface */
  * this is the host's own. g_target_lost: the snapshot cannot name the
  * target -- the bound texture was released (the host still draws into it
  * through its surface), or the host refused the last switch. */
-static IDirect3DTexture8 *g_target_texture;
-static UINT               g_target_level;
+static IDirect3DBaseTexture8 *g_target_texture;
+static UINT               g_target_level, g_target_face;
 static IDirect3DSurface8 *g_target_depth;
 static int                g_target_lost;
 
@@ -120,6 +120,25 @@ static int texture_find(IDirect3DBaseTexture8 *object)
         if (g_textures[i].object == object)
             return i;
     return -1;
+}
+
+/* A cube texture's creation, with no contents. d3d8_cube_info is also the
+ * type test: it answers only for a cube. */
+static int cube_write(IDirect3DBaseTexture8 *object, uint32_t id)
+{
+    D3D8CubeInfo info;
+    D3D8CapCubeTexture head;
+
+    if (!d3d8_cube_info(object, &info))
+        return 0;
+    head.id     = id;
+    head.format = (uint32_t)info.format;
+    head.edge   = info.edge;
+    head.levels = info.levels;
+    head.usage  = info.usage;
+    chunk(D3D8CAP_CUBE_TEXTURE, &head, sizeof head, NULL, 0, NULL, 0);
+    g_texture_writes++;
+    return 1;
 }
 
 /* The whole texture as the host holds it. The host keeps its levels back to
@@ -178,7 +197,8 @@ static uint32_t texture_id(IDirect3DBaseTexture8 *object)
     if (i >= 0)
         return g_textures[i].id;
     if (g_texture_count >= CAPTURE_MAX_TEXTURES ||
-        !texture_write(object, g_next_texture_id)) {
+        (!texture_write(object, g_next_texture_id) &&
+         !cube_write(object, g_next_texture_id))) {
         g_unrecorded_binds++;
         return 0;
     }
@@ -353,17 +373,18 @@ static uint32_t depth_id(IDirect3DSurface8 *object)
 
 /* A target the capture cannot name is recorded as the back buffer, which is
  * where replay would draw without it anyway, and counted. */
-static void rec_set_render_target(IDirect3DTexture8 *texture, UINT level,
-                                  IDirect3DSurface8 *depth, int lost)
+static void rec_set_render_target(IDirect3DBaseTexture8 *texture, UINT level,
+                                  UINT face, IDirect3DSurface8 *depth, int lost)
 {
     D3D8CapSetRenderTarget c;
     unsigned long binds = g_unrecorded_binds;
 
     /* texture_id counts a failure as a texture bind; this one is counted
      * below, as a target. */
-    c.texture_id = texture_id((IDirect3DBaseTexture8 *)texture);
+    c.texture_id = texture_id(texture);
     g_unrecorded_binds = binds;
     c.level      = c.texture_id ? level : 0;
+    c.face       = c.texture_id ? face : 0;
     c.depth_id   = depth_id(depth);
     if (lost || (texture && !c.texture_id) || (depth && !c.depth_id))
         g_unrecorded_targets++;
@@ -417,8 +438,8 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
     rec_set_vertex_shader(vs);
     for (s = 0; s < CAPTURE_STAGES; s++)
         rec_set_texture(s, d3d8_GetStageTexture(s));
-    rec_set_render_target(g_target_texture, g_target_level, g_target_depth,
-                          g_target_lost);
+    rec_set_render_target(g_target_texture, g_target_level, g_target_face,
+                          g_target_depth, g_target_lost);
 
     for (i = 0; i < (int)(sizeof transforms / sizeof transforms[0]); i++) {
         const D3DMATRIX *m = d3d8_GetTransform((D3DTRANSFORMSTATETYPE)transforms[i]);
@@ -677,6 +698,14 @@ HRESULT host_CreateTexture(IDirect3DDevice8 *dev, UINT width, UINT height,
                                       pool, texture);
 }
 
+HRESULT host_CreateCubeTexture(IDirect3DDevice8 *dev, UINT edge, UINT levels,
+                               DWORD usage, D3DFORMAT format, D3DPOOL pool,
+                               IDirect3DCubeTexture8 **texture)
+{
+    return dev->lpVtbl->CreateCubeTexture(dev, edge, levels, usage, format,
+                                          pool, texture);
+}
+
 HRESULT host_LockRect(IDirect3DTexture8 *texture, UINT level,
                       D3DLOCKED_RECT *locked, const RECT *rect, DWORD flags)
 {
@@ -717,7 +746,7 @@ ULONG host_ReleaseTexture(IDirect3DTexture8 *texture)
     int i;
 
     /* Only the pointer is used from here on, as a key: the object may be gone. */
-    if (left == 0 && texture == g_target_texture) {
+    if (left == 0 && (IDirect3DBaseTexture8 *)texture == g_target_texture) {
         g_target_texture = NULL;
         g_target_lost = 1;
     }
@@ -733,14 +762,23 @@ ULONG host_ReleaseTexture(IDirect3DTexture8 *texture)
 
 /* ------------------------------------------------------- render targets */
 
-HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DTexture8 *texture,
-                             UINT level, IDirect3DSurface8 *depth)
+HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DBaseTexture8 *texture,
+                             UINT level, UINT face, IDirect3DSurface8 *depth)
 {
     IDirect3DSurface8 *surface = NULL;
+    D3D8CubeInfo cube;
     HRESULT hr;
 
-    if (texture) {
-        hr = texture->lpVtbl->GetSurfaceLevel(texture, level, &surface);
+    if (texture && d3d8_cube_info(texture, &cube)) {
+        IDirect3DCubeTexture8 *c = (IDirect3DCubeTexture8 *)texture;
+
+        hr = c->lpVtbl->GetCubeMapSurface(c, (D3DCUBEMAP_FACES)face, level, &surface);
+        if (FAILED(hr) || !surface)
+            return FAILED(hr) ? hr : E_FAIL;
+    } else if (texture) {
+        IDirect3DTexture8 *t = (IDirect3DTexture8 *)texture;
+
+        hr = t->lpVtbl->GetSurfaceLevel(t, level, &surface);
         if (FAILED(hr) || !surface)
             return FAILED(hr) ? hr : E_FAIL;
     }
@@ -751,10 +789,11 @@ HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DTexture8 *texture,
      * refusal with it. */
     g_target_texture = texture;
     g_target_level   = level;
+    g_target_face    = face;
     g_target_depth   = depth;
     g_target_lost    = FAILED(hr);
     if (g_cap)
-        rec_set_render_target(texture, level, depth, 0);
+        rec_set_render_target(texture, level, face, depth, 0);
     return hr;
 }
 

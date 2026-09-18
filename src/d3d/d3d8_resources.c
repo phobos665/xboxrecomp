@@ -1672,6 +1672,17 @@ ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture)
         offsetof(D3D8Texture, srv));
 }
 
+/* The D3D11 resource behind any base texture, through the same overlay as
+ * d3d8_base_srv. Used to tell whether a texture is the one currently being
+ * rendered into. */
+ID3D11Resource *d3d8_base_resource(IDirect3DBaseTexture8 *texture)
+{
+    if (!texture) return NULL;
+    d3d8_check_overlay();
+    return *(ID3D11Resource **)((BYTE *)texture +
+        offsetof(D3D8Texture, d3d11_texture));
+}
+
 /* Look up the palette index a base texture bakes. All wrapper types keep
  * `palette` at the same offset (behind srv), mirroring the SRV overlay. */
 static UINT base_texture_palette(IDirect3DBaseTexture8 *texture)
@@ -1941,6 +1952,22 @@ static const IDirect3DCubeTexture8Vtbl g_cube_vtbl = {
     cube_GetLevelCount,
     cube_GetLevelDesc, cube_GetCubeMapSurface, cube_LockRect, cube_UnlockRect,
 };
+
+/* The same for a cube texture, and the type test that tells the two apart.
+ * Contents are not exposed: shadow mode mirrors only the cubes a title
+ * renders into, whose texels live on the GPU and never in sys_mem. */
+BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info)
+{
+    const D3D8CubeTexture *cube = (const D3D8CubeTexture *)texture;
+
+    if (!cube || !info || cube->iface.lpVtbl != &g_cube_vtbl)
+        return FALSE;
+    info->format = cube->d3d8_format;
+    info->edge   = cube->width;
+    info->levels = cube->levels;
+    info->usage  = cube->usage;
+    return TRUE;
+}
 
 HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DCubeTexture8 **ppTex)
 {

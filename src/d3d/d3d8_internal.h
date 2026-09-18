@@ -72,6 +72,15 @@ typedef struct D3D8TextureInfo {
     DWORD     usage;
 } D3D8TextureInfo;
 BOOL d3d8_texture_info(IDirect3DBaseTexture8 *texture, D3D8TextureInfo *info);
+
+/* A cube texture's shape, for frame capture. TRUE only for a cube, so this
+ * doubles as the type test against d3d8_texture_info. */
+typedef struct D3D8CubeInfo {
+    D3DFORMAT format;
+    UINT      edge, levels;
+    DWORD     usage;
+} D3D8CubeInfo;
+BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info);
 BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
                         const BYTE **bits, UINT *pitch, UINT *rows);
 
@@ -266,6 +275,7 @@ HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format,
  * volume). All three implementations keep the SRV at the same offset
  * as D3D8Texture. */
 ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
+ID3D11Resource *d3d8_base_resource(IDirect3DBaseTexture8 *texture);
 
 /* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);
