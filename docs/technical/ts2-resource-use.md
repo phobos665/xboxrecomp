@@ -51,10 +51,15 @@ second window, **17:51:06–17:51:50**, on the same process in the same place.
 
 ### Reaching the level without a human, and how to know you did
 
-The path in `docs/technical/second-title-bringup.md` stops one press short on
-this build: its twelve presses end on the level-select screen, and a run that
-sits there reports a perfectly steady 57 fps that looks like gameplay. Four more
-`a` presses reach the level:
+The twelve-press path in `docs/technical/second-title-bringup.md` reaches the
+level by t = 75 s **only when the save folder holds no profile**. The game
+writes one at about t = 40 s of every run, so a run started with the previous
+run's profile still there takes a different path ("save exists, overwrite?")
+and ends on the level-select screen, where it reports a perfectly steady 57 fps
+that looks like gameplay. Clear (move aside, never delete) the 12-hex folders
+under `games/Time Splitters 2/UDATA/4553000a/` before **every** run. Four
+extra `a` presses make the path tolerant of that prompt, at the cost of a later
+arrival:
 
 ```text
 RECOMP_INPUT_SEQ=12000:start,16000:start,20000:start,24000:start,28000:a,34000:a,40000:a,46000:a,52000:a,58000:a,64000:a,70000:a,76000:a,82000:a,88000:a,94000:a
@@ -67,6 +72,12 @@ from the frame rate — `[HLE-D3D8] shadow:` draw totals differenced over swaps
 give ~190 draws a frame in the front end and 370–470 in the level, which is the
 check `docs/technical/ts2-performance-plan.md` prescribes. Both windows here were
 verified that way and by a screenshot taken mid-window.
+
+One more caveat on the capped frame rate: the same build, unsampled, holds
+59.9–60.1 in the level (`ts2-performance-plan.md`, runs 68 and 69). Sampled once
+a second with `Get-Counter` it reads 57.4, in the level and in the front end
+alike, so the missing frames are the sampler's own load disturbing the adaptive
+gate, not the title. The uncapped and xemu numbers are unaffected.
 
 The save profile has to be gone before **every** run, not just the first: a run
 writes one at about t = 40 s, so the second run down a script takes a different
