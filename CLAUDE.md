@@ -96,7 +96,24 @@ without `--trace-all-entries`. The level runs 80 fps uncapped on this machine, s
 `docs/technical/ts2-performance-plan.md`, items 1-7, took the level from 12.4 ms a frame to
 5.0 ms (branch `perf/ts2-items-1-7`). From the user's first pad session: `D3DDevice_SetScissors`
 is forwarded (the briefing text was spilling out of its box), and closing the game window
-exits the process.
+exits the process. **F9 shows the frame rate on screen and F10 steps the frame cap**
+(adaptive/60/30/off) while a title runs; `RECOMP_FPS_OVERLAY=1` starts with the counter on.
+
+**Audio de-sync was dropped sound, not a clock (19 Sep 2026).** The host audio queue held four
+submissions and a DirectSound stream was feeding it a tick's worth at a time against a 400 ms
+lead, so most submissions were refused and the stream stepped over them: TimeSplitters 2's
+cutscene lost 42 seconds of music in two minutes. A refused chunk is now retried, the chunks
+are whole, the queue is deeper, and a stream's packets complete when the host has actually
+played them (`RECOMP_DSOUND_WALLCLOCK=1` for the old wall clock). If a title's sound ever
+drifts again, read `[audio-output] dropped=` and the `[DSOUND] ... from the host's play
+position` line before suspecting anything else.
+
+**Widescreen and internal resolution** are investigated in
+`docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or
+game-specific. Two things to know before touching either: `XGetVideoFlags` returns 0 today
+because the kernel puts the video flags in the low half-word and XAPI reads the high one, and
+Xbox widescreen is anamorphic, so a title that has a 16:9 mode needs no stretching anywhere
+while a title that has none (TimeSplitters 2) cannot be given one natively.
 
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
