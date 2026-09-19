@@ -1405,6 +1405,41 @@ static volatile LONG *bridge_guest_event(uint32_t va, int *sync)
 /* Wait for a guest event by watching its SignalState. The Xbox timeout is a
  * LARGE_INTEGER in 100 ns units: absent means forever, zero means poll,
  * negative is relative and positive is an absolute system time. */
+/* RECOMP_WAIT_LOG=1 -- every distinct object waited on and set, once each.
+ *
+ * A title that hangs is nearly always waiting for something nothing signals,
+ * and the two facts needed to see that are which objects it waits on and
+ * which it sets. Printing every call drowns the log; printing each object
+ * once fits on a screen and answers the question. */
+static int wait_log_wanted(void)
+{
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *v = getenv("RECOMP_WAIT_LOG");
+        wanted = v && *v && strcmp(v, "0") != 0;
+    }
+    return wanted;
+}
+
+static void wait_log_note(const char *what, uint32_t object, uint32_t extra)
+{
+    static uint32_t seen[64];
+    static int nseen;
+    int i;
+
+    if (!wait_log_wanted())
+        return;
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == (object ^ (uint32_t)what[0] << 24))
+            return;
+    if (nseen < 64) {
+        seen[nseen++] = object ^ (uint32_t)what[0] << 24;
+        fprintf(stderr, "  [WAIT] %s object 0x%08X (caller 0x%08X)\n",
+                what, object, extra);
+        fflush(stderr);
+    }
+}
+
 static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
                                         uint32_t timeout_va)
 {
@@ -1451,6 +1486,8 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
 static void bridge_KeSetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);
+    wait_log_note("sets    ", guest_va, BRIDGE_MEM32(g_esp));
+
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
     volatile LONG *state = bridge_guest_event(guest_va, NULL);
@@ -1493,6 +1530,8 @@ static void bridge_KeWaitForSingleObject(void)
     int sync = 0;
     volatile LONG *state = bridge_guest_event(object, &sync);
     HANDLE h;
+
+    wait_log_note("waits on", object, BRIDGE_MEM32(g_esp));
 
     /* Same split as KeSetEvent: wait on the guest's own SignalState when the
      * object lives in guest memory, and fall through to the shadow handle
@@ -3238,7 +3277,18 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
 {
     if (event_token) {
         HANDLE ev = bridge_resolve_handle(event_token);
-        if (ev) SetEvent(ev);
+        if (ev) {
+            SetEvent(ev);
+        } else {
+            /* The title is waiting on this event for the read to finish,
+             * and nothing will ever signal it. Silence here is a title
+             * that hangs with no fault and no clue, so say it once. */
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [FILE] completion event 0x%08X does not "
+                        "resolve to a host handle; whoever waits on it waits "
+                        "forever\n", event_token);
+        }
     }
     if (apc_routine) {
         deliver_one_apc(apc_routine, apc_context, iostatus);
