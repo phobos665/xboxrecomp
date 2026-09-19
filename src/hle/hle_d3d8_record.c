@@ -508,12 +508,15 @@ static void capture_configure(void)
 void hle_d3d8_capture_next_frame(void)
 {
     static char fallback[512];
+    static int asked;
 
     if (!g_configured)
         capture_configure();
     if (!g_path || !*g_path) {
-        /* Nowhere was asked for, so put it where the player can find it. */
-        snprintf(fallback, sizeof fallback, "frame%s", D3D8CAP_EXTENSION);
+        /* Nowhere was asked for, so put it where the player can find it --
+         * numbered, like the dumps, because somebody pressing the key at
+         * several places wants all of them, not the last one. */
+        snprintf(fallback, sizeof fallback, "frame%03d%s", asked++, D3D8CAP_EXTENSION);
         g_path = fallback;
         g_every = 0;
         g_min_draws = 0;
