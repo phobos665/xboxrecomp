@@ -266,22 +266,78 @@ static D3D11_FILTER d3d8_to_d3d11_filter(DWORD mag, DWORD min, DWORD mip)
     return D3D11_FILTER_MIN_MAG_MIP_POINT;
 }
 
+/* Sampler objects, kept by descriptor. Every draw applies all four stages,
+ * and a title's stages mostly keep their filter and addressing from one
+ * draw to the next, so a stage whose descriptor has not changed keeps its
+ * object and is not re-bound; a descriptor seen before gets its object
+ * back. Creating a sampler takes the device lock, and this used to be four
+ * creates and four releases per draw. The cache owns one reference to each
+ * object and each bound stage owns another, so replacing a cache entry can
+ * never pull an object from under a stage. */
+#define SAMPLER_CACHE_SIZE 32
+
+typedef struct SamplerCacheEntry {
+    D3D11_SAMPLER_DESC  desc;
+    ID3D11SamplerState *state;
+} SamplerCacheEntry;
+
+static SamplerCacheEntry  g_sampler_cache[SAMPLER_CACHE_SIZE];
+static int                g_sampler_cache_count;
+static int                g_sampler_cache_next;       /* replacement cursor */
+static D3D11_SAMPLER_DESC g_sampler_bound_desc[4];    /* what each stage holds */
+
+static ID3D11SamplerState *sampler_cache_get(const D3D11_SAMPLER_DESC *sd)
+{
+    SamplerCacheEntry *e;
+    HRESULT hr;
+    int i;
+
+    for (i = 0; i < g_sampler_cache_count; i++)
+        if (memcmp(&g_sampler_cache[i].desc, sd, sizeof(*sd)) == 0)
+            return g_sampler_cache[i].state;
+
+    if (g_sampler_cache_count < SAMPLER_CACHE_SIZE) {
+        e = &g_sampler_cache[g_sampler_cache_count++];
+    } else {
+        e = &g_sampler_cache[g_sampler_cache_next];
+        g_sampler_cache_next = (g_sampler_cache_next + 1) % SAMPLER_CACHE_SIZE;
+        if (e->state) {
+            ID3D11SamplerState_Release(e->state);
+            e->state = NULL;
+        }
+    }
+    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), sd, &e->state);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateSamplerState failed: 0x%08lX\n", hr);
+        e->state = NULL;
+    }
+    memcpy(&e->desc, sd, sizeof(*sd));
+    return e->state;
+}
+
+static void sampler_cache_shutdown(void)
+{
+    int i;
+    for (i = 0; i < g_sampler_cache_count; i++) {
+        if (g_sampler_cache[i].state)
+            ID3D11SamplerState_Release(g_sampler_cache[i].state);
+        g_sampler_cache[i].state = NULL;
+    }
+    g_sampler_cache_count = 0;
+    g_sampler_cache_next = 0;
+    memset(g_sampler_bound_desc, 0, sizeof(g_sampler_bound_desc));
+}
+
 void d3d8_states_apply_sampler(DWORD stage)
 {
     const DWORD *tss;
     D3D11_SAMPLER_DESC sd;
-    HRESULT hr;
+    ID3D11SamplerState *state;
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
 
     if (stage >= 4) return;
     tss = d3d8_GetTSS(stage);
     if (!tss) return;
-
-    /* Release old sampler */
-    if (g_sampler_states[stage]) {
-        ID3D11SamplerState_Release(g_sampler_states[stage]);
-        g_sampler_states[stage] = NULL;
-    }
 
     memset(&sd, 0, sizeof(sd));
     sd.Filter = d3d8_to_d3d11_filter(
@@ -295,10 +351,20 @@ void d3d8_states_apply_sampler(DWORD stage)
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
 
-    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_sampler_states[stage]);
-    if (SUCCEEDED(hr)) {
-        ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
-    }
+    /* Unchanged since it was bound: nothing to do. */
+    if (g_sampler_states[stage] &&
+        memcmp(&sd, &g_sampler_bound_desc[stage], sizeof(sd)) == 0)
+        return;
+
+    state = sampler_cache_get(&sd);
+    if (!state) return;
+
+    if (g_sampler_states[stage])
+        ID3D11SamplerState_Release(g_sampler_states[stage]);
+    ID3D11SamplerState_AddRef(state);
+    g_sampler_states[stage] = state;
+    memcpy(&g_sampler_bound_desc[stage], &sd, sizeof(sd));
+    ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
 }
 
 /* ================================================================
@@ -323,6 +389,7 @@ void d3d8_states_shutdown(void)
             g_sampler_states[i] = NULL;
         }
     }
+    sampler_cache_shutdown();
     g_last_blend_hash = 0;
     g_last_raster_hash = 0;
 }
