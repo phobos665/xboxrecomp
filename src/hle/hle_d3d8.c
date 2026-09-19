@@ -1735,7 +1735,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     uint16_t *list = NULL;
     uint8_t *expanded;
     D3DPRIMITIVETYPE pt;
-    UINT prims, vertices = 0, i, n = 0, host_stride = stride;
+    UINT prims, vertices = 0, i, n = 0, host_stride = stride, min_index = 0;
     int failed;
     HRESULT hr;
 
@@ -1747,18 +1747,32 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         g_draws_primitive++;
         return;
     }
-    for (i = 0; i < count; i++)
-        if ((UINT)idx[i] + 1 > vertices)
-            vertices = (UINT)idx[i] + 1;
+    /* Only the vertices between the lowest and highest index are handed to
+     * the host, with the indices rebased to start at zero. A title that
+     * draws a level from one shared vertex buffer indexes tens of thousands
+     * of vertices in: TimeSplitters 2's Siberia draws 340 pieces a frame with
+     * indices up to 35,000, and copying every vertex below the highest one
+     * for each of them moved hundreds of megabytes a frame and ran at 14 fps.
+     * The range a draw actually uses is a few kilobytes. */
+    {
+        UINT lo = 0xFFFFu, hi = 0;
+        for (i = 0; i < count; i++) {
+            if (idx[i] < lo) lo = idx[i];
+            if (idx[i] > hi) hi = idx[i];
+        }
+        min_index = lo;
+        vertices = hi - lo + 1;
+        verts = (const uint8_t *)verts + (size_t)lo * stride;
+    }
 
     switch (xpt) {
     case XPT_TRIANGLEFAN:
     case XPT_POLYGON:
         list = malloc((size_t)prims * 3 * sizeof *list);
         for (i = 0; list && i < prims; i++) {
-            list[n++] = idx[0];
-            list[n++] = idx[i + 1];
-            list[n++] = idx[i + 2];
+            list[n++] = (uint16_t)(idx[0] - min_index);
+            list[n++] = (uint16_t)(idx[i + 1] - min_index);
+            list[n++] = (uint16_t)(idx[i + 2] - min_index);
         }
         pt = D3DPT_TRIANGLELIST;
         break;
@@ -1766,24 +1780,31 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         list = malloc((size_t)prims * 6 * sizeof *list);
         for (i = 0; list && i < prims; i++) {
             const uint16_t *q = idx + i * 4;
-            list[n++] = q[0]; list[n++] = q[1]; list[n++] = q[2];
-            list[n++] = q[0]; list[n++] = q[2]; list[n++] = q[3];
+            uint16_t a = (uint16_t)(q[0] - min_index), b = (uint16_t)(q[1] - min_index);
+            uint16_t c = (uint16_t)(q[2] - min_index), d = (uint16_t)(q[3] - min_index);
+            list[n++] = a; list[n++] = b; list[n++] = c;
+            list[n++] = a; list[n++] = c; list[n++] = d;
         }
         pt = D3DPT_TRIANGLELIST;
         prims *= 2;
         break;
     case XPT_LINELOOP:
         list = malloc(((size_t)count + 1) * sizeof *list);
-        if (list) {
-            memcpy(list, idx, (size_t)count * sizeof *list);
-            list[count] = idx[0];
-        }
+        for (i = 0; list && i < count; i++)
+            list[i] = (uint16_t)(idx[i] - min_index);
+        if (list)
+            list[count] = (uint16_t)(idx[0] - min_index);
         break;
     default:
+        if (min_index) {
+            list = malloc((size_t)count * sizeof *list);
+            for (i = 0; list && i < count; i++)
+                list[i] = (uint16_t)(idx[i] - min_index);
+        }
         break;
     }
     if ((xpt == XPT_TRIANGLEFAN || xpt == XPT_POLYGON || xpt == XPT_QUADLIST ||
-         xpt == XPT_LINELOOP) && !list) {
+         xpt == XPT_LINELOOP || min_index) && !list) {
         g_draws_failed++;
         return;
     }
