@@ -938,8 +938,11 @@ static void ff_vs_prepare_draw(DWORD fvf)
             memcpy(cb->world_inv_transpose, identity, sizeof(identity));
             memcpy(cb->world_view, identity, sizeof(identity));
             memcpy(cb->world_view_inv_transpose, identity, sizeof(identity));
-            cb->screen_w = (float)d3d8_GetBackbufferWidth();
-            cb->screen_h = (float)d3d8_GetBackbufferHeight();
+            /* Pre-transformed vertices are in the guest's screen pixels,
+             * not the host back buffer's: the two differ once the host
+             * renders larger than the guest asked (d3d8_GetGuestWidth). */
+            cb->screen_w = (float)d3d8_GetGuestWidth();
+            cb->screen_h = (float)d3d8_GetGuestHeight();
             cb->flags = 0x01; /* pre-transformed */
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];
@@ -970,8 +973,8 @@ static void ff_vs_prepare_draw(DWORD fvf)
             mat4_transpose(wv_inv_t, wv_inv);
             memcpy(cb->world_view_inv_transpose, wv_inv_t, sizeof(wv_inv_t));
 
-            cb->screen_w = (float)d3d8_GetBackbufferWidth();
-            cb->screen_h = (float)d3d8_GetBackbufferHeight();
+            cb->screen_w = (float)d3d8_GetGuestWidth();
+            cb->screen_h = (float)d3d8_GetGuestHeight();
             cb->flags = 0;
 
             /* Compute eye position from inverse view matrix */

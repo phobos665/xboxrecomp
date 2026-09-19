@@ -1160,6 +1160,9 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  * 0 presents without waiting, for a device that is not the title's display.
  */
 void xbox_D3D8SetPresentInterval(UINT interval);
+/* The size the guest presents at, for its screen-space geometry; the HLE
+ * sets it from the title's present parameters (d3d8_GetGuestWidth). */
+void xbox_D3D8SetGuestSize(UINT width, UINT height);
 
 /**
  * Present frame and pump window messages.

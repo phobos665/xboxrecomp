@@ -155,6 +155,21 @@ ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
+
+/* The size the guest believes it presents at, which is what its
+ * pre-transformed (XYZRHW) vertices are measured in. The same as the back
+ * buffer until a host renders larger than the guest asked; then every
+ * screen-space quad must still be divided by the guest's 640x480, or a
+ * scaled-up window draws its menus in the top-left quarter. Set by the HLE
+ * from the title's own present parameters; unset means the back buffer. */
+static UINT g_guest_width, g_guest_height;
+void xbox_D3D8SetGuestSize(UINT width, UINT height)
+{
+    g_guest_width = width;
+    g_guest_height = height;
+}
+UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.width; }
+UINT d3d8_GetGuestHeight(void) { return g_guest_height ? g_guest_height : g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return (stage < 4) ? g_cur_textures[stage] : NULL; }

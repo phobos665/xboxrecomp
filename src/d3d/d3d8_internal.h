@@ -34,6 +34,9 @@ IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
+/* The guest's presentation size (d3d8_device.c); the back buffer's when unset. */
+UINT                 d3d8_GetGuestWidth(void);
+UINT                 d3d8_GetGuestHeight(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 
 /* Current render state array accessor */

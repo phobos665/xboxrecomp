@@ -346,6 +346,9 @@ static void shadow_create(uint32_t pp_va)
      * frames it presents itself; a vsync wait on this side device throttled
      * Burnout 2's whole loop to 27 frames a second. */
     xbox_D3D8SetPresentInterval(0);
+    /* The size the title's screen-space geometry is measured in, whatever
+     * size the host ends up rendering at. */
+    xbox_D3D8SetGuestSize(width, height);
     g_shadow_width = width;
     g_shadow_height = height;
     g_target_width = width;

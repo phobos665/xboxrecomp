@@ -1056,6 +1056,17 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void)
     return &g_device;
 }
 
+/* The guest's presentation size (see d3d8_device.c); this backend has no
+ * separate host size yet, so the getters answer the same. */
+static UINT g_guest_width, g_guest_height;
+void xbox_D3D8SetGuestSize(UINT width, UINT height)
+{
+    g_guest_width = width;
+    g_guest_height = height;
+}
+UINT d3d8_GetGuestWidth(void)  { return g_guest_width; }
+UINT d3d8_GetGuestHeight(void) { return g_guest_height; }
+
 void xbox_D3D8SetPresentInterval(UINT interval)
 {
     g_present_interval = interval;
