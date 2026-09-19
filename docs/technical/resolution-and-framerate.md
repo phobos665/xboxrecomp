@@ -250,16 +250,17 @@ Burnout 2's front end went from 1300 fps to a steady 60.0 with 1 ms of work
 per frame under either; `[HLE-D3D8] swap timing` on the five-second report
 shows the split.
 
-**The gate is off by default, for now.** Measured over the same stretch of
-TimeSplitters 2's Siberia (run53, 170 s, saves cleared, same script), the
-adaptive mode averaged 33 fps against 44 uncapped, while its own wait
-measured 0.00 ms per frame: the title's frame itself got 25% longer. Strict
-gives a steady 30 there, as a console would with 20 ms frames. Why a wait
-that never waits lengthens the frame is not understood; candidates are the
-title's own per-frame wait on the vblank counter interacting with the
-Swap-to-vblank phase, and the vblank tick's ISR/DPC running on the timer
-thread at the moment the guest thread wakes. Settle it with the sampling
-profiler on the two runs before making any mode the default.
+**The gate is off by default, for now.** One comparison over the same
+stretch of TimeSplitters 2's Siberia (run53, 170 s, saves cleared, same
+script) had the adaptive mode at 33 fps against 44 uncapped, with the gate's
+own wait at 0.00 ms per frame -- the title's frame itself was longer. But a
+later uncapped run of the same stretch gave 33-37, and another 48-52, and
+every one of those runs shared the machine with a build in another worktree.
+The level's frame rate moves more between runs than the gate appeared to
+cost, so that measurement is not evidence either way. Strict does give a
+steady 30 there, as a console would with 20 ms frames. Before any mode
+becomes the default: repeat uncapped and adaptive on a quiet machine, three
+runs each, and read `[HLE-D3D8] swap timing` and `RECOMP_SAMPLE` on both.
 
 On hardware the flip completes at the next vblank. Reproduce that:
 

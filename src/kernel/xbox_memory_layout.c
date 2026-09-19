@@ -550,12 +550,13 @@ static void frame_counters_tick(void)
  * that steps its logic per presented frame. RECOMP_FPS_CAP=adaptive lets a
  * frame that already missed a vblank present at once and holds only a frame
  * that finished inside the period, meant to keep a 20 ms frame at 50 fps
- * rather than 30. It is not the default because, measured over the same
- * stretch of TimeSplitters 2's Siberia, it ran at 33 fps against 44
- * uncapped while its own wait measured zero -- the title's frame itself got
- * longer, and why is not yet understood (docs/technical/
- * resolution-and-framerate.md). Burnout 2's front end, 1 ms of work a frame,
- * holds 60.0 under either mode. */
+ * rather than 30. Neither is the default yet: the one comparison made
+ * (TimeSplitters 2's Siberia, adaptive 33 fps against 44 uncapped with the
+ * gate's own wait at zero) was taken on a machine shared with another
+ * build, and uncapped runs of the same stretch since have ranged 33-52 on
+ * their own. Until that is measured quietly, the choice is the user's
+ * (docs/technical/resolution-and-framerate.md). Burnout 2's front end, 1 ms
+ * of work a frame, holds 60.0 under either mode. */
 static HANDLE        g_flip_gate_event;
 static volatile LONG g_flip_gate_vblanks;
 static int           g_flip_gate_divisor = -1;      /* -1: not configured */
