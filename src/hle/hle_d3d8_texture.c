@@ -43,6 +43,8 @@
 /* From hle_d3d8.c: the shadow device, or NULL, and its swap count. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
 unsigned long hle_d3d8_shadow_swaps(void);
+/* Whether these texels are the frame buffer's -- see hle_d3d8.c. */
+int hle_d3d8_is_framebuffer(uint32_t phys);
 
 #define CONTIG_BASE          0x80000000u
 #define CONTIG_SIZE          (64u * 1024u * 1024u)   /* kernel.h XBOX_CONTIG_SIZE */
@@ -63,6 +65,9 @@ typedef struct {
      * the content -- the guest's bytes are not, since nothing on the guest
      * side draws them, so it is never re-uploaded. */
     int                rendered;
+    /* The texels are the frame buffer's, so the content comes from the
+     * host's finished frame and is refreshed every frame it is bound. */
+    int                framebuffer;
 } texture_entry;
 
 static texture_entry g_textures[TEXTURE_CACHE];
@@ -233,6 +238,55 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
     return victim;
 }
 
+/* A texture whose texels are the frame buffer: created as a render target so
+ * the host can draw the finished frame into it, refreshed once per frame, and
+ * never uploaded from guest memory. */
+static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va,
+                                              const texture_layout *t)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    texture_entry *e = NULL;
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->va == va && c->framebuffer) {
+            e = c;
+            break;
+        }
+    }
+    if (!e) {
+        e = cache_slot(dev, now);
+        if (!e)
+            return NULL;
+        if (FAILED(host_CreateTexture(dev, t->width, t->height, 1, D3DUSAGE_RENDERTARGET,
+                                      (D3DFORMAT)t->fmt, D3DPOOL_DEFAULT, &e->host)) ||
+            !e->host) {
+            memset(e, 0, sizeof *e);
+            g_skip_create++;
+            return NULL;
+        }
+        e->va = va;
+        e->rendered = 1;
+        e->framebuffer = 1;
+        fprintf(stderr, "[HLE-D3D8] the title binds its own frame as a texture "
+                "0x%08X (%ux%u, format 0x%02X); filling it from the host's frame\n",
+                va, t->width, t->height, t->fmt);
+        fflush(stderr);
+    }
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->used_swap = now;
+    /* Once per frame: the picture it should hold is this frame's, so far. */
+    if (e->checked_swap != now) {
+        e->checked_swap = now;
+        xbox_D3D8CopyBackBufferToTexture(e->host);
+    }
+    return e->host;
+}
+
 static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
 {
     unsigned long now = hle_d3d8_shadow_swaps();
@@ -240,6 +294,15 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     texture_entry *e = NULL;
     uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
     int i;
+
+    /* Before the ordinary lookup, because these are not identified by
+     * their texels -- they have none of their own -- and because they
+     * must be refreshed every frame, which a cache hit would skip. */
+    if (hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) && read_layout(va, &t)) {
+        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
+        if (fb)
+            return fb;
+    }
 
     for (i = 0; i < g_texture_count; i++) {
         texture_entry *c = &g_textures[i];
@@ -273,6 +336,14 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     if (!read_layout(va, &t))
         return NULL;
     note_format(&t);
+    /* The title's own frame, bound as a texture. Nothing drew those texels on
+     * the guest side, so they are zeros; the host's frame goes in instead, and
+     * the entry is marked so the zeros never overwrite it. */
+    if (hle_d3d8_is_framebuffer(t.phys)) {
+        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
+        if (fb)
+            return fb;
+    }
     e = cache_slot(dev, now);
     if (!e)
         return NULL;

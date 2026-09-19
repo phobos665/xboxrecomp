@@ -237,6 +237,43 @@ static HWND shadow_window(UINT width, UINT height)
  * device's own depth surface (shadow_set_render_target). */
 static int      g_in_create_device;
 static uint32_t g_backbuffer_va, g_autodepth_va;
+
+/* Where the frame buffer lives, as physical addresses. A title that
+ * post-processes its own image does not copy the screen anywhere: it makes
+ * a texture whose texels ARE the frame buffer and binds that. On hardware
+ * that samples what the GPU just drew; here nothing draws on the guest side,
+ * so those texels are zeros and the effect blends black over the picture.
+ * Recognising the address is what lets the texture layer fill it from the
+ * host's own frame instead. There are two, flipped between. */
+static uint32_t g_framebuffer_phys[4];
+static int      g_framebuffer_count;
+
+static void note_framebuffer_phys(uint32_t data)
+{
+    uint32_t phys = data & 0x0FFFFFFFu;
+    int i;
+
+    if (!phys)
+        return;
+    for (i = 0; i < g_framebuffer_count; i++)
+        if (g_framebuffer_phys[i] == phys)
+            return;
+    if (g_framebuffer_count < 4) {
+        g_framebuffer_phys[g_framebuffer_count++] = phys;
+        fprintf(stderr, "[HLE-D3D8] frame buffer at physical 0x%08X; a texture"
+                " whose texels live there is the title reading its own screen\n", phys);
+        fflush(stderr);
+    }
+}
+
+int hle_d3d8_is_framebuffer(uint32_t phys)
+{
+    int i;
+    for (i = 0; i < g_framebuffer_count; i++)
+        if (g_framebuffer_phys[i] == phys)
+            return 1;
+    return 0;
+}
 static IDirect3DSurface8 *g_device_depth;
 
 /* ------------------------------------------------------------- viewports */
@@ -777,6 +814,8 @@ HLE_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
 HLE_ORIGINAL(D3DDevice_SetTransform);
 HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetScissors);
+HLE_ORIGINAL(D3DDevice_CopyRects);
+HLE_ORIGINAL(D3DDevice_GetBackBuffer2);
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
 HLE_ORIGINAL(D3DDevice_SetPixelShader);
 HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
@@ -1042,6 +1081,10 @@ HLE_EXPORT(D3DDevice_Swap)
     /* Counted before anything else here runs, so RECOMP_FPS means the same
      * thing whatever is switched on below. */
     xbox_FpsCountSwap();
+#ifdef _WIN32
+    if (g_backbuffer_va)
+        note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+#endif
     first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
         HLE_RETURN(0x80004005u);
@@ -1884,6 +1927,96 @@ HLE_EXPORT(D3DDevice_SetRenderTarget)
         shadow_set_render_target(rt, zs);
 #endif
 }
+
+/* IDirect3DSurface8 *D3DDevice_GetBackBuffer2(INT BackBuffer)
+ * Xbox-only: the back buffer's surface, returned rather than written through
+ * a pointer. Worth replacing only to learn which surface that is, so
+ * CopyRects below can tell "the title is copying the screen" from "the title
+ * is copying something else". */
+HLE_EXPORT(D3DDevice_GetBackBuffer2)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_GetBackBuffer2", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_GetBackBuffer2, "D3DDevice_GetBackBuffer2"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_GetBackBuffer2);
+#ifdef _WIN32
+    if (g_shadow && g_eax && (int32_t)HLE_ARG(0) <= 0)
+        g_backbuffer_va = g_eax;
+#endif
+}
+
+/* HRESULT D3DDevice_CopyRects(IDirect3DSurface8 *src, const RECT *srcRects,
+ *                             UINT count, IDirect3DSurface8 *dst,
+ *                             const POINT *dstPoints)
+ *
+ * The case this exists for is a title copying the finished frame into a
+ * texture and drawing that texture back over the scene -- a glow or a
+ * soften. The title's own copy still runs, but it runs in the guest's world
+ * where nothing is rendered, so what it reads is zeros; TimeSplitters 2 then
+ * blends those zeros over its own image three times a frame and loses 62% of
+ * the picture's brightness. The host repeats the copy from its own back
+ * buffer, into the host texture standing in for the destination.
+ *
+ * Only that case. A copy between two of the title's own surfaces is left to
+ * the title, whose result the host never sees anyway, and is counted so a
+ * title that needs more than this says so in the log. */
+HLE_EXPORT(D3DDevice_CopyRects)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t src = HLE_ARG(0), dst = HLE_ARG(3);
+#endif
+
+    first_call(&seen, "D3DDevice_CopyRects", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_CopyRects, "D3DDevice_CopyRects"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_CopyRects);
+#ifdef _WIN32
+    if (g_shadow && src && dst) {
+        static unsigned long from_screen, elsewhere;
+        static int said_other;
+        uint32_t src_parent = HLE_MEM32(src + SURFACE_PARENT);
+        uint32_t dst_parent = HLE_MEM32(dst + SURFACE_PARENT);
+        UINT sw, sh, dw, dh;
+        uint32_t sfmt, dfmt;
+
+        surface_measure(src, &sw, &sh, &sfmt);
+        surface_measure(dst, &dw, &dh, &dfmt);
+        /* The source is the screen when it is the surface GetBackBuffer2
+         * returned, or -- before that is known -- any parentless surface of
+         * the back buffer's size, the same test SetRenderTarget uses. */
+        if (dst != g_backbuffer_va &&
+            (g_backbuffer_va ? src == g_backbuffer_va
+                             : (!src_parent && sw == g_shadow_width && sh == g_shadow_height)) &&
+            dst_parent && HLE_MEM32(dst_parent + 4) == HLE_MEM32(dst + 4)) {
+            IDirect3DTexture8 *tex = hle_d3d8_render_texture(g_shadow, dst_parent);
+
+            if (tex && SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(tex)))
+                from_screen++;
+            if (from_screen == 1)
+                fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "
+                        "copying the host frame into texture 0x%08X (%ux%u)\n",
+                        dst_parent, dw, dh);
+        } else {
+            elsewhere++;
+            if (dst == g_backbuffer_va || !dst_parent) {
+                note_framebuffer_phys(HLE_MEM32(dst + 4));
+                note_framebuffer_phys(HLE_MEM32(src + 4));
+            }
+            if (said_other++ < 8)
+                fprintf(stderr, "[HLE-D3D8] CopyRects not recognised as a screen read: "
+                        "src 0x%08X %ux%u parent 0x%08X | dst 0x%08X %ux%u parent 0x%08X "
+                        "(dst parent data 0x%08X, dst data 0x%08X; back buffer 0x%08X)\n",
+                        src, sw, sh, src_parent, dst, dw, dh, dst_parent,
+                        dst_parent ? HLE_MEM32(dst_parent + 4) : 0u,
+                        HLE_MEM32(dst + 4), g_backbuffer_va);
+        }
+    }
+#endif
+}
+
 
 #ifdef _WIN32
 /* The vertices a program with NORMPACKED3 registers reads: each vertex copied

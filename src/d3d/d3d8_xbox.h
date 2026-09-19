@@ -1171,6 +1171,15 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height);
 void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
 BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
 
+/* The Xbox's CopyRects, for the one case a title uses it for in anger:
+   copying the finished frame into a texture it then draws over the scene.
+   The host's own back buffer is the source, because the guest's is empty --
+   nothing renders on that side. Scales if the texture is not screen-sized.
+   The destination must be a render-target texture. */
+HRESULT       xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+unsigned long xbox_D3D8ScreenCopyCount(void);
+void          xbox_D3D8ScreenCopyShutdown(void);
+
 /**
  * Present frame and pump window messages.
  * Called from recompiled game code (replaces RW driver Present path).

@@ -275,7 +275,9 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    /* SHADER_INPUT as well: a title that post-processes its own image reads
+     * the finished frame back (d3d8_screencopy.c), and that reads this. */
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
     scd.OutputWindow = pp->hDeviceWindow;
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
@@ -448,6 +450,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         /* Cleanup subsystems first */
         up_ring_shutdown();
         d3d8_overlay_shutdown();
+        xbox_D3D8ScreenCopyShutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();

@@ -1084,6 +1084,15 @@ void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
         g_scissor_rect = rects[0];
 }
 
+HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
+{
+    (void)dst;
+    return E_NOTIMPL;
+}
+
+unsigned long xbox_D3D8ScreenCopyCount(void) { return 0; }
+void xbox_D3D8ScreenCopyShutdown(void) {}
+
 BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
 {
     if (count)     *count = g_scissor_count;
