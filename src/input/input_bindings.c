@@ -774,6 +774,21 @@ static int source_magnitude(const Source *s, KeyCache *kc,
     }
 }
 
+/* The first thing pressed on a port, named once. A binding that is wrong is
+ * otherwise invisible: the title just never responds, and there is no way to
+ * tell a mis-bound key from a title that is not reading the pad at all. */
+static void say_first_press(unsigned port, const char *control)
+{
+    static int said[PORTS];
+
+    if (port < PORTS && !said[port]) {
+        said[port] = 1;
+        fprintf(stderr, "[INPUT] port %u first press: %s (%s)\n", port + 1,
+                control, g_ctl[port].label);
+        fflush(stderr);
+    }
+}
+
 int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
 {
     Controller *c;
@@ -807,6 +822,7 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
         }
         if (!mag)
             continue;
+        say_first_press(port, CONTROLS[i].name);
         switch (CONTROLS[i].kind) {
         case K_DIGITAL:
             if (mag >= 64)

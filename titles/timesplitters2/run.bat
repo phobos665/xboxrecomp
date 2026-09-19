@@ -7,9 +7,15 @@ rem   cmake --build titles\timesplitters2\build --config Release
 rem
 rem The picture is in the second window, titled as the shadow renderer; the
 rem first window is the title's own frame buffer, which nothing draws into.
-rem Keyboard: arrows = D-pad, Enter = START, Backspace = BACK, Z = A, X = B,
-rem A = X, S = Y, Q = White, W = Black, E = left trigger, R = right trigger.
-rem An XInput controller on port 0 works as itself.
+rem Keyboard, unless it has been rebound: arrows = D-pad, Enter = START,
+rem Backspace = BACK, Z = A, X = B, A = X, S = Y, Q = White, W = Black,
+rem E = left trigger, R = right trigger. An XInput controller on port 0 works
+rem as itself, and pads in slots 1-3 become controllers 2-4.
+rem
+rem To rebind, or to pick which device drives which controller:
+rem   py -3 -m tools.input_ui
+rem It writes %APPDATA%\xboxrecomp\input_bindings.json, which every title
+rem reads; see docs\technical\input-binding.md.
 rem
 rem The game saves under games\Time Splitters 2\UDATA\4553000a\. A profile
 rem saved by an earlier run changes the menu path ("save exists, overwrite?"),

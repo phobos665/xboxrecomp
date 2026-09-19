@@ -85,6 +85,13 @@ before every function rebuild). When a title "hangs" after drawing, suspect the 
 first, and when it spins on an `[ICALL] unknown target` a few bytes past a function end, look
 for a `jmp [reg*4 + table]` just before it.
 
+**Input is bound, not hard-coded (Sep 2026):** all four ports read
+`src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
+`%APPDATA%\xboxrecomp\input_bindings.json`, else one beside the executable — and falls
+back to exactly the old behaviour when there is none. `py -3 -m tools.input_ui` is the UI
+that writes it. See `docs/technical/input-binding.md`. `RECOMP_FAKE_INPUT` and
+`RECOMP_INPUT_SEQ` still apply to controller 1 and ignore the bindings.
+
 Two things that cost days and are worth knowing before touching this code. The title's
 **deferred render state arrays do not follow its pixel shader** — `SetPixelShader` selects
 an object carrying a `D3DPIXELSHADERDEF`, and the arrays hold whichever shader last went
@@ -227,6 +234,7 @@ lives here.
 | Infinite loop | Waiting on hardware state — stub the wait or fake the state |
 | Stack overflow | Wrong ESP at entry, or runaway recursion |
 | **Subtly wrong physics or RNG, no crash** | **x87 precision divergence — suspect this first when behaviour differs from xemu without a fault** |
+| A key or pad does nothing, and no `[INPUT] port N first press` line appears | The binding, not the title. `[INPUT] bindings from ...` at start-up names the config that was loaded and the device on each port; `py -3 -m tools.input_ui --print` shows what it holds |
 | Exits via `HalReturnToFirmware` after ~15 kernel calls | XAPI's retail disc check failed (certificate `AllowedMedia` is DVD-X2 only). The kernel answers it since Sep 2026; if it recurs, look at the mode-sense reply in `kernel_bridge.c` |
 | Main thread stops entering new functions right after the first `Swap`; ISR keeps ticking | `D3D_BlockOnTime` waiting for the GPU time fence. The HLE mirrors it from `D3D_BlockOnTime`'s prologue; a "not mirrored" line in the log means this XDK's prologue differs |
 | Stops in DirectSound start-up, watchdog shows `ebx = <block>+0x810` | The DSP doorbell. Found from `GPSADDR`/`EPSADDR` under `RECOMP_AC97_READY`; without that switch DirectSound never gets this far and the title dereferences a half-built sound object instead |
