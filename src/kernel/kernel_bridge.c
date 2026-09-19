@@ -1532,6 +1532,19 @@ static void bridge_KeWaitForSingleObject(void)
     HANDLE h;
 
     wait_log_note("waits on", object, BRIDGE_MEM32(g_esp));
+    if (wait_log_wanted()) {
+        /* The dispatcher header decides the semantics: Type 0 is a
+         * notification event a waiter does not consume, Type 1 a
+         * synchronisation event it does. Reading it wrong turns a
+         * handshake into a spin, so print it once. */
+        static int dumped;
+        if (!dumped++) {
+            const uint8_t *h = (const uint8_t *)(uintptr_t)(object + g_xbox_mem_offset);
+            fprintf(stderr, "  [WAIT] header at 0x%08X: type %u absolute %u size %u "
+                    "inserted %u signalstate %d\n", object, h[0], h[1], h[2], h[3],
+                    (int)BRIDGE_MEM32(object + 4));
+        }
+    }
 
     /* Same split as KeSetEvent: wait on the guest's own SignalState when the
      * object lives in guest memory, and fall through to the shadow handle
@@ -1545,6 +1558,14 @@ static void bridge_KeWaitForSingleObject(void)
                     sync ? "synchronisation" : "notification", object);
         }
         g_eax = bridge_wait_guest_event(state, sync, timeout_ptr);
+        if (wait_log_wanted()) {
+            /* Success or timeout, and with what timeout asked for: the two
+             * say different things about why a loop goes round again. */
+            static int shown;
+            if (shown++ < 10)
+                fprintf(stderr, "  [WAIT] 0x%08X -> %s (timeout arg 0x%08X)\n",
+                        object, g_eax ? "TIMEOUT" : "signalled", timeout_ptr);
+        }
         return;
     }
 
@@ -3533,7 +3554,11 @@ static void bridge_NtReadFile(void)
         fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> %s\n",
                 STACK_ARG(1), STACK_ARG(2),
                 STACK_ARG(2) ? "completed now" : "pending");
-        if (!STACK_ARG(2))
+        /* RECOMP_FILE_SYNC=1 reports the read finished, for a title whose
+         * loader does not come back for the result. Burnout 2 needs the
+         * opposite -- its stream reader only accepts a short count on the
+         * pending path -- so this is a switch, not a change. */
+        if (!STACK_ARG(2) && !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
             g_eax = 0x00000103u;           /* STATUS_PENDING */
     }
 }
