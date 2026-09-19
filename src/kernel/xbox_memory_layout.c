@@ -2225,6 +2225,26 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                             XBOX_TILED_BASE, XBOX_CONTIG_BASE);
                 *via_contig = saved;
             }
+            /* RECOMP_ALIAS_HIGH=1: a second alias of the same window at
+             * 0xF8000000, for finding out whether a title that dereferences
+             * an address there means physical memory or is simply holding a
+             * bad pointer. Outrun 2 faults on a this-pointer of 0xF8604020,
+             * which is a valid cached pointer 0x80604020 biased by
+             * 0x78000000 -- suggestive, but suggestive is not evidence, and
+             * mapping it settles the question in one run: real memory and
+             * the title carries on, garbage and it faults again at once.
+             *
+             * Off by default. Nothing is known to need it, and silently
+             * backing an address no console ever had would hide the next
+             * title's bad pointer instead of reporting it. */
+            if (xbox_EnvSwitch("RECOMP_ALIAS_HIGH", 0) && g_contig_mapping) {
+                void *high = MapViewOfFileEx(
+                    g_contig_mapping, FILE_MAP_ALL_ACCESS, 0, 0, tiled_size,
+                    (LPVOID)(uintptr_t)(0xF8000000u + g_memory_offset));
+                fprintf(stderr, "  RECOMP_ALIAS_HIGH: 0x%08X %s\n", 0xF8000000u,
+                        high ? "aliased to the contiguous window (an experiment)"
+                             : "could not be mapped");
+            }
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
                     " (aliases the contiguous window)\n",
                     (unsigned)(g_memory_size / (1024 * 1024)),
