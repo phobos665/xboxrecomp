@@ -1067,6 +1067,29 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width; }
 UINT d3d8_GetGuestHeight(void) { return g_guest_height; }
 
+/* Scissors are not applied by this backend; the state is kept so a
+ * capture snapshot can still read it. */
+static UINT    g_scissor_count;
+static BOOL    g_scissor_exclusive;
+static D3DRECT g_scissor_rect;
+
+void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
+{
+    g_scissor_count = rects ? count : 0;
+    g_scissor_exclusive = exclusive;
+    memset(&g_scissor_rect, 0, sizeof g_scissor_rect);
+    if (g_scissor_count)
+        g_scissor_rect = rects[0];
+}
+
+BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
+{
+    if (count)     *count = g_scissor_count;
+    if (exclusive) *exclusive = g_scissor_exclusive;
+    if (rect)      *rect = g_scissor_rect;
+    return g_scissor_count != 0;
+}
+
 void xbox_D3D8SetPresentInterval(UINT interval)
 {
     g_present_interval = interval;

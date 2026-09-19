@@ -827,6 +827,23 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         r->dev->lpVtbl->SetViewport(r->dev, &vp);
         break;
     }
+    case D3D8CAP_SCISSORS: {
+        const D3D8CapScissors *p = c->data;
+        D3DRECT rect;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        rect.x1 = p->rect.x1; rect.y1 = p->rect.y1;
+        rect.x2 = p->rect.x2; rect.y2 = p->rect.y2;
+        if (g_list_draws)
+            fprintf(stderr, "[scissors] %lu rect(s)%s: %ld,%ld-%ld,%ld\n",
+                    (unsigned long)p->count, p->exclusive ? " exclusive" : "",
+                    (long)rect.x1, (long)rect.y1, (long)rect.x2, (long)rect.y2);
+        xbox_D3D8SetScissors(p->count, p->exclusive ? TRUE : FALSE, &rect);
+        break;
+    }
     case D3D8CAP_SET_TEXTURE: {
         const D3D8CapSetTexture *p = c->data;
         ReplayTexture *slot;

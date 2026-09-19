@@ -239,6 +239,19 @@ static void rec_transform(DWORD state, const D3DMATRIX *m)
     chunk(D3D8CAP_TRANSFORM, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
+static void rec_scissors(UINT count, BOOL exclusive, const D3DRECT *rect)
+{
+    D3D8CapScissors c;
+
+    c.count = count;
+    c.exclusive = exclusive ? 1 : 0;
+    c.rect.x1 = rect ? rect->x1 : 0;
+    c.rect.y1 = rect ? rect->y1 : 0;
+    c.rect.x2 = rect ? rect->x2 : 0;
+    c.rect.y2 = rect ? rect->y2 : 0;
+    chunk(D3D8CAP_SCISSORS, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
 static void rec_viewport(const D3DVIEWPORT8 *vp)
 {
     D3D8CapViewport c;
@@ -448,6 +461,11 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
     }
     dev->lpVtbl->GetViewport(dev, &vp);
     rec_viewport(&vp);
+    {
+        UINT count; BOOL exclusive; D3DRECT rect;
+        xbox_D3D8GetScissors(&count, &exclusive, &rect);
+        rec_scissors(count, exclusive, &rect);
+    }
 
     for (s = 0; rs && s < CAPTURE_RENDER_STATES; s++)
         rec_render_state(s, rs[s]);
@@ -618,6 +636,13 @@ HRESULT host_SetTransform(IDirect3DDevice8 *dev, D3DTRANSFORMSTATETYPE state,
     if (g_cap && matrix)
         rec_transform((DWORD)state, matrix);
     return dev->lpVtbl->SetTransform(dev, state, matrix);
+}
+
+void host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
+{
+    if (g_cap)
+        rec_scissors(count, exclusive, count && rects ? &rects[0] : NULL);
+    xbox_D3D8SetScissors(count, exclusive, rects);
 }
 
 HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport)

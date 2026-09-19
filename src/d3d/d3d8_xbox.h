@@ -1164,6 +1164,13 @@ void xbox_D3D8SetPresentInterval(UINT interval);
  * sets it from the title's present parameters (d3d8_GetGuestWidth). */
 void xbox_D3D8SetGuestSize(UINT width, UINT height);
 
+/* The Xbox's D3DDevice_SetScissors: clip drawing to the rectangles (or, with
+ * exclusive set, outside them); count 0 turns it off. The host applies one
+ * inclusive rectangle at most. Get returns whether a scissor is set, with
+ * the first rectangle, for capture snapshots. */
+void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
+BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
+
 /**
  * Present frame and pump window messages.
  * Called from recompiled game code (replaces RW driver Present path).

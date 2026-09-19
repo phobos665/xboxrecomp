@@ -114,10 +114,11 @@ static DWORD hash_blend_states(const DWORD *rs)
            (rs[D3DRS_COLORWRITEENABLE] << 16);
 }
 
-static DWORD hash_raster_states(const DWORD *rs)
+static DWORD hash_raster_states(const DWORD *rs, BOOL scissor)
 {
     return rs[D3DRS_CULLMODE] ^
-           (rs[D3DRS_FILLMODE] << 4);
+           (rs[D3DRS_FILLMODE] << 4) ^
+           (scissor ? 0x100u : 0u);
 }
 
 /* ================================================================
@@ -188,9 +189,9 @@ static void update_depth_stencil_state(const DWORD *rs)
         memcpy(&g_last_ds_desc, &dsd, sizeof(dsd));
 }
 
-static void update_rasterizer_state(const DWORD *rs)
+static void update_rasterizer_state(const DWORD *rs, BOOL scissor)
 {
-    DWORD hash = hash_raster_states(rs);
+    DWORD hash = hash_raster_states(rs, scissor);
     D3D11_RASTERIZER_DESC rd;
     HRESULT hr;
 
@@ -219,7 +220,7 @@ static void update_rasterizer_state(const DWORD *rs)
 
     rd.FrontCounterClockwise = FALSE;
     rd.DepthClipEnable = TRUE;
-    rd.ScissorEnable = FALSE;
+    rd.ScissorEnable = scissor;
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
 
@@ -399,12 +400,17 @@ void d3d8_states_apply(void)
     const DWORD *rs = d3d8_GetRenderStates();
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     float blend_factor[4] = { 1, 1, 1, 1 };
+    static D3D11_RECT last_scissor;
+    static BOOL last_scissor_on;
+    D3D11_RECT scissor;
+    BOOL scissor_on;
 
     if (!rs || !ctx) return;
 
+    scissor_on = d3d8_GetScissor(&scissor);
     update_blend_state(rs);
     update_depth_stencil_state(rs);
-    update_rasterizer_state(rs);
+    update_rasterizer_state(rs, scissor_on);
 
     if (g_blend_state)
         ID3D11DeviceContext_OMSetBlendState(ctx, g_blend_state, blend_factor, 0xFFFFFFFF);
@@ -412,6 +418,13 @@ void d3d8_states_apply(void)
         ID3D11DeviceContext_OMSetDepthStencilState(ctx, g_ds_state, rs[D3DRS_STENCILREF]);
     if (g_raster_state)
         ID3D11DeviceContext_RSSetState(ctx, g_raster_state);
+    /* The rectangle only matters while the rasterizer state has scissoring
+     * on, and is re-sent only when it changes. */
+    if (scissor_on && (!last_scissor_on || memcmp(&scissor, &last_scissor, sizeof scissor) != 0)) {
+        ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &scissor);
+        last_scissor = scissor;
+    }
+    last_scissor_on = scissor_on;
 
     /* Apply samplers for all 4 texture stages */
     {

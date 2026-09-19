@@ -742,6 +742,7 @@ HLE_ORIGINAL(D3DDevice_SelectVertexShader);
 HLE_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
 HLE_ORIGINAL(D3DDevice_SetTransform);
 HLE_ORIGINAL(D3DDevice_SetViewport);
+HLE_ORIGINAL(D3DDevice_SetScissors);
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
 HLE_ORIGINAL(D3DDevice_SetPixelShader);
 HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
@@ -1487,6 +1488,36 @@ HLE_EXPORT(D3DDevice_SetViewport)
         g_title_viewport_set = 1;
         g_host_viewport_mode = -1;       /* the next draw picks which to use */
         shadow_viewport_constants(&vp);
+    }
+#endif
+}
+
+/* void D3DDevice_SetScissors(DWORD Count, BOOL Exclusive, const D3DRECT *pRects)
+ * Xbox-only: clip drawing to (or, with Exclusive, outside) up to eight
+ * rectangles of the render target; Count 0 turns it off. TimeSplitters 2
+ * scrolls its mission briefing inside one, and without this the text ran
+ * over the heading and the button bar. */
+HLE_EXPORT(D3DDevice_SetScissors)
+{
+    static int seen;
+    uint32_t count = HLE_ARG(0);
+    uint32_t exclusive = HLE_ARG(1);
+    uint32_t rects = HLE_ARG(2);
+
+    first_call(&seen, "D3DDevice_SetScissors", count);
+    if (original_missing(hle_original_D3DDevice_SetScissors, "D3DDevice_SetScissors"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetScissors);
+#ifdef _WIN32
+    if (g_shadow) {
+        D3DRECT rect[8];
+        UINT n = count > 8 ? 8 : count;
+
+        if (n && rects)
+            memcpy(rect, HLE_PTR(rects), n * sizeof rect[0]);
+        else
+            n = 0;
+        host_SetScissors(n, exclusive != 0, rect);
     }
 #endif
 }

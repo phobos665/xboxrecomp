@@ -169,6 +169,57 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
     g_guest_height = height;
 }
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.width; }
+
+/* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
+ * keeps one: D3D11 applies one scissor per viewport, and what titles clip
+ * with it -- a scrolling text box, a minimap -- is one rectangle. More than
+ * one, or an exclusive scissor (draw outside the rectangles), cannot be
+ * expressed here and is applied as no scissor, said once. Coordinates are
+ * render-target pixels, as on the Xbox; when the host renders larger than
+ * the guest they will need scaling, like the viewport. */
+static BOOL       g_scissor_enabled;
+static D3D11_RECT g_scissor;
+static UINT       g_scissor_count;
+static BOOL       g_scissor_exclusive;
+static D3DRECT    g_scissor_rect;
+
+void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
+{
+    static int said;
+
+    if (!rects)
+        count = 0;
+    g_scissor_count = count;
+    g_scissor_exclusive = exclusive;
+    memset(&g_scissor_rect, 0, sizeof g_scissor_rect);
+    if (count)
+        g_scissor_rect = rects[0];
+    g_scissor_enabled = count >= 1 && !exclusive;
+    if (g_scissor_enabled) {
+        g_scissor.left   = rects[0].x1;
+        g_scissor.top    = rects[0].y1;
+        g_scissor.right  = rects[0].x2;
+        g_scissor.bottom = rects[0].y2;
+    }
+    if ((count > 1 || (count && exclusive)) && !said++)
+        fprintf(stderr, "D3D8: SetScissors with %u rectangle(s)%s: the host applies at most "
+                        "one inclusive rectangle\n", count, exclusive ? ", exclusive" : "");
+}
+
+BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
+{
+    if (count)     *count = g_scissor_count;
+    if (exclusive) *exclusive = g_scissor_exclusive;
+    if (rect)      *rect = g_scissor_rect;
+    return g_scissor_count != 0;
+}
+
+BOOL d3d8_GetScissor(D3D11_RECT *out)
+{
+    if (out)
+        *out = g_scissor;
+    return g_scissor_enabled;
+}
 UINT d3d8_GetGuestHeight(void) { return g_guest_height ? g_guest_height : g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
