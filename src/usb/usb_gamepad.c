@@ -139,9 +139,12 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
 
 /* ---- the input report -------------------------------------------------- */
 
-/* The host's own pad, through the layer that already maps one to XInput.
- * A real controller plugged into the PC drives this emulated one. */
+/* The host's own pad, through the layer that maps one to XInput and applies
+ * the user's bindings. A real controller plugged into the PC drives this
+ * emulated one, and so does a keyboard if that is what port 1 is bound to.
+ * This device is the one on port 1; the OHCI side has no others yet. */
 #include "../input/xinput_xbox.h"
+#include "../input/input_bindings.h"
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -255,8 +258,8 @@ static void fake_input_apply(uint8_t *out)
 
 int usb_gamepad_report(uint8_t *out, int max)
 {
-    XBOX_INPUT_STATE state;
-    const XBOX_GAMEPAD *g;
+    XBOX_GAMEPAD pad;
+    const XBOX_GAMEPAD *g = &pad;
     int i;
 
     if (max < 20)
@@ -278,10 +281,9 @@ int usb_gamepad_report(uint8_t *out, int max)
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
-    if (xbox_InputGetState(0, &state) != 0)
+    if (!recomp_bindings_sample(0, &pad))
         return 20;
 
-    g = &state.Gamepad;
     out[2] = (uint8_t)(g->wButtons & 0xFF);
     out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
     for (i = 0; i < 8; i++)

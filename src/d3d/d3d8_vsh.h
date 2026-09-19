@@ -70,6 +70,7 @@ typedef struct NV2AVshSlot {
     DWORD   microcode[NV2A_VS_MAX_INSTRUCTIONS * 4]; /* Raw 128-bit instructions */
     int     length;         /* Number of instructions */
     int     in_use;         /* 1 if this slot is allocated */
+    uint32_t hash;          /* of the microcode, the compiled-shader cache key */
     /* The vertex declaration, when one was given (d3d8_vsh_set_declaration).
      * Without it the input layout is guessed from the registers read. */
     D3D8VshInput decl[NV2A_VS_MAX_INPUTS];

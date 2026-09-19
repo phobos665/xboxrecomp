@@ -22,6 +22,8 @@ set(KERNEL_SOURCES
     xbox_memory_layout.c
     icall_feedback.c
     recomp_trace.c
+    recomp_fps.c
+    recomp_sample.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
     nv2a_vsh.c
@@ -41,7 +43,9 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    # winmm for timeBeginPeriod (the vblank clock's fallback timer), dbghelp
+    # and psapi for the sampling profiler's symbol and module lookups.
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt winmm dbghelp psapi)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
@@ -49,7 +53,11 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- $<$<NOT:$<CONFIG:Debug>>:/O2> /GS- /Gy)
+    # /Zi in every configuration: the title links with /DEBUG, so the PDB then
+    # names this library's static functions too, and a sampled profile
+    # (RECOMP_SAMPLE) attributes time to nv2a_ack_thread rather than to whatever
+    # public symbol happens to precede it. No effect on the generated code.
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- $<$<NOT:$<CONFIG:Debug>>:/O2> /GS- /Gy /Zi)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)

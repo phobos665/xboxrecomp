@@ -124,6 +124,7 @@ const DWORD *d3d8_GetPalette(DWORD stage)
 /* Forward declarations */
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
+#include "d3d8_overlay.h"
 
 /* ================================================================
  * Public frame pump (called from recompiled game code)
@@ -152,9 +153,77 @@ ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_dev
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
+UINT d3d8_GetBackBufferWidth(void)  { return g_device_state.width; }
+UINT d3d8_GetBackBufferHeight(void) { return g_device_state.height; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
+
+/* The size the guest believes it presents at, which is what its
+ * pre-transformed (XYZRHW) vertices are measured in. The same as the back
+ * buffer until a host renders larger than the guest asked; then every
+ * screen-space quad must still be divided by the guest's 640x480, or a
+ * scaled-up window draws its menus in the top-left quarter. Set by the HLE
+ * from the title's own present parameters; unset means the back buffer. */
+static UINT g_guest_width, g_guest_height;
+void xbox_D3D8SetGuestSize(UINT width, UINT height)
+{
+    g_guest_width = width;
+    g_guest_height = height;
+}
+UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.width; }
+
+/* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
+ * keeps one: D3D11 applies one scissor per viewport, and what titles clip
+ * with it -- a scrolling text box, a minimap -- is one rectangle. More than
+ * one, or an exclusive scissor (draw outside the rectangles), cannot be
+ * expressed here and is applied as no scissor, said once. Coordinates are
+ * render-target pixels, as on the Xbox; when the host renders larger than
+ * the guest they will need scaling, like the viewport. */
+static BOOL       g_scissor_enabled;
+static D3D11_RECT g_scissor;
+static UINT       g_scissor_count;
+static BOOL       g_scissor_exclusive;
+static D3DRECT    g_scissor_rect;
+
+void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
+{
+    static int said;
+
+    if (!rects)
+        count = 0;
+    g_scissor_count = count;
+    g_scissor_exclusive = exclusive;
+    memset(&g_scissor_rect, 0, sizeof g_scissor_rect);
+    if (count)
+        g_scissor_rect = rects[0];
+    g_scissor_enabled = count >= 1 && !exclusive;
+    if (g_scissor_enabled) {
+        g_scissor.left   = rects[0].x1;
+        g_scissor.top    = rects[0].y1;
+        g_scissor.right  = rects[0].x2;
+        g_scissor.bottom = rects[0].y2;
+    }
+    if ((count > 1 || (count && exclusive)) && !said++)
+        fprintf(stderr, "D3D8: SetScissors with %u rectangle(s)%s: the host applies at most "
+                        "one inclusive rectangle\n", count, exclusive ? ", exclusive" : "");
+}
+
+BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
+{
+    if (count)     *count = g_scissor_count;
+    if (exclusive) *exclusive = g_scissor_exclusive;
+    if (rect)      *rect = g_scissor_rect;
+    return g_scissor_count != 0;
+}
+
+BOOL d3d8_GetScissor(D3D11_RECT *out)
+{
+    if (out)
+        *out = g_scissor;
+    return g_scissor_enabled;
+}
+UINT d3d8_GetGuestHeight(void) { return g_guest_height ? g_guest_height : g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return (stage < 4) ? g_cur_textures[stage] : NULL; }
@@ -206,7 +275,9 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    /* SHADER_INPUT as well: a title that post-processes its own image reads
+     * the finished frame back (d3d8_screencopy.c), and that reads this. */
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
     scd.OutputWindow = pp->hDeviceWindow;
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
@@ -378,6 +449,8 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     if (ref <= 0) {
         /* Cleanup subsystems first */
         up_ring_shutdown();
+        d3d8_overlay_shutdown();
+        xbox_D3D8ScreenCopyShutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
@@ -775,70 +848,89 @@ static void *convert_fan_or_quad(D3DPRIMITIVETYPE pt, const void *src,
 }
 
 /* ================================================================
- * DrawPrimitiveUP ring buffer
+ * DrawPrimitiveUP ring buffers
  *
- * Instead of creating and destroying a D3D11 buffer on every
- * DrawPrimitiveUP call, use a persistent ring buffer.
+ * Instead of creating and destroying a D3D11 buffer on every UP draw,
+ * append into a persistent dynamic buffer with the discard /
+ * no-overwrite discipline: NO_OVERWRITE while there is room, DISCARD
+ * at the wrap, which renames the buffer underneath draws already
+ * submitted so they keep their data. One ring holds vertices, one
+ * holds indices; the indexed draw used to create and release two
+ * immutable buffers per call, ~700 a frame in TimeSplitters 2's level.
  * ================================================================ */
 
-#define UP_RING_BUFFER_SIZE (4 * 1024 * 1024)  /* 4MB ring buffer */
+#define UP_RING_BUFFER_SIZE (4 * 1024 * 1024)  /* 4MB per ring */
 
-static ID3D11Buffer *g_up_ring_buffer = NULL;
-static UINT          g_up_ring_offset = 0;
+typedef struct UpRing {
+    ID3D11Buffer *buffer;
+    UINT          offset;
+    UINT          bind;      /* D3D11_BIND_VERTEX_BUFFER or D3D11_BIND_INDEX_BUFFER */
+    UINT          wraps;     /* how often the ring started over */
+} UpRing;
 
-static HRESULT up_ring_init(void)
+static UpRing g_up_vertex_ring = { NULL, 0, D3D11_BIND_VERTEX_BUFFER, 0 };
+static UpRing g_up_index_ring  = { NULL, 0, D3D11_BIND_INDEX_BUFFER, 0 };
+
+static HRESULT up_ring_init(UpRing *ring)
 {
     D3D11_BUFFER_DESC bd;
     memset(&bd, 0, sizeof(bd));
     bd.ByteWidth = UP_RING_BUFFER_SIZE;
     bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.BindFlags = ring->bind;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &g_up_ring_buffer);
+    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &ring->buffer);
+}
+
+static void up_ring_release(UpRing *ring)
+{
+    if (ring->buffer) {
+        ID3D11Buffer_Release(ring->buffer);
+        ring->buffer = NULL;
+    }
+    ring->offset = 0;
 }
 
 static void up_ring_shutdown(void)
 {
-    if (g_up_ring_buffer) {
-        ID3D11Buffer_Release(g_up_ring_buffer);
-        g_up_ring_buffer = NULL;
-    }
-    g_up_ring_offset = 0;
+    up_ring_release(&g_up_vertex_ring);
+    up_ring_release(&g_up_index_ring);
 }
 
-/* Upload vertex data to ring buffer, returns offset. Returns (UINT)-1 on failure. */
-static UINT up_ring_upload(const void *data, UINT size)
+/* Append data to a ring, returns its byte offset. Returns (UINT)-1 on failure. */
+static UINT up_ring_upload(UpRing *ring, const void *data, UINT size)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
     D3D11_MAP map_type;
     HRESULT hr;
     UINT offset;
 
-    if (!g_up_ring_buffer) {
-        if (FAILED(up_ring_init())) return (UINT)-1;
+    if (!ring->buffer) {
+        if (FAILED(up_ring_init(ring))) return (UINT)-1;
     }
 
     if (size > UP_RING_BUFFER_SIZE) return (UINT)-1;
 
     /* Wrap around if not enough space */
-    if (g_up_ring_offset + size > UP_RING_BUFFER_SIZE) {
-        g_up_ring_offset = 0;
+    if (ring->offset + size > UP_RING_BUFFER_SIZE) {
+        ring->offset = 0;
+        ring->wraps++;
         map_type = D3D11_MAP_WRITE_DISCARD;
     } else {
         map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
     }
 
     hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
-        (ID3D11Resource *)g_up_ring_buffer, 0, map_type, 0, &mapped);
+        (ID3D11Resource *)ring->buffer, 0, map_type, 0, &mapped);
     if (FAILED(hr)) return (UINT)-1;
 
-    offset = g_up_ring_offset;
+    offset = ring->offset;
     memcpy((BYTE *)mapped.pData + offset, data, size);
 
     ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
-        (ID3D11Resource *)g_up_ring_buffer, 0);
+        (ID3D11Resource *)ring->buffer, 0);
 
-    g_up_ring_offset = (offset + size + 15) & ~15;  /* 16-byte align */
+    ring->offset = (offset + size + 15) & ~15;  /* 16-byte align */
     return offset;
 }
 
@@ -853,8 +945,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     if (vertex_count == 0) return E_INVALIDARG;
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -873,8 +964,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     if (index_count == 0) return E_INVALIDARG;
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -935,18 +1025,17 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     vb_size = vertex_count * VertexStreamZeroStride;
 
     /* Upload to ring buffer */
-    ring_offset = up_ring_upload(draw_data, vb_size);
+    ring_offset = up_ring_upload(&g_up_vertex_ring, draw_data, vb_size);
     if (converted) free(converted);
 
     if (ring_offset == (UINT)-1) return E_OUTOFMEMORY;
 
     /* Bind ring buffer at the right offset */
     ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-        0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
+        0, 1, &g_up_vertex_ring.buffer, &VertexStreamZeroStride, &ring_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -967,13 +1056,10 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     (void)self; (void)MinVertexIndex;
     g_d3d_draw_count++;
     D3D11_PRIMITIVE_TOPOLOGY topology;
-    D3D11_BUFFER_DESC bd;
-    D3D11_SUBRESOURCE_DATA sd;
-    ID3D11Buffer *tmp_vb = NULL, *tmp_ib = NULL;
     UINT index_count, vb_size, ib_size, offset = 0;
+    UINT vb_offset, ib_offset;
     UINT idx_bytes;
     DXGI_FORMAT ib_fmt;
-    HRESULT hr;
 
     if (!pVertexData || !pIndexData || !VertexStreamZeroStride) return E_INVALIDARG;
 
@@ -985,40 +1071,25 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     vb_size = NumVertices * VertexStreamZeroStride;
     ib_size = index_count * idx_bytes;
 
-    /* Create temp vertex buffer */
-    memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = vb_size;
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    memset(&sd, 0, sizeof(sd));
-    sd.pSysMem = pVertexData;
-    hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, &sd, &tmp_vb);
-    if (FAILED(hr)) return hr;
-
-    /* Create temp index buffer */
-    bd.ByteWidth = ib_size;
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    sd.pSysMem = pIndexData;
-    hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, &sd, &tmp_ib);
-    if (FAILED(hr)) { ID3D11Buffer_Release(tmp_vb); return hr; }
+    /* Append vertices and indices to their rings; the draw reads them at
+     * the returned offsets. */
+    vb_offset = up_ring_upload(&g_up_vertex_ring, pVertexData, vb_size);
+    if (vb_offset == (UINT)-1) return E_OUTOFMEMORY;
+    ib_offset = up_ring_upload(&g_up_index_ring, pIndexData, ib_size);
+    if (ib_offset == (UINT)-1) return E_OUTOFMEMORY;
 
     /* Bind, prepare, draw */
     ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-        0, 1, &tmp_vb, &VertexStreamZeroStride, &offset);
+        0, 1, &g_up_vertex_ring.buffer, &VertexStreamZeroStride, &vb_offset);
     ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
-        tmp_ib, ib_fmt, 0);
+        g_up_index_ring.buffer, ib_fmt, ib_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
     ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
-
-    /* Cleanup temp buffers */
-    ID3D11Buffer_Release(tmp_ib);
-    ID3D11Buffer_Release(tmp_vb);
 
     /* Restore previous bindings */
     if (g_cur_vb) {

@@ -141,3 +141,28 @@ class Originals(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Imports(unittest.TestCase):
+    """HLE_IMPORT_VAR resolves functions as well as variables.
+
+    The D3D replacement imports D3D_BlockOnTime to read the device-struct
+    offsets out of its prologue; the address of a function is as good an
+    import as the address of a variable, and was refused before.
+    """
+
+    def test_a_function_symbol_resolves_like_a_variable(self):
+        from tools.recomp.hle import resolve_variables
+        symbols = [{"name": "D3D_g_pDevice", "address": 0x1E9238, "kind": "variable"},
+                   sym("D3D_BlockOnTime", 0x1E03F0)]
+        values, notes = resolve_variables(["D3D_BlockOnTime", "D3D_g_pDevice"], symbols)
+        self.assertEqual(values, {"D3D_BlockOnTime": 0x1E03F0,
+                                  "D3D_g_pDevice": 0x1E9238})
+        self.assertEqual(notes, [])
+
+    def test_a_name_at_two_addresses_is_not_guessed(self):
+        from tools.recomp.hle import resolve_variables
+        symbols = [sym("D3D_BlockOnTime", 0x1000), sym("D3D_BlockOnTime", 0x2000)]
+        values, notes = resolve_variables(["D3D_BlockOnTime"], symbols)
+        self.assertEqual(values, {"D3D_BlockOnTime": 0})
+        self.assertEqual(len(notes), 1)

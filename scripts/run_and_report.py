@@ -76,12 +76,23 @@ def run(exe: Path, seconds: float, out_dir: Path, tag: str, profile=None,
                     # comparing one against a run with it reads as "the change
                     # did nothing".
                     "switches=" + ",".join(
-                        k for k in ("RECOMP_VBLANK", "RECOMP_PB_EXEC",
+                        # With the value, where it is more than a flag: 60 Hz
+                        # and 120 Hz are different runs.
+                        (k if os.environ.get(k) == "1" else f"{k}={os.environ.get(k)}")
+                        for k in ("RECOMP_VBLANK", "RECOMP_PB_EXEC",
                                     "RECOMP_PB_SCAN", "RECOMP_NV2A_TRACE",
                                     # Without these DirectSoundCreate fails,
                                     # and the title crashes much later in
                                     # DownloadEffectsImage on a null object.
-                                    "RECOMP_AC97_READY", "RECOMP_APU_DSP_ACK")
+                                    "RECOMP_AC97_READY", "RECOMP_APU_DSP_ACK",
+                                    # Host drawing, the frame clock and the
+                                    # profilers: a frame-rate comparison
+                                    # between runs is meaningless unless
+                                    # these match, and RECOMP_SAMPLE costs a
+                                    # little itself.
+                                    "RECOMP_HLE_D3D8", "RECOMP_VBLANK_HZ",
+                                    "RECOMP_VBLANK_CLOCK", "RECOMP_FPS",
+                                    "RECOMP_SAMPLE")
                         if os.environ.get(k)) or "switches=none",
                     f"exe={exe}", ""]),
         encoding="utf-8")
@@ -195,8 +206,9 @@ def main() -> int:
                          "often a running total is printed; this reads the "
                          "highest. Keep it small while a title dies early -- a "
                          "run that faults before the first report leaves none, "
-                         "and a crash never reaches atexit. Raise it once the "
-                         "title runs long enough to make the lines a nuisance.")
+                         "and a crash never reaches atexit. The runtime caps "
+                         "reports at one per second regardless, so a small "
+                         "interval no longer slows the title.")
     ap.add_argument("--kernel-log", type=int, default=None, metavar="N",
                     help="How many kernel calls to log (RECOMP_KERNEL_LOG_BUDGET). "
                          "The default of 200 is a budget, not a limit on the "

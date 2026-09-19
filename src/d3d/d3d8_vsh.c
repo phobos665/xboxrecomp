@@ -1235,10 +1235,12 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
         return E_OUTOFMEMORY;
     }
 
-    /* Store microcode (deferred compilation) */
+    /* Store microcode (deferred compilation); its hash is the cache key
+     * every draw with this program looks up, so it is taken once here. */
     memcpy(g_vsh_slots[slot].microcode, microcode,
            (size_t)num_insns * 4 * sizeof(DWORD));
     g_vsh_slots[slot].length = num_insns;
+    g_vsh_slots[slot].hash = fnv1a_hash(microcode, (size_t)num_insns * 4 * sizeof(DWORD));
     g_vsh_slots[slot].in_use = 1;
     g_vsh_slots[slot].decl_count = 0;
     g_vsh_slots[slot].decl_hash = 0;
@@ -1248,8 +1250,16 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
      * Xbox D3D8 uses handles with the high bit set (> 0xFFFF). */
     *out_handle = (DWORD)(slot + 0x10000);
 
-    fprintf(stderr, "D3D8 VSH: Created shader handle 0x%lX (%d instructions)\n",
-            *out_handle, num_insns);
+    /* Titles that stream programs create thousands of these; stderr is
+     * unbuffered and this line was a tenth of a frame. */
+    {
+        static int logged;
+        if (logged < 64) {
+            fprintf(stderr, "D3D8 VSH: Created shader handle 0x%lX (%d instructions)%s\n",
+                    *out_handle, num_insns,
+                    ++logged == 64 ? " (further creates not logged)" : "");
+        }
+    }
 
     return S_OK;
 }
@@ -1414,8 +1424,8 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     if (!vsh->in_use)
         return FALSE;
 
-    /* Hash the microcode to look up in cache */
-    hash = fnv1a_hash(vsh->microcode, (size_t)vsh->length * 4 * sizeof(DWORD));
+    /* The microcode's hash, taken when the program was loaded */
+    hash = vsh->hash;
 
     /* Look up in cache */
     entry = cache_lookup(hash);

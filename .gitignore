@@ -13,6 +13,9 @@ tools/abi_analysis/output/
 #xbox-specific
 /games
 /xemu*
+# A title's generated code dropped at the repo root (game/recomp/gen): game
+# content, like everything else derived from an XBE.
+/game
 
 # Game files (user provides their own)
 game_files/

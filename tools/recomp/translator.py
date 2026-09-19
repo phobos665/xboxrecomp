@@ -23,7 +23,31 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers, _func_ident)
+                     detect_setjmp_helpers, _func_ident, _operand_width)
+
+
+def _merge_flag_states(states):
+    """Merge comparable snapshots without requiring identical source operands.
+
+    CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
+    runtime. A shared consumer can use whichever predecessor executed. Keep
+    operation and width equal because sign/parity handling depends on them;
+    arithmetic states still reconstruct operands and cannot use this merge.
+    """
+    if not states or any(not state or not state[0] for state in states):
+        return None
+    first = states[0]
+    if all(state == first for state in states[1:]):
+        return first
+    if first[0] not in ("cmp", "test") or len(first[1]) != 2:
+        return None
+    width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+    for kind, ops in states[1:]:
+        if kind != first[0] or len(ops) != 2:
+            return None
+        if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+            return None
+    return first
 
 
 def write_if_changed(path, text):
@@ -647,7 +671,7 @@ class FunctionTranslator:
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
-                    and last_setter in CF_TRACKED):
+                    and (last_setter in CF_TRACKED or last_setter in ("inc", "dec"))):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
@@ -745,13 +769,17 @@ class FunctionTranslator:
         self.lifter.imm_code_refs = imm_refs
 
         # Collect switch table targets as extra block leaders
-        switch_leaders = set(imm_refs)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                targets = self.lifter._analyze_switch_table(insn.operands)
-                for t in targets:
-                    if start <= t < end:
-                        switch_leaders.add(t)
+        def collect_switch_leaders(insns):
+            leaders = set(imm_refs)
+            for insn in insns:
+                if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                    targets = self.lifter._analyze_switch_table(insn.operands)
+                    for t in targets:
+                        if start <= t < end:
+                            leaders.add(t)
+            return leaders
+
+        switch_leaders = collect_switch_leaders(instructions)
 
         # A switch target the decode never produced an instruction for cannot
         # become a block leader, so it gets no label and its `goto` is dropped
@@ -760,11 +788,33 @@ class FunctionTranslator:
         # the code it points at: decoding the table as instructions leaves the
         # stream misaligned across the first case. Re-decode, telling the
         # disassembler where the real instruction boundaries are.
+        #
+        # Iterated, because the re-decode can reveal more dispatches. The
+        # linear sweep stops dead at the first table it walks into (capstone
+        # gives up on the first undecodable byte), so a function with several
+        # tables -- TimeSplitters 2's memcpy (sub_001D3340) has five -- only
+        # ever showed its first one here; re-syncing from that table's arms
+        # decoded the rest of the function, including the later dispatches,
+        # but their arms were never made leaders, and the two just past the
+        # fourth table stayed inside the out-of-phase junk. Every call through
+        # them failed to resolve at run time.
         if recovered is None:
-            missing = switch_leaders - {insn.address for insn in instructions}
-            if missing:
+            resync = set()
+            for _round in range(8):
+                missing = switch_leaders - {insn.address for insn in instructions}
+                if not missing:
+                    break
+                resync |= missing
                 instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end, resync=missing)
+                    raw_bytes, start, end, resync=resync)
+                switch_leaders = collect_switch_leaders(instructions)
+        # RECOMP_DEBUG_FUNC=<hex start>: say how this function's switch arms
+        # were found, for the one that lifts with a dead arm.
+        if os.environ.get("RECOMP_DEBUG_FUNC", "").upper() == f"{start:08X}":
+            have = {insn.address for insn in instructions}
+            print(f"[debug] sub_{start:08X}: end 0x{end:08X} recovered={recovered is not None} "
+                  f"insns={len(instructions)} switch_leaders={sorted(hex(t) for t in switch_leaders)} "
+                  f"undecoded={sorted(hex(t) for t in switch_leaders - have)}")
 
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(
@@ -902,7 +952,15 @@ class FunctionTranslator:
         if "ebp" in used_regs:
             reg_decls.append("ebp")
         if reg_decls:
-            lines.append(f"    uint32_t {', '.join(reg_decls)};")
+            # Initialised, not just declared. A function with a real
+            # "push ebp; mov ebp, esp" prologue pushes ebp before it ever
+            # assigns one, so its first statement reads this local while the
+            # value is still indeterminate. At -O0 that is whatever the host
+            # stack happened to hold; from -O1 up it is poison the compiler is
+            # free to propagate, and the pushed word is a frame pointer the
+            # epilogue pops back and callers may walk.
+            decls = ", ".join(f"{r} = 0" for r in reg_decls)
+            lines.append(f"    uint32_t {decls};")
 
         # A function with no `push ebp; mov ebp, esp` prologue that still reads
         # ebp is addressing its *caller's* frame. MSVC emits these for shared
@@ -920,7 +978,12 @@ class FunctionTranslator:
         # would still hold. Deliberately not the same as making ebp global:
         # that also changes save/restore, and a callee that fails to restore
         # then corrupts its caller (tried; esp underflowed inside XapiStartup).
-        if "ebp" in used_regs and not self._func_has_prologue(instructions):
+        if "ebp" in used_regs and self._func_has_prologue(instructions):
+            # The prologue's first PUSH saves the incoming register before
+            # MOV establishes this function's frame. It must not push an
+            # uninitialized C local into the guest's saved-frame chain.
+            lines.append("    ebp = g_ebp;  /* prologue saves caller's frame */")
+        elif "ebp" in used_regs:
             lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
         # Add _flags variable if function has conditional instructions
@@ -941,7 +1004,7 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg")
+                                 "lock cmpxchg", "inc", "dec")
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -1063,20 +1126,17 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
+            # Inherit agreed state, including compatible CMP/TEST snapshots
+            # whose source operands differ between predecessor paths.
             # Blocks are walked in address order, so a back edge's predecessor
             # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
+            # guessing at which operation produced the runtime flags.
             sources = preds[bb.start]
             if bb.start == start or not sources:
                 incoming = None
             elif all(p in out_state for p in sources):
                 states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
+                incoming = _merge_flag_states(states)
             else:
                 incoming = None
 

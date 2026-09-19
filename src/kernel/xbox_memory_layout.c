@@ -521,6 +521,174 @@ static void frame_counters_tick(void)
     }
 }
 
+/* The flip gate (xbox_memory_layout.h).
+ *
+ * The HLE Swap calls xbox_Nv2aFlipGateArm() before it runs the title's own
+ * Swap, and that call sleeps until the kernel's vblank tick releases it. So
+ * there is one Swap per vblank, the guest thread sleeps for the rest of the
+ * frame instead of spinning, and the title's own fence wait is not involved.
+ *
+ * It is not involved on purpose. The first version held the fence mirror
+ * instead, so that the title's wait inside Swap would block; but a title
+ * waits for the *previous* frame's fence there (its flips are double
+ * buffered), which the mirror had already completed at the last vblank, and
+ * two Swaps got through per vblank: TimeSplitters 2's menus measured 120-140
+ * fps with a 60 Hz vblank.
+ *
+ * The gate only holds once a vblank has ever been delivered -- without
+ * RECOMP_VBLANK nothing would release it -- and never for more than a quarter
+ * of a second, so a vblank thread that stops cannot hang the title; the first
+ * timeout is logged, because it means pacing is not happening. A vblank that
+ * arrived while the title was still drawing does not count: the wait is for
+ * the next one, or the frame after it could present again in the same period.
+ *
+ * Adaptive by default: a Swap that arrives after the vblank it should have
+ * waited for presents at once, and only a frame that finished inside the
+ * period is held for the next vblank. RECOMP_FPS_CAP=<fps> is the strict
+ * console cadence instead -- every Swap waits for the next release, and the
+ * release comes every (vblank rate / fps)th vblank; 30 with a 60 Hz vblank
+ * is what a title sees on hardware when it misses every other frame, fine
+ * for a fixed-30 title and half speed for one that steps its logic per
+ * presented frame. RECOMP_FPS_CAP=0 switches the gate off, for measuring.
+ *
+ * Why adaptive won (TimeSplitters 2's Siberia, 19 Sep 2026, quiet machine,
+ * three scripted runs of each, docs/technical/resolution-and-framerate.md):
+ * uncapped the level ran 79-89 fps with a 12.4 ms frame, so the title was
+ * not paced at all; adaptive held 59.9-60.2 in every five-second window with
+ * 3.7 ms of gate wait per frame; strict 60 held 60 most of the time but
+ * dipped to 55-58 and once to 45 at the same points in all three runs,
+ * because a frame that just misses its vblank waits out a whole extra one.
+ * Burnout 2's front end, 1 ms of work a frame, holds 60.0 under either. */
+static HANDLE        g_flip_gate_event;
+static volatile LONG g_flip_gate_vblanks;
+static int           g_flip_gate_divisor = -1;      /* -1: not configured */
+static int           g_flip_gate_strict;            /* RECOMP_FPS_CAP given */
+
+/* What the on-screen toggle cycles through: the settings a player picks
+ * between, in that order. A RECOMP_FPS_CAP outside this list still works --
+ * it is simply not one of the stops, and the first press moves to the
+ * first one. */
+static const struct { int divisor, strict; const char *name; } g_gate_modes[] = {
+    { 1, 0, "adaptive" },
+    { 1, 1, "60" },
+    { 2, 1, "30" },
+    { 0, 0, "off" },
+};
+
+/* A switch that is on unless it is turned off, or off unless turned on.
+ *
+ * The things a title needs in order to run at all -- the vblank, the audio
+ * codec's ready bit, the replacement renderer -- began as experiments, and an
+ * experiment is off until asked for. They are not experiments any more: a
+ * player double-clicking the executable should get the game, not a black
+ * window, so they default on and the variable turns them off. "0", "off",
+ * "no" and "false" mean off; anything else, including an empty value, means
+ * on. */
+int xbox_EnvSwitch(const char *name, int default_on)
+{
+    const char *v = name ? getenv(name) : NULL;
+
+    if (!v)
+        return default_on;
+    if (!*v)
+        return 1;
+    return !(strcmp(v, "0") == 0 || _stricmp(v, "off") == 0 ||
+             _stricmp(v, "no") == 0 || _stricmp(v, "false") == 0);
+}
+
+static int flip_gate_divisor(void)
+{
+    if (g_flip_gate_divisor < 0) {
+        const char *cap = getenv("RECOMP_FPS_CAP");
+        const char *hz = getenv("RECOMP_VBLANK_HZ");
+        int vblank = hz && atoi(hz) > 0 ? atoi(hz) : 60;
+        int d = 1;                                      /* adaptive unless asked */
+
+        if (cap && *cap) {
+            int fps = atoi(cap);
+            if (strcmp(cap, "adaptive") == 0)
+                d = 1;
+            else if (strcmp(cap, "0") == 0 || strcmp(cap, "off") == 0)
+                d = 0;
+            else if (fps > 0) {
+                d = (vblank + fps / 2) / fps;
+                if (d < 1) d = 1;
+                g_flip_gate_strict = 1;
+            }
+        }
+        g_flip_gate_divisor = d;
+        fprintf(stderr, "  [NV2A] flip gate: %s\n",
+                d == 0 ? "off, Swap never waits (RECOMP_FPS_CAP=adaptive or 60 to pace)"
+                       : !g_flip_gate_strict ? "adaptive, at most one Swap per vblank (RECOMP_FPS_CAP=0 to switch off)"
+                       : d == 1 ? "strict, one Swap per vblank" : "strict, one Swap per N vblanks");
+        if (d > 1)
+            fprintf(stderr, "  [NV2A] flip gate divisor %d (RECOMP_FPS_CAP=%s at %d Hz)\n",
+                    d, cap, vblank);
+        fflush(stderr);
+    }
+    return g_flip_gate_divisor;
+}
+
+/* Where the current setting sits in that list, or -1 for one that is not in
+ * it. */
+static int flip_gate_mode_index(void)
+{
+    int d = flip_gate_divisor(), i;
+
+    for (i = 0; i < (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]); i++)
+        if (g_gate_modes[i].divisor == d &&
+            (d == 0 || g_gate_modes[i].strict == g_flip_gate_strict))
+            return i;
+    return -1;
+}
+
+const char *xbox_Nv2aFlipGateModeName(void)
+{
+    int i = flip_gate_mode_index();
+    return i < 0 ? "custom" : g_gate_modes[i].name;
+}
+
+void xbox_Nv2aFlipGateCycle(void)
+{
+    int i = flip_gate_mode_index();
+
+    i = i < 0 ? 0 : (i + 1) % (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]);
+    g_flip_gate_divisor = g_gate_modes[i].divisor;
+    g_flip_gate_strict = g_gate_modes[i].strict;
+    fprintf(stderr, "  [NV2A] flip gate: %s\n", g_gate_modes[i].name);
+    fflush(stderr);
+}
+
+void xbox_Nv2aFlipGateArm(void)
+{
+    static int said;
+
+    if (flip_gate_divisor() == 0)
+        return;
+    if (!InterlockedCompareExchange(&g_flip_gate_vblanks, 0, 0))
+        return;                                         /* no vblank has ever come */
+    if (!g_flip_gate_event)
+        return;
+    if (g_flip_gate_strict)
+        ResetEvent(g_flip_gate_event);                  /* the next vblank, not a past one */
+    if (WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
+        fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "
+                        "the title is not being paced\n");
+        fflush(stderr);
+    }
+}
+
+void xbox_Nv2aFlipGateRelease(void)
+{
+    LONG n = InterlockedIncrement(&g_flip_gate_vblanks);
+    int d = flip_gate_divisor();
+
+    if (!g_flip_gate_event)
+        g_flip_gate_event = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset */
+    if (g_flip_gate_event && (d <= 1 || n % d == 0))
+        SetEvent(g_flip_gate_event);
+}
+
 static void fence_mirrors_tick(void)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
@@ -612,6 +780,7 @@ static void framebuffer_probe_tick(void)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xbox_NameCurrentThread(L"nv2a ack");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
@@ -916,6 +1085,7 @@ RECOMP_TLS int g_fp_top = 0;
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;
@@ -1688,7 +1858,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Only when RECOMP_VBLANK is set, because that is the only thing that
          * raises an interrupt for anyone to acknowledge.
          */
-        if (g_nv2a_memory && getenv("RECOMP_VBLANK")) {
+        if (g_nv2a_memory && xbox_EnvSwitch("RECOMP_VBLANK", 1)) {
             DWORD old_nv;
             if (VirtualProtect((char *)g_nv2a_memory + XBOX_NV2A_PCRTC_PAGE,
                                4096, PAGE_READONLY, &old_nv))
@@ -1775,7 +1945,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * init. Until the DSP handshake is answered, the honest default is
              * the failure that gets further, with the correct behaviour one
              * variable away. */
-            if (getenv("RECOMP_AC97_READY")) {
+            if (xbox_EnvSwitch("RECOMP_AC97_READY", 1)) {
                 /* The APU's registers have to fault so they can be routed to
                  * the emulated APU, which is the half that answers the DSP
                  * handshake. Backed as plain memory the guest's writes go

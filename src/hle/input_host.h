@@ -16,9 +16,14 @@ enum {
     HOST_ANALOG_BLACK, HOST_ANALOG_WHITE, HOST_ANALOG_LTRIG, HOST_ANALOG_RTRIG,
 };
 
-/* One sample of XInput pad 0, the keyboard, and any RECOMP_FAKE_INPUT press,
- * as the Xbox gamepad the title reads. Always succeeds: with nothing
- * connected or pressed it is a neutral pad. */
+/* One sample of the host device bound to this port, as the Xbox gamepad the
+ * title reads. Always succeeds: with nothing connected or pressed it is a
+ * neutral pad. RECOMP_FAKE_INPUT and RECOMP_INPUT_SEQ presses are added on
+ * port 0 only. Ports are 0-based here and 1-based in the UI and the config
+ * file, where they are what is written on the console. */
+bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad);
+
+/* Port 0, for callers that only ever had one pad. */
 bool recomp_input_host_sample(RecompInputGamepad *gamepad);
 
 #endif

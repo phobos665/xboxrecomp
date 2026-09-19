@@ -184,6 +184,84 @@ static void dsp_ack_discovered(MCPXAPUState *d)
     }
 }
 
+/* Physical address of the first page a DSP scatter-gather table maps, or 0.
+ *
+ * `saddr_reg` is one of GPSADDR/GPFADDR/EPSADDR/EPFADDR: the physical address
+ * of a table of 8-byte {page, 0} entries. Everything is bounds-checked
+ * against the 128 MB the physical mirror can address, because a register the
+ * title has not written yet reads as zero and a half-written one as garbage. */
+#define APU_PHYS_LIMIT 0x08000000u
+
+static uint32_t sge_first_page(MCPXAPUState *d, uint32_t saddr_reg)
+{
+    uint32_t table = d->regs[saddr_reg] & ~0xFFFu;
+    uint32_t page;
+
+    if (!table || table + 8 > APU_PHYS_LIMIT)
+        return 0;
+    page = *(const volatile uint32_t *)(d->ram_ptr + table) & ~0xFFFu;
+    if (!page || page + APU_DSP_DOORBELL_OFFSET + 4 > APU_PHYS_LIMIT)
+        return 0;
+    return page;
+}
+
+static int dsp_ack_from_page_tables(MCPXAPUState *d)
+{
+    static const struct { uint32_t reg; const char *name; } tables[] = {
+        { NV_PAPU_GPSADDR, "GP scratch" },
+        { NV_PAPU_EPSADDR, "EP scratch" },
+    };
+    static uint32_t seen_page[2];
+    static int reported_tables;
+    int i, any = 0;
+
+    /* Once, so a run log says which pages the tables map and the doorbell
+     * offset can be checked against a watchdog sample if it ever moves. */
+    if (!reported_tables) {
+        uint32_t gps = d->regs[NV_PAPU_GPSADDR], gpf = d->regs[NV_PAPU_GPFADDR];
+        uint32_t eps = d->regs[NV_PAPU_EPSADDR], epf = d->regs[NV_PAPU_EPFADDR];
+        if (gps || gpf || eps || epf) {
+            reported_tables = 1;
+            fprintf(stderr, "[APU] DSP page tables: GPS 0x%08X (page 0 0x%08X) "
+                            "GPF 0x%08X (page 0 0x%08X) EPS 0x%08X (page 0 0x%08X) "
+                            "EPF 0x%08X (page 0 0x%08X)\n",
+                    gps, sge_first_page(d, NV_PAPU_GPSADDR),
+                    gpf, sge_first_page(d, NV_PAPU_GPFADDR),
+                    eps, sge_first_page(d, NV_PAPU_EPSADDR),
+                    epf, sge_first_page(d, NV_PAPU_EPFADDR));
+        }
+    }
+
+    for (i = 0; i < 2; i++) {
+        uint32_t page = sge_first_page(d, tables[i].reg);
+        volatile uint32_t *slot;
+        uint32_t v;
+
+        if (!page)
+            continue;
+        any = 1;
+        if (seen_page[i] != page) {
+            seen_page[i] = page;
+            fprintf(stderr, "[APU] DSP doorbell (%s): page 0 at 0x%08X, "
+                            "command word at 0x%08X\n",
+                    tables[i].name, page, page + APU_DSP_DOORBELL_OFFSET);
+        }
+        slot = (volatile uint32_t *)(d->ram_ptr + page + APU_DSP_DOORBELL_OFFSET);
+        v = *slot;
+        /* A command is a small code -- 2 and 3 seen so far. Anything larger
+         * is data in a page that is not what this thinks it is. */
+        if (v && v <= 0xFF) {
+            static int shown[2];
+            if (shown[i]++ < 3)
+                fprintf(stderr, "[APU] DSP doorbell (%s) 0x%08X: command 0x%02X "
+                                "acknowledged\n",
+                        tables[i].name, page + APU_DSP_DOORBELL_OFFSET, v);
+            *slot = 0;
+        }
+    }
+    return any;
+}
+
 static void dsp_ack_frame(MCPXAPUState *d)
 {
     int i;
@@ -197,7 +275,10 @@ static void dsp_ack_frame(MCPXAPUState *d)
      * measured, there is no reason to re-derive it every frame. */
     if (s_dsp_ack_count) {
         for (i = 0; i < s_dsp_ack_count; i++) {
-            uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+            /* The list holds guest VAs as the watchdog prints them
+             * (0x83650810); ram_ptr is the physical view, so take the page
+             * number within the 64 MB. */
+            uint32_t *slot = (uint32_t *)(d->ram_ptr + (s_dsp_ack[i] & 0x03FFFFFFu));
             if (*slot) {
                 static int shown[APU_DSP_ACK_MAX];
                 if (shown[i]++ < 3)
@@ -208,6 +289,26 @@ static void dsp_ack_frame(MCPXAPUState *d)
         }
         return;
     }
+
+    /* Derive the doorbell from the DSP's own page tables.
+     *
+     * The command block is not "a DirectSound heap allocation" the way the
+     * note above assumes. It is the first page of the DSP's scratch memory,
+     * and DirectSound tells the hardware where that is: it builds a
+     * scatter-gather table -- one {physical page, 0} pair per page, built
+     * with MmGetPhysicalAddress in a loop -- and writes the table's address
+     * to GPSADDR (EPSADDR for the encode processor). The DSP program then
+     * reads its command word from a fixed offset in scratch page 0. So the
+     * address IS derivable from the registers, one indirection deeper than
+     * the note looked: entry 0 of the table GPSADDR points at, plus 0x810.
+     *
+     * TimeSplitters 2's doorbell was found by the watchdog at 0x83650810,
+     * held command 3 (download the effects image), and both of Burnout 2's
+     * sat at base + 0x810 too. Acknowledged the same way as the explicit
+     * list: a small non-zero word is a command, and clearing it is what
+     * "done" looks like. Runs by default; RECOMP_APU_DSP_ACK still wins. */
+    if (dsp_ack_from_page_tables(d))
+        return;
 
     /* Opt-in, because it does not work yet.
      *

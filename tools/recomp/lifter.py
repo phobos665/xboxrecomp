@@ -48,6 +48,13 @@ if os.path.exists(_WIN32_EXPORTS_FILE):
 # APIs they wrap, so the same clash happens there for the linker. Mangle with
 # the address, the same suffixed-<addr> scheme func_id already uses for
 # duplicate names.
+#
+# This is the last guard before a name becomes a C token, and the only one
+# every name source passes through -- Ghidra, IDA, a hand-written symbols
+# file. tools/ghidra_naming/merge_names.py filters a similar set earlier, but
+# it only sees the Ghidra path, so this list must not be the smaller of the
+# two. Over-mangling costs an address suffix on a name; under-mangling costs
+# a build.
 _FUNC_RESERVED_IDENT = frozenset({
     # C and C++ keywords
     "asm", "auto", "break", "case", "char", "const", "continue",
@@ -60,17 +67,34 @@ _FUNC_RESERVED_IDENT = frozenset({
     "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat",
     "strchr", "strcmp", "strcoll", "strcpy", "strcspn", "strerror",
     "strlen", "strncat", "strncmp", "strncpy", "strpbrk", "strrchr",
-    "strspn", "strstr", "strtok", "strxfrm",
-    # <math.h>
+    "strspn", "strstr", "strtok", "strxfrm", "strdup", "strnlen",
+    # <math.h> C89
     "acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp",
     "fabs", "floor", "fmod", "frexp", "ldexp", "log", "log10", "modf",
     "pow", "sin", "sinh", "sqrt", "tan", "tanh",
+    # <math.h> C99 classification and comparison. These are function-like
+    # *macros*, which makes them the worst members of this set: a function
+    # named `isnan` does not collide, it expands. `void isnan(void);` becomes
+    # `void (fpclassify(void) == FP_NAN);` and the compiler reports a bad
+    # parameter declarator inside corecrt_math.h, naming neither the guest
+    # function nor the clash. Reported from a FIFA Street 2 port.
+    "fpclassify", "isfinite", "isgreater", "isgreaterequal", "isinf",
+    "isless", "islessequal", "islessgreater", "isnan", "isnormal",
+    "isunordered", "signbit",
+    # <math.h> C99 functions
+    "acosh", "asinh", "atanh", "cbrt", "copysign", "erf", "erfc", "exp2",
+    "expm1", "fdim", "fma", "fmax", "fmin", "hypot", "ilogb", "lgamma",
+    "llrint", "llround", "log1p", "log2", "logb", "lrint", "lround",
+    "nan", "nearbyint", "nextafter", "nexttoward", "remainder", "remquo",
+    "rint", "round", "scalbln", "scalbn", "tgamma", "trunc",
     # <stdlib.h>
     "abort", "abs", "atexit", "atof", "atoi", "atol", "bsearch",
     "calloc", "div", "exit", "free", "getenv", "labs", "ldiv", "malloc",
     "mblen", "mbstowcs", "mbtowc", "onexit", "qsort", "rand", "realloc",
     "srand", "strtod", "strtol", "strtoul", "system", "wctomb",
     "wcstombs",
+    # <stdlib.h> C99
+    "atoll", "llabs", "lldiv", "strtof", "strtold", "strtoll", "strtoull",
     # <setjmp.h>
     "longjmp", "setjmp",
     # Host Win32 API export names (data/win32_api_names.txt) so a guest
@@ -657,26 +681,49 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"((int32_t){lhs} <= 0)", desc
         if jcc == "jg":
             return f"((int32_t){lhs} > 0)", desc
-        if jcc in ("jb", "jnae", "jbe", "jna"):
+        if jcc in ("jb", "jnae"):
             return "0", desc  # CF=0 after and/or/xor
-        if jcc in ("jae", "jnb", "ja", "jnbe"):
+        if jcc in ("jae", "jnb"):
             return "1", desc
+        # jbe and ja are not carry-only: jbe is CF|ZF, ja is !CF && !ZF. CF is
+        # 0 here, but ZF is whatever the result was, so these reduce to ZF and
+        # !ZF -- not to constants. Folding them to 0 and 1 meant
+        # "and eax, eax; jbe" never branched and "; ja" always did. The
+        # CF_TRACKED path above already spells the same two conditions out in
+        # full, as does the CMP_BE/CMP_A that `test` goes through.
+        if jcc in ("jbe", "jna"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("ja", "jnbe"):
+            return f"({lhs} != 0)", desc
         return None
 
     # ── dec/inc: result-based, CF unchanged ──
     if flag_setter in ("dec", "inc"):
+        lhs = "_fa"  # Result at the flag-setting instruction, before later MOVs.
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        if jcc in ("ja", "jnbe"):
+            return f"(!_cf && {lhs} != 0)", desc
+        if jcc in ("jbe", "jna"):
+            return f"(_cf || {lhs} == 0)", desc
         if jcc in ("je", "jz"):
             return f"({lhs} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return "(_fas < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return "(_fas >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
-            cast = "(int32_t)" + lhs
-            op = {"jl": "<", "jle": "<=", "jg": ">", "jge": ">="}[jcc]
-            return f"({cast} {op} 0)", desc
+            less = "((_fas < 0) != (_fb != 0))"
+            return {"jl": less, "jle": f"({less} || _fa == 0)",
+                    "jg": f"(!{less} && _fa != 0)", "jge": f"!{less}"}[jcc], desc
+        if jcc in ("jo", "jno"):
+            return ("(_fb != 0)" if jcc == "jo" else "(_fb == 0)"), desc
+        if jcc in ("jp", "jpe", "jnp", "jpo"):
+            return ("RECOMP_PARITY8(_fa)" if jcc in ("jp", "jpe") else "!RECOMP_PARITY8(_fa)"), desc
         return None
 
     # ── neg: flags from (0 - a_orig), result is -a ──
@@ -1587,9 +1634,15 @@ class Lifter:
         # For sub-registers (al, cl, etc.), use the SET macro instead of ++
         if ops[0].type == "reg" and ops[0].reg in (
                 "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"):
-            return [f"{val}{'++' if m == 'inc' else '--'};"]
+            out = [f"{val}{'++' if m == 'inc' else '--'};"]
         else:
-            return [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+            out = [_fmt_operand_write(ops[0], f"{val} {op_char} {delta}")]
+        size = _operand_width(ops[0]) or 4
+        mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
+        overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
+        out += [f"_fa = (uint32_t)({val}) & {mask};",
+                f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
+        return out
 
     def _lift_neg(self, insn, ops, preserve_carry=False):
         if len(ops) < 1:
@@ -1712,14 +1765,43 @@ class Lifter:
         return out
 
     def _lift_sar(self, insn, ops):
+        """Arithmetic shift right, at the operand's own width.
+
+        Two things have to be right that a bare "(int32_t)dst >> cnt" gets
+        wrong.
+
+        The cast must match the operand. Every narrow read arrives
+        zero-extended - LO8/HI8/LO16 mask, and MEM8/MEM16 are unsigned - so
+        casting an 8- or 16-bit operand to int32_t produces a positive number
+        and the ">>" is a logical shift wearing an arithmetic cast. "sar al, 1"
+        with al = 0x80 gave 0x40 where x86 gives 0xC0: a negative value halved
+        into a positive one, which is how a fixed-point divide or a signed
+        average goes quietly wrong without ever faulting. int8_t/int16_t
+        promote to int before the shift, so a count at or above the operand
+        width still sign-fills and stays well defined.
+
+        The count must be masked to 5 bits, as x86 does for 8-, 16- and 32-bit
+        operands. Unmasked, "sar eax, 33" asks C for a shift of 33 on a 32-bit
+        type, which is undefined - the host may fold it to 33 & 31 and look
+        correct, which is exactly why it cannot be left to chance.
+
+        CF reads the sign-extended value too, not the raw operand. For a
+        count below the operand width either spelling gives the same bit, but
+        x86 keeps sign-filling past that width: "sar al, 31" on al = 0x80
+        leaves CF = 1. Reading bit 30 of the zero-extended 0x80 gives 0, and
+        reading it of the sign-extended 0xFFFFFF80 gives 1. It takes the count
+        mask for the same reason the value does.
+        """
         if len(ops) < 2:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
+        width = (_operand_width(ops[0]) or 4) * 8
+        signed = f"(int32_t)(int{width}_t)({dst})"
         out = []
         if self.needs_cf:
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
+            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
         return out
 
     def _lift_rotate(self, insn, ops, m):
@@ -1732,7 +1814,8 @@ class Lifter:
 
     # ── Compare / Test (standalone) ──
 
-    # Widths for the flag snapshot below.
+    # Sign-extending cast and mask per operand width, shared by the flag
+    # snapshot below and by the arithmetic shift above.
     _SNAP_MASK = {1: "0xFFu", 2: "0xFFFFu", 4: "0xFFFFFFFFu"}
     _SNAP_SX = {1: "(int8_t)", 2: "(int16_t)", 4: "(int32_t)"}
 
@@ -3028,7 +3111,7 @@ class Lifter:
                     size, "int32_t")
                 pop = " fp_pop();" if m == "fistp" else ""
                 return [f"{mem_acc}({_fmt_mem(ops[0])}) = "
-                        f"({int_type})llrint(fp_top());{pop} /* {m} */"]
+                        f"({int_type})recomp_fist(fp_top(), g_fp_control_word, {size * 8});{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
@@ -3165,8 +3248,10 @@ class Lifter:
         if m == "fldln2":
             return [f"fp_push(0.69314718055994530942); /* fldln2 */"]
         if m == "ftst":
-            return [f"g_fp_cmp = (fp_top() < 0.0) ? -1 : "
-                    f"(fp_top() > 0.0) ? 1 : 0; /* ftst */"]
+            return ["g_fp_cmp = RECOMP_FCMP(fp_top(), 0.0); "
+                    "g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp); /* ftst */"]
+        if m == "fxam":
+            return ["g_fp_cc = recomp_fxam(fp_top()); /* fxam */"]
         if m == "fxch":
             # fxch st(i) swaps st0 with st(i); the bare form is st(1). Was
             # hardcoded to st1, so fxch st(2)/st(3)/st(4) (86/7/1 sites in Halo)
@@ -3200,6 +3285,7 @@ class Lifter:
             npop = 2 if m.endswith("pp") else (1 if m.endswith("p") else 0)
             pops = " fp_pop();" * npop
             return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), {rhs});"
+                    " g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp);"
                     f"{pops} /* {m} {insn.op_str} */"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
             # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
@@ -3226,10 +3312,7 @@ class Lifter:
             # `test ah, 0x44; jp` -- the standard isnan idiom -- reads exactly
             # those two bits. Reporting equal for a NaN compare sends every
             # float classification in a title down the wrong branch.
-            status = ("(uint16_t)(((g_fp_top & 7u) << 11) |"
-                      " (g_fp_cmp == 2 ? 0x4500u :"
-                      " g_fp_cmp < 0 ? 0x0100u :"
-                      " g_fp_cmp > 0 ? 0x0000u : 0x4000u))")
+            status = "(uint16_t)(((g_fp_top & 7u) << 11) | g_fp_cc)"
             if insn.op_str.strip() in ("ax", "eax"):
                 # `fnstsw ax` writes the whole of AX, not just AH.
                 return [f"eax = (eax & 0xFFFF0000u) | (uint32_t){status};"

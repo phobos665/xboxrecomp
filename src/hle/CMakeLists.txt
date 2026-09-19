@@ -7,6 +7,12 @@
 # The DirectSound replacement (hle_dsound.c and the files it uses) is adapted
 # from doaxbv-re (https://github.com/NoRain211/doaxbv-re), GPL-3.0.
 
+if(MSVC)
+    # /Zi so the PDB names this library's static functions in a sampled
+    # profile (RECOMP_SAMPLE); see src/kernel/CMakeLists.txt.
+    add_compile_options(/Zi)
+endif()
+
 add_library(xbox_hle STATIC
     hle_d3d8.c
     hle_d3d8_state.c
@@ -15,6 +21,7 @@ add_library(xbox_hle STATIC
     hle_d3d8_record.c
     d3d8_capture.c
     hle_dsound.c
+    hle_dsound_stream.c
     dsound_buffer_model.c
     xbox_adpcm.c
     hle_input.c
@@ -34,6 +41,9 @@ if(WIN32)
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_kernel)
+# Host device choice and per-control bindings (src/input/input_bindings.c),
+# shared with the USB gamepad so one config file covers both input paths.
+target_link_libraries(xbox_hle PUBLIC xbox_input)
 if(WIN32)
     target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
     # The D3D8 replacements drive the host renderer in src/d3d, and open a

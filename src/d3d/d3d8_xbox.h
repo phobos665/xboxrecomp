@@ -1160,6 +1160,25 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  * 0 presents without waiting, for a device that is not the title's display.
  */
 void xbox_D3D8SetPresentInterval(UINT interval);
+/* The size the guest presents at, for its screen-space geometry; the HLE
+ * sets it from the title's present parameters (d3d8_GetGuestWidth). */
+void xbox_D3D8SetGuestSize(UINT width, UINT height);
+
+/* The Xbox's D3DDevice_SetScissors: clip drawing to the rectangles (or, with
+ * exclusive set, outside them); count 0 turns it off. The host applies one
+ * inclusive rectangle at most. Get returns whether a scissor is set, with
+ * the first rectangle, for capture snapshots. */
+void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
+BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
+
+/* The Xbox's CopyRects, for the one case a title uses it for in anger:
+   copying the finished frame into a texture it then draws over the scene.
+   The host's own back buffer is the source, because the guest's is empty --
+   nothing renders on that side. Scales if the texture is not screen-sized.
+   The destination must be a render-target texture. */
+HRESULT       xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+unsigned long xbox_D3D8ScreenCopyCount(void);
+void          xbox_D3D8ScreenCopyShutdown(void);
 
 /**
  * Present frame and pump window messages.

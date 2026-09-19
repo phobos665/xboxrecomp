@@ -68,6 +68,7 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
+#include "d3d8_overlay.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
 #endif
@@ -113,6 +114,7 @@ static UINT               g_shadow_width, g_shadow_height;
 static UINT               g_target_width, g_target_height;
 static unsigned long      g_target_sets, g_target_scratch, g_target_failed;
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
+static HWND               g_shadow_hwnd;
 static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
 static int                g_shadow_thread_notes;
@@ -127,7 +129,13 @@ static int shadow_requested(void)
         const char *mode = getenv("RECOMP_HLE_D3D8");
         const char *fmv  = getenv("RECOMP_FMV_HOST");
 
-        g_shadow_mode = mode && strcmp(mode, "shadow") == 0;
+        /* On by default: it is what draws the picture, and a player running
+         * the executable wants the picture. RECOMP_HLE_D3D8=off turns it off
+         * for the measurements that need the title alone. */
+        g_shadow_mode = mode ? strcmp(mode, "shadow") == 0 : 1;
+        if (mode && !g_shadow_mode)
+            fprintf(stderr, "[HLE-D3D8] RECOMP_HLE_D3D8=%s: nothing draws the "
+                    "picture; the title runs blind\n", mode);
         if (g_shadow_mode && fmv && *fmv && strcmp(fmv, "0") != 0) {
             fprintf(stderr, "[HLE-D3D8] shadow mode off: RECOMP_FMV_HOST creates the "
                     "same host device, and there is only one\n");
@@ -137,11 +145,20 @@ static int shadow_requested(void)
     return g_shadow_mode;
 }
 
+/* kernel_bridge.c: the flushes a title's own exit does, then ExitProcess. */
+extern void xbox_HostExit(const char *why);
+
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case WM_CLOSE:                       /* closing it must not end the title */
-        ShowWindow(hwnd, SW_HIDE);
+    case WM_CLOSE:
+        /* This window is the game's display now, so closing it is the user
+         * quitting. (It used to hide, from when it sat beside the title's
+         * own window as a comparison.) The title cannot be told; it has no
+         * such event on the console either. */
+        fprintf(stderr, "[HLE-D3D8] window closed by the user\n");
+        fflush(stderr);
+        xbox_HostExit("window closed");
         return 0;
     case SHADOW_WM_DESTROY:              /* DestroyWindow only works on this thread */
         DestroyWindow(hwnd);
@@ -226,6 +243,43 @@ static HWND shadow_window(UINT width, UINT height)
  * device's own depth surface (shadow_set_render_target). */
 static int      g_in_create_device;
 static uint32_t g_backbuffer_va, g_autodepth_va;
+
+/* Where the frame buffer lives, as physical addresses. A title that
+ * post-processes its own image does not copy the screen anywhere: it makes
+ * a texture whose texels ARE the frame buffer and binds that. On hardware
+ * that samples what the GPU just drew; here nothing draws on the guest side,
+ * so those texels are zeros and the effect blends black over the picture.
+ * Recognising the address is what lets the texture layer fill it from the
+ * host's own frame instead. There are two, flipped between. */
+static uint32_t g_framebuffer_phys[4];
+static int      g_framebuffer_count;
+
+static void note_framebuffer_phys(uint32_t data)
+{
+    uint32_t phys = data & 0x0FFFFFFFu;
+    int i;
+
+    if (!phys)
+        return;
+    for (i = 0; i < g_framebuffer_count; i++)
+        if (g_framebuffer_phys[i] == phys)
+            return;
+    if (g_framebuffer_count < 4) {
+        g_framebuffer_phys[g_framebuffer_count++] = phys;
+        fprintf(stderr, "[HLE-D3D8] frame buffer at physical 0x%08X; a texture"
+                " whose texels live there is the title reading its own screen\n", phys);
+        fflush(stderr);
+    }
+}
+
+int hle_d3d8_is_framebuffer(uint32_t phys)
+{
+    int i;
+    for (i = 0; i < g_framebuffer_count; i++)
+        if (g_framebuffer_phys[i] == phys)
+            return 1;
+    return 0;
+}
 static IDirect3DSurface8 *g_device_depth;
 
 /* ------------------------------------------------------------- viewports */
@@ -322,6 +376,7 @@ static void shadow_create(uint32_t pp_va)
         g_z_scale = xbox_depth_z_scale(HLE_MEM32(pp_va + 36));
 
     hwnd = shadow_window(width, height);
+    g_shadow_hwnd = hwnd;
     if (!hwnd)
         return;
 
@@ -346,6 +401,9 @@ static void shadow_create(uint32_t pp_va)
      * frames it presents itself; a vsync wait on this side device throttled
      * Burnout 2's whole loop to 27 frames a second. */
     xbox_D3D8SetPresentInterval(0);
+    /* The size the title's screen-space geometry is measured in, whatever
+     * size the host ends up rendering at. */
+    xbox_D3D8SetGuestSize(width, height);
     g_shadow_width = width;
     g_shadow_height = height;
     g_target_width = width;
@@ -387,17 +445,24 @@ static void shadow_create(uint32_t pp_va)
 
 enum { SHADER_DECLARATION, SHADER_HOST_PROGRAM, SHADER_NOT_REPLAYED };
 
-#define SHADOW_MAX_PACKED 4              /* NORMPACKED3 registers per program */
+#define SHADOW_MAX_PACKED 8              /* registers expanded to floats per draw */
 
 struct shadow_program {
     uint32_t guest;
     DWORD    host;
     int      kind;
+    int      from_slot;                  /* host belongs to g_slot_host, not this entry */
     /* From the declaration (shadow_read_declaration), host programs only. */
     int      has_declaration;            /* the host has its vertex layout */
     UINT     extent;                     /* bytes of a vertex it reads */
-    int      packed_count;               /* NORMPACKED3 registers */
-    UINT     packed_offset[SHADOW_MAX_PACKED];
+    /* Registers in a format the host cannot read as it is (xbox_vsdt_expanded).
+     * Each draw copies its vertices with these unpacked to floats in a prefix
+     * of expanded_bytes; the rest of the vertex follows unchanged. */
+    int      packed_count;
+    UINT     packed_offset[SHADOW_MAX_PACKED];   /* in the guest vertex */
+    UINT     packed_out[SHADOW_MAX_PACKED];      /* in the prefix */
+    uint32_t packed_format[SHADOW_MAX_PACKED];   /* X_D3DVSDT */
+    UINT     expanded_bytes;
 };
 
 static struct shadow_program g_programs[SHADOW_MAX_PROGRAMS];
@@ -420,7 +485,78 @@ static int shadow_program_find(uint32_t guest)
     return -1;
 }
 
-static void shadow_select_vertex_shader(uint32_t handle)
+/* Programs loaded by slot rather than created by handle.
+ *
+ * The NV2A holds 136 transform-program instruction slots. Two XDK paths fill
+ * them: CreateVertexShader keeps the microcode in a shader object and
+ * LoadVertexShader copies it in when the object is selected -- the path
+ * Burnout 2 (5344) takes, tracked in g_programs by the object's handle --
+ * and LoadVertexShaderProgram(pFunction, Address), which copies microcode
+ * straight into slot Address with no object at all. TimeSplitters 2 (4721)
+ * takes the second: four programs loaded once, then
+ * SelectVertexShaderDirect(pVAF, Address) copies the vertex declaration into
+ * one static object in the D3D section and selects that object's handle with
+ * the slot number. Keyed by handle alone, every one of its draws was
+ * "unknown shader". So the slot number is tracked too, and a selected handle
+ * with no created program borrows the program loaded at its slot. */
+#define SHADOW_PROGRAM_SLOTS 136
+static DWORD g_slot_host[SHADOW_PROGRAM_SLOTS];
+static int   g_slot_loaded[SHADOW_PROGRAM_SLOTS];
+static unsigned long g_slot_reloads;   /* loads answered from the program cache */
+
+/* Host programs by microcode. A title on this API rotates a few programs
+ * through the same slots -- TimeSplitters 2 puts three different programs
+ * into slot 0 in turn, ~60k loads in two minutes -- so "the slot already
+ * holds this" almost never matches. A load is answered by content instead:
+ * a host program, once made, is kept for the run and shared by every slot
+ * and every selected entry that names it, and is never deleted while it is
+ * in here. Beyond the cache's size loads fall back to create-and-delete. */
+#define SLOT_PROGRAM_CACHE 96
+
+typedef struct SlotProgram {
+    uint32_t hash;
+    int      count;
+    DWORD    host;
+} SlotProgram;
+
+static SlotProgram g_slot_programs[SLOT_PROGRAM_CACHE];
+static int         g_slot_program_count;
+
+static uint32_t microcode_hash(const DWORD *microcode, int count)
+{
+    const uint8_t *p = (const uint8_t *)microcode;
+    size_t n = (size_t)count * 4 * sizeof(DWORD), i;
+    uint32_t h = 0x811C9DC5u;
+
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+static int slot_program_find(uint32_t hash, int count, const DWORD *microcode)
+{
+    int i;
+    for (i = 0; i < g_slot_program_count; i++)
+        if (g_slot_programs[i].hash == hash && g_slot_programs[i].count == count &&
+            host_vsh_same_microcode(g_slot_programs[i].host, microcode, count))
+            return i;
+    return -1;
+}
+
+static int slot_program_cached(DWORD host)
+{
+    int i;
+    for (i = 0; i < g_slot_program_count; i++)
+        if (g_slot_programs[i].host == host)
+            return 1;
+    return 0;
+}
+
+static void shadow_read_declaration(int slot, uint32_t handle);
+
+static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
     int i;
 
@@ -433,6 +569,27 @@ static void shadow_select_vertex_shader(uint32_t handle)
         return;
     }
     i = shadow_program_find(handle);
+    if ((i < 0 || g_programs[i].from_slot) &&
+        address < SHADOW_PROGRAM_SLOTS && g_slot_loaded[address]) {
+        /* A handle whose program came from a slot: the object holds only the
+         * declaration, and SelectVertexShaderDirect rewrites it on every
+         * call, so the layout is re-read each time it is selected. */
+        if (i < 0 && g_program_count < SHADOW_MAX_PROGRAMS) {
+            i = g_program_count++;
+            g_programs[i].guest = handle;
+        }
+        if (i >= 0) {
+            static int said;
+            g_programs[i].host = g_slot_host[address];
+            g_programs[i].kind = SHADER_HOST_PROGRAM;
+            g_programs[i].from_slot = 1;
+            shadow_read_declaration(i, handle);
+            if (said++ < 4)
+                fprintf(stderr, "[HLE-D3D8] shadow vertex shader 0x%08X: program from "
+                                "slot %u%s\n", handle, address,
+                        g_programs[i].has_declaration ? "" : " (no host layout)");
+        }
+    }
     g_shadow_vs_slot = i;
     g_shadow_vs_kind = i >= 0 ? g_programs[i].kind : -1;
     if (g_shadow_vs_kind == SHADER_HOST_PROGRAM)
@@ -547,11 +704,21 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 
 /* ------------------------------------------------------------ frame dumps */
 
+/* Set by the key that asks for the frame on screen; see overlay_frame. */
+static int g_dump_requested;
+
+static void shadow_dump_next_frame(void)
+{
+    g_dump_requested = 1;
+}
+
 static void shadow_dump_frame(void)
 {
     static const char *prefix;
     static int configured, every = 300, written;
-    static unsigned long min_draws, last_dump;
+    static unsigned long min_draws, last_dump, from_swap;
+    static char asked_prefix[8];
+    int asked;
     IDirect3DSurface8 *surf = NULL;
     D3DLOCKED_RECT lr;
     char path[512];
@@ -572,15 +739,32 @@ static void shadow_dump_frame(void)
         e = getenv("RECOMP_HLE_D3D8_DUMP_MINDRAWS");
         if (e && atol(e) > 0)
             min_draws = (unsigned long)atol(e);
+        /* RECOMP_HLE_D3D8_DUMP_FROM=<swap>: nothing before this swap, so the
+         * 24 dumps can bracket a moment late in a run instead of its start. */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_FROM");
+        if (e && atol(e) > 0)
+            from_swap = (unsigned long)atol(e);
     }
-    if (!prefix || !*prefix || written >= 24)
-        return;
-    if (min_draws) {
-        if (g_frame_draws < min_draws || (last_dump && g_shadow_swaps - last_dump < (unsigned long)every))
+    /* Asked for by hand: this frame, wherever the run has got to, whatever
+     * the interval and the 24-file cap say, and beside the executable when
+     * no prefix was given -- so pressing the key is the whole procedure. */
+    asked = g_dump_requested;
+    g_dump_requested = 0;
+    if (asked && (!prefix || !*prefix)) {
+        snprintf(asked_prefix, sizeof asked_prefix, "frame");
+        prefix = asked_prefix;
+    }
+    if (!asked) {
+        if (!prefix || !*prefix || written >= 24 || g_shadow_swaps < from_swap)
             return;
-        last_dump = g_shadow_swaps;
-    } else if ((g_shadow_swaps % (unsigned long)every) != 0) {
-        return;
+        if (min_draws) {
+            if (g_frame_draws < min_draws ||
+                (last_dump && g_shadow_swaps - last_dump < (unsigned long)every))
+                return;
+            last_dump = g_shadow_swaps;
+        } else if ((g_shadow_swaps % (unsigned long)every) != 0) {
+            return;
+        }
     }
 
     if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
@@ -632,14 +816,95 @@ HLE_ORIGINAL(D3DDevice_Swap);
 HLE_ORIGINAL(D3DDevice_CreateVertexShader);
 HLE_ORIGINAL(D3DDevice_SetVertexShader);
 HLE_ORIGINAL(D3DDevice_SelectVertexShader);
+HLE_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
 HLE_ORIGINAL(D3DDevice_SetTransform);
 HLE_ORIGINAL(D3DDevice_SetViewport);
+HLE_ORIGINAL(D3DDevice_SetScissors);
+HLE_ORIGINAL(D3DDevice_CopyRects);
+HLE_ORIGINAL(D3DDevice_GetBackBuffer2);
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
 HLE_ORIGINAL(D3DDevice_SetPixelShader);
 HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
 HLE_ORIGINAL(D3DDevice_SetVertexData2f);
 HLE_ORIGINAL(D3DDevice_DrawVerticesUP);
 HLE_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
+
+/* The GPU "time" fence.
+ *
+ * D3D8 stamps the push buffer with a rising fence value and keeps the value
+ * the GPU has reached in a word of guest memory the device points at; the
+ * GPU's interrupt writes it. D3D_BlockOnTime(time) spins until that word
+ * catches up, and D3D_KickOffAndWaitForIdle, BlockOnFence, BlockOnResource
+ * and Swap all wait through it. Nothing here raises that interrupt, so the
+ * word never moves and the first wait is the last thing the title does:
+ * TimeSplitters 2 stopped after its first Swap, 270 functions in, with the
+ * ISR still ticking.
+ *
+ * The kernel's fence mirror is the answer -- it copies the device's
+ * submitted value onto the completed word every poll, the same
+ * acknowledgement DMA_GET = DMA_PUT makes for the FIFO. It needs the two
+ * device offsets, and those move between XDK builds (5344: +0x2C submitted,
+ * +0x30 pointer to completed; 4721: +0x30 and +0x34). Rather than a table by
+ * XDK version, read them from D3D_BlockOnTime's own prologue, which is the
+ * one place they are certainly right for this title:
+ *
+ *     56                push esi
+ *     8B 35 <g_pDevice> mov  esi, [D3D_g_pDevice]
+ *     8B 46 <A>         mov  eax, [esi + A]     ; pointer to the completed word
+ *     8B 08             mov  ecx, [eax]
+ *     8B 46 <B>         mov  eax, [esi + B]     ; last submitted value
+ *
+ * Identical in both builds seen so far apart from A and B. A build whose
+ * compiler laid it out differently gets a line saying so and no mirror,
+ * which is the hang this replaces, not a wrong write.
+ */
+HLE_IMPORT_VAR(D3D_g_pDevice);
+HLE_IMPORT_VAR(D3D_BlockOnTime);
+
+static void mirror_gpu_time_fence(void)
+{
+    static int done;
+    const uint8_t *code;
+    uint32_t get_ptr_off, put_off;
+
+    if (done)
+        return;
+    done = 1;
+    if (!hle_var_D3D_g_pDevice || !hle_var_D3D_BlockOnTime) {
+        fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: %s not named in "
+                        "this XBE\n",
+                hle_var_D3D_g_pDevice ? "D3D_BlockOnTime" : "D3D_g_pDevice");
+        return;
+    }
+    code = (const uint8_t *)HLE_PTR(hle_var_D3D_BlockOnTime);
+    if (!(code[0] == 0x56 && code[1] == 0x8B && code[2] == 0x35 &&
+          code[7] == 0x8B && code[8] == 0x46 &&
+          code[10] == 0x8B && code[11] == 0x08 &&
+          code[12] == 0x8B && code[13] == 0x46)) {
+        fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: D3D_BlockOnTime "
+                        "at 0x%08X does not start as expected (%02X %02X %02X .. "
+                        "%02X %02X)\n", hle_var_D3D_BlockOnTime,
+                code[0], code[1], code[2], code[7], code[8]);
+        return;
+    }
+    {
+        uint32_t device_global;
+        memcpy(&device_global, code + 3, 4);
+        if (device_global != hle_var_D3D_g_pDevice) {
+            fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
+                            "D3D_BlockOnTime reads the device from 0x%08X, the "
+                            "symbols say 0x%08X\n",
+                    device_global, hle_var_D3D_g_pDevice);
+            return;
+        }
+    }
+    get_ptr_off = code[9];
+    put_off = code[14];
+    if (xbox_Nv2aMirrorFence(hle_var_D3D_g_pDevice, put_off, get_ptr_off) == 0)
+        fprintf(stderr, "[HLE-D3D8] GPU time fence mirrored: device +0x%02X -> "
+                        "*(device +0x%02X), offsets read from D3D_BlockOnTime\n",
+                put_off, get_ptr_off);
+}
 
 /* tools.recomp keeps the original whenever it replaces one of these names and
  * lifts its body, so a missing one means a build/lift mismatch or a body this
@@ -669,6 +934,9 @@ HLE_EXPORT(Direct3D_CreateDevice)
     g_in_create_device = 1;
 #endif
     HLE_CALL_ORIGINAL(Direct3D_CreateDevice);
+    /* Only beside a guest device that exists: the original's HRESULT. */
+    if ((int32_t)g_eax >= 0)
+        mirror_gpu_time_fence();
 #ifdef _WIN32
     g_in_create_device = 0;
     if (!g_backbuffer_va)
@@ -709,15 +977,141 @@ HLE_EXPORT(D3DDevice_Clear)
 #endif
 }
 
+/* Where a frame's time goes around Swap, for the five-second report. */
+static LARGE_INTEGER g_swap_last;
+static long long g_swap_gate_ticks, g_swap_body_ticks, g_swap_frame_ticks;
+static unsigned long g_swap_timed;
+
+static void swap_timing_report(void)
+{
+    LARGE_INTEGER qpf;
+    double ms;
+
+    if (!g_swap_timed)
+        return;
+    QueryPerformanceFrequency(&qpf);
+    ms = 1000.0 / (double)qpf.QuadPart / (double)g_swap_timed;
+    fprintf(stderr, "[HLE-D3D8] swap timing over %lu frames: gate wait %.2f ms, "
+            "title's Swap %.2f ms, rest of frame %.2f ms (per frame)\n",
+            g_swap_timed, (double)g_swap_gate_ticks * ms,
+            (double)g_swap_body_ticks * ms, (double)g_swap_frame_ticks * ms);
+    g_swap_gate_ticks = g_swap_body_ticks = g_swap_frame_ticks = 0;
+    g_swap_timed = 0;
+}
+
+/* ------------------------------------------------------------------ overlay
+ *
+ * A frame-rate counter the player can turn on, and a frame cap they can
+ * change without restarting. The renderer draws the line (d3d8_overlay.h);
+ * what it says and when it appears is decided here, because this is where
+ * the frame rate is already counted and where the flip gate is reachable.
+ *
+ * F9 shows or hides the counter, F10 steps the cap. Both are read only while
+ * the game's window is in front, so they do nothing while the player is in
+ * another application, and neither is a key the input bindings offer, so
+ * neither can collide with a control. RECOMP_FPS_OVERLAY=1 starts with the
+ * counter already on.
+ *
+ * The rate is measured over half-second windows at the same Swap that
+ * RECOMP_FPS counts, so the number on screen and the number in the log are
+ * the same measurement.
+ */
+static void overlay_frame(void)
+{
+    static int configured, enabled, f9_was_down, f10_was_down, f11_was_down;
+    static LARGE_INTEGER qpf, window_start;
+    static unsigned window_frames;
+    static char line[96];
+    LARGE_INTEGER now;
+    int front, f9, f10, f11;
+
+    if (!configured) {
+        const char *v = getenv("RECOMP_FPS_OVERLAY");
+
+        configured = 1;
+        enabled = v && *v && strcmp(v, "0") != 0;
+        QueryPerformanceFrequency(&qpf);
+        QueryPerformanceCounter(&window_start);
+        snprintf(line, sizeof line, "-- fps   cap %s", xbox_Nv2aFlipGateModeName());
+        fprintf(stderr, "[HLE-D3D8] F9 shows the frame rate on screen, F10 steps the "
+                "frame cap (now %s)\n", xbox_Nv2aFlipGateModeName());
+        fflush(stderr);
+    }
+
+    front = g_shadow_hwnd && GetForegroundWindow() == g_shadow_hwnd;
+    f9  = front && (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
+    f10 = front && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    f11 = front && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (f11 && !f11_was_down) {
+        /* Both, because they answer different questions: the picture shows
+         * what is wrong, the capture lets it be replayed draw by draw with
+         * no game running (src/replay). */
+        hle_d3d8_capture_next_frame();
+        shadow_dump_next_frame();
+    }
+    f11_was_down = f11;
+    if (f9 && !f9_was_down)
+        enabled = !enabled;
+    if (f10 && !f10_was_down) {
+        xbox_Nv2aFlipGateCycle();
+        window_start.QuadPart = 0;           /* the old window straddles the change */
+    }
+    f9_was_down = f9;
+    f10_was_down = f10;
+
+    QueryPerformanceCounter(&now);
+    if (!window_start.QuadPart) {
+        window_start = now;
+        window_frames = 0;
+    }
+    window_frames++;
+    if (qpf.QuadPart &&
+        now.QuadPart - window_start.QuadPart >= qpf.QuadPart / 2) {
+        double secs = (double)(now.QuadPart - window_start.QuadPart) / (double)qpf.QuadPart;
+
+        snprintf(line, sizeof line, "%.1f fps   cap %s",
+                 (double)window_frames / secs, xbox_Nv2aFlipGateModeName());
+        window_start = now;
+        window_frames = 0;
+    }
+
+    if (enabled)
+        d3d8_overlay_draw(line);
+}
+
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */
 HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
 
+    /* Counted before anything else here runs, so RECOMP_FPS means the same
+     * thing whatever is switched on below. */
+    xbox_FpsCountSwap();
+#ifdef _WIN32
+    if (g_backbuffer_va)
+        note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+#endif
     first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
         HLE_RETURN(0x80004005u);
-    HLE_CALL_ORIGINAL(D3DDevice_Swap);
+    /* Console pacing: the flip gate sleeps here until the next vblank
+     * (xbox_memory_layout.h), before the title's own Swap runs. The three
+     * times are kept for the five-second report below: how long the gate
+     * held, how long the title's own Swap took, and the rest of the frame. */
+    {
+        LARGE_INTEGER t0, t1, t2;
+        QueryPerformanceCounter(&t0);
+        if (g_swap_last.QuadPart)
+            g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
+        xbox_Nv2aFlipGateArm();
+        QueryPerformanceCounter(&t1);
+        HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        QueryPerformanceCounter(&t2);
+        g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
+        g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
+        g_swap_last = t2;
+        g_swap_timed++;
+    }
 #ifdef _WIN32
     if (g_shadow) {
         DWORD now = GetTickCount();
@@ -739,6 +1133,7 @@ HLE_EXPORT(D3DDevice_Swap)
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
         shadow_dump_frame();             /* before Present discards the buffer */
         g_frame_draws = 0;
+        overlay_frame();                 /* after the dump: not in the captures */
         host_Swap(g_shadow, 0);
         if (!g_shadow_last_report) {
             g_shadow_last_report = now;
@@ -753,6 +1148,10 @@ HLE_EXPORT(D3DDevice_Swap)
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
+            swap_timing_report();
+            if (g_slot_reloads)
+                fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads answered from "
+                        "the %d cached host programs\n", g_slot_reloads, g_slot_program_count);
             if (g_target_sets)
                 fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
                         "scratch target, %lu failed\n", g_target_sets,
@@ -818,14 +1217,38 @@ static int xbox_vsdt_to_dxgi(uint32_t format, DXGI_FORMAT *dxgi, UINT *size)
     }
 }
 
+/* An X_D3DVSDT format the host cannot read as it is, expanded to floats per
+ * draw (shadow_expand_vertices): how many floats it becomes, with *size the
+ * bytes it occupies in the guest vertex, or 0 for a format read directly.
+ * NORMPACKED3 has no DXGI format at all. The unnormalised shorts do (R16_SINT
+ * and friends) but those need an integer shader input, and the generated
+ * programs read floats; TimeSplitters 2's world geometry is SHORT2 texture
+ * coordinates and SHORT4 positions, 15% of its in-level draws. */
+static int xbox_vsdt_expanded(uint32_t format, UINT *size)
+{
+    switch (format) {
+    case 0x16: *size = 4; return 3;      /* NORMPACKED3, 11:11:10 signed */
+    case 0x15: *size = 2; return 1;      /* SHORT1 */
+    case 0x25: *size = 4; return 2;      /* SHORT2 */
+    case 0x35: *size = 6; return 3;      /* SHORT3 */
+    case 0x45: *size = 8; return 4;      /* SHORT4 */
+    default:   return 0;
+    }
+}
+
+static const DXGI_FORMAT FLOATN_FORMAT[5] = {
+    DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+};
+
 /* The host program's vertex layout, from the same slots: each register at its
- * declared offset in the stream 0 vertex. NORMPACKED3 (0x16, 11:11:10 signed
- * bits) has no DXGI format, so each draw copies the vertex behind its unpacked
- * normals (shadow_expand_vertices): those registers read float3s from the
- * front, and every other offset moves up by 12 bytes per packed register. A
- * declaration the host cannot take -- another stream, or a format with no
- * DXGI equivalent -- leaves has_declaration 0, and its draws are skipped and
- * counted. */
+ * declared offset in the stream 0 vertex. Registers in a format the host
+ * cannot read as it is (xbox_vsdt_expanded) are unpacked to floats per draw:
+ * each draw copies the vertex behind a prefix holding those floats
+ * (shadow_expand_vertices), so they read from the prefix and every other
+ * offset moves up by its size. A declaration the host cannot take -- another
+ * stream, or a format with no DXGI equivalent -- leaves has_declaration 0,
+ * and its draws are skipped and counted. */
 static void shadow_read_declaration(int slot, uint32_t handle)
 {
     static int notes;
@@ -833,20 +1256,25 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     D3D8VshInput in[16];
     uint32_t object = handle & ~1u, i;
     uint32_t bad_reg = 0, bad_stream = 0, bad_format = 0;
-    UINT shift;
+    UINT shift = 0, out = 0;
     int n = 0, packed = 0, refused = 0;
 
     p->has_declaration = 0;
     p->extent = 0;
     p->packed_count = 0;
+    p->expanded_bytes = 0;
     if (!object)
         return;
-    for (i = 0; i < 16u; i++)
-        if (HLE_MEM32(object + 20u + i * 16u + 8u) == 0x16u)
+    for (i = 0; i < 16u; i++) {
+        UINT size;
+        int floats = xbox_vsdt_expanded(HLE_MEM32(object + 20u + i * 16u + 8u), &size);
+        if (floats) {
             packed++;
+            shift += (UINT)floats * 4u;
+        }
+    }
     if (packed > SHADOW_MAX_PACKED)
         return;
-    shift = (UINT)packed * 12u;
     packed = 0;
 
     for (i = 0; i < 16u; i++) {
@@ -855,16 +1283,20 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         uint32_t format = HLE_MEM32(attr + 8u);
         DXGI_FORMAT dxgi;
         UINT size;
+        int floats;
 
         if (format <= 0x02u)
             continue;
         if (stream != 0u || offset > 0xFFFFu) {
             refused = 1;
-        } else if (format == 0x16u) {
+        } else if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             p->packed_offset[packed] = offset;
-            in[n].format = DXGI_FORMAT_R32G32B32_FLOAT;
-            in[n].offset = 12u * (UINT)packed++;
-            size = 4;
+            p->packed_out[packed] = out;
+            p->packed_format[packed] = format;
+            packed++;
+            in[n].format = FLOATN_FORMAT[floats];
+            in[n].offset = out;
+            out += (UINT)floats * 4u;
         } else if (xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
             in[n].format = dxgi;
             in[n].offset = offset + shift;
@@ -886,6 +1318,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     if (!refused && n > 0 && SUCCEEDED(host_vsh_set_declaration(p->host, in, n))) {
         p->has_declaration = 1;
         p->packed_count = packed;
+        p->expanded_bytes = shift;
     } else if (refused && notes++ < 16) {
         fprintf(stderr, "[HLE-D3D8] shadow declaration 0x%08X: v%u (stream %u, format "
                 "0x%02X) has no host layout; its draws are skipped\n",
@@ -925,8 +1358,9 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
         int kind;
 
         if (slot >= 0) {                 /* handle reused: drop the old program */
-            if (g_programs[slot].kind == SHADER_HOST_PROGRAM)
+            if (g_programs[slot].kind == SHADER_HOST_PROGRAM && !g_programs[slot].from_slot)
                 host_vsh_delete_shader(g_programs[slot].host);
+            g_programs[slot].from_slot = 0;
         } else if (g_program_count < SHADOW_MAX_PROGRAMS) {
             slot = g_program_count++;
         }
@@ -962,6 +1396,71 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
 #endif
 }
 
+/* void D3DDevice_LoadVertexShaderProgram(const DWORD *pFunction, DWORD Address)
+ * Xbox-only: copy a compiled program (the same X_VSH_SHADER_HEADER form
+ * CreateVertexShader takes) into transform-program slot Address, with no
+ * shader object. Selected later by SelectVertexShader(handle, Address). */
+HLE_EXPORT(D3DDevice_LoadVertexShaderProgram)
+{
+    static int seen;
+    uint32_t function = HLE_ARG(0);
+#ifdef _WIN32
+    uint32_t address = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_LoadVertexShaderProgram", function);
+    if (original_missing(hle_original_D3DDevice_LoadVertexShaderProgram,
+                         "D3DDevice_LoadVertexShaderProgram"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
+#ifdef _WIN32
+    if (g_shadow && function && address < SHADOW_PROGRAM_SLOTS) {
+        static int logged;
+        uint32_t header = HLE_MEM32(function);
+        int count = (int)(header >> 16);
+        int valid = (header & 0xFFFF) == 0x2078 && count != 0 &&
+                    (uint32_t)count <= SHADOW_PROGRAM_SLOTS - address;
+        const DWORD *microcode = (const DWORD *)HLE_PTR(function + 4);
+        DWORD host = 0;
+        HRESULT hr = E_FAIL;
+
+        if (valid) {
+            uint32_t hash = microcode_hash(microcode, count);
+            int i = slot_program_find(hash, count, microcode);
+
+            if (i >= 0) {
+                host = g_slot_programs[i].host;
+                hr = S_OK;
+                g_slot_reloads++;
+            } else {
+                hr = host_vsh_create_shader(microcode, count, &host);
+                if (SUCCEEDED(hr) && g_slot_program_count < SLOT_PROGRAM_CACHE) {
+                    SlotProgram *sp = &g_slot_programs[g_slot_program_count++];
+                    sp->hash = hash;
+                    sp->count = count;
+                    sp->host = host;
+                }
+            }
+        }
+        /* The slot's previous program goes only if nothing else can name it. */
+        if (g_slot_loaded[address] && g_slot_host[address] != host &&
+            !slot_program_cached(g_slot_host[address]))
+            host_vsh_delete_shader(g_slot_host[address]);
+        g_slot_loaded[address] = SUCCEEDED(hr);
+        g_slot_host[address] = SUCCEEDED(hr) ? host : 0;
+        if (!valid || !slot_program_cached(host) || g_slot_programs[g_slot_program_count - 1].host == host) {
+            /* a new program, or one that could not be made: worth a line */
+            if (logged < 64 && !(valid && hr == S_OK && g_slot_reloads && slot_program_cached(host) &&
+                                 g_slot_programs[g_slot_program_count - 1].host != host))
+                fprintf(stderr, "[HLE-D3D8] shadow vertex program at slot %u: %u instructions, %s%s\n",
+                        address, header >> 16,
+                        SUCCEEDED(hr) ? "host program" : "not replayed",
+                        ++logged == 64 ? " (further loads not logged)" : "");
+        }
+    }
+#endif
+}
+
 /* HRESULT D3DDevice_SetVertexShader(DWORD Handle)                            */
 HLE_EXPORT(D3DDevice_SetVertexShader)
 {
@@ -974,7 +1473,7 @@ HLE_EXPORT(D3DDevice_SetVertexShader)
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShader);
 #ifdef _WIN32
     if (g_shadow)
-        shadow_select_vertex_shader(handle);
+        shadow_select_vertex_shader(handle, SHADOW_PROGRAM_SLOTS);
 #endif
 }
 
@@ -994,7 +1493,7 @@ HLE_EXPORT(D3DDevice_SelectVertexShader)
     HLE_CALL_ORIGINAL(D3DDevice_SelectVertexShader);
 #ifdef _WIN32
     if (g_shadow && handle)
-        shadow_select_vertex_shader(handle);
+        shadow_select_vertex_shader(handle, HLE_ARG(1));
 #endif
 }
 
@@ -1153,6 +1652,36 @@ HLE_EXPORT(D3DDevice_SetViewport)
         g_title_viewport_set = 1;
         g_host_viewport_mode = -1;       /* the next draw picks which to use */
         shadow_viewport_constants(&vp);
+    }
+#endif
+}
+
+/* void D3DDevice_SetScissors(DWORD Count, BOOL Exclusive, const D3DRECT *pRects)
+ * Xbox-only: clip drawing to (or, with Exclusive, outside) up to eight
+ * rectangles of the render target; Count 0 turns it off. TimeSplitters 2
+ * scrolls its mission briefing inside one, and without this the text ran
+ * over the heading and the button bar. */
+HLE_EXPORT(D3DDevice_SetScissors)
+{
+    static int seen;
+    uint32_t count = HLE_ARG(0);
+    uint32_t exclusive = HLE_ARG(1);
+    uint32_t rects = HLE_ARG(2);
+
+    first_call(&seen, "D3DDevice_SetScissors", count);
+    if (original_missing(hle_original_D3DDevice_SetScissors, "D3DDevice_SetScissors"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetScissors);
+#ifdef _WIN32
+    if (g_shadow) {
+        D3DRECT rect[8];
+        UINT n = count > 8 ? 8 : count;
+
+        if (n && rects)
+            memcpy(rect, HLE_PTR(rects), n * sizeof rect[0]);
+        else
+            n = 0;
+        host_SetScissors(n, exclusive != 0, rect);
     }
 #endif
 }
@@ -1405,6 +1934,96 @@ HLE_EXPORT(D3DDevice_SetRenderTarget)
 #endif
 }
 
+/* IDirect3DSurface8 *D3DDevice_GetBackBuffer2(INT BackBuffer)
+ * Xbox-only: the back buffer's surface, returned rather than written through
+ * a pointer. Worth replacing only to learn which surface that is, so
+ * CopyRects below can tell "the title is copying the screen" from "the title
+ * is copying something else". */
+HLE_EXPORT(D3DDevice_GetBackBuffer2)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_GetBackBuffer2", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_GetBackBuffer2, "D3DDevice_GetBackBuffer2"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_GetBackBuffer2);
+#ifdef _WIN32
+    if (g_shadow && g_eax && (int32_t)HLE_ARG(0) <= 0)
+        g_backbuffer_va = g_eax;
+#endif
+}
+
+/* HRESULT D3DDevice_CopyRects(IDirect3DSurface8 *src, const RECT *srcRects,
+ *                             UINT count, IDirect3DSurface8 *dst,
+ *                             const POINT *dstPoints)
+ *
+ * The case this exists for is a title copying the finished frame into a
+ * texture and drawing that texture back over the scene -- a glow or a
+ * soften. The title's own copy still runs, but it runs in the guest's world
+ * where nothing is rendered, so what it reads is zeros; TimeSplitters 2 then
+ * blends those zeros over its own image three times a frame and loses 62% of
+ * the picture's brightness. The host repeats the copy from its own back
+ * buffer, into the host texture standing in for the destination.
+ *
+ * Only that case. A copy between two of the title's own surfaces is left to
+ * the title, whose result the host never sees anyway, and is counted so a
+ * title that needs more than this says so in the log. */
+HLE_EXPORT(D3DDevice_CopyRects)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t src = HLE_ARG(0), dst = HLE_ARG(3);
+#endif
+
+    first_call(&seen, "D3DDevice_CopyRects", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_CopyRects, "D3DDevice_CopyRects"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_CopyRects);
+#ifdef _WIN32
+    if (g_shadow && src && dst) {
+        static unsigned long from_screen, elsewhere;
+        static int said_other;
+        uint32_t src_parent = HLE_MEM32(src + SURFACE_PARENT);
+        uint32_t dst_parent = HLE_MEM32(dst + SURFACE_PARENT);
+        UINT sw, sh, dw, dh;
+        uint32_t sfmt, dfmt;
+
+        surface_measure(src, &sw, &sh, &sfmt);
+        surface_measure(dst, &dw, &dh, &dfmt);
+        /* The source is the screen when it is the surface GetBackBuffer2
+         * returned, or -- before that is known -- any parentless surface of
+         * the back buffer's size, the same test SetRenderTarget uses. */
+        if (dst != g_backbuffer_va &&
+            (g_backbuffer_va ? src == g_backbuffer_va
+                             : (!src_parent && sw == g_shadow_width && sh == g_shadow_height)) &&
+            dst_parent && HLE_MEM32(dst_parent + 4) == HLE_MEM32(dst + 4)) {
+            IDirect3DTexture8 *tex = hle_d3d8_render_texture(g_shadow, dst_parent);
+
+            if (tex && SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(tex)))
+                from_screen++;
+            if (from_screen == 1)
+                fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "
+                        "copying the host frame into texture 0x%08X (%ux%u)\n",
+                        dst_parent, dw, dh);
+        } else {
+            elsewhere++;
+            if (dst == g_backbuffer_va || !dst_parent) {
+                note_framebuffer_phys(HLE_MEM32(dst + 4));
+                note_framebuffer_phys(HLE_MEM32(src + 4));
+            }
+            if (said_other++ < 8)
+                fprintf(stderr, "[HLE-D3D8] CopyRects not recognised as a screen read: "
+                        "src 0x%08X %ux%u parent 0x%08X | dst 0x%08X %ux%u parent 0x%08X "
+                        "(dst parent data 0x%08X, dst data 0x%08X; back buffer 0x%08X)\n",
+                        src, sw, sh, src_parent, dst, dw, dh, dst_parent,
+                        dst_parent ? HLE_MEM32(dst_parent + 4) : 0u,
+                        HLE_MEM32(dst + 4), g_backbuffer_va);
+        }
+    }
+#endif
+}
+
+
 #ifdef _WIN32
 /* The vertices a program with NORMPACKED3 registers reads: each vertex copied
  * behind its unpacked normals, as shadow_read_declaration laid them out. The
@@ -1426,7 +2045,7 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     p = &g_programs[g_shadow_vs_slot];
     if (!p->packed_count)
         return NULL;
-    shift = (UINT)p->packed_count * 12u;
+    shift = p->expanded_bytes;
     out_stride = in_stride + shift;
     out = malloc((size_t)vertices * out_stride);
     if (!out) {
@@ -1438,14 +2057,26 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         uint8_t *dst = out + (size_t)v * out_stride;
 
         for (k = 0; k < p->packed_count; k++) {
-            uint32_t bits;
-            float n[3];
+            const uint8_t *at = src + p->packed_offset[k];
+            float n[4];
+            int c, count;
 
-            memcpy(&bits, src + p->packed_offset[k], sizeof bits);
-            n[0] = (float)((int32_t)(bits << 21) >> 21) / 1023.0f;
-            n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
-            n[2] = (float)((int32_t)bits >> 22) / 511.0f;
-            memcpy(dst + 12u * (UINT)k, n, sizeof n);
+            if (p->packed_format[k] == 0x16u) {      /* NORMPACKED3 */
+                uint32_t bits;
+                memcpy(&bits, at, sizeof bits);
+                n[0] = (float)((int32_t)(bits << 21) >> 21) / 1023.0f;
+                n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
+                n[2] = (float)((int32_t)bits >> 22) / 511.0f;
+                count = 3;
+            } else {                                 /* SHORTn: the value itself */
+                count = (int)(p->packed_format[k] >> 4);
+                for (c = 0; c < count; c++) {
+                    int16_t s;
+                    memcpy(&s, at + 2 * c, sizeof s);
+                    n[c] = (float)s;
+                }
+            }
+            memcpy(dst + p->packed_out[k], n, (size_t)count * sizeof n[0]);
         }
         memcpy(dst + shift, src, in_stride);
     }
@@ -1513,7 +2144,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
     uint16_t *list = NULL;
     uint8_t *expanded;
     D3DPRIMITIVETYPE pt;
-    UINT prims, vertices = 0, i, n = 0, host_stride = stride;
+    UINT prims, vertices = 0, i, n = 0, host_stride = stride, min_index = 0;
     int failed;
     HRESULT hr;
 
@@ -1525,18 +2156,32 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         g_draws_primitive++;
         return;
     }
-    for (i = 0; i < count; i++)
-        if ((UINT)idx[i] + 1 > vertices)
-            vertices = (UINT)idx[i] + 1;
+    /* Only the vertices between the lowest and highest index are handed to
+     * the host, with the indices rebased to start at zero. A title that
+     * draws a level from one shared vertex buffer indexes tens of thousands
+     * of vertices in: TimeSplitters 2's Siberia draws 340 pieces a frame with
+     * indices up to 35,000, and copying every vertex below the highest one
+     * for each of them moved hundreds of megabytes a frame and ran at 14 fps.
+     * The range a draw actually uses is a few kilobytes. */
+    {
+        UINT lo = 0xFFFFu, hi = 0;
+        for (i = 0; i < count; i++) {
+            if (idx[i] < lo) lo = idx[i];
+            if (idx[i] > hi) hi = idx[i];
+        }
+        min_index = lo;
+        vertices = hi - lo + 1;
+        verts = (const uint8_t *)verts + (size_t)lo * stride;
+    }
 
     switch (xpt) {
     case XPT_TRIANGLEFAN:
     case XPT_POLYGON:
         list = malloc((size_t)prims * 3 * sizeof *list);
         for (i = 0; list && i < prims; i++) {
-            list[n++] = idx[0];
-            list[n++] = idx[i + 1];
-            list[n++] = idx[i + 2];
+            list[n++] = (uint16_t)(idx[0] - min_index);
+            list[n++] = (uint16_t)(idx[i + 1] - min_index);
+            list[n++] = (uint16_t)(idx[i + 2] - min_index);
         }
         pt = D3DPT_TRIANGLELIST;
         break;
@@ -1544,24 +2189,31 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         list = malloc((size_t)prims * 6 * sizeof *list);
         for (i = 0; list && i < prims; i++) {
             const uint16_t *q = idx + i * 4;
-            list[n++] = q[0]; list[n++] = q[1]; list[n++] = q[2];
-            list[n++] = q[0]; list[n++] = q[2]; list[n++] = q[3];
+            uint16_t a = (uint16_t)(q[0] - min_index), b = (uint16_t)(q[1] - min_index);
+            uint16_t c = (uint16_t)(q[2] - min_index), d = (uint16_t)(q[3] - min_index);
+            list[n++] = a; list[n++] = b; list[n++] = c;
+            list[n++] = a; list[n++] = c; list[n++] = d;
         }
         pt = D3DPT_TRIANGLELIST;
         prims *= 2;
         break;
     case XPT_LINELOOP:
         list = malloc(((size_t)count + 1) * sizeof *list);
-        if (list) {
-            memcpy(list, idx, (size_t)count * sizeof *list);
-            list[count] = idx[0];
-        }
+        for (i = 0; list && i < count; i++)
+            list[i] = (uint16_t)(idx[i] - min_index);
+        if (list)
+            list[count] = (uint16_t)(idx[0] - min_index);
         break;
     default:
+        if (min_index) {
+            list = malloc((size_t)count * sizeof *list);
+            for (i = 0; list && i < count; i++)
+                list[i] = (uint16_t)(idx[i] - min_index);
+        }
         break;
     }
     if ((xpt == XPT_TRIANGLEFAN || xpt == XPT_POLYGON || xpt == XPT_QUADLIST ||
-         xpt == XPT_LINELOOP) && !list) {
+         xpt == XPT_LINELOOP || min_index) && !list) {
         g_draws_failed++;
         return;
     }
