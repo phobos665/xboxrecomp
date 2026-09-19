@@ -8,14 +8,23 @@
  * still get past "Press START"; and RECOMP_INPUT_SEQ, a one-shot timed
  * sequence that walks a menu path the same way every run.
  *
- * Keyboard: arrows = D-pad, Enter = START, Backspace = BACK, Z = A, X = B,
- * A = X, S = Y, Q = White, W = Black, E = left trigger, R = right trigger.
+ * Which host device drives which of the four ports, and which key or pad
+ * control drives each Xbox input, is src/input/input_bindings.c reading the
+ * config file the input UI writes (`py -3 -m tools.input_ui`). With no config
+ * file the defaults are what this file used to hard-code: XInput pad 0 plus
+ * the keyboard on port 1 -- arrows = D-pad, Enter = START, Backspace = BACK,
+ * Z = A, X = B, A = X, S = Y, Q = White, W = Black, E/R = triggers -- and
+ * XInput pad N on port N.
+ *
+ * RECOMP_FAKE_INPUT and RECOMP_INPUT_SEQ still press buttons directly, on
+ * port 1 only: they are a substitute for a person at the keyboard, so they
+ * are deliberately unaffected by what that person bound.
  */
 #include "input_host.h"
+#include "input_bindings.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <xinput.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,11 +38,6 @@ enum {
     XBOX_START = 0x0010u,
     XBOX_BACK = 0x0020u,
 };
-
-static bool pressed(int key)
-{
-    return (GetAsyncKeyState(key) & 0x8000) != 0;
-}
 
 /* RECOMP_FAKE_INPUT=start,a  presses each listed button in turn, one per
  * cycle; RECOMP_FAKE_INPUT_MS (default 500) is how long each press and each
@@ -207,52 +211,34 @@ static void fake_input(RecompInputGamepad *g)
     }
 }
 
-bool recomp_input_host_sample(RecompInputGamepad *gamepad)
+/* One port, through its bindings. The bound sample arrives as the layout
+ * src/input already speaks (XBOX_GAMEPAD); the two structures are the same
+ * eight analog bytes and four axes in the same order, so this is a copy. */
+bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
 {
-    XINPUT_STATE state;
+    XBOX_GAMEPAD pad;
+    int i;
 
     if (gamepad == NULL)
         return false;
     memset(gamepad, 0, sizeof *gamepad);
-    memset(&state, 0, sizeof state);
-    if (XInputGetState(0u, &state) == ERROR_SUCCESS) {
-        WORD digital = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN |
-                       XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT |
-                       XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK |
-                       XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
-        WORD b = state.Gamepad.wButtons;
-
-        gamepad->buttons = b & digital;
-        gamepad->analog_buttons[HOST_ANALOG_A] = (b & XINPUT_GAMEPAD_A) ? 0xFFu : 0u;
-        gamepad->analog_buttons[HOST_ANALOG_B] = (b & XINPUT_GAMEPAD_B) ? 0xFFu : 0u;
-        gamepad->analog_buttons[HOST_ANALOG_X] = (b & XINPUT_GAMEPAD_X) ? 0xFFu : 0u;
-        gamepad->analog_buttons[HOST_ANALOG_Y] = (b & XINPUT_GAMEPAD_Y) ? 0xFFu : 0u;
-        gamepad->analog_buttons[HOST_ANALOG_BLACK] =
-            (b & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 0xFFu : 0u;
-        gamepad->analog_buttons[HOST_ANALOG_WHITE] =
-            (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 0xFFu : 0u;
-        gamepad->analog_buttons[HOST_ANALOG_LTRIG] = state.Gamepad.bLeftTrigger;
-        gamepad->analog_buttons[HOST_ANALOG_RTRIG] = state.Gamepad.bRightTrigger;
-        gamepad->thumb_lx = state.Gamepad.sThumbLX;
-        gamepad->thumb_ly = state.Gamepad.sThumbLY;
-        gamepad->thumb_rx = state.Gamepad.sThumbRX;
-        gamepad->thumb_ry = state.Gamepad.sThumbRY;
+    if (recomp_bindings_sample(port, &pad)) {
+        gamepad->buttons = (uint16_t)pad.wButtons;
+        for (i = 0; i < RECOMP_INPUT_ANALOG_BUTTON_COUNT; i++)
+            gamepad->analog_buttons[i] = pad.bAnalogButtons[i];
+        gamepad->thumb_lx = (int16_t)pad.sThumbLX;
+        gamepad->thumb_ly = (int16_t)pad.sThumbLY;
+        gamepad->thumb_rx = (int16_t)pad.sThumbRX;
+        gamepad->thumb_ry = (int16_t)pad.sThumbRY;
     }
-    if (pressed(VK_UP))     gamepad->buttons |= XBOX_DPAD_UP;
-    if (pressed(VK_DOWN))   gamepad->buttons |= XBOX_DPAD_DOWN;
-    if (pressed(VK_LEFT))   gamepad->buttons |= XBOX_DPAD_LEFT;
-    if (pressed(VK_RIGHT))  gamepad->buttons |= XBOX_DPAD_RIGHT;
-    if (pressed(VK_RETURN)) gamepad->buttons |= XBOX_START;
-    if (pressed(VK_BACK))   gamepad->buttons |= XBOX_BACK;
-    if (pressed('Z')) gamepad->analog_buttons[HOST_ANALOG_A] = 0xFFu;
-    if (pressed('X')) gamepad->analog_buttons[HOST_ANALOG_B] = 0xFFu;
-    if (pressed('A')) gamepad->analog_buttons[HOST_ANALOG_X] = 0xFFu;
-    if (pressed('S')) gamepad->analog_buttons[HOST_ANALOG_Y] = 0xFFu;
-    if (pressed('Q')) gamepad->analog_buttons[HOST_ANALOG_WHITE] = 0xFFu;
-    if (pressed('W')) gamepad->analog_buttons[HOST_ANALOG_BLACK] = 0xFFu;
-    if (pressed('E')) gamepad->analog_buttons[HOST_ANALOG_LTRIG] = 0xFFu;
-    if (pressed('R')) gamepad->analog_buttons[HOST_ANALOG_RTRIG] = 0xFFu;
-    fake_input(gamepad);
-    seq_input(gamepad);
+    if (port == 0) {
+        fake_input(gamepad);
+        seq_input(gamepad);
+    }
     return true;
+}
+
+bool recomp_input_host_sample(RecompInputGamepad *gamepad)
+{
+    return recomp_input_host_sample_port(0u, gamepad);
 }
