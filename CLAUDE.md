@@ -98,6 +98,17 @@ without `--trace-all-entries`. The level runs 80 fps uncapped on this machine, s
 is forwarded (the briefing text was spilling out of its box), and closing the game window
 exits the process. **F9 shows the frame rate on screen and F10 steps the frame cap**
 (adaptive/60/30/off) while a title runs; `RECOMP_FPS_OVERLAY=1` starts with the counter on.
+**The built executable runs the game on its own** (Sep 2026): double-click it, or shortcut it
+from anywhere. It looks for the game in a `game` folder beside itself, then at `games/<title>/`
+relative to itself, then `RECOMP_GAME_DIR`; and the vblank, the emulated audio hardware and the
+shadow renderer are **on unless turned off** (`RECOMP_VBLANK=0`, `RECOMP_AC97_READY=0`,
+`RECOMP_HLE_D3D8=off`; `xbox_EnvSwitch` reads them). The `run.bat` files are debugging launchers
+now, not a requirement. It is a windowed program, so a double-click gives it no console:
+diagnostics go to whatever redirected them, else to the terminal it was started from, else to
+`<executable>.log` beside it (`setup_output` in the template). Note the switch a title needs is read in **five** places including the
+title's own `main.c` (from `templates/new-game/src/main.c`), so change the template and
+regenerate with `scripts/regen_title_main.py`.
+
 **F11 captures the frame on screen** -- a BMP and a replayable capture, beside the executable --
 which is how a player reports a rendering bug that only happens somewhere specific.
 `RECOMP_INPUT_SEQ` can now hold stick directions (`lstick_up`, `rstick_left`, ...) as well as

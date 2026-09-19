@@ -1,11 +1,12 @@
 @echo off
-rem Burnout 2 -- run the Release build with the switches it needs.
-rem See titles\timesplitters2\run.bat for the build commands, the windows and
-rem the keyboard mapping; they are the same here.
+rem Burnout 2 -- a debugging launcher.
+rem
+rem You do not need this to play: burnout2_recomp.exe in build\Release runs the
+rem game on its own, from a double-click or a shortcut anywhere. See
+rem titles\timesplitters2\run.bat for where the game files are looked for, the
+rem keys, and the switches a debugging session might want; they are the same
+rem here.
 setlocal
 cd /d "%~dp0build\Release" || exit /b 1
-set RECOMP_VBLANK=1
-set RECOMP_AC97_READY=1
-set RECOMP_HLE_D3D8=shadow
-set RECOMP_TRACE_BUDGET=0
+set RECOMP_FPS=5
 burnout2_recomp.exe %*

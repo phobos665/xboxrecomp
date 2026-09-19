@@ -129,7 +129,13 @@ static int shadow_requested(void)
         const char *mode = getenv("RECOMP_HLE_D3D8");
         const char *fmv  = getenv("RECOMP_FMV_HOST");
 
-        g_shadow_mode = mode && strcmp(mode, "shadow") == 0;
+        /* On by default: it is what draws the picture, and a player running
+         * the executable wants the picture. RECOMP_HLE_D3D8=off turns it off
+         * for the measurements that need the title alone. */
+        g_shadow_mode = mode ? strcmp(mode, "shadow") == 0 : 1;
+        if (mode && !g_shadow_mode)
+            fprintf(stderr, "[HLE-D3D8] RECOMP_HLE_D3D8=%s: nothing draws the "
+                    "picture; the title runs blind\n", mode);
         if (g_shadow_mode && fmv && *fmv && strcmp(fmv, "0") != 0) {
             fprintf(stderr, "[HLE-D3D8] shadow mode off: RECOMP_FMV_HOST creates the "
                     "same host device, and there is only one\n");
