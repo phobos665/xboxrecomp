@@ -28,12 +28,25 @@
  * decides, the first method call on an object binds it to the interface
  * created nearest above it.
  *
+ * The clock. A stream's packets complete when the hardware has consumed
+ * them, and on the console that is the audio hardware's own clock. Here the
+ * host plays the samples, so the host is asked where it is
+ * (recomp_audio_output_position) and the clock is pulled onto that reading
+ * every tick. Wall-clock time is only the fallback -- for a format the host
+ * cannot play, before the voice exists, and while the voice is dry -- because
+ * a wall clock drifts away from what is coming out of the speakers by the
+ * device's rate error and by every gap the queue ran dry for, and a title
+ * that paces a cutscene on its music drifts with it. RECOMP_DSOUND_WALLCLOCK=1
+ * keeps the old behaviour, and the five-second line reports the correction
+ * being applied so drift can be seen rather than guessed at.
+ *
  * Not done: SYNCHPLAYBACK pauses like PAUSE; envelope and 3D settings are
  * ignored; a stream whose format the host cannot play still completes packets
  * on the clock, silently, so the title does not stall on it.
  */
 #include "platform/xbox_winnt.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "hle.h"
@@ -97,6 +110,12 @@ typedef struct Stream {
     uint64_t consumed_base;          /* consumed when the clock last (re)started */
     uint64_t resumed_ms;             /* host time of that start; 0 = stopped */
     uint64_t sent;                   /* decoded bytes submitted to the host */
+    /* The stream position the host voice's first sample holds. Everything
+     * submitted since is contiguous from here, so the voice's played-sample
+     * count reads directly as a stream position; any discontinuity resets
+     * the voice and moves this. */
+    uint64_t play_origin;
+    int      play_anchored;          /* the host clock has been read at least once */
 } Stream;
 
 /* What the title asks of its streams, reported every five seconds while any
@@ -104,6 +123,15 @@ typedef struct Stream {
  * GetStatus or Process count that stops moving. */
 static unsigned long g_calls_process, g_calls_status, g_calls_pause, g_calls_flush,
                      g_packets_done;
+/* How far the wall clock had run from the host's own play position, the last
+ * time they were compared, and the worst seen. Milliseconds, signed: positive
+ * means packets were completing ahead of the sound. */
+static long g_drift_ms, g_drift_ms_worst;
+/* Every correction added up: in the default mode this is how far the
+ * packets would have run from the sound by now, which is the drift the
+ * fix removes; under RECOMP_DSOUND_WALLCLOCK it is the drift itself. */
+static long g_drift_total_ms;
+static int  g_wallclock = -1;        /* RECOMP_DSOUND_WALLCLOCK */
 
 static Stream g_streams[MAX_STREAMS];
 static CRITICAL_SECTION g_lock;
@@ -175,6 +203,18 @@ static uint64_t decoded_size(const Stream *s, uint32_t size)
     return size - size % frame_bytes(s);
 }
 
+static int wallclock_only(void)
+{
+    if (g_wallclock < 0) {
+        const char *v = getenv("RECOMP_DSOUND_WALLCLOCK");
+        g_wallclock = v && *v && strcmp(v, "0") != 0;
+        if (g_wallclock)
+            fprintf(stderr, "[DSOUND] streams complete on the wall clock, not the "
+                            "host's play position\n");
+    }
+    return g_wallclock;
+}
+
 static uint64_t consumed(const Stream *s, uint64_t now)
 {
     uint64_t c = s->consumed_base;
@@ -189,6 +229,41 @@ static void restart_clock(Stream *s, uint64_t now)
 {
     s->consumed_base = s->queued;
     s->resumed_ms = s->paused ? 0u : now;
+}
+
+/* Pull the clock onto the host's own play position, so packets complete when
+ * the sound is actually heard. Skipped while the voice is dry: its position
+ * has stopped meaning anything, and letting the wall clock run on is what
+ * lets a starved stream restart. */
+static void sync_to_host(Stream *s, uint64_t now)
+{
+    uint64_t played = 0, pos;
+    uint32_t queued = 0;
+
+    if (!s->output || s->paused || !s->resumed_ms)
+        return;
+    if (!recomp_audio_output_position(slot_of(s), &played, &queued) || queued == 0)
+        return;
+
+    pos = s->play_origin + played;
+    if (pos > s->queued)
+        pos = s->queued;
+    if (s->play_anchored) {
+        uint64_t wall = consumed(s, now);
+        uint64_t bps = bytes_per_ms_x1000(s);
+        long drift = bps ? (long)(((int64_t)wall - (int64_t)pos) * 1000 / (int64_t)bps) : 0;
+        g_drift_ms = drift;
+        if (drift > g_drift_ms_worst) g_drift_ms_worst = drift;
+        if (-drift > g_drift_ms_worst) g_drift_ms_worst = -drift;
+        g_drift_total_ms += drift;
+    }
+    s->play_anchored = 1;
+    /* Measured either way, corrected unless the wall clock was asked for,
+     * so one run of each says how far the sound and the packets parted. */
+    if (wallclock_only())
+        return;
+    s->consumed_base = pos;
+    s->resumed_ms = now;
 }
 
 static Stream *find_by_iface(uint32_t iface)
@@ -300,14 +375,25 @@ static void pump(Stream *s, uint64_t now)
             Packet *q = &s->packets[(s->head + i) % MAX_PACKETS];
             if (s->sent >= q->start && s->sent < q->end) { p = q; break; }
         }
-        if (!p) {                    /* a gap: packets already completed */
+        if (!p) {
+            /* A gap: the clock has run past data the host was never given,
+             * so what the voice holds is no longer contiguous with the
+             * stream. Start it again from here, or its played-sample count
+             * would read as a position it is not at. */
+            recomp_audio_output_reset_voice(slot_of(s));
             s->sent = target;
+            s->play_origin = target;
+            s->play_anchored = 0;
             break;
         }
         within = s->sent - p->start;
+        /* A whole chunk, even when that reaches a little past the target:
+         * clipping it to the target instead meant one buffer per tick of
+         * whatever the tick was worth, ~16 ms, and 25 of those outstanding
+         * for a 400 ms lead -- more than the host queues, so every tick
+         * ended in a refusal. The lead is a buffer, not a deadline. */
         want = ms_to_bytes(s, CHUNK_MS);
         if (want > p->end - s->sent) want = p->end - s->sent;
-        if (want > target - s->sent) want = target - s->sent;
         if (want > sizeof pcm) want = sizeof pcm;
         if (s->tag == TAG_ADPCM) {
             uint32_t block = XBOX_ADPCM_BLOCK_BYTES * s->channels;
@@ -338,8 +424,13 @@ static void pump(Stream *s, uint64_t now)
             }
             memcpy(pcm, HLE_PTR(p->data + (uint32_t)within), bytes);
         }
-        recomp_audio_output_submit(slot_of(s), pcm, bytes, s->rate, s->channels,
-                                   out_bits(s), s->volume);
+        /* Only sound the host actually took counts as sent. A full queue is
+          * normal -- the lead is deliberately more than one chunk -- and
+          * stepping over the refusal would delete that sound from the stream
+          * and leave everything after it late by its length. */
+        if (!recomp_audio_output_submit(slot_of(s), pcm, bytes, s->rate, s->channels,
+                                        out_bits(s), s->volume))
+            break;
         s->sent += bytes;
     }
 }
@@ -349,11 +440,14 @@ static void refeed(Stream *s, uint64_t now)
 {
     recomp_audio_output_reset_voice(slot_of(s));
     s->sent = consumed(s, now);
+    s->play_origin = s->sent;
+    s->play_anchored = 0;
     pump(s, now);
 }
 
 static void tick(Stream *s, uint64_t now)
 {
+    sync_to_host(s, now);
     complete_passed(s, now);
     pump(s, now);
 }
@@ -379,6 +473,11 @@ void hle_dsound_stream_tick(uint64_t now)
                     (unsigned long long)s->queued, s->paused ? "paused" : "running",
                     g_calls_process, g_calls_status, g_calls_pause, g_calls_flush,
                     g_packets_done);
+            if (s->play_anchored)
+                fprintf(stderr, "[DSOUND] stream %08X: %+ld ms from the host's play "
+                        "position since the last tick, %+ld ms in total, worst single "
+                        "%ld ms%s\n", s->iface, g_drift_ms, g_drift_total_ms,
+                        g_drift_ms_worst, wallclock_only() ? " (not corrected)" : "");
         }
         fflush(stderr);
     }
