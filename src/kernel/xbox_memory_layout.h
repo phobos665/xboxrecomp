@@ -198,11 +198,12 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * until then. Here the fence mirror completed everything the instant it was
  * submitted and titles presented as fast as the host allowed. The HLE Swap
  * calls Arm before it runs the title's own Swap, and Arm sleeps until the
- * kernel's vblank tick calls Release. Off unless RECOMP_FPS_CAP is set:
- * <fps> releases every (vblank rate / fps)th vblank, "adaptive" holds only
- * a frame that finished inside the period. See the comment above the
- * implementation for why the gate sleeps in Swap rather than holding the
- * fence, and why it is not on by default. */
+ * kernel's vblank tick calls Release. Adaptive by default: a frame that
+ * finished inside the period waits for the next vblank, a late one presents
+ * at once. RECOMP_FPS_CAP=<fps> releases every (vblank rate / fps)th vblank
+ * strictly, RECOMP_FPS_CAP=0 switches the gate off. See the comment above
+ * the implementation for why the gate sleeps in Swap rather than holding
+ * the fence, and the measurements behind the default. */
 void xbox_Nv2aFlipGateArm(void);
 void xbox_Nv2aFlipGateRelease(void);
 

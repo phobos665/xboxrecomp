@@ -24,10 +24,10 @@ rem
 rem Extra arguments are passed to the executable. Useful environment:
 rem   RECOMP_FPS=5                      frame-rate line every 5 s on stderr
 rem   RECOMP_INPUT_SEQ=12000:start,...  scripted presses (see input_host.c)
-rem   RECOMP_FPS_CAP=60                 console pacing: one present per vblank
-rem                                     (30 = every second vblank; "adaptive"
-rem                                     holds only fast frames). Off by default:
-rem                                     the level runs faster uncapped.
+rem   RECOMP_FPS_CAP=adaptive           the default: at most one present per
+rem                                     vblank, late frames present at once.
+rem                                     60 or 30 = strict console cadence
+rem                                     (30 = every second vblank), 0 = off.
 setlocal
 cd /d "%~dp0build\Release" || exit /b 1
 set RECOMP_VBLANK=1

@@ -85,6 +85,16 @@ before every function rebuild). When a title "hangs" after drawing, suspect the 
 first, and when it spins on an `[ICALL] unknown target` a few bytes past a function end, look
 for a `jmp [reg*4 + table]` just before it.
 
+**Update, 19 Sep 2026:** TimeSplitters 2 plays. The dark level was stale blend and depth
+state (`SetRenderState_Simple` is now stored), the black story intro was a DirectSound
+stream status word (`DSSTREAMSTATUS_PLAYING` is 0x10000), the last unresolved indirect
+call was a switch arm the translator lost after a re-sync, and both titles are lifted
+without `--trace-all-entries`. The level runs 80 fps uncapped on this machine, so the
+**flip gate is on by default in adaptive mode** (`RECOMP_FPS_CAP=0` to switch it off,
+`=60`/`=30` for the strict console cadence); the measurements behind that are in
+`docs/technical/resolution-and-framerate.md`. Next: the performance plan in
+`docs/technical/ts2-performance-plan.md`, items 1-7.
+
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
 `%APPDATA%\xboxrecomp\input_bindings.json`, else one beside the executable — and falls
@@ -209,8 +219,14 @@ each other silently. Give each title its own outputs and project:
 
 ```bash
 py -3 scripts/recompile.py "games/<title>/default.xbe" \
-    --work-dir games/_pipeline/<name>/out --project titles/<name> --trace-all-entries
+    --work-dir games/_pipeline/<name>/out --project titles/<name>
 ```
+
+Add `--trace-all-entries` only while bringing a title up: it puts a hook at every lifted
+function's entry (for `[TRACE]` lines, `RECOMP_TRACE_ONLY`, the entry profiler and the
+"main thread stops entering new functions" diagnosis) and costs a few percent of frame
+time. A plain lift keeps `RECOMP_SAMPLE` and the kernel log. Both titles are lifted plain
+now; TimeSplitters 2 was re-lifted plain on 19 Sep 2026 with no change in behaviour.
 
 Projects live in `titles/<name>/` (committed: CMakeLists, `main.c`, `recomp_manual.c`),
 game data in `games/<title>/` and stage output in `games/_pipeline/<name>/out` (both

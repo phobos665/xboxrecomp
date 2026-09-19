@@ -217,11 +217,17 @@ objects behind it), so the script is the save state. Frame dumps
     games/_pipeline/<name>/out/       disasm/ func_id/ recomp/ for that title           (ignored)
 
     py -3 scripts/recompile.py "games/<title>/default.xbe" \
-        --work-dir games/_pipeline/<name>/out --project titles/<name> --trace-all-entries
+        --work-dir games/_pipeline/<name>/out --project titles/<name> [--trace-all-entries]
     cmake -S titles/<name> -B titles/<name>/build -G "Visual Studio 16 2019" -A x64 -DRECOMP_ABI_CHECK=ON
     cmake --build titles/<name>/build --config Release -- -m
     RECOMP_VBLANK=1 RECOMP_AC97_READY=1 py -3 scripts/run_and_report.py \
         titles/<name>/build/Release/<name>_recomp.exe --seconds 60 --profile 100
+
+`--trace-all-entries` is the bring-up hook: every lifted function starts by
+calling `recomp_trace_enter`, which is what `[TRACE]`, `RECOMP_TRACE_ONLY` and
+the entry profiler hang off. Once the title runs, lift it again without the
+flag; the sampler (`RECOMP_SAMPLE`) and the kernel log do not need it.
+TimeSplitters 2 was re-lifted plain on 19 Sep 2026 and behaves the same.
 
 `--work-dir` exists because every stage defaulted to one shared
 `tools/*/output`, and the recompiler's guard against mixing titles compares

@@ -542,21 +542,23 @@ static void frame_counters_tick(void)
  * arrived while the title was still drawing does not count: the wait is for
  * the next one, or the frame after it could present again in the same period.
  *
- * Off unless RECOMP_FPS_CAP is set, for now. Two ways to wait when it is:
- * RECOMP_FPS_CAP=<fps> is the strict console cadence -- every Swap waits for
- * the next release, and the release comes every (vblank rate / fps)th
- * vblank; 30 with a 60 Hz vblank is what a title sees on hardware when it
- * misses every other frame, fine for a fixed-30 title and half speed for one
- * that steps its logic per presented frame. RECOMP_FPS_CAP=adaptive lets a
- * frame that already missed a vblank present at once and holds only a frame
- * that finished inside the period, meant to keep a 20 ms frame at 50 fps
- * rather than 30. Neither is the default yet: the one comparison made
- * (TimeSplitters 2's Siberia, adaptive 33 fps against 44 uncapped with the
- * gate's own wait at zero) was taken on a machine shared with another
- * build, and uncapped runs of the same stretch since have ranged 33-52 on
- * their own. Until that is measured quietly, the choice is the user's
- * (docs/technical/resolution-and-framerate.md). Burnout 2's front end, 1 ms
- * of work a frame, holds 60.0 under either mode. */
+ * Adaptive by default: a Swap that arrives after the vblank it should have
+ * waited for presents at once, and only a frame that finished inside the
+ * period is held for the next vblank. RECOMP_FPS_CAP=<fps> is the strict
+ * console cadence instead -- every Swap waits for the next release, and the
+ * release comes every (vblank rate / fps)th vblank; 30 with a 60 Hz vblank
+ * is what a title sees on hardware when it misses every other frame, fine
+ * for a fixed-30 title and half speed for one that steps its logic per
+ * presented frame. RECOMP_FPS_CAP=0 switches the gate off, for measuring.
+ *
+ * Why adaptive won (TimeSplitters 2's Siberia, 19 Sep 2026, quiet machine,
+ * three scripted runs of each, docs/technical/resolution-and-framerate.md):
+ * uncapped the level ran 79-89 fps with a 12.4 ms frame, so the title was
+ * not paced at all; adaptive held 59.9-60.2 in every five-second window with
+ * 3.7 ms of gate wait per frame; strict 60 held 60 most of the time but
+ * dipped to 55-58 and once to 45 at the same points in all three runs,
+ * because a frame that just misses its vblank waits out a whole extra one.
+ * Burnout 2's front end, 1 ms of work a frame, holds 60.0 under either. */
 static HANDLE        g_flip_gate_event;
 static volatile LONG g_flip_gate_vblanks;
 static int           g_flip_gate_divisor = -1;      /* -1: not configured */
@@ -568,12 +570,14 @@ static int flip_gate_divisor(void)
         const char *cap = getenv("RECOMP_FPS_CAP");
         const char *hz = getenv("RECOMP_VBLANK_HZ");
         int vblank = hz && atoi(hz) > 0 ? atoi(hz) : 60;
-        int d = 0;                                      /* off unless asked */
+        int d = 1;                                      /* adaptive unless asked */
 
         if (cap && *cap) {
             int fps = atoi(cap);
             if (strcmp(cap, "adaptive") == 0)
                 d = 1;
+            else if (strcmp(cap, "0") == 0 || strcmp(cap, "off") == 0)
+                d = 0;
             else if (fps > 0) {
                 d = (vblank + fps / 2) / fps;
                 if (d < 1) d = 1;
@@ -582,8 +586,8 @@ static int flip_gate_divisor(void)
         }
         g_flip_gate_divisor = d;
         fprintf(stderr, "  [NV2A] flip gate: %s\n",
-                d == 0 ? "off, Swap never waits (RECOMP_FPS_CAP=60 for console pacing)"
-                       : !g_flip_gate_strict ? "adaptive, at most one Swap per vblank"
+                d == 0 ? "off, Swap never waits (RECOMP_FPS_CAP=adaptive or 60 to pace)"
+                       : !g_flip_gate_strict ? "adaptive, at most one Swap per vblank (RECOMP_FPS_CAP=0 to switch off)"
                        : d == 1 ? "strict, one Swap per vblank" : "strict, one Swap per N vblanks");
         if (d > 1)
             fprintf(stderr, "  [NV2A] flip gate divisor %d (RECOMP_FPS_CAP=%s at %d Hz)\n",
