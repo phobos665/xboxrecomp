@@ -100,10 +100,13 @@ bytes barely exceed its working set because it commits little it does not touch,
 and its guest address space is a file mapping rather than private commit.
 
 † The private-bytes figure comes from a third run, same build, same switches,
-same t = 195–245 s window; that run reached the level at t = 207 s, so a quarter
-of its window is still the cutscene. Its working set (239 MB) and private
-working set (149 MB) match the run in the table to within 1 %, which is the
-check that the two runs are the same thing.
+same t = 195–245 s window — **and that run overlapped another session's run of
+the same title on this machine**, so its CPU, GPU and frame-rate samples are
+discarded and only the memory figure is quoted. Memory is the one thing
+contention does not move: that run's working set (239 MB) and private working
+set (149 MB) match the clean run in the table to within 1 %, which is what
+licenses quoting its private bytes and nothing else from it. The run also
+reached the level at t = 207 s, so a quarter of its window is still cutscene.
 
 CPU looks like a tie and is not one. Let run free, the recompiled build spends
 251 % of a core against xemu's 244 % — both keep about two and a half cores busy
@@ -145,9 +148,11 @@ vblank is not something these counters can say.
   running; earlier attempts that overlapped a build were discarded, and so were
   two runs that turned out to be sitting in the front end rather than the level.
   Eight idle `MSBuild.exe` node-reuse processes were resident throughout and used
-  0 % CPU. The third run was watched while it ran, and reading its growing stderr
-  once a minute cost it a couple of points of CPU (148 % against 145 %); that is
-  why the table's CPU figures come from the unwatched runs.
+  0 % CPU. The third run, the one the private-bytes figure comes from, overlapped
+  another session's run of the same title; everything but its memory counters is
+  dropped for that reason. Two earlier attempts that overlapped a compile, and
+  two that turned out to be parked in the front end, were rerun rather than
+  reported.
 - `Working Set - Private` is resident private memory and `Private Bytes` is
   commitment; they are not the same number and for xemu they differ by a factor
   of nearly four.
