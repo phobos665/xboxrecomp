@@ -564,6 +564,17 @@ static volatile LONG g_flip_gate_vblanks;
 static int           g_flip_gate_divisor = -1;      /* -1: not configured */
 static int           g_flip_gate_strict;            /* RECOMP_FPS_CAP given */
 
+/* What the on-screen toggle cycles through: the settings a player picks
+ * between, in that order. A RECOMP_FPS_CAP outside this list still works --
+ * it is simply not one of the stops, and the first press moves to the
+ * first one. */
+static const struct { int divisor, strict; const char *name; } g_gate_modes[] = {
+    { 1, 0, "adaptive" },
+    { 1, 1, "60" },
+    { 2, 1, "30" },
+    { 0, 0, "off" },
+};
+
 static int flip_gate_divisor(void)
 {
     if (g_flip_gate_divisor < 0) {
@@ -595,6 +606,36 @@ static int flip_gate_divisor(void)
         fflush(stderr);
     }
     return g_flip_gate_divisor;
+}
+
+/* Where the current setting sits in that list, or -1 for one that is not in
+ * it. */
+static int flip_gate_mode_index(void)
+{
+    int d = flip_gate_divisor(), i;
+
+    for (i = 0; i < (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]); i++)
+        if (g_gate_modes[i].divisor == d &&
+            (d == 0 || g_gate_modes[i].strict == g_flip_gate_strict))
+            return i;
+    return -1;
+}
+
+const char *xbox_Nv2aFlipGateModeName(void)
+{
+    int i = flip_gate_mode_index();
+    return i < 0 ? "custom" : g_gate_modes[i].name;
+}
+
+void xbox_Nv2aFlipGateCycle(void)
+{
+    int i = flip_gate_mode_index();
+
+    i = i < 0 ? 0 : (i + 1) % (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]);
+    g_flip_gate_divisor = g_gate_modes[i].divisor;
+    g_flip_gate_strict = g_gate_modes[i].strict;
+    fprintf(stderr, "  [NV2A] flip gate: %s\n", g_gate_modes[i].name);
+    fflush(stderr);
 }
 
 void xbox_Nv2aFlipGateArm(void)

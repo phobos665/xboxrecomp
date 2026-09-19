@@ -68,6 +68,7 @@
 #ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
+#include "d3d8_overlay.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
 #endif
@@ -113,6 +114,7 @@ static UINT               g_shadow_width, g_shadow_height;
 static UINT               g_target_width, g_target_height;
 static unsigned long      g_target_sets, g_target_scratch, g_target_failed;
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
+static HWND               g_shadow_hwnd;
 static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
 static int                g_shadow_thread_notes;
@@ -331,6 +333,7 @@ static void shadow_create(uint32_t pp_va)
         g_z_scale = xbox_depth_z_scale(HLE_MEM32(pp_va + 36));
 
     hwnd = shadow_window(width, height);
+    g_shadow_hwnd = hwnd;
     if (!hwnd)
         return;
 
@@ -929,6 +932,77 @@ static void swap_timing_report(void)
     g_swap_timed = 0;
 }
 
+/* ------------------------------------------------------------------ overlay
+ *
+ * A frame-rate counter the player can turn on, and a frame cap they can
+ * change without restarting. The renderer draws the line (d3d8_overlay.h);
+ * what it says and when it appears is decided here, because this is where
+ * the frame rate is already counted and where the flip gate is reachable.
+ *
+ * F9 shows or hides the counter, F10 steps the cap. Both are read only while
+ * the game's window is in front, so they do nothing while the player is in
+ * another application, and neither is a key the input bindings offer, so
+ * neither can collide with a control. RECOMP_FPS_OVERLAY=1 starts with the
+ * counter already on.
+ *
+ * The rate is measured over half-second windows at the same Swap that
+ * RECOMP_FPS counts, so the number on screen and the number in the log are
+ * the same measurement.
+ */
+static void overlay_frame(void)
+{
+    static int configured, enabled, f9_was_down, f10_was_down;
+    static LARGE_INTEGER qpf, window_start;
+    static unsigned window_frames;
+    static char line[96];
+    LARGE_INTEGER now;
+    int front, f9, f10;
+
+    if (!configured) {
+        const char *v = getenv("RECOMP_FPS_OVERLAY");
+
+        configured = 1;
+        enabled = v && *v && strcmp(v, "0") != 0;
+        QueryPerformanceFrequency(&qpf);
+        QueryPerformanceCounter(&window_start);
+        snprintf(line, sizeof line, "-- fps   cap %s", xbox_Nv2aFlipGateModeName());
+        fprintf(stderr, "[HLE-D3D8] F9 shows the frame rate on screen, F10 steps the "
+                "frame cap (now %s)\n", xbox_Nv2aFlipGateModeName());
+        fflush(stderr);
+    }
+
+    front = g_shadow_hwnd && GetForegroundWindow() == g_shadow_hwnd;
+    f9  = front && (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
+    f10 = front && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (f9 && !f9_was_down)
+        enabled = !enabled;
+    if (f10 && !f10_was_down) {
+        xbox_Nv2aFlipGateCycle();
+        window_start.QuadPart = 0;           /* the old window straddles the change */
+    }
+    f9_was_down = f9;
+    f10_was_down = f10;
+
+    QueryPerformanceCounter(&now);
+    if (!window_start.QuadPart) {
+        window_start = now;
+        window_frames = 0;
+    }
+    window_frames++;
+    if (qpf.QuadPart &&
+        now.QuadPart - window_start.QuadPart >= qpf.QuadPart / 2) {
+        double secs = (double)(now.QuadPart - window_start.QuadPart) / (double)qpf.QuadPart;
+
+        snprintf(line, sizeof line, "%.1f fps   cap %s",
+                 (double)window_frames / secs, xbox_Nv2aFlipGateModeName());
+        window_start = now;
+        window_frames = 0;
+    }
+
+    if (enabled)
+        d3d8_overlay_draw(line);
+}
+
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */
 HLE_EXPORT(D3DDevice_Swap)
 {
@@ -979,6 +1053,7 @@ HLE_EXPORT(D3DDevice_Swap)
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
         shadow_dump_frame();             /* before Present discards the buffer */
         g_frame_draws = 0;
+        overlay_frame();                 /* after the dump: not in the captures */
         host_Swap(g_shadow, 0);
         if (!g_shadow_last_report) {
             g_shadow_last_report = now;

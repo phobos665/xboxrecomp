@@ -207,6 +207,12 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
 void xbox_Nv2aFlipGateArm(void);
 void xbox_Nv2aFlipGateRelease(void);
 
+/* The setting by name ("adaptive", "60", "30", "off", or "custom" for one
+ * RECOMP_FPS_CAP asked for that is not a stop on the cycle), and the next
+ * one along. For a key the player presses while the title runs. */
+const char *xbox_Nv2aFlipGateModeName(void);
+void        xbox_Nv2aFlipGateCycle(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**
