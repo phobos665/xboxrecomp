@@ -575,6 +575,27 @@ static const struct { int divisor, strict; const char *name; } g_gate_modes[] = 
     { 0, 0, "off" },
 };
 
+/* A switch that is on unless it is turned off, or off unless turned on.
+ *
+ * The things a title needs in order to run at all -- the vblank, the audio
+ * codec's ready bit, the replacement renderer -- began as experiments, and an
+ * experiment is off until asked for. They are not experiments any more: a
+ * player double-clicking the executable should get the game, not a black
+ * window, so they default on and the variable turns them off. "0", "off",
+ * "no" and "false" mean off; anything else, including an empty value, means
+ * on. */
+int xbox_EnvSwitch(const char *name, int default_on)
+{
+    const char *v = name ? getenv(name) : NULL;
+
+    if (!v)
+        return default_on;
+    if (!*v)
+        return 1;
+    return !(strcmp(v, "0") == 0 || _stricmp(v, "off") == 0 ||
+             _stricmp(v, "no") == 0 || _stricmp(v, "false") == 0);
+}
+
 static int flip_gate_divisor(void)
 {
     if (g_flip_gate_divisor < 0) {
@@ -1837,7 +1858,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Only when RECOMP_VBLANK is set, because that is the only thing that
          * raises an interrupt for anyone to acknowledge.
          */
-        if (g_nv2a_memory && getenv("RECOMP_VBLANK")) {
+        if (g_nv2a_memory && xbox_EnvSwitch("RECOMP_VBLANK", 1)) {
             DWORD old_nv;
             if (VirtualProtect((char *)g_nv2a_memory + XBOX_NV2A_PCRTC_PAGE,
                                4096, PAGE_READONLY, &old_nv))
@@ -1924,7 +1945,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * init. Until the DSP handshake is answered, the honest default is
              * the failure that gets further, with the correct behaviour one
              * variable away. */
-            if (getenv("RECOMP_AC97_READY")) {
+            if (xbox_EnvSwitch("RECOMP_AC97_READY", 1)) {
                 /* The APU's registers have to fault so they can be routed to
                  * the emulated APU, which is the half that answers the DSP
                  * handshake. Backed as plain memory the guest's writes go

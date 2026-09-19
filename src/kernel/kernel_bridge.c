@@ -2203,7 +2203,7 @@ static void vblank_clock_configure(void)
     LARGE_INTEGER li;
 
     s_vblank_clock.configured = 1;
-    s_vblank_clock.enabled = getenv("RECOMP_VBLANK") != NULL;
+    s_vblank_clock.enabled = xbox_EnvSwitch("RECOMP_VBLANK", 1);
     if (!s_vblank_clock.enabled)
         return;
     s_vblank_clock.legacy = clock && strcmp(clock, "tick") == 0;

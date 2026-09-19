@@ -204,6 +204,13 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * strictly, RECOMP_FPS_CAP=0 switches the gate off. See the comment above
  * the implementation for why the gate sleeps in Swap rather than holding
  * the fence, and the measurements behind the default. */
+/* A host switch read from the environment: on unless turned off when
+ * default_on, off unless turned on otherwise. "0", "off", "no" and "false"
+ * turn one off; an empty value turns it on. The switches a title needs to
+ * run at all default on, so the executable runs the game when it is simply
+ * double-clicked. */
+int xbox_EnvSwitch(const char *name, int default_on);
+
 void xbox_Nv2aFlipGateArm(void);
 void xbox_Nv2aFlipGateRelease(void);
 
