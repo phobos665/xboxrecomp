@@ -661,11 +661,21 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 
 /* ------------------------------------------------------------ frame dumps */
 
+/* Set by the key that asks for the frame on screen; see overlay_frame. */
+static int g_dump_requested;
+
+static void shadow_dump_next_frame(void)
+{
+    g_dump_requested = 1;
+}
+
 static void shadow_dump_frame(void)
 {
     static const char *prefix;
     static int configured, every = 300, written;
     static unsigned long min_draws, last_dump, from_swap;
+    static char asked_prefix[8];
+    int asked;
     IDirect3DSurface8 *surf = NULL;
     D3DLOCKED_RECT lr;
     char path[512];
@@ -692,14 +702,26 @@ static void shadow_dump_frame(void)
         if (e && atol(e) > 0)
             from_swap = (unsigned long)atol(e);
     }
-    if (!prefix || !*prefix || written >= 24 || g_shadow_swaps < from_swap)
-        return;
-    if (min_draws) {
-        if (g_frame_draws < min_draws || (last_dump && g_shadow_swaps - last_dump < (unsigned long)every))
+    /* Asked for by hand: this frame, wherever the run has got to, whatever
+     * the interval and the 24-file cap say, and beside the executable when
+     * no prefix was given -- so pressing the key is the whole procedure. */
+    asked = g_dump_requested;
+    g_dump_requested = 0;
+    if (asked && (!prefix || !*prefix)) {
+        snprintf(asked_prefix, sizeof asked_prefix, "frame");
+        prefix = asked_prefix;
+    }
+    if (!asked) {
+        if (!prefix || !*prefix || written >= 24 || g_shadow_swaps < from_swap)
             return;
-        last_dump = g_shadow_swaps;
-    } else if ((g_shadow_swaps % (unsigned long)every) != 0) {
-        return;
+        if (min_draws) {
+            if (g_frame_draws < min_draws ||
+                (last_dump && g_shadow_swaps - last_dump < (unsigned long)every))
+                return;
+            last_dump = g_shadow_swaps;
+        } else if ((g_shadow_swaps % (unsigned long)every) != 0) {
+            return;
+        }
     }
 
     if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
@@ -951,12 +973,12 @@ static void swap_timing_report(void)
  */
 static void overlay_frame(void)
 {
-    static int configured, enabled, f9_was_down, f10_was_down;
+    static int configured, enabled, f9_was_down, f10_was_down, f11_was_down;
     static LARGE_INTEGER qpf, window_start;
     static unsigned window_frames;
     static char line[96];
     LARGE_INTEGER now;
-    int front, f9, f10;
+    int front, f9, f10, f11;
 
     if (!configured) {
         const char *v = getenv("RECOMP_FPS_OVERLAY");
@@ -974,6 +996,15 @@ static void overlay_frame(void)
     front = g_shadow_hwnd && GetForegroundWindow() == g_shadow_hwnd;
     f9  = front && (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
     f10 = front && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    f11 = front && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (f11 && !f11_was_down) {
+        /* Both, because they answer different questions: the picture shows
+         * what is wrong, the capture lets it be replayed draw by draw with
+         * no game running (src/replay). */
+        hle_d3d8_capture_next_frame();
+        shadow_dump_next_frame();
+    }
+    f11_was_down = f11;
     if (f9 && !f9_was_down)
         enabled = !enabled;
     if (f10 && !f10_was_down) {

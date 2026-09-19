@@ -55,6 +55,13 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
 /* True while a frame is being recorded. */
 int hle_d3d8_capture_active(void);
 
+/* Capture the next frame, whatever swap it turns out to be. This is the
+ * answer to "it looks wrong here": a swap number has to be guessed before
+ * the run, and nobody knows in advance which swap they will be standing on
+ * when they see it. Without RECOMP_D3D8_CAPTURE the file lands beside the
+ * executable. */
+void hle_d3d8_capture_next_frame(void);
+
 /* ----------------------------------------------------------- device calls */
 
 HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,

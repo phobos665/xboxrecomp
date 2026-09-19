@@ -62,6 +62,7 @@ static D3D8CapWriter *g_cap;
 static int            g_configured;
 static const char    *g_path;
 static unsigned long  g_target_swap;
+static int            g_capture_asap;   /* the next swap, whichever it is */
 static unsigned long  g_frame;
 static unsigned long  g_every;       /* RECOMP_D3D8_CAPTURE_EVERY, 0 = once */
 static unsigned long  g_min_draws;   /* RECOMP_D3D8_CAPTURE_MINDRAWS, 0 = any */
@@ -504,6 +505,24 @@ static void capture_configure(void)
                 g_path, D3D8CAP_VERSION);
 }
 
+void hle_d3d8_capture_next_frame(void)
+{
+    static char fallback[512];
+
+    if (!g_configured)
+        capture_configure();
+    if (!g_path || !*g_path) {
+        /* Nowhere was asked for, so put it where the player can find it. */
+        snprintf(fallback, sizeof fallback, "frame%s", D3D8CAP_EXTENSION);
+        g_path = fallback;
+        g_every = 0;
+        g_min_draws = 0;
+    }
+    g_capture_asap = 1;                  /* whichever swap comes next */
+    fprintf(stderr, "[HLE-D3D8] capturing the next frame to %s\n", g_path);
+    fflush(stderr);
+}
+
 void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
 {
     IDirect3DDevice8 *dev;
@@ -549,6 +568,12 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
         return;
     }
 start:
+    /* Asked for by hand: this swap is the target, since the number it would
+     * otherwise have to match cannot be known before the run. */
+    if (g_capture_asap) {
+        g_capture_asap = 0;
+        g_target_swap = swaps;
+    }
     if (swaps != g_target_swap)
         return;
     dev = hle_d3d8_shadow_device();
