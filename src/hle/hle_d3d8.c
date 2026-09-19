@@ -447,7 +447,57 @@ static int shadow_program_find(uint32_t guest)
 #define SHADOW_PROGRAM_SLOTS 136
 static DWORD g_slot_host[SHADOW_PROGRAM_SLOTS];
 static int   g_slot_loaded[SHADOW_PROGRAM_SLOTS];
-static unsigned long g_slot_reloads;   /* loads that repeated a slot's microcode */
+static unsigned long g_slot_reloads;   /* loads answered from the program cache */
+
+/* Host programs by microcode. A title on this API rotates a few programs
+ * through the same slots -- TimeSplitters 2 puts three different programs
+ * into slot 0 in turn, ~60k loads in two minutes -- so "the slot already
+ * holds this" almost never matches. A load is answered by content instead:
+ * a host program, once made, is kept for the run and shared by every slot
+ * and every selected entry that names it, and is never deleted while it is
+ * in here. Beyond the cache's size loads fall back to create-and-delete. */
+#define SLOT_PROGRAM_CACHE 96
+
+typedef struct SlotProgram {
+    uint32_t hash;
+    int      count;
+    DWORD    host;
+} SlotProgram;
+
+static SlotProgram g_slot_programs[SLOT_PROGRAM_CACHE];
+static int         g_slot_program_count;
+
+static uint32_t microcode_hash(const DWORD *microcode, int count)
+{
+    const uint8_t *p = (const uint8_t *)microcode;
+    size_t n = (size_t)count * 4 * sizeof(DWORD), i;
+    uint32_t h = 0x811C9DC5u;
+
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+static int slot_program_find(uint32_t hash, int count, const DWORD *microcode)
+{
+    int i;
+    for (i = 0; i < g_slot_program_count; i++)
+        if (g_slot_programs[i].hash == hash && g_slot_programs[i].count == count &&
+            host_vsh_same_microcode(g_slot_programs[i].host, microcode, count))
+            return i;
+    return -1;
+}
+
+static int slot_program_cached(DWORD host)
+{
+    int i;
+    for (i = 0; i < g_slot_program_count; i++)
+        if (g_slot_programs[i].host == host)
+            return 1;
+    return 0;
+}
 
 static void shadow_read_declaration(int slot, uint32_t handle);
 
@@ -935,8 +985,8 @@ HLE_EXPORT(D3DDevice_Swap)
                     g_draws_off_thread);
             swap_timing_report();
             if (g_slot_reloads)
-                fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads repeated a "
-                        "slot's microcode and kept the host program\n", g_slot_reloads);
+                fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads answered from "
+                        "the %d cached host programs\n", g_slot_reloads, g_slot_program_count);
             if (g_target_sets)
                 fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
                         "scratch target, %lu failed\n", g_target_sets,
@@ -1209,21 +1259,34 @@ HLE_EXPORT(D3DDevice_LoadVertexShaderProgram)
         DWORD host = 0;
         HRESULT hr = E_FAIL;
 
-        /* Titles on this API reload the same program into the same slot
-         * several times a frame (TimeSplitters 2: 26k loads in two minutes).
-         * Identical microcode keeps the host program, and with it the handle
-         * that selected entries already refer to. */
-        if (valid && g_slot_loaded[address] &&
-            host_vsh_same_microcode(g_slot_host[address], microcode, count)) {
-            g_slot_reloads++;
-        } else {
-            if (valid)
+        if (valid) {
+            uint32_t hash = microcode_hash(microcode, count);
+            int i = slot_program_find(hash, count, microcode);
+
+            if (i >= 0) {
+                host = g_slot_programs[i].host;
+                hr = S_OK;
+                g_slot_reloads++;
+            } else {
                 hr = host_vsh_create_shader(microcode, count, &host);
-            if (g_slot_loaded[address])
-                host_vsh_delete_shader(g_slot_host[address]);
-            g_slot_loaded[address] = SUCCEEDED(hr);
-            g_slot_host[address] = SUCCEEDED(hr) ? host : 0;
-            if (logged < 64)
+                if (SUCCEEDED(hr) && g_slot_program_count < SLOT_PROGRAM_CACHE) {
+                    SlotProgram *sp = &g_slot_programs[g_slot_program_count++];
+                    sp->hash = hash;
+                    sp->count = count;
+                    sp->host = host;
+                }
+            }
+        }
+        /* The slot's previous program goes only if nothing else can name it. */
+        if (g_slot_loaded[address] && g_slot_host[address] != host &&
+            !slot_program_cached(g_slot_host[address]))
+            host_vsh_delete_shader(g_slot_host[address]);
+        g_slot_loaded[address] = SUCCEEDED(hr);
+        g_slot_host[address] = SUCCEEDED(hr) ? host : 0;
+        if (!valid || !slot_program_cached(host) || g_slot_programs[g_slot_program_count - 1].host == host) {
+            /* a new program, or one that could not be made: worth a line */
+            if (logged < 64 && !(valid && hr == S_OK && g_slot_reloads && slot_program_cached(host) &&
+                                 g_slot_programs[g_slot_program_count - 1].host != host))
                 fprintf(stderr, "[HLE-D3D8] shadow vertex program at slot %u: %u instructions, %s%s\n",
                         address, header >> 16,
                         SUCCEEDED(hr) ? "host program" : "not replayed",
