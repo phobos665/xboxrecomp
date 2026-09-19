@@ -42,6 +42,17 @@
 #include "input_host.h"
 #include "input_bindings.h"
 
+/* RECOMP_INPUT_LOG=1 -- see the read in XInputGetState below. */
+static int input_log_wanted(void)
+{
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *v = getenv("RECOMP_INPUT_LOG");
+        wanted = v && *v && strcmp(v, "0") != 0;
+    }
+    return wanted;
+}
+
 HLE_IMPORT_VAR(g_DeviceType_Gamepad);
 
 enum {
@@ -224,6 +235,23 @@ HLE_EXPORT(XInputGetState)
         memcpy(p + 18, &pad.thumb_rx, 2);
         memcpy(p + 20, &pad.thumb_ry, 2);
         result = ERR_SUCCESS;
+        /* RECOMP_INPUT_LOG=1: what the title is actually reading, twice a
+         * second while anything is held. "The game ignores my controller"
+         * splits here into a binding that produces nothing, a title that
+         * never reads this port, and a title that reads it and does
+         * nothing with it -- and only the last one is the title's fault. */
+        if (input_log_wanted() && (pad.buttons || pad.thumb_lx || pad.thumb_ly ||
+                                   pad.thumb_rx || pad.thumb_ry)) {
+            static ULONGLONG next;
+            ULONGLONG now = GetTickCount64();
+            if (now >= next) {
+                next = now + 500;
+                fprintf(stderr, "[INPUT] port %u reads buttons 0x%04X lx %6d ly %6d "
+                        "rx %6d ry %6d\n", port + 1u, pad.buttons, pad.thumb_lx,
+                        pad.thumb_ly, pad.thumb_rx, pad.thumb_ry);
+                fflush(stderr);
+            }
+        }
     }
     unlock();
     HLE_RETURN(result);
