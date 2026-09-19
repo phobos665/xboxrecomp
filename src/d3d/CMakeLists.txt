@@ -10,8 +10,10 @@ if(WIN32)
         d3d8_states.c
         d3d8_combiners.c
         d3d8_vsh.c
+        d3d8_overlay.c
     )
-    target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
+    # gdi32: the overlay renders its text with GDI rather than an embedded font.
+    target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler gdi32)
 
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke

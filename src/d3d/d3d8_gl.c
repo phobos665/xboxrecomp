@@ -1064,6 +1064,8 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
     g_guest_width = width;
     g_guest_height = height;
 }
+UINT d3d8_GetBackBufferWidth(void)  { return g_guest_width; }
+UINT d3d8_GetBackBufferHeight(void) { return g_guest_height; }
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width; }
 UINT d3d8_GetGuestHeight(void) { return g_guest_height; }
 

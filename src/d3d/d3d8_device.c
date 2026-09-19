@@ -124,6 +124,7 @@ const DWORD *d3d8_GetPalette(DWORD stage)
 /* Forward declarations */
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
+#include "d3d8_overlay.h"
 
 /* ================================================================
  * Public frame pump (called from recompiled game code)
@@ -152,6 +153,8 @@ ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_dev
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
+UINT d3d8_GetBackBufferWidth(void)  { return g_device_state.width; }
+UINT d3d8_GetBackBufferHeight(void) { return g_device_state.height; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
@@ -444,6 +447,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     if (ref <= 0) {
         /* Cleanup subsystems first */
         up_ring_shutdown();
+        d3d8_overlay_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
