@@ -85,15 +85,51 @@ up again. It should never be turned on to make a title "work": all it does is
 let a bad pointer read zeros instead of faulting, which trades a clear failure
 for a mysterious one.
 
+## What the object is
+
+The crash handler now prints the raw stack as well as the return addresses,
+which is what made the rest of this findable — the useful word was a data
+pointer the filtered list threw away.
+
+The saved registers put **0x00257360** in the frame. That address is in
+`.rdata`, is not writable, and holds eight pointers into `.text`: it is a
+**vtable**. So this is a C++ object, and the field being dereferenced is one
+of its members.
+
+Two constructors install that vtable, and comparing them says what the member
+is:
+
+```
+sub_001BB69D:  MEM32(eax)     = 0x257360;      /* vtable */
+               ecx            = MEM32(ecx + 0x18);
+               MEM32(eax + 4) = ecx;           /* +4 <- a dword from elsewhere */
+
+sub_001BB27E:  MEM8(eax + 4)  = ...;           /* +4 <- four separate bytes */
+               MEM8(eax + 5)  = ...;
+               MEM8(eax + 6)  = ...;
+               MEM32(eax)     = 0x257360;      /* vtable */
+               MEM8(eax + 7)  = ...;
+```
+
+One writes four bytes into +4..+7; the other writes a dword. So **+4 is a
+four-byte payload whose meaning depends on how the object was made** — a
+variant, or a property holding either inline data or a reference.
+
+The caller that crashes, `sub_001BC6B2`, does `ecx = MEM32(ecx + 4)` and then
+calls a method on the result: it is treating the payload as an object
+pointer. The payload holds float data. So either the object was built by the
+wrong constructor, or the value handed to `sub_001BB69D` from `[ecx + 0x18]`
+was already wrong.
+
+That is a much smaller question than "why does it crash", and it is where the
+next session should start: instrument `sub_001BB69D` to record what it is
+given, and find what writes `+0x18` of the object that feeds it.
+
 ## Next
 
-1. **Find the structure that is not initialised.** The crash chain is
-   `sub_001BD653` -> `sub_001BD525` -> `sub_001BC6B2` -> `sub_001BB846`, and
-   the immediate caller does `ecx = MEM32(ecx + 4)` — it loads the object
-   pointer out of its own object's field. So the *parent* is real and its
-   field is not. Find what writes that field: it is either something the
-   title does that we prevented, or something one of the 48 replaced XDK
-   functions was supposed to do and did not.
+1. **Find what feeds the payload**, as above: `sub_001BB69D`'s source
+   `[ecx + 0x18]`, and which constructor actually built the instance that
+   crashes. Static analysis plus one instrumented run.
 2. Then the ordinary boot loop: `docs/technical/second-title-bringup.md` is the
    worked example of what that looks like, and `CLAUDE.md`'s debug table maps
    symptoms to causes.

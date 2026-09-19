@@ -233,6 +233,15 @@ static void print_guest_context(void *rip)
                 shown++;
             }
         }
+        /* And the raw words, because the useful thing is often not a
+         * return address. A fault through a garbage pointer is diagnosed
+         * by finding where the pointer came from, and the object it was
+         * loaded out of is usually sitting in the frame -- invisible in
+         * the filtered list above, which keeps only code addresses. */
+        fprintf(stderr, "  guest stack (raw):\n");
+        for (i = 0; i < 16; i += 4)
+            fprintf(stderr, "    [esp+%-3d] %08X %08X %08X %08X\n",
+                    i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
     }
 }
 
