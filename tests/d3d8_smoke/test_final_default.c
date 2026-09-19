@@ -28,6 +28,10 @@ const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return states; }
 const DWORD *d3d8_GetRenderStates(void) { return states; }
 const DWORD *d3d8_GetTSS(DWORD stage) { return stages[stage]; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { (void)stage; return NULL; }
+/* The size the guest's pre-transformed geometry is measured in; the host
+ * back buffer's size is the fallback, and here they are the same. */
+UINT d3d8_GetGuestWidth(void) { return 1; }
+UINT d3d8_GetGuestHeight(void) { return 1; }
 UINT d3d8_GetBackbufferWidth(void) { return 1; }
 UINT d3d8_GetBackbufferHeight(void) { return 1; }
 const D3DMATRIX *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type) { (void)type; return &identity; }
