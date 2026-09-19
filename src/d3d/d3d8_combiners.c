@@ -38,6 +38,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -98,16 +99,28 @@ static uint32_t fnv1a_hash(const void *data, size_t len)
     return h;
 }
 
+/* Only the structural part of the state is the key: the constant colours
+ * that follow it are uploaded per draw and are not in the HLSL, and keying
+ * on them made every distinct colour a new entry and a new D3DCompile in a
+ * 128-entry table that then evicted and recompiled the same shaders in
+ * steady state. */
 static uint32_t combiner_state_hash(const NV2ACombinerState *state)
 {
-    return fnv1a_hash(state, sizeof(NV2ACombinerState));
+    return fnv1a_hash(state, NV2A_COMBINER_KEY_BYTES);
 }
 
 static BOOL combiner_state_equal(const NV2ACombinerState *a,
                                  const NV2ACombinerState *b)
 {
-    return memcmp(a, b, sizeof(NV2ACombinerState)) == 0;
+    return memcmp(a, b, NV2A_COMBINER_KEY_BYTES) == 0;
 }
+
+/* The shader for g_combiner_state as last parsed. The lookup hashes ~1.5 KB
+ * per call and was the largest host-side symbol in TimeSplitters 2's
+ * profile; the state only changes when a PS render state does, so the
+ * result is kept until the next parse. Only this path calls the lookup in
+ * the runtime, so the entry cannot be evicted while it is held. */
+static ID3D11PixelShader *g_last_shader;
 
 /* ================================================================
  * Color Helpers
@@ -1066,6 +1079,7 @@ HRESULT d3d8_combiners_init(void)
     memset(&g_combiner_state, 0, sizeof(g_combiner_state));
     g_ps_token = 0;
     g_dirty = TRUE;
+    g_last_shader = NULL;
     g_frame_counter = 0;
 
     /* Create the PS constant buffer for combiner shaders.
@@ -1100,6 +1114,7 @@ void d3d8_combiners_shutdown(void)
         }
     }
     memset(g_cache, 0, sizeof(g_cache));
+    g_last_shader = NULL;
 
     if (g_combiner_cb) {
         ID3D11Buffer_Release(g_combiner_cb);
@@ -1159,10 +1174,13 @@ BOOL d3d8_combiners_prepare_draw(void)
     if (g_dirty) {
         d3d8_combiners_parse_token(g_ps_token, rs, &g_combiner_state);
         g_dirty = FALSE;
+        g_last_shader = NULL;
     }
 
     /* Get or compile the pixel shader for this combiner state */
-    ps = d3d8_combiners_get_shader(&g_combiner_state);
+    if (!g_last_shader)
+        g_last_shader = d3d8_combiners_get_shader(&g_combiner_state);
+    ps = g_last_shader;
     if (!ps) {
         fprintf(stderr, "NV2A combiners: Failed to get shader, "
                 "falling back to FFP\n");

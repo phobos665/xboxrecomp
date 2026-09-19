@@ -40,6 +40,7 @@
 #ifndef XBOXRECOMP_D3D8_COMBINERS_H
 #define XBOXRECOMP_D3D8_COMBINERS_H
 
+#include <stddef.h>
 #include <d3d11.h>
 #include <stdint.h>
 #include <windows.h>
@@ -228,6 +229,18 @@ typedef struct NV2ACombinerState {
     /* --- Final combiner --- */
     NV2ACombinerInput final_input[7]; /* A, B, C, D, E, F, G */
 
+    /* --- Texture modes --- */
+    NV2ATextureMode tex_mode[NV2A_MAX_TEXTURES];
+
+    /* --- Flags --- */
+    DWORD flags;     /* Dot mapping and other flags from token bits 24-31 */
+
+    /* Everything above decides the generated shader and is its cache key
+     * (NV2A_COMBINER_KEY_BYTES). Everything below is uploaded to the
+     * constant buffer each draw and never appears in the HLSL, so it must
+     * stay after the structural fields: keying on it compiled a new shader
+     * for every constant colour a title used. */
+
     /* --- Per-stage constant colors --- */
     DWORD c0[NV2A_MAX_COMBINER_STAGES]; /* D3DCOLOR (ARGB) per stage */
     DWORD c1[NV2A_MAX_COMBINER_STAGES]; /* D3DCOLOR (ARGB) per stage */
@@ -235,13 +248,10 @@ typedef struct NV2ACombinerState {
     /* --- Final combiner constants --- */
     DWORD final_c0; /* Final combiner C0 (same as stage[final].c0) */
     DWORD final_c1; /* Final combiner C1 (same as stage[final].c1) */
-
-    /* --- Texture modes --- */
-    NV2ATextureMode tex_mode[NV2A_MAX_TEXTURES];
-
-    /* --- Flags --- */
-    DWORD flags;     /* Dot mapping and other flags from token bits 24-31 */
 } NV2ACombinerState;
+
+/* The bytes of NV2ACombinerState that select a shader. */
+#define NV2A_COMBINER_KEY_BYTES offsetof(NV2ACombinerState, c0)
 
 /* ================================================================
  * PS Constant Buffer (HLSL layout - must be 16-byte aligned)
