@@ -42,14 +42,26 @@ enum {
 /* RECOMP_FAKE_INPUT=start,a  presses each listed button in turn, one per
  * cycle; RECOMP_FAKE_INPUT_MS (default 500) is how long each press and each
  * gap lasts. Pressed and released rather than held: menus act on the edge. */
-static const struct { const char *name; int analog; unsigned value; } FAKE[] = {
-    { "start", 0, XBOX_START },      { "back",  0, XBOX_BACK },
-    { "up",    0, XBOX_DPAD_UP },    { "down",  0, XBOX_DPAD_DOWN },
-    { "left",  0, XBOX_DPAD_LEFT },  { "right", 0, XBOX_DPAD_RIGHT },
-    { "a",     1, HOST_ANALOG_A },   { "b",     1, HOST_ANALOG_B },
-    { "x",     1, HOST_ANALOG_X },   { "y",     1, HOST_ANALOG_Y },
-    { "white", 1, HOST_ANALOG_WHITE }, { "black", 1, HOST_ANALOG_BLACK },
-    { "lt",    1, HOST_ANALOG_LTRIG }, { "rt",    1, HOST_ANALOG_RTRIG },
+/* kind: 0 a button, 1 an analog button, 2 a stick pushed fully one way.
+ * The sticks are here because a script that can only press buttons can reach
+ * a menu but not a place in a level, and "walk to where it looks wrong" is
+ * how a rendering bug gets reproduced without a person at the pad. The names
+ * match the controls in the binding config (src/input/input_bindings.c). */
+enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK };
+enum { STICK_LX, STICK_LY, STICK_RX, STICK_RY };
+
+static const struct { const char *name; int kind; unsigned value; int sign; } FAKE[] = {
+    { "start", FAKE_BUTTON, XBOX_START, 0 },      { "back",  FAKE_BUTTON, XBOX_BACK, 0 },
+    { "up",    FAKE_BUTTON, XBOX_DPAD_UP, 0 },    { "down",  FAKE_BUTTON, XBOX_DPAD_DOWN, 0 },
+    { "left",  FAKE_BUTTON, XBOX_DPAD_LEFT, 0 },  { "right", FAKE_BUTTON, XBOX_DPAD_RIGHT, 0 },
+    { "a",     FAKE_ANALOG, HOST_ANALOG_A, 0 },   { "b",     FAKE_ANALOG, HOST_ANALOG_B, 0 },
+    { "x",     FAKE_ANALOG, HOST_ANALOG_X, 0 },   { "y",     FAKE_ANALOG, HOST_ANALOG_Y, 0 },
+    { "white", FAKE_ANALOG, HOST_ANALOG_WHITE, 0 }, { "black", FAKE_ANALOG, HOST_ANALOG_BLACK, 0 },
+    { "lt",    FAKE_ANALOG, HOST_ANALOG_LTRIG, 0 }, { "rt",    FAKE_ANALOG, HOST_ANALOG_RTRIG, 0 },
+    { "lstick_up",    FAKE_STICK, STICK_LY,  1 }, { "lstick_down",  FAKE_STICK, STICK_LY, -1 },
+    { "lstick_left",  FAKE_STICK, STICK_LX, -1 }, { "lstick_right", FAKE_STICK, STICK_LX,  1 },
+    { "rstick_up",    FAKE_STICK, STICK_RY,  1 }, { "rstick_down",  FAKE_STICK, STICK_RY, -1 },
+    { "rstick_left",  FAKE_STICK, STICK_RX, -1 }, { "rstick_right", FAKE_STICK, STICK_RX,  1 },
 };
 
 /* Name -> FAKE index, or -1. `n` is the name's length inside a longer spec. */
@@ -64,15 +76,32 @@ static int fake_lookup(const char *p, size_t n)
 
 static void fake_apply(RecompInputGamepad *g, int i)
 {
-    if (FAKE[i].analog)
+    int16_t push = (int16_t)(FAKE[i].sign > 0 ? 32767 : -32767);
+
+    switch (FAKE[i].kind) {
+    case FAKE_ANALOG:
         g->analog_buttons[FAKE[i].value] = 0xFFu;
-    else
+        break;
+    case FAKE_STICK:
+        switch (FAKE[i].value) {
+        case STICK_LX: g->thumb_lx = push; break;
+        case STICK_LY: g->thumb_ly = push; break;
+        case STICK_RX: g->thumb_rx = push; break;
+        default:       g->thumb_ry = push; break;
+        }
+        break;
+    default:
         g->buttons |= (uint16_t)FAKE[i].value;
+        break;
+    }
 }
 
 /* RECOMP_INPUT_SEQ=1500:start,4000:a,6000:down+a:400 -- a one-shot script.
  *
- * Each step is <ms>:<button>[+<button>...][:<hold ms>]. The clock starts the
+ * Each step is <ms>:<control>[+<control>...][:<hold ms>]. A control is a
+ * button, an analog button, or a stick direction held all the way over
+ * (lstick_up, rstick_left, ...), so a script can walk and turn, not only
+ * press. The clock starts the
  * first time the title reads the pad, so a slow boot does not eat the script;
  * hold defaults to 200 ms, long enough for a title polling at 60 Hz to see the
  * press and the release. Steps may overlap, which is how a chord is held.
