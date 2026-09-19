@@ -769,13 +769,17 @@ class FunctionTranslator:
         self.lifter.imm_code_refs = imm_refs
 
         # Collect switch table targets as extra block leaders
-        switch_leaders = set(imm_refs)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                targets = self.lifter._analyze_switch_table(insn.operands)
-                for t in targets:
-                    if start <= t < end:
-                        switch_leaders.add(t)
+        def collect_switch_leaders(insns):
+            leaders = set(imm_refs)
+            for insn in insns:
+                if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                    targets = self.lifter._analyze_switch_table(insn.operands)
+                    for t in targets:
+                        if start <= t < end:
+                            leaders.add(t)
+            return leaders
+
+        switch_leaders = collect_switch_leaders(instructions)
 
         # A switch target the decode never produced an instruction for cannot
         # become a block leader, so it gets no label and its `goto` is dropped
@@ -784,11 +788,33 @@ class FunctionTranslator:
         # the code it points at: decoding the table as instructions leaves the
         # stream misaligned across the first case. Re-decode, telling the
         # disassembler where the real instruction boundaries are.
+        #
+        # Iterated, because the re-decode can reveal more dispatches. The
+        # linear sweep stops dead at the first table it walks into (capstone
+        # gives up on the first undecodable byte), so a function with several
+        # tables -- TimeSplitters 2's memcpy (sub_001D3340) has five -- only
+        # ever showed its first one here; re-syncing from that table's arms
+        # decoded the rest of the function, including the later dispatches,
+        # but their arms were never made leaders, and the two just past the
+        # fourth table stayed inside the out-of-phase junk. Every call through
+        # them failed to resolve at run time.
         if recovered is None:
-            missing = switch_leaders - {insn.address for insn in instructions}
-            if missing:
+            resync = set()
+            for _round in range(8):
+                missing = switch_leaders - {insn.address for insn in instructions}
+                if not missing:
+                    break
+                resync |= missing
                 instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end, resync=missing)
+                    raw_bytes, start, end, resync=resync)
+                switch_leaders = collect_switch_leaders(instructions)
+        # RECOMP_DEBUG_FUNC=<hex start>: say how this function's switch arms
+        # were found, for the one that lifts with a dead arm.
+        if os.environ.get("RECOMP_DEBUG_FUNC", "").upper() == f"{start:08X}":
+            have = {insn.address for insn in instructions}
+            print(f"[debug] sub_{start:08X}: end 0x{end:08X} recovered={recovered is not None} "
+                  f"insns={len(instructions)} switch_leaders={sorted(hex(t) for t in switch_leaders)} "
+                  f"undecoded={sorted(hex(t) for t in switch_leaders - have)}")
 
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(
