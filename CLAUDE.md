@@ -98,6 +98,10 @@ without `--trace-all-entries`. The level runs 80 fps uncapped on this machine, s
 is forwarded (the briefing text was spilling out of its box), and closing the game window
 exits the process. **F9 shows the frame rate on screen and F10 steps the frame cap**
 (adaptive/60/30/off) while a title runs; `RECOMP_FPS_OVERLAY=1` starts with the counter on.
+**F11 captures the frame on screen** -- a BMP and a replayable capture, beside the executable --
+which is how a player reports a rendering bug that only happens somewhere specific.
+`RECOMP_INPUT_SEQ` can now hold stick directions (`lstick_up`, `rstick_left`, ...) as well as
+buttons, and `RECOMP_INPUT_LOG=1` prints what the title actually reads from the pad.
 
 **Audio de-sync was dropped sound, not a clock (19 Sep 2026).** The host audio queue held four
 submissions and a DirectSound stream was feeding it a tick's worth at a time against a 400 ms
