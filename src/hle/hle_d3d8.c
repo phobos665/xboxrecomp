@@ -137,11 +137,20 @@ static int shadow_requested(void)
     return g_shadow_mode;
 }
 
+/* kernel_bridge.c: the flushes a title's own exit does, then ExitProcess. */
+extern void xbox_HostExit(const char *why);
+
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case WM_CLOSE:                       /* closing it must not end the title */
-        ShowWindow(hwnd, SW_HIDE);
+    case WM_CLOSE:
+        /* This window is the game's display now, so closing it is the user
+         * quitting. (It used to hide, from when it sat beside the title's
+         * own window as a comparison.) The title cannot be told; it has no
+         * such event on the console either. */
+        fprintf(stderr, "[HLE-D3D8] window closed by the user\n");
+        fflush(stderr);
+        xbox_HostExit("window closed");
         return 0;
     case SHADOW_WM_DESTROY:              /* DestroyWindow only works on this thread */
         DestroyWindow(hwnd);

@@ -1204,6 +1204,21 @@ static void bridge_HalReturnToFirmware(void)
     xbox_HalReturnToFirmware(routine);
 }
 
+/* The host asking to quit -- the user closed the window. The same flushes as
+ * a title's own exit above, then ExitProcess, which runs no atexit handler.
+ * Called from whichever thread owns the window. */
+void xbox_HostExit(const char *why)
+{
+    fprintf(stderr, "  [KERNEL] exiting: %s\n", why);
+    fflush(stderr);
+    RECOMP_ICALL_FEEDBACK_DUMP();
+    {
+        extern void recomp_profile_dump(void);
+        recomp_profile_dump();
+    }
+    ExitProcess(0);
+}
+
 static void bridge_ExAllocatePool(void)
 {
     uint32_t size = STACK_ARG(0);

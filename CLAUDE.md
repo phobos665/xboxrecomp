@@ -92,8 +92,11 @@ call was a switch arm the translator lost after a re-sync, and both titles are l
 without `--trace-all-entries`. The level runs 80 fps uncapped on this machine, so the
 **flip gate is on by default in adaptive mode** (`RECOMP_FPS_CAP=0` to switch it off,
 `=60`/`=30` for the strict console cadence); the measurements behind that are in
-`docs/technical/resolution-and-framerate.md`. Next: the performance plan in
-`docs/technical/ts2-performance-plan.md`, items 1-7.
+`docs/technical/resolution-and-framerate.md`. The performance plan in
+`docs/technical/ts2-performance-plan.md`, items 1-7, took the level from 12.4 ms a frame to
+5.0 ms (branch `perf/ts2-items-1-7`). From the user's first pad session: `D3DDevice_SetScissors`
+is forwarded (the briefing text was spilling out of its box), and closing the game window
+exits the process.
 
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
