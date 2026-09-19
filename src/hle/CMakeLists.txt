@@ -41,6 +41,9 @@ if(WIN32)
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_kernel)
+# Host device choice and per-control bindings (src/input/input_bindings.c),
+# shared with the USB gamepad so one config file covers both input paths.
+target_link_libraries(xbox_hle PUBLIC xbox_input)
 if(WIN32)
     target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
     # The D3D8 replacements drive the host renderer in src/d3d, and open a

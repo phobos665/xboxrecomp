@@ -2,7 +2,9 @@
  * input_model.h -- controller state behind the replaced XAPI input functions.
  *
  * From doaxbv-re (https://github.com/NoRain211/doaxbv-re,
- * recomp-runtime/input_model.h), GPL-3.0. Unchanged apart from this header.
+ * recomp-runtime/input_model.h), GPL-3.0. Added here:
+ * recomp_input_port_for_handle, so a caller holding a handle can sample the
+ * right one of the four host devices.
  */
 #ifndef XBOXRECOMP_INPUT_MODEL_H
 #define XBOXRECOMP_INPUT_MODEL_H
@@ -49,6 +51,7 @@ bool recomp_input_get_device_changes(
     uint32_t *insertions,
     uint32_t *removals);
 uint32_t recomp_input_open(RecompInputModel *model, uint32_t port);
+bool recomp_input_port_for_handle(uint32_t handle, uint32_t *port);
 void recomp_input_close(RecompInputModel *model, uint32_t handle);
 bool recomp_input_set_gamepad(
     RecompInputModel *model,
