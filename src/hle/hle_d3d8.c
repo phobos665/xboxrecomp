@@ -843,6 +843,28 @@ HLE_EXPORT(D3DDevice_Clear)
 #endif
 }
 
+/* Where a frame's time goes around Swap, for the five-second report. */
+static LARGE_INTEGER g_swap_last;
+static long long g_swap_gate_ticks, g_swap_body_ticks, g_swap_frame_ticks;
+static unsigned long g_swap_timed;
+
+static void swap_timing_report(void)
+{
+    LARGE_INTEGER qpf;
+    double ms;
+
+    if (!g_swap_timed)
+        return;
+    QueryPerformanceFrequency(&qpf);
+    ms = 1000.0 / (double)qpf.QuadPart / (double)g_swap_timed;
+    fprintf(stderr, "[HLE-D3D8] swap timing over %lu frames: gate wait %.2f ms, "
+            "title's Swap %.2f ms, rest of frame %.2f ms (per frame)\n",
+            g_swap_timed, (double)g_swap_gate_ticks * ms,
+            (double)g_swap_body_ticks * ms, (double)g_swap_frame_ticks * ms);
+    g_swap_gate_ticks = g_swap_body_ticks = g_swap_frame_ticks = 0;
+    g_swap_timed = 0;
+}
+
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */
 HLE_EXPORT(D3DDevice_Swap)
 {
@@ -854,7 +876,24 @@ HLE_EXPORT(D3DDevice_Swap)
     first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
         HLE_RETURN(0x80004005u);
-    HLE_CALL_ORIGINAL(D3DDevice_Swap);
+    /* Console pacing: the flip gate sleeps here until the next vblank
+     * (xbox_memory_layout.h), before the title's own Swap runs. The three
+     * times are kept for the five-second report below: how long the gate
+     * held, how long the title's own Swap took, and the rest of the frame. */
+    {
+        LARGE_INTEGER t0, t1, t2;
+        QueryPerformanceCounter(&t0);
+        if (g_swap_last.QuadPart)
+            g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
+        xbox_Nv2aFlipGateArm();
+        QueryPerformanceCounter(&t1);
+        HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        QueryPerformanceCounter(&t2);
+        g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
+        g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
+        g_swap_last = t2;
+        g_swap_timed++;
+    }
 #ifdef _WIN32
     if (g_shadow) {
         DWORD now = GetTickCount();
@@ -890,6 +929,7 @@ HLE_EXPORT(D3DDevice_Swap)
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
+            swap_timing_report();
             if (g_target_sets)
                 fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
                         "scratch target, %lu failed\n", g_target_sets,

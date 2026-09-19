@@ -235,6 +235,32 @@ paces differently.
 
 ### The fix: a flip gate on the fence
 
+*Implemented 19 Sep 2026, with one change from the plan below.* Holding the
+fence mirror did not pace anything: a title's Swap waits for the *previous*
+frame's fence, which the mirror had completed at the last vblank, so two
+Swaps got through per vblank and TimeSplitters 2's menus measured 120-140
+fps. The gate that shipped sleeps in the HLE `Swap` itself
+(`xbox_Nv2aFlipGateArm`, on an event the vblank tick sets), before the
+title's own Swap runs, so the fence is not involved and the guest thread
+sleeps instead of spinning. `RECOMP_FPS_CAP=60` (or 30) is the strict
+console cadence described below. `RECOMP_FPS_CAP=adaptive` lets a frame that
+already missed a vblank present at once and holds only a frame that finished
+inside the period, meant to keep a 20 ms frame at ~50 fps rather than 30.
+Burnout 2's front end went from 1300 fps to a steady 60.0 with 1 ms of work
+per frame under either; `[HLE-D3D8] swap timing` on the five-second report
+shows the split.
+
+**The gate is off by default, for now.** Measured over the same stretch of
+TimeSplitters 2's Siberia (run53, 170 s, saves cleared, same script), the
+adaptive mode averaged 33 fps against 44 uncapped, while its own wait
+measured 0.00 ms per frame: the title's frame itself got 25% longer. Strict
+gives a steady 30 there, as a console would with 20 ms frames. Why a wait
+that never waits lengthens the frame is not understood; candidates are the
+title's own per-frame wait on the vblank counter interacting with the
+Swap-to-vblank phase, and the vblank tick's ISR/DPC running on the timer
+thread at the moment the guest thread wakes. Settle it with the sampling
+profiler on the two runs before making any mode the default.
+
 On hardware the flip completes at the next vblank. Reproduce that:
 
 - `xbox_memory_layout.c` gets a flag and two calls,

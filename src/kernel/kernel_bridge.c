@@ -2253,6 +2253,10 @@ static void kernel_vblank_tick(void)
             s_vblank_clock.next = now.QuadPart + s_vblank_clock.period;
     }
 
+    /* A vblank: the flip a Swap submitted completes now. Before the ISR
+     * check, so a title that never connects one is still paced. */
+    xbox_Nv2aFlipGateRelease();
+
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 

@@ -192,6 +192,20 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* The flip gate: console pacing for a title that waits on the mirrored fence.
+ *
+ * On hardware a flip completes at the next vblank, so a title's Swap blocks
+ * until then. Here the fence mirror completed everything the instant it was
+ * submitted and titles presented as fast as the host allowed. The HLE Swap
+ * calls Arm before it runs the title's own Swap, and Arm sleeps until the
+ * kernel's vblank tick calls Release. Off unless RECOMP_FPS_CAP is set:
+ * <fps> releases every (vblank rate / fps)th vblank, "adaptive" holds only
+ * a frame that finished inside the period. See the comment above the
+ * implementation for why the gate sleeps in Swap rather than holding the
+ * fence, and why it is not on by default. */
+void xbox_Nv2aFlipGateArm(void);
+void xbox_Nv2aFlipGateRelease(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

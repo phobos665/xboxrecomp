@@ -521,6 +521,107 @@ static void frame_counters_tick(void)
     }
 }
 
+/* The flip gate (xbox_memory_layout.h).
+ *
+ * The HLE Swap calls xbox_Nv2aFlipGateArm() before it runs the title's own
+ * Swap, and that call sleeps until the kernel's vblank tick releases it. So
+ * there is one Swap per vblank, the guest thread sleeps for the rest of the
+ * frame instead of spinning, and the title's own fence wait is not involved.
+ *
+ * It is not involved on purpose. The first version held the fence mirror
+ * instead, so that the title's wait inside Swap would block; but a title
+ * waits for the *previous* frame's fence there (its flips are double
+ * buffered), which the mirror had already completed at the last vblank, and
+ * two Swaps got through per vblank: TimeSplitters 2's menus measured 120-140
+ * fps with a 60 Hz vblank.
+ *
+ * The gate only holds once a vblank has ever been delivered -- without
+ * RECOMP_VBLANK nothing would release it -- and never for more than a quarter
+ * of a second, so a vblank thread that stops cannot hang the title; the first
+ * timeout is logged, because it means pacing is not happening. A vblank that
+ * arrived while the title was still drawing does not count: the wait is for
+ * the next one, or the frame after it could present again in the same period.
+ *
+ * Off unless RECOMP_FPS_CAP is set, for now. Two ways to wait when it is:
+ * RECOMP_FPS_CAP=<fps> is the strict console cadence -- every Swap waits for
+ * the next release, and the release comes every (vblank rate / fps)th
+ * vblank; 30 with a 60 Hz vblank is what a title sees on hardware when it
+ * misses every other frame, fine for a fixed-30 title and half speed for one
+ * that steps its logic per presented frame. RECOMP_FPS_CAP=adaptive lets a
+ * frame that already missed a vblank present at once and holds only a frame
+ * that finished inside the period, meant to keep a 20 ms frame at 50 fps
+ * rather than 30. It is not the default because, measured over the same
+ * stretch of TimeSplitters 2's Siberia, it ran at 33 fps against 44
+ * uncapped while its own wait measured zero -- the title's frame itself got
+ * longer, and why is not yet understood (docs/technical/
+ * resolution-and-framerate.md). Burnout 2's front end, 1 ms of work a frame,
+ * holds 60.0 under either mode. */
+static HANDLE        g_flip_gate_event;
+static volatile LONG g_flip_gate_vblanks;
+static int           g_flip_gate_divisor = -1;      /* -1: not configured */
+static int           g_flip_gate_strict;            /* RECOMP_FPS_CAP given */
+
+static int flip_gate_divisor(void)
+{
+    if (g_flip_gate_divisor < 0) {
+        const char *cap = getenv("RECOMP_FPS_CAP");
+        const char *hz = getenv("RECOMP_VBLANK_HZ");
+        int vblank = hz && atoi(hz) > 0 ? atoi(hz) : 60;
+        int d = 0;                                      /* off unless asked */
+
+        if (cap && *cap) {
+            int fps = atoi(cap);
+            if (strcmp(cap, "adaptive") == 0)
+                d = 1;
+            else if (fps > 0) {
+                d = (vblank + fps / 2) / fps;
+                if (d < 1) d = 1;
+                g_flip_gate_strict = 1;
+            }
+        }
+        g_flip_gate_divisor = d;
+        fprintf(stderr, "  [NV2A] flip gate: %s\n",
+                d == 0 ? "off, Swap never waits (RECOMP_FPS_CAP=60 for console pacing)"
+                       : !g_flip_gate_strict ? "adaptive, at most one Swap per vblank"
+                       : d == 1 ? "strict, one Swap per vblank" : "strict, one Swap per N vblanks");
+        if (d > 1)
+            fprintf(stderr, "  [NV2A] flip gate divisor %d (RECOMP_FPS_CAP=%s at %d Hz)\n",
+                    d, cap, vblank);
+        fflush(stderr);
+    }
+    return g_flip_gate_divisor;
+}
+
+void xbox_Nv2aFlipGateArm(void)
+{
+    static int said;
+
+    if (flip_gate_divisor() == 0)
+        return;
+    if (!InterlockedCompareExchange(&g_flip_gate_vblanks, 0, 0))
+        return;                                         /* no vblank has ever come */
+    if (!g_flip_gate_event)
+        return;
+    if (g_flip_gate_strict)
+        ResetEvent(g_flip_gate_event);                  /* the next vblank, not a past one */
+    if (WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
+        fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "
+                        "the title is not being paced\n");
+        fflush(stderr);
+    }
+}
+
+void xbox_Nv2aFlipGateRelease(void)
+{
+    LONG n = InterlockedIncrement(&g_flip_gate_vblanks);
+    int d = flip_gate_divisor();
+
+    if (!g_flip_gate_event)
+        g_flip_gate_event = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset */
+    if (g_flip_gate_event && (d <= 1 || n % d == 0))
+        SetEvent(g_flip_gate_event);
+}
+
 static void fence_mirrors_tick(void)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
