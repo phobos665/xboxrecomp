@@ -393,6 +393,75 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
 /* ── WinMain ───────────────────────────────────────────────── */
 
+/* ============================================================
+ * Where the diagnostics go
+ *
+ * This is a windowed program, so a double-click gives it no console and
+ * every printf would be thrown away -- which is the worst of both worlds:
+ * no window full of text, and no record either. Three cases, in order:
+ *
+ *   1. Somebody redirected the output (a script capturing stderr to a file,
+ *      a pipe). Those handles are already what was wanted: leave them.
+ *   2. It was started from a terminal, which shares its console. Write
+ *      there, so running it by hand behaves as it always has.
+ *   3. It was double-clicked. Write to <executable>.log beside the program,
+ *      truncated each run, so there is something to read after a crash.
+ *
+ * The log's path is remembered so a failure can name it in its message box:
+ * "it did not start" is not a bug report, and the file is.
+ * ============================================================ */
+
+static char g_log_path[MAX_PATH];
+
+static BOOL handle_is_real(DWORD which)
+{
+    HANDLE h = GetStdHandle(which);
+
+    if (h == NULL || h == INVALID_HANDLE_VALUE)
+        return FALSE;
+    return GetFileType(h) != FILE_TYPE_UNKNOWN;
+}
+
+static void setup_output(void)
+{
+    char exe[MAX_PATH];
+    char *dot;
+    FILE *f;
+
+    if (handle_is_real(STD_OUTPUT_HANDLE) || handle_is_real(STD_ERROR_HANDLE))
+        return;                                  /* redirected: leave it */
+
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {  /* started from a terminal */
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+        return;
+    }
+
+    if (!GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe))
+        return;
+    snprintf(g_log_path, sizeof g_log_path, "%s", exe);
+    dot = strrchr(g_log_path, '.');
+    if (dot && !strchr(dot, '\\'))
+        *dot = '\0';
+    strncat(g_log_path, ".log", sizeof g_log_path - strlen(g_log_path) - 1);
+
+    f = freopen(g_log_path, "w", stderr);
+    if (!f) {                                    /* read-only folder */
+        g_log_path[0] = '\0';
+        return;
+    }
+    freopen(g_log_path, "a", stdout);
+}
+
+/* Appended to a message box, when there is a file worth reading. */
+static void log_hint(char *buf, size_t bytes)
+{
+    size_t n = strlen(buf);
+
+    if (g_log_path[0] && bytes > n)
+        snprintf(buf + n, bytes - n, "\n\nThere is more in:\n%s", g_log_path);
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
@@ -404,7 +473,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
-    /* Unbuffered output for immediate visibility during debugging */
+    /* Before anything prints: a windowed program has nowhere to print
+     * unless this says where. */
+    setup_output();
+
+    /* Unbuffered output for immediate visibility during debugging, and so a
+     * crash keeps the tail of the log rather than losing it in a buffer. */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -430,6 +504,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                      "\"game\\default.xbe\" exists, or set RECOMP_GAME_DIR to where they are.\n\n"
                      "Looked for:\n%s", tried);
             fprintf(stderr, "%s\n", message);
+            log_hint(message, sizeof message);
             MessageBoxA(NULL, message, "TimeSplitters 2", MB_ICONERROR);
             return 1;
         }
@@ -438,6 +513,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             snprintf(message, sizeof message,
                      "Found the game at\n%s\nbut could not read default.xbe.",
                      g_game_dir);
+            log_hint(message, sizeof message);
             MessageBoxA(NULL, message, "TimeSplitters 2", MB_ICONERROR);
             return 1;
         }

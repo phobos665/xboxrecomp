@@ -103,7 +103,9 @@ from anywhere. It looks for the game in a `game` folder beside itself, then at `
 relative to itself, then `RECOMP_GAME_DIR`; and the vblank, the emulated audio hardware and the
 shadow renderer are **on unless turned off** (`RECOMP_VBLANK=0`, `RECOMP_AC97_READY=0`,
 `RECOMP_HLE_D3D8=off`; `xbox_EnvSwitch` reads them). The `run.bat` files are debugging launchers
-now, not a requirement. Note the switch a title needs is read in **five** places including the
+now, not a requirement. It is a windowed program, so a double-click gives it no console:
+diagnostics go to whatever redirected them, else to the terminal it was started from, else to
+`<executable>.log` beside it (`setup_output` in the template). Note the switch a title needs is read in **five** places including the
 title's own `main.c` (from `templates/new-game/src/main.c`), so change the template and
 regenerate with `scripts/regen_title_main.py`.
 

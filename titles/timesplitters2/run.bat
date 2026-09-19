@@ -10,6 +10,10 @@ rem game beside itself, and the vblank, the audio hardware and the renderer
 rem are all on unless something turns them off. This file exists only to set
 rem the switches a debugging session wants, and to write down the keys.
 rem
+rem It is a windowed program, so there is no console. Its diagnostics go to
+rem timesplitters2_recomp.log beside the executable when it is double-clicked,
+rem or to this window when it is started from here.
+rem
 rem Where the game files are looked for, in order:
 rem   1. a folder called "game" next to the executable
 rem   2. games\<title>\ in this repository, relative to the executable
