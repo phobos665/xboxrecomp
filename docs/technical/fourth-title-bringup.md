@@ -85,65 +85,100 @@ up again. It should never be turned on to make a title "work": all it does is
 let a bad pointer read zeros instead of faulting, which trades a clear failure
 for a mysterious one.
 
-## What the object is
+## What it actually was: a null std::map, and debris
 
-The crash handler now prints the raw stack as well as the return addresses,
-which is what made the rest of this findable — the useful word was a data
-pointer the filtered list threw away.
+**The C++ object reading of this was wrong, and is retracted.** An earlier
+pass here read the vtable 0x00257360 out of the crash frame, found the two
+constructors that install it, and concluded the object had been built by the
+wrong one. None of that was the bug. The vtable was a leftover word on the
+stack, and the value being dereferenced was never written by anything.
 
-The saved registers put **0x00257360** in the frame. That address is in
-`.rdata`, is not writable, and holds eight pointers into `.text`: it is a
-**vtable**. So this is a C++ object, and the field being dereferenced is one
-of its members.
+Three new switches settled it in three runs. They are general, they are
+described in `docs/technical/memory-watchpoints.md`, and this was the case
+they were built for.
 
-Two constructors install that vtable, and comparing them says what the member
-is:
+**Run 1, who holds it.** `RECOMP_FIND_VALUE=0xF8604020` scans guest RAM at the
+crash for that value. Exactly one word in 64 MB held it, at **guest address
+4**. A value living at address 4 is not an aperture question. It is a null
+pointer with a small offset added.
+
+**Run 2, what wrote it.** `RECOMP_WATCH_WRITE=0x00000004` protects the page
+and names every writer:
 
 ```
-sub_001BB69D:  MEM32(eax)     = 0x257360;      /* vtable */
-               ecx            = MEM32(ecx + 0x18);
-               MEM32(eax + 4) = ecx;           /* +4 <- a dword from elsewhere */
-
-sub_001BB27E:  MEM8(eax + 4)  = ...;           /* +4 <- four separate bytes */
-               MEM8(eax + 5)  = ...;
-               MEM8(eax + 6)  = ...;
-               MEM32(eax)     = 0x257360;      /* vtable */
-               MEM8(eax + 7)  = ...;
+[WATCH] write to 0x00000004 ... eax=0x8239F620 edi=0x00000004
+[WATCH]   0x008239F5 -> 0x8239F620
+[WATCH] write to 0x00000005 ... eax=0x8239F740 edi=0x00000005
+[WATCH]   0x8239F620 -> 0x39F74020
+[WATCH] write to 0x00000006 ... eax=0x8239F860 edi=0x00000006
+[WATCH]   0x39F74020 -> 0xF8604020
 ```
 
-One writes four bytes into +4..+7; the other writes a dword. So **+4 is a
-four-byte payload whose meaning depends on how the object was made** — a
-variant, or a property holding either inline data or a reference.
+Three unaligned dword stores, one byte apart, each of an unrelated
+contiguous-memory pointer. Byte 4 comes from the first, byte 5 from the
+second, bytes 6 and 7 from the third. **0xF8604020 is debris** -- the tail of
+one store and the head of the next, later read back as a pointer. There is no
+instruction anywhere that wrote it, which is why searching for one got
+nowhere.
 
-The caller that crashes, `sub_001BC6B2`, does `ecx = MEM32(ecx + 4)` and then
-calls a method on the result: it is treating the payload as an object
-pointer. The payload holds float data. So either the object was built by the
-wrong constructor, or the value handed to `sub_001BB69D` from `[ecx + 0x18]`
-was already wrong.
+**Run 3, where the mistake is.** `RECOMP_TRAP_NULL=1` makes guest page zero
+unreadable, so the null access faults where it happens:
 
-That is a much smaller question than "why does it crash", and it is where the
-next session should start: instrument `sub_001BB69D` to record what it is
-given, and find what writes `+0x18` of the object that feeds it.
+```
+[CRASH] Access violation, Xbox VA of fault: 0x00000008 (read)
+  ecx=0x00000000
+  in sub_001BD1DA+0x3B
+```
 
-## Also ruled out
+`sub_001BD1DA` loads `[ecx+8]`, then walks `+4` as a key and `+0x10` and
+`+0x14` as children, comparing and branching left or right. That is a
+red-black tree lookup: a `std::map::find`. Its `this` is null.
 
+The chain is `sub_001C0D4C` -> `sub_001C051F` -> `sub_001BD97C` ->
+`sub_001BD1DA`, and the null arrives as **`sub_001C0D4C`'s first stack
+parameter**. `sub_001C0D4C` loads it with `ecx = MEM32(ebp + 8)` and passes
+it straight down.
+
+So the question is now a small one: who calls `sub_001C0D4C` with a null
+first argument, and what should have produced that map. Worth checking early,
+because it would be a toolkit problem rather than a title one: whether the
+title's C++ static initialisers all ran. `tools/disasm/functions.py` already
+carries a fix for exactly this in TimeSplitters 2, where initialiser table
+entries pointed inside other functions and `_initterm` silently skipped every
+one. A global `std::map` that was never constructed is the same symptom.
+
+## Ruled out along the way
+
+- **Our own D3D8 replacement.** `RECOMP_HLE_D3D8=off` crashes identically, at
+  the same address in the same function. `RECOMP_AC97_READY=0` likewise.
+  `RECOMP_VBLANK=0` does not crash only because the title then blocks forever
+  on its presentation event and never reaches the code.
+- **A missing memory aperture.** `RECOMP_ALIAS_HIGH=1` maps 0xF8000000 as a
+  second alias purely to test this. The title then reads that address happily
+  and faults at 0xFFC00000 instead, which is a NaN bit pattern occurring 1548
+  times in the image. Following a bad pointer looks exactly like that; a real
+  aperture does not.
 - **File I/O and the cache partition.** The title opens the raw disk
   devices and sets its cache partition up successfully: `Partition5`
   opens, and it reads and writes sector 4 of `Partition0` (the partition
   images live under `%LOCALAPPDATA%` in the `xboxrecomp` folder). The one
   failed open in a whole run is the downloadable-content metadata file
   under `TDATA`, which does not exist and is not supposed to.
-- **Uninitialised heap.** The bad payload is **0xF8604020 in every run**.
-  A deterministic value is something the title computed the same way each
-  time, not whatever happened to be lying in memory.
+- **Uninitialised heap.** The debris is **0xF8604020 in every run**, and the
+  three stores that build it are the same three every time. Determinism is
+  what made the three-run loop above possible at all: each run could assume
+  the last one's findings still held.
 
 ## Next
 
-1. **Find what feeds the payload**, as above: `sub_001BB69D`'s source
-   `[ecx + 0x18]`, and which constructor actually built the instance that
-   crashes. Static analysis plus one instrumented run.
-2. Then the ordinary boot loop: `docs/technical/second-title-bringup.md` is the
-   worked example of what that looks like, and `CLAUDE.md`'s debug table maps
-   symptoms to causes.
-3. The demand-loaded sections (four of them) have not been exercised yet and
+1. **Find who passes the null map.** `sub_001C0D4C` takes it as its first
+   stack parameter and passes it down. Watch or read back from there.
+2. **Check the static initialisers first**, because it is the cheap answer and
+   it is a toolkit bug if it is true. `tools/disasm/functions.py` already
+   handles one shape of this from TimeSplitters 2, where initialiser table
+   entries pointed inside other functions and `_initterm` skipped them all. A
+   global `std::map` that was never constructed has exactly this symptom.
+3. Then the ordinary boot loop: `docs/technical/second-title-bringup.md` is the
+   worked example, and `CLAUDE.md`'s debug table maps symptoms to causes.
+4. The demand-loaded sections (four of them) have not been exercised yet and
    are worth remembering when something later is mysteriously absent.

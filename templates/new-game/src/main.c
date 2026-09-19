@@ -39,6 +39,7 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include "xbox_watchpoint.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -292,6 +293,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
      * run on a fresh machine died that way, in a write to the vblank
      * interrupt-enable register. Breakpoints and the debugger's thread-naming
      * exception are the only ones not worth a line. */
+    /* A watchpoint stepping over the instruction it just trapped. This
+     * has to come first: it is a single-step exception this process
+     * asked for, not a fault, and reporting it would bury the watch
+     * output in noise. */
+    if (code == EXCEPTION_SINGLE_STEP && xbox_watch_handle_step(ep))
+        return EXCEPTION_CONTINUE_EXECUTION;
+
     if (code == EXCEPTION_BREAKPOINT || code == 0x406D1388)
         return EXCEPTION_CONTINUE_SEARCH;
     if (code != EXCEPTION_ACCESS_VIOLATION) {
@@ -306,6 +314,12 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
     {
         uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
         int is_write = ep->ExceptionRecord->ExceptionInformation[0] == 1;
+
+        /* An armed watchpoint, which protected the page on purpose.
+         * Checked before the device ranges because a watch is a
+         * deliberate trap and the device hooks would not know it. */
+        if (xbox_watch_handle_av(ep, fault_addr, is_write))
+            return EXCEPTION_CONTINUE_EXECUTION;
 
         /* A trapped device register: serviced and resumed, not a crash. */
         if (g_xbox_mem_offset &&
@@ -341,6 +355,12 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          * ran immediately before the crash are missing from it, and their
          * absence reads as "never ran". */
         recomp_profile_dump();
+
+        /* RECOMP_FIND_VALUE: when the fault is through a garbage pointer,
+         * the next question is who is holding it. Scanning guest RAM for
+         * the value names the field, and that field is what to point
+         * RECOMP_WATCH_WRITE at on the next run. */
+        xbox_watch_scan_on_crash();
 
         /*
          * TODO: Add game-specific diagnostics here. Examples:
@@ -552,6 +572,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
+
+    /* Step 5a: memory watchpoints, if any were asked for. After the
+     * bridge, so the pages a watch names are mapped and committed. */
+    xbox_watch_init();
 
     /* Step 5b: the emulated APU, when its registers are trapped.
      *
