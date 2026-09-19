@@ -1111,7 +1111,12 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     if (!d3d8_vsh_prepare_draw(handle))
         ff_vs_prepare_draw(handle);
 
-    /* Pixel state is independent of whether the vertex shader is programmable. */
+    /* Pixel state is independent of whether the vertex shader is programmable.
+     * A combiner shader, when one is active, binds its own pixel shader and
+     * constants and the fixed-function ones below would only be replaced;
+     * they are still the fallback when the combiner shader cannot be built. */
+    if (d3d8_combiners_prepare_draw())
+        return;
     if (!g_ps_cb) return;
     ps = ff_ps_get_shader(ff_ps_compute_signature());
     if (!ps) return;
