@@ -170,23 +170,25 @@ title sets through `SetRenderState_Simple` now reach the shadow, and a
 which is why a scripted menu path only repeats if the profile folders under
 `UDATA/4553000a/` are cleared first.
 
-1. **Lighting and vertex colour.** The level is very dark; the frame dumps
-   show the geometry is there but barely lit. Compare a frame with xemu;
-   `docs/technical/shadow-mode.md` lists lighting as a gap. Related one-line
-   fix from the resolution design (`docs/technical/resolution-and-framerate.md`):
-   pre-transformed 2D geometry is divided by the host back-buffer size instead
-   of the guest's.
-2. **Frame pacing.** See item 3 below and the flip gate in the design doc.
-3. **Frame pacing.** In-level the title presents at 85-145 fps because `Swap`'s
+With the simple render states stored, the level is lit as it should be: the
+Siberia tunnel, snow, trees and the starting terminal, at 52 fps once indexed
+draws stopped copying the whole vertex buffer (they carried every vertex up
+to the highest index; the range they use is a few kilobytes). Run it with
+`titles\timesplitters2\run.bat`.
+
+1. **Frame pacing.** See item 3 below and the flip gate in the design doc.
+   The level runs uncapped at about 52 fps on this machine, so it is no
+   longer running away, but it is not console timing either.
+2. **Frame pacing.** In-level the title presents at 85-145 fps because `Swap`'s
    fence completes immediately. Making it wait for the next vblank gives
    console timing; `docs/technical/performance-60fps.md` has the plan, and a
    design for user-selectable resolution and frame-rate cap is in progress.
-4. **Play it.** Keyboard and XInput are mapped in `src/hle/input_host.c`; the
+3. **Play it.** Keyboard and XInput are mapped in `src/hle/input_host.c`; the
    title has only been driven by scripts so far.
-5. **One unresolved indirect call**, 0x001D35E4 (119 calls). The seed is
+4. **One unresolved indirect call**, 0x001D35E4 (119 calls). The seed is
    rejected as landing inside a decoded instruction, so it is probably another
    misdecode like the switch above.
-6. **Junk in the lift.** 1,124 unimplemented-instruction comments in the
+5. **Junk in the lift.** 1,124 unimplemented-instruction comments in the
    TimeSplitters lift, 1,010 of them inside XGRPH, are data the disassembler
    took for code (`outsd`, `insb`, `popal`, `arpl`). Harmless unless executed;
    the function-discovery item in `CLAUDE.md`.
