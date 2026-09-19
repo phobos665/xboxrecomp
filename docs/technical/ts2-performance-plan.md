@@ -1,11 +1,12 @@
 # TimeSplitters 2: where the frame goes, and what to do about it
 
-**PARTIAL — the session was stopped part-way.** Everything under "What was
-measured" is real and reproducible. The ranked plan is built from those
-measurements plus code reading; the items marked *(not yet measured in
-isolation)* have a mechanism identified in the source and a share of the
-profile that is consistent with it, but no A/B run of their own. `PAUSE.md`
-at the repo root says exactly what is left and how to resume.
+**Items 1-7 are done (19 Sep 2026); the results are at the end.** Everything
+under "What was measured" is real and reproducible. The ranked plan was built
+from those measurements plus code reading; the items marked *(not yet measured
+in isolation)* had a mechanism identified in the source and a share of the
+profile consistent with it, and were then done together and measured together.
+Items 8-13 are still open (11 and 13, the TS2-specific ones, were done on the
+bring-up branch: the title is lifted plain and has no unresolved calls).
 
 Everything here is from one machine (Windows 10 19045, 20 logical cores,
 Intel integrated GPU, `igd10um64xe.DLL`), Release build, shadow mode, lifted
@@ -423,3 +424,59 @@ Never pass `--profile` for a speed measurement, and check `tasklist` for
 `MSBuild.exe`, `cl.exe` and `*_recomp.exe` first. Confirm the run reached the
 level by reading the `[HLE-D3D8] shadow:` draw counts before trusting its fps:
 the level is ≈390 draws a frame, the front end ≈170.
+
+---
+
+## Results (19 Sep 2026)
+
+Items 1-7 were done on `perf/ts2-items-1-7`, one commit each, and measured
+together on the same machine, quiet, with the title lifted **without** the
+trace hook, the same script, saves cleared, `RECOMP_FPS_CAP=0`, reading the
+level phase (t = 75-125 s) of `[FPS]` and `[HLE-D3D8] swap timing`. The
+baseline is three runs of the bring-up branch at 672e322.
+
+| Build | Level fps, five-second windows | Rest of frame | stderr lines / 130 s |
+| --- | --- | --- | --- |
+| baseline (plain lift, cap off) | 79-89 | 12.4 ms | 130,003 |
+| items 1-7 | 188-202 | 5.0 ms | 10,874 |
+
+Two independent checks that nothing drawn changed:
+
+- **Capture/replay.** Three level frames captured from the baseline
+  (`RECOMP_D3D8_CAPTURE`, swaps 12500, 14000 and 15500, 359-389 draws each)
+  replay **pixel-identical** (`cmp` on the BMPs) through the new renderer.
+  This is the check item 3 asked for.
+- **Replay as a renderer benchmark.** `d3d8_replay <capture> --loops 300
+  --quiet` runs the host renderer alone, no game, present interval 0.
+  Baseline 5.28-5.40 s for 300 loops (17.7 ms a frame); new 4.14-4.20 s
+  (14.0 ms). The rest of the in-game gain is the HLE side (items 4 and 6)
+  and what the D3D11 device lock was costing the guest thread.
+
+Under the default flip gate (adaptive) the level holds 60.0 with 13.4 ms of
+gate wait and 3.2 ms of frame, which is the headroom a slower machine will
+spend. Burnout 2's front end is unchanged: 60.0 under the gate, 0.55 ms of
+frame, no faults.
+
+What each item turned out to be worth was not measured in isolation; the
+profile said items 1-3 were the bulk, and the replay benchmark (renderer
+only, items 1, 2, 3, 5 and 7) accounts for a fifth of the frame while the
+in-game number halved again, so the HLE-side items 4 and 6 (log lines and
+program reloads: `[HLE-D3D8] shadow vertex programs: N loads repeated a
+slot's microcode` on the five-second report says how many) were worth more
+than the 9% the sampler gave `NtWriteFile`.
+
+Item 6 needed a second pass. The plan's "compare with what the slot holds"
+matched 47 loads in a run: the title does not reload the *same* program
+into a slot, it rotates a few through it (slot 0 takes 49-, 50- and
+13-instruction programs in turn; 59,722 loads in the baseline's 130 s). Host
+programs are now found by microcode content and kept for the run, shared by
+every slot and every selected entry that names them: 41,103 of a run's loads
+were answered from 12 cached host programs, and the five-second report says
+so (`[HLE-D3D8] shadow vertex programs: N loads answered from the M cached
+host programs`).
+
+Still open, in the order the profile suggests: 9 (texture change
+detection, `level0_checksum`, ~4%), 8 (texture cache scan), 10 (`strlen` in
+the trace hook, moot for a plain lift), 12 (ack-thread sleep, no gain
+measured). Take a new `RECOMP_SAMPLE` profile first: the frame is 5 ms now
+and its shape has changed.
