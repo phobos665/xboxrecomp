@@ -38,6 +38,10 @@
 /* ---- the controls a title can read ------------------------------------- */
 
 enum { K_DIGITAL, K_ANALOG, K_AXIS };
+
+/* XINPUT_GAMEPAD_TRIGGER_THRESHOLD: the value XInput documents as the point
+ * a trigger counts as pressed. */
+#define TRIGGER_THRESHOLD 30
 enum { AXIS_LX, AXIS_LY, AXIS_RX, AXIS_RY };
 
 static const struct {
@@ -751,10 +755,17 @@ static int source_magnitude(const Source *s, KeyCache *kc,
         if (!have_pad)
             return 0;
         return (pad->Gamepad.wButtons & PAD_BITS[s->arg]) ? 255 : 0;
-    case SRC_PAD_TRIGGER:
+    case SRC_PAD_TRIGGER: {
+        /* A resting XInput trigger can read a few units above zero, and a
+         * title that treats any non-zero analog button as pressed would
+         * fire forever. Below XInput's own recommended threshold is "not
+         * pressed"; above it the value passes through untouched. */
+        int t;
         if (!have_pad)
             return 0;
-        return s->arg ? pad->Gamepad.bRightTrigger : pad->Gamepad.bLeftTrigger;
+        t = s->arg ? pad->Gamepad.bRightTrigger : pad->Gamepad.bLeftTrigger;
+        return t < TRIGGER_THRESHOLD ? 0 : t;
+    }
     case SRC_PAD_AXIS: {
         int v, span;
         if (!have_pad)
