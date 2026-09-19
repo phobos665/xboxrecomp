@@ -95,6 +95,15 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
+        # Displacement the dispatch names -> where the table actually starts.
+        # They differ when the index can be negative (memcpy's tail table) or
+        # never takes the low values, and jump_table_entries() is asked by the
+        # displacement, which is what the instruction carries.
+        self._jt_by_disp: Dict[int, int] = {}
+        # Candidates already resynced. resync_jump_tables() runs more than
+        # once -- decode_at() keeps finding dispatches the sweep had out of
+        # phase -- and a table must not be measured twice.
+        self._jt_done: Set[int] = set()
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -281,7 +290,10 @@ class DisasmEngine:
             if insn.end_address > dispatch_end.get(jt, 0):
                 dispatch_end[jt] = insn.end_address
 
-        for tbl in sorted(self._jt_candidates):
+        for disp in sorted(self._jt_candidates):
+            if disp in self._jt_done:
+                continue
+            tbl = disp
             # XBEs mark .rdata and .data executable, so "points at an
             # executable section" alone would let an array of data pointers
             # pass as a jump table -- and resyncing over real instructions is
@@ -415,18 +427,41 @@ class DisasmEngine:
             self._sorted_addrs = None
 
             self.jump_tables[tbl] = end
+            self._jt_by_disp[disp] = tbl
+            self._jt_done.add(disp)
             self.decode_at(end)
+
+            # The case bodies as well. When the table is not inline -- MSVC
+            # parks it after the function when the cases are large -- the
+            # sweep reached the cases through whatever preceded them, and if
+            # that was out of phase the bodies were decoded as junk too.
+            # TimeSplitters 2's 0x000DDD7D dispatches through 0x000DDEB8 to
+            # five cases starting at 0x000DDD84; the sweep had 0x000DDD80 as a
+            # 5-byte mov, so no instruction started at 0x000DDD84, the
+            # function ended on the dispatch, and the lifted jump fell through
+            # to an "unknown target" that returned without running the case.
+            # The title's front end then span there (448 million calls).
+            # decode_at() only adds where nothing is decoded, so an entry the
+            # sweep already had right costs nothing.
+            for a in range(tbl, end, 4):
+                target = self.image.read_u32_at_va(a)
+                if target is not None:
+                    self.decode_at(target)
             resynced += 1
 
         return resynced
 
     def jump_table_entries(self, tbl: int) -> List[int]:
-        """Code pointers held by a resynced jump table, or [] if unknown."""
-        end = self.jump_tables.get(tbl)
+        """Code pointers held by a resynced jump table, or [] if unknown.
+
+        `tbl` may be the displacement the dispatch names or the table's real
+        start; they differ when the index is offset (see _jt_by_disp)."""
+        start = self._jt_by_disp.get(tbl, tbl)
+        end = self.jump_tables.get(start)
         if end is None:
             return []
         return [self.image.read_u32_at_va(a) or 0
-                for a in range(tbl, end, 4)]
+                for a in range(start, end, 4)]
 
     def decode_at(self, addr: int, max_insns: int = 4096) -> int:
         """

@@ -55,6 +55,13 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
 /* True while a frame is being recorded. */
 int hle_d3d8_capture_active(void);
 
+/* Capture the next frame, whatever swap it turns out to be. This is the
+ * answer to "it looks wrong here": a swap number has to be guessed before
+ * the run, and nobody knows in advance which swap they will be standing on
+ * when they see it. Without RECOMP_D3D8_CAPTURE the file lands beside the
+ * executable. */
+void hle_d3d8_capture_next_frame(void);
+
 /* ----------------------------------------------------------- device calls */
 
 HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,
@@ -68,6 +75,8 @@ HRESULT host_SetTextureStageState(IDirect3DDevice8 *dev, DWORD stage,
 HRESULT host_SetTransform(IDirect3DDevice8 *dev, D3DTRANSFORMSTATETYPE state,
                           const D3DMATRIX *matrix);
 HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport);
+/* The Xbox scissor (xbox_D3D8SetScissors); the first rectangle is recorded. */
+void    host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
 HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage,
                         IDirect3DBaseTexture8 *texture);
 HRESULT host_SetVertexShader(IDirect3DDevice8 *dev, DWORD handle);
@@ -119,6 +128,8 @@ IDirect3DSurface8 *host_DeviceDepthSurface(IDirect3DDevice8 *dev);
 
 HRESULT host_vsh_create_shader(const DWORD *microcode, int insn_count, DWORD *handle);
 HRESULT host_vsh_delete_shader(DWORD handle);
+/* Whether the host program behind handle holds exactly this microcode. */
+BOOL    host_vsh_same_microcode(DWORD handle, const DWORD *microcode, int insn_count);
 void    host_vsh_set_constant(int first_reg, const float *data, int count);
 HRESULT host_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count);
 void    host_vsh_set_screenspace(const float scale[4], const float offset[4]);

@@ -32,8 +32,16 @@ ID3D11Device        *d3d8_GetD3D11Device(void);
 ID3D11DeviceContext *d3d8_GetD3D11Context(void);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
+/* The host back buffer's size, which is what clip space maps onto. */
+UINT                 d3d8_GetBackBufferWidth(void);
+UINT                 d3d8_GetBackBufferHeight(void);
 HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
+/* The guest's presentation size (d3d8_device.c); the back buffer's when unset. */
+UINT                 d3d8_GetGuestWidth(void);
+/* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
+BOOL                 d3d8_GetScissor(D3D11_RECT *out);
+UINT                 d3d8_GetGuestHeight(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 
 /* Current render state array accessor */

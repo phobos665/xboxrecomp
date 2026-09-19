@@ -479,7 +479,8 @@ def main():
         # there is a symbols file: the implementations declare them either
         # way, so the generated file has to define them either way (as 0 when
         # they cannot be named) or the build does not link.
-        from .hle import imported_variables, load_variables, resolve_variables
+        from .hle import (imported_variables, load_variables, load_symbols,
+                          resolve_variables)
         hle_impl_paths = args.hle_impl or [os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))), "src", "hle")]
@@ -487,9 +488,12 @@ def main():
             [p for p in hle_impl_paths if os.path.exists(p)])
         hle_variables = {name: 0 for name in hle_var_names}
         if args.hle_symbols and hle_var_names:
+            # Functions too: an implementation may import a function's
+            # address to read its code (see hle.resolve_variables).
             hle_variables, var_notes = resolve_variables(
-                hle_var_names, load_variables(args.hle_symbols))
-            print(f"XDK variables imported by name: "
+                hle_var_names, load_variables(args.hle_symbols)
+                + load_symbols(args.hle_symbols))
+            print(f"XDK symbols imported by name: "
                   f"{sum(1 for v in hle_variables.values() if v)} of "
                   f"{len(hle_var_names)}", file=sys.stderr)
             for note in var_notes:

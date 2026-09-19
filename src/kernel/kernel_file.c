@@ -114,6 +114,17 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path)
         return FALSE;
+    if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
+        !(xbox_path[0] && xbox_path[1] == ':')) {
+        /* XDeleteSaveGame opens each child relative to its save directory. */
+        DWORD used = GetFinalPathNameByHandleW(ObjectAttributes->RootDirectory,
+            win_path, buf_size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
+        if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
+        int count = MultiByteToWideChar(CP_ACP, 0, xbox_path, -1,
+            win_path + used, (int)(buf_size - used));
+        return count != 0;
+    }
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
@@ -160,9 +171,52 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    /* A device opened as itself.
+     *
+     * "\Device\CdRom0" with nothing after it translates to the game
+     * directory. The caller did not ask for a directory -- XAPI's disc check
+     * opens the drive with FILE_SYNCHRONOUS_IO_NONALERT alone and then talks
+     * to it with NtDeviceIoControlFile -- but a directory is what the host
+     * has there, and CreateFileW refuses one without
+     * FILE_FLAG_BACKUP_SEMANTICS. So when the translated path is an existing
+     * directory, open it as one: the handle is valid for exactly what a
+     * device handle gets used for here, which is IOCTLs and volume queries. */
+    {
+        DWORD attrs = GetFileAttributesW(win_path);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(CreateOptions & XBOX_FILE_DIRECTORY_FILE)) {
+            CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                     "NtCreateFile: %S is a directory, opened as a device handle",
+                     win_path);
+        }
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
-            CreateDirectoryW(win_path, NULL);
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            if (!CreateDirectoryW(win_path, NULL) &&
+                GetLastError() == ERROR_ALREADY_EXISTS &&
+                CreateDisposition == XBOX_FILE_CREATE) {
+                /* FILE_CREATE on a directory that exists is a collision on
+                 * the console, and a title's save path depends on hearing
+                 * it. TimeSplitters 2 names its save folder from the profile
+                 * (XCreateSaveGame), asks to create it, and on "collision"
+                 * takes its overwrite path. Opening the old folder here
+                 * instead let it believe the folder was fresh: it wrote its
+                 * metadata files (overwrite dispositions), then created its
+                 * signature file with FILE_CREATE, found last run's there,
+                 * and reported the hard disk had failed. */
+                g_xbox_last_file_error = ERROR_ALREADY_EXISTS;
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                         "NtCreateFile: FILE_CREATE on existing directory %S -> collision",
+                         win_path);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = STATUS_OBJECT_NAME_COLLISION;
+                    IoStatusBlock->Information = 0;
+                }
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -200,16 +254,27 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * build that decision was invisible. */
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                  "NtCreateFile FAILED: %S (err=%u)", win_path, err);
-        if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
-            IoStatusBlock->Information = 0;
-        }
-        switch (err) {
-            case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-            case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-            case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
-            case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
-            default:                   return STATUS_UNSUCCESSFUL;
+        {
+            NTSTATUS status;
+            switch (err) {
+                case ERROR_FILE_NOT_FOUND: status = STATUS_OBJECT_NAME_NOT_FOUND; break;
+                case ERROR_PATH_NOT_FOUND: status = STATUS_OBJECT_PATH_NOT_FOUND; break;
+                case ERROR_ACCESS_DENIED:  status = STATUS_ACCESS_DENIED; break;
+                /* CREATE_NEW on an existing file is ERROR_FILE_EXISTS (80);
+                 * CreateDirectory on an existing one is ERROR_ALREADY_EXISTS
+                 * (183). Both are the same NT answer, and a title that saves
+                 * over an old profile checks for exactly that answer:
+                 * TimeSplitters 2 retried its save four times against
+                 * STATUS_UNSUCCESSFUL and then said the hard disk had failed. */
+                case ERROR_FILE_EXISTS:
+                case ERROR_ALREADY_EXISTS: status = STATUS_OBJECT_NAME_COLLISION; break;
+                default:                   status = STATUS_UNSUCCESSFUL; break;
+            }
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = status;
+                IoStatusBlock->Information = 0;
+            }
+            return status;
         }
     }
 
@@ -463,9 +528,19 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
-            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                         "SetFileDispositionInfo failed: err=%u", GetLastError());
+            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi))) {
+                /* stderr, like the unhandled-class case below: a delete that
+                 * did not happen is how a title's next save finds its own old
+                 * file in the way and reports the disk has failed. */
+                DWORD err = GetLastError();
+                fprintf(stderr, "  [FILE] delete-on-close for handle %p refused "
+                                "(win32 err=%u)\n", FileHandle, err);
+                fflush(stderr);
+                IoStatusBlock->Status = err == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
+                                                                    : STATUS_UNSUCCESSFUL;
+                return IoStatusBlock->Status;
+            }
+            fprintf(stderr, "  [FILE] delete-on-close set for handle %p\n", FileHandle);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -610,6 +685,7 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     DIR_CONTEXT* ctx;
@@ -618,6 +694,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    IoStatusBlock->Information = 0;
+    if (FileInformationClass != XboxFileDirectoryInformation) {
+        IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
+        return STATUS_INVALID_INFO_CLASS;
+    }
 
     ctx = find_or_create_dir_context(FileHandle, TRUE);
     if (!ctx)
@@ -656,6 +737,18 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         ctx->first_done = TRUE;
     } else {
+        if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+            FindClose(ctx->find_handle);
+            ctx->find_handle = NULL;
+            ctx->file_handle = NULL;
+            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+            return STATUS_NO_MORE_FILES;
+        }
+    }
+
+    /* FATX enumeration never exposes the host's dot directories. */
+    while (!wcscmp(ctx->find_data.cFileName, L".") ||
+           !wcscmp(ctx->find_data.cFileName, L"..")) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
@@ -1107,11 +1200,17 @@ static BOOL s_dir_cs_init = FALSE;
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
 {
     (void)Event; (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
+    IoStatusBlock->Information = 0;
+    if (FileInformationClass != XboxFileDirectoryInformation) {
+        IoStatusBlock->Status = STATUS_INVALID_INFO_CLASS;
+        return STATUS_INVALID_INFO_CLASS;
+    }
 
     if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
     EnterCriticalSection(&s_dir_cs);
@@ -1162,6 +1261,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
         if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
             break;
     }

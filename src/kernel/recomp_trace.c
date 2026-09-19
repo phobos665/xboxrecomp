@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
 
 #include "xbox_memory_layout.h"
 
@@ -179,9 +180,22 @@ static void prof_count(const char *name, uint32_t va)
 
     /* A title being profiled for a hang or a slowdown is a title that gets
      * killed rather than exited, and a kill does not reach atexit. Report as
-     * it goes, so there is always a recent one. */
-    if (++g_prof_calls % prof_interval() == 0)
-        prof_report();
+     * it goes, so there is always a recent one.
+     *
+     * At most once a second, whatever the interval. A report walks the whole
+     * table forty times and rewrites the dump file, which is milliseconds; at
+     * an interval of 100 calls (the run_and_report.py default) a title
+     * entering a few thousand functions per frame spent 85% of its main
+     * thread in that report and drew one frame every twenty seconds. That
+     * looked exactly like a hang in the title, and cost a day. */
+    if (++g_prof_calls % prof_interval() == 0) {
+        static time_t last;
+        time_t now = time(NULL);
+        if (now != last) {
+            last = now;
+            prof_report();
+        }
+    }
 
     for (n = 0; n < PROF_SLOTS; n++) {
         unsigned k = (i + n) & (PROF_SLOTS - 1);
@@ -285,16 +299,25 @@ static void watch_check(const char *name)
 static void dump_va_once(void)
 {
     static int done;
-    const char *spec;
+    static const char *spec = (const char *)-1;
     const uint8_t *mem;
     uint32_t va, n, i;
     char *colon;
 
     if (done)
         return;
-    spec = getenv("RECOMP_DUMP_VA");
-    if (!spec || !*spec)
+    /* Read the switch once. This used to call getenv on every function entry
+     * of a --trace-all-entries build, and the CRT's getenv takes a lock and
+     * walks the environment block: sampled at 1 kHz, Burnout 2's main thread
+     * spent 83% of its time here, and the title ran at a third of the speed
+     * it does with the switch cached. The other getenv calls in this file are
+     * behind static caches or the trace budget already. */
+    if (spec == (const char *)-1)
+        spec = getenv("RECOMP_DUMP_VA");
+    if (!spec || !*spec) {
+        done = 1;
         return;
+    }
 
     va = (uint32_t)strtoul(spec, &colon, 0);
     n = (colon && *colon == ':') ? (uint32_t)strtoul(colon + 1, NULL, 0) : 16;

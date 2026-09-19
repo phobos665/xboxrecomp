@@ -33,3 +33,19 @@ if(WIN32)
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
 endif()
+
+if(WIN32)
+    # Pure parsing of a pixel shader definition: no device, so it can run
+    # under ctest. Links the same sources as d3d8_a8 because d3d8_combiners.c
+    # reaches into the device layer for state it does not use here.
+    add_executable(d3d8_final_default
+        test_final_default.c
+        ../../src/d3d/d3d8_resources.c
+        ../../src/d3d/d3d8_shaders.c
+        ../../src/d3d/d3d8_combiners.c
+    )
+    target_include_directories(d3d8_final_default PRIVATE ../../src/d3d)
+    target_link_libraries(d3d8_final_default PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    # Registered with ctest from the root CMakeLists: this directory is
+    # entered from src/d3d, before the root calls enable_testing().
+endif()

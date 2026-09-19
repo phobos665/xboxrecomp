@@ -177,6 +177,9 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
   functions (D3D8, DirectSound, ...) linked into a title; step 1 builds it.
 - An original Xbox game disc image (you must own the game)
 
+`py -3` below is the Windows Python Launcher — on Linux and macOS use
+`python3`, and on a Microsoft Store install that has no `py`, use `python`.
+
 ### Step-by-Step
 
 The condensed version. [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) is
