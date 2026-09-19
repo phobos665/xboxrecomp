@@ -119,6 +119,8 @@ IDirect3DSurface8 *host_DeviceDepthSurface(IDirect3DDevice8 *dev);
 
 HRESULT host_vsh_create_shader(const DWORD *microcode, int insn_count, DWORD *handle);
 HRESULT host_vsh_delete_shader(DWORD handle);
+/* Whether the host program behind handle holds exactly this microcode. */
+BOOL    host_vsh_same_microcode(DWORD handle, const DWORD *microcode, int insn_count);
 void    host_vsh_set_constant(int first_reg, const float *data, int count);
 HRESULT host_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int count);
 void    host_vsh_set_screenspace(const float scale[4], const float offset[4]);

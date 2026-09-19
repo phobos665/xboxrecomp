@@ -832,6 +832,19 @@ HRESULT host_vsh_create_shader(const DWORD *microcode, int insn_count, DWORD *ha
     return hr;
 }
 
+BOOL host_vsh_same_microcode(DWORD handle, const DWORD *microcode, int insn_count)
+{
+    const DWORD *have;
+    int length;
+
+    if (insn_count > NV2A_VS_MAX_INSTRUCTIONS)
+        insn_count = NV2A_VS_MAX_INSTRUCTIONS;
+    if (!d3d8_vsh_get_slot((int)(handle - 0x10000), NULL, &have, &length, NULL, NULL))
+        return FALSE;
+    return length == insn_count &&
+           memcmp(have, microcode, (size_t)insn_count * 4 * sizeof(DWORD)) == 0;
+}
+
 HRESULT host_vsh_delete_shader(DWORD handle)
 {
     if (g_cap) {

@@ -447,6 +447,7 @@ static int shadow_program_find(uint32_t guest)
 #define SHADOW_PROGRAM_SLOTS 136
 static DWORD g_slot_host[SHADOW_PROGRAM_SLOTS];
 static int   g_slot_loaded[SHADOW_PROGRAM_SLOTS];
+static unsigned long g_slot_reloads;   /* loads that repeated a slot's microcode */
 
 static void shadow_read_declaration(int slot, uint32_t handle);
 
@@ -933,6 +934,9 @@ HLE_EXPORT(D3DDevice_Swap)
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
             swap_timing_report();
+            if (g_slot_reloads)
+                fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads repeated a "
+                        "slot's microcode and kept the host program\n", g_slot_reloads);
             if (g_target_sets)
                 fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
                         "scratch target, %lu failed\n", g_target_sets,
@@ -1196,21 +1200,35 @@ HLE_EXPORT(D3DDevice_LoadVertexShaderProgram)
     HLE_CALL_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
 #ifdef _WIN32
     if (g_shadow && function && address < SHADOW_PROGRAM_SLOTS) {
+        static int logged;
         uint32_t header = HLE_MEM32(function);
+        int count = (int)(header >> 16);
+        int valid = (header & 0xFFFF) == 0x2078 && count != 0 &&
+                    (uint32_t)count <= SHADOW_PROGRAM_SLOTS - address;
+        const DWORD *microcode = (const DWORD *)HLE_PTR(function + 4);
         DWORD host = 0;
         HRESULT hr = E_FAIL;
 
-        if ((header & 0xFFFF) == 0x2078 && (header >> 16) != 0 &&
-            (header >> 16) <= SHADOW_PROGRAM_SLOTS - address)
-            hr = host_vsh_create_shader((const DWORD *)HLE_PTR(function + 4),
-                                        (int)(header >> 16), &host);
-        if (g_slot_loaded[address])
-            host_vsh_delete_shader(g_slot_host[address]);
-        g_slot_loaded[address] = SUCCEEDED(hr);
-        g_slot_host[address] = SUCCEEDED(hr) ? host : 0;
-        fprintf(stderr, "[HLE-D3D8] shadow vertex program at slot %u: %u instructions, %s\n",
-                address, header >> 16,
-                SUCCEEDED(hr) ? "host program" : "not replayed");
+        /* Titles on this API reload the same program into the same slot
+         * several times a frame (TimeSplitters 2: 26k loads in two minutes).
+         * Identical microcode keeps the host program, and with it the handle
+         * that selected entries already refer to. */
+        if (valid && g_slot_loaded[address] &&
+            host_vsh_same_microcode(g_slot_host[address], microcode, count)) {
+            g_slot_reloads++;
+        } else {
+            if (valid)
+                hr = host_vsh_create_shader(microcode, count, &host);
+            if (g_slot_loaded[address])
+                host_vsh_delete_shader(g_slot_host[address]);
+            g_slot_loaded[address] = SUCCEEDED(hr);
+            g_slot_host[address] = SUCCEEDED(hr) ? host : 0;
+            if (logged < 64)
+                fprintf(stderr, "[HLE-D3D8] shadow vertex program at slot %u: %u instructions, %s%s\n",
+                        address, header >> 16,
+                        SUCCEEDED(hr) ? "host program" : "not replayed",
+                        ++logged == 64 ? " (further loads not logged)" : "");
+        }
     }
 #endif
 }
