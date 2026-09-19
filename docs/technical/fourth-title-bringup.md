@@ -125,6 +125,18 @@ That is a much smaller question than "why does it crash", and it is where the
 next session should start: instrument `sub_001BB69D` to record what it is
 given, and find what writes `+0x18` of the object that feeds it.
 
+## Also ruled out
+
+- **File I/O and the cache partition.** The title opens the raw disk
+  devices and sets its cache partition up successfully: `Partition5`
+  opens, and it reads and writes sector 4 of `Partition0` (the partition
+  images live under `%LOCALAPPDATA%` in the `xboxrecomp` folder). The one
+  failed open in a whole run is the downloadable-content metadata file
+  under `TDATA`, which does not exist and is not supposed to.
+- **Uninitialised heap.** The bad payload is **0xF8604020 in every run**.
+  A deterministic value is something the title computed the same way each
+  time, not whatever happened to be lying in memory.
+
 ## Next
 
 1. **Find what feeds the payload**, as above: `sub_001BB69D`'s source
