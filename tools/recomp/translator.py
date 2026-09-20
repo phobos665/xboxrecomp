@@ -938,6 +938,18 @@ class FunctionTranslator:
         if start in self.trace_functions or self.trace_all_entries:
             lines.append(
                 f'    RECOMP_TRACE_ENTER("{name}", 0x{start:08X});')
+
+        # _CxxThrowException. This runtime cannot unwind, so the call inside
+        # does nothing and control falls through the int3 the compiler put
+        # after it: the throw returns, on a stack nobody cleaned up. Report it
+        # here, at the throw, where the arguments are still on the stack and
+        # the type that was thrown can be named -- rather than leaving the
+        # consequences to surface somewhere unrelated later.
+        # At entry esp points at the return address, so the two __stdcall
+        # arguments are just above it.
+        if start is not None and start == getattr(self.lifter, "CXX_THROW", None):
+            lines.append("    recomp_cxx_throw(MEM32(esp + 4), "
+                         "MEM32(esp + 8));")
         # Entry tracing shows what went in; it cannot show what came back, and
         # "this function returns with esi wrong" is exactly the question that
         # kept coming up. The lifter emits the matching exit trace at each ret.

@@ -684,3 +684,91 @@ void recomp_int3_reached(uint32_t va)
         "       after this line as a consequence, not a new bug.\n", va);
     fflush(stderr);
 }
+
+/* ---------------------------------------------------------------------------
+ * A C++ throw, reported where it happens.
+ *
+ * MSVC compiles `throw x` into _CxxThrowException(&object, &throwinfo), which
+ * never returns. This runtime has no exception support: the call does nothing
+ * useful and control falls through the int3 the compiler put after it, so the
+ * throw *returns*, on a stack nothing unwound and with callee-saved registers
+ * nobody restored. Everything afterwards is wreckage, and none of it mentions
+ * an exception.
+ *
+ * Reporting here costs nothing and turns that into one legible line. The
+ * _ThrowInfo hanging off the second argument names the type, which is usually
+ * enough to recognise what the title was doing:
+ *
+ *   _ThrowInfo      { attributes, pmfnUnwind, pForwardCompat, pCatchableTypeArray }
+ *   CatchableTypeArray { nCatchableTypes, arrayOfCatchableTypes[] }
+ *   CatchableType   { properties, pType, thisDisplacement, ... }
+ *   type_info       { vfptr, _M_data, _M_d_name[] }   <- the mangled name
+ *
+ * MSVC's mangling for the built-ins is a leading '.': ".D" is char, ".H" int,
+ * ".M" float, ".PAX" void*. A class is ".?AVname@@".
+ *
+ * Reported once per throw site. A throw in a loop is still one bug, and the
+ * first one is the one that matters -- everything after it happened on a
+ * broken stack.
+ * ------------------------------------------------------------------------- */
+void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va)
+{
+    enum { SLOTS = 8 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
+    const char *type_name = NULL;
+    uint32_t caller = 0;
+    int i;
+
+    if (!mem)
+        return;
+
+    /* The throw site, not the throw helper: at entry esp still points at the
+     * return address the caller pushed. */
+    if (g_esp && guest_readable(g_esp, 4))
+        caller = *(const uint32_t *)(mem + g_esp);
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == caller)
+            return;
+    if (count < SLOTS)
+        seen[count++] = caller;
+
+    /* _ThrowInfo -> CatchableTypeArray -> first CatchableType -> type_info.
+     * Every hop is guest data and may be anything, so every hop is checked. */
+    if (throwinfo_va && guest_readable(throwinfo_va, 16)) {
+        uint32_t cta = *(const uint32_t *)(mem + throwinfo_va + 12);
+        if (cta && guest_readable(cta, 8)) {
+            uint32_t n = *(const uint32_t *)(mem + cta);
+            uint32_t ct = *(const uint32_t *)(mem + cta + 4);
+            if (n && ct && guest_readable(ct, 8)) {
+                uint32_t ti = *(const uint32_t *)(mem + ct + 4);
+                if (ti && guest_readable(ti + 8, 32))
+                    type_name = (const char *)(mem + ti + 8);
+            }
+        }
+    }
+
+    fprintf(stderr,
+        "[THROW] the title threw a C++ exception from 0x%08X",
+        caller);
+    if (type_name && *type_name)
+        fprintf(stderr, ", type \"%.48s\"", type_name);
+    fprintf(stderr, "\n");
+    if (object_va && guest_readable(object_va, 4))
+        fprintf(stderr, "        object at 0x%08X, first dword 0x%08X\n",
+                object_va, *(const uint32_t *)(mem + object_va));
+    fprintf(stderr,
+        "        This runtime cannot unwind, so the throw will RETURN and\n"
+        "        execution continues on a stack nothing cleaned up. Treat\n"
+        "        anything odd after this line as a consequence, not a new\n"
+        "        bug. RECOMP_THROW_FATAL=1 stops here instead.\n");
+    fflush(stderr);
+
+    if (getenv("RECOMP_THROW_FATAL")) {
+        fprintf(stderr, "[THROW] RECOMP_THROW_FATAL is set; exiting.\n");
+        fflush(stderr);
+        exit(4);
+    }
+}

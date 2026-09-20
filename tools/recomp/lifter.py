@@ -967,6 +967,83 @@ _SEH_PROLOG_MAX_SIZE = 128
 _SEH_EPILOG_MAX_SIZE = 64
 
 
+# MSVC compiles `throw x` into a call to _CxxThrowException, which never
+# returns. This runtime cannot unwind, so the call falls through to the int3
+# the compiler puts after it and the throw simply returns, on a stack nothing
+# cleaned up. Naming the function lets the runtime report the throw at the
+# point it happens, with the type that was thrown, instead of leaving the
+# consequences to surface somewhere unrelated. See
+# docs/technical/cpp-exceptions.md.
+#
+# The function is found through the static EHExceptionRecord template it
+# copies onto its own stack. That template is unmistakable:
+#
+#   +0x00  0xE06D7363   the C++ exception code, 'msc' | 0xE0000000
+#   +0x04  1            EXCEPTION_NONCONTINUABLE
+#   +0x10  3            NumberParameters
+#   +0x14  0x19930520   EH_MAGIC_NUMBER1
+#
+# so find the template first, then the small function that references its
+# address. Matching on 0x19930520 alone would not do: it appears 146 times in
+# Outrun 2, once in every function's exception state table, while the record
+# code appears eight.
+_EH_EXCEPTION_CODE = 0xE06D7363
+_EH_MAGIC_NUMBER1 = 0x19930520
+_CXX_THROW_MAX_SIZE = 256
+
+
+def _is_eh_record_template(xbe_data, va):
+    """Whether guest VA `va` holds MSVC's EHExceptionRecord template."""
+    from .config import va_to_file_offset
+    import struct
+
+    off = va_to_file_offset(va)
+    if off is None or off + 32 > len(xbe_data):
+        return False
+    w = struct.unpack("<8I", xbe_data[off:off + 32])
+    return (w[0] == _EH_EXCEPTION_CODE and w[4] == 3
+            and w[5] == _EH_MAGIC_NUMBER1)
+
+
+def detect_cxx_throw(func_db, xbe_data, verbose=False):
+    """Locate _CxxThrowException, or None for a title that never throws."""
+    import struct
+
+    if not func_db or not xbe_data:
+        return None
+
+    from .config import va_to_file_offset
+
+    for addr in sorted(func_db):
+        info = func_db[addr]
+        try:
+            size = int(info.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0 or size > _CXX_THROW_MAX_SIZE:
+            continue
+        off = va_to_file_offset(addr)
+        if off is None or off + size > len(xbe_data):
+            continue
+        body = xbe_data[off:off + size]
+
+        # Any 4-byte window could be the template's address as an immediate.
+        for k in range(0, len(body) - 3):
+            cand = struct.unpack("<I", body[k:k + 4])[0]
+            if cand and _is_eh_record_template(xbe_data, cand):
+                if verbose:
+                    import sys
+                    print(f"  _CxxThrowException: 0x{addr:08X} "
+                          f"(record template at 0x{cand:08X})", file=sys.stderr)
+                return addr
+
+    if verbose:
+        import sys
+        print("  _CxxThrowException: not found "
+              "(this title may not use C++ exceptions)", file=sys.stderr)
+    return None
+
+
 def detect_seh_helpers(func_db, xbe_data, verbose=False):
     """Locate __SEH_prolog / __SEH_epilog in the target binary.
 
@@ -1142,6 +1219,9 @@ class Lifter:
 
         self.SEH_PROLOGS = _as_set(seh_prolog, found_prologs)
         self.SEH_EPILOGS = _as_set(seh_epilog, found_epilogs)
+
+        self.CXX_THROW = (detect_cxx_throw(self.func_db, xbe_data)
+                          if self.func_db else None)
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
@@ -1970,6 +2050,10 @@ class Lifter:
     # callers that construct a Lifter without a function database.
     SEH_PROLOGS = frozenset()
     SEH_EPILOGS = frozenset()
+
+    # _CxxThrowException, detected from the binary. None when the title
+    # never throws.
+    CXX_THROW = None
 
     # The CRT's setjmp/longjmp, detected by detect_setjmp_helpers().
     SETJMP_FN = None

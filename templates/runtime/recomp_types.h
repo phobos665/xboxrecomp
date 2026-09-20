@@ -82,6 +82,10 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va);
  * C++ throw. Silent before; see docs/technical/cpp-exceptions.md. */
 void recomp_int3_reached(uint32_t va);
 
+/* A C++ throw, reported at the throw with the type that was thrown. This
+ * runtime cannot unwind, so it returns; see docs/technical/cpp-exceptions.md. */
+void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va);
+
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
  * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
 #if !defined(_MSC_VER) && !defined(__debugbreak)

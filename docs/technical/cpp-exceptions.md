@@ -72,13 +72,60 @@ is filtered out at run time, so it stays quiet. Padding between functions is
 never executed and never reported. What is left is traps the title genuinely
 reached.
 
+## What the runtime does now
+
+The throw is identified and reported at the point it happens, before the
+stack is wrecked.
+
+`detect_cxx_throw` in `tools/recomp/lifter.py` finds `_CxxThrowException` by
+the static `EHExceptionRecord` template it copies onto its own stack, then
+locating the small function that references that template's address. Matching
+the magic number alone would not work: `0x19930520` occurs 146 times in Outrun
+2, once in every function's exception state table, while the record's
+exception code occurs eight times. The translator emits one call at that
+function's entry, where the two `__stdcall` arguments are still on the stack.
+
+```
+[THROW] the title threw a C++ exception from 0x001BB7B5, type ".D"
+        object at 0x00F7F0A7, first dword 0xF7F12C21
+        This runtime cannot unwind, so the throw will RETURN and
+        execution continues on a stack nothing cleaned up. Treat
+        anything odd after this line as a consequence, not a new
+        bug. RECOMP_THROW_FATAL=1 stops here instead.
+```
+
+`.D` is MSVC's mangling for `char` and the object's first byte is 0x21, which
+is what the static decode above predicted. Reported once per throw site, since
+a throw in a loop is one bug and the first one is the only one that happened
+on an intact stack.
+
+`RECOMP_THROW_FATAL=1` exits at the throw instead of carrying on. On Outrun 2
+that turns a thirty-second run ending in a confusing access violation into a
+clean stop with a 29 KB log and no crash at all. Use it as soon as a `[THROW]`
+line appears: everything after it is untrustworthy.
+
+The default is to continue, because that is what the runtime did before and a
+title that throws somewhere harmless should not be stopped by a diagnostic.
+
+## The hook for real support already exists
+
+The throw reaches the kernel bridge. The same run prints:
+
+```
+  [KERNEL] RtlRaiseException: record=0x00F7F004 code=0xE06D7363 (#1)
+```
+
+`bridge_RtlRaiseException` in `src/kernel/kernel_bridge.c` receives the fully
+built `EHExceptionRecord`, with the C++ exception code, the magic number, and
+the object and `_ThrowInfo` pointers as its parameters. That is where an
+implementation belongs: everything a real unwinder needs is already handed to
+it, and nothing else has to be intercepted.
+
 ## What it would take to support throws
 
-Not started. The pieces, roughly in order:
+The first step is done. The rest are not started:
 
-1. **`_CxxThrowException` as an HLE entry point.** Identify it by signature —
-   it is CRT boilerplate, so it is per-XDK, the same kind of problem as the
-   SEH prologues in `docs/technical/eh-prolog-frames.md`.
+1. ~~**Identify `_CxxThrowException`.**~~ Done, 20 Sep 2026, as above.
 2. **Walk the exception registration chain.** `fs:[0]` already holds it: the
    SEH prologue links a record on every function with a try block, and this
    runtime already models that well enough for the frame pointers to be right.
