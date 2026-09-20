@@ -927,15 +927,20 @@ HLE_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
  * XDK version, read them from D3D_BlockOnTime's own prologue, which is the
  * one place they are certainly right for this title:
  *
- *     56                push esi
- *     8B 35 <g_pDevice> mov  esi, [D3D_g_pDevice]
- *     8B 46 <A>         mov  eax, [esi + A]     ; pointer to the completed word
+ *     8B 3D <g_pDevice> mov  edi, [D3D_g_pDevice]
+ *     8B 47 <A>         mov  eax, [edi + A]     ; pointer to the completed word
  *     8B 08             mov  ecx, [eax]
- *     8B 46 <B>         mov  eax, [esi + B]     ; last submitted value
+ *     8B 47 <B>         mov  eax, [edi + B]     ; last submitted value
  *
- * Identical in both builds seen so far apart from A and B. A build whose
- * compiler laid it out differently gets a line saying so and no mirror,
- * which is the hang this replaces, not a wrong write.
+ * Which register holds the device varies. 5344 and 4721 load it into esi
+ * first thing; 4134 (Jet Set Radio Future) puts the `time` argument in esi
+ * and the device in edi, so the same three reads are 8B 47 rather than
+ * 8B 46. The scan below therefore looks for the load of D3D_g_pDevice
+ * wherever it sits in the prologue, takes the register from its ModRM, and
+ * reads A and B against that -- which also rejects a prologue reading some
+ * other global without a separate check. A build laid out differently still
+ * gets a line saying so and no mirror, which is the hang this replaces,
+ * not a wrong write.
  */
 HLE_IMPORT_VAR(D3D_g_pDevice);
 HLE_IMPORT_VAR(D3D_BlockOnTime);
@@ -956,29 +961,54 @@ static void mirror_gpu_time_fence(void)
         return;
     }
     code = (const uint8_t *)HLE_PTR(hle_var_D3D_BlockOnTime);
-    if (!(code[0] == 0x56 && code[1] == 0x8B && code[2] == 0x35 &&
-          code[7] == 0x8B && code[8] == 0x46 &&
-          code[10] == 0x8B && code[11] == 0x08 &&
-          code[12] == 0x8B && code[13] == 0x46)) {
-        fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: D3D_BlockOnTime "
-                        "at 0x%08X does not start as expected (%02X %02X %02X .. "
-                        "%02X %02X)\n", hle_var_D3D_BlockOnTime,
-                code[0], code[1], code[2], code[7], code[8]);
-        return;
-    }
     {
-        uint32_t device_global;
-        memcpy(&device_global, code + 3, 4);
-        if (device_global != hle_var_D3D_g_pDevice) {
+        /* Find `mov <reg>, [D3D_g_pDevice]` rather than assuming which
+         * register holds the device or where the load sits. ModRM for
+         * `mov r32, [disp32]` is (reg << 3) | 0x05, so the destination is
+         * (modrm >> 3) & 7 and the address follows it. Matching on the
+         * address means a prologue that reads some other global is rejected
+         * for free, which the separate check used to do. */
+        enum { SCAN = 24 };
+        int at = -1, reg = -1, i;
+
+        for (i = 0; i + 6 <= SCAN; i++) {
+            uint32_t addr;
+            if (code[i] != 0x8B || (code[i + 1] & 0xC7) != 0x05)
+                continue;
+            memcpy(&addr, code + i + 2, 4);
+            if (addr != hle_var_D3D_g_pDevice)
+                continue;
+            reg = (code[i + 1] >> 3) & 7;
+            at = i + 6;
+            break;
+        }
+        if (at < 0) {
             fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
-                            "D3D_BlockOnTime reads the device from 0x%08X, the "
-                            "symbols say 0x%08X\n",
-                    device_global, hle_var_D3D_g_pDevice);
+                            "D3D_BlockOnTime at 0x%08X does not load the device "
+                            "from 0x%08X in its first %d bytes (starts %02X %02X "
+                            "%02X %02X)\n",
+                    hle_var_D3D_BlockOnTime, hle_var_D3D_g_pDevice, (int)SCAN,
+                    code[0], code[1], code[2], code[3]);
             return;
         }
+        /* Then, against that register:
+         *     8B <40|reg> A   mov eax, [reg + A]   ; -> completed word
+         *     8B 08           mov ecx, [eax]
+         *     8B <40|reg> B   mov eax, [reg + B]   ; last submitted value */
+        if (code[at] != 0x8B || code[at + 1] != (uint8_t)(0x40 | reg) ||
+            code[at + 3] != 0x8B || code[at + 4] != 0x08 ||
+            code[at + 5] != 0x8B || code[at + 6] != (uint8_t)(0x40 | reg)) {
+            fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
+                            "D3D_BlockOnTime at 0x%08X loads the device into r%d "
+                            "but does not then read the fence as expected "
+                            "(%02X %02X .. %02X %02X)\n",
+                    hle_var_D3D_BlockOnTime, reg,
+                    code[at], code[at + 1], code[at + 5], code[at + 6]);
+            return;
+        }
+        get_ptr_off = code[at + 2];
+        put_off = code[at + 7];
     }
-    get_ptr_off = code[9];
-    put_off = code[14];
     if (xbox_Nv2aMirrorFence(hle_var_D3D_g_pDevice, put_off, get_ptr_off) == 0)
         fprintf(stderr, "[HLE-D3D8] GPU time fence mirrored: device +0x%02X -> "
                         "*(device +0x%02X), offsets read from D3D_BlockOnTime\n",
