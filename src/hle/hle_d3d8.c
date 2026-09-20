@@ -1327,6 +1327,68 @@ static void shadow_read_declaration(int slot, uint32_t handle)
 }
 #endif
 
+/* TEMPORARY DIAGNOSTIC (RECOMP_DECL_TOKENS=1): the declaration token stream
+ * exactly as the title supplies it, before anything here parses it, so the
+ * register numbers can be read from the title's own data rather than inferred
+ * from the XDK's parsed array. Xbox D3DVSD token form: bits 31..29 select the
+ * token type -- 1 STREAM (index in the low bits, bit 28 = tessellator
+ * stream), 2 STREAMDATA (bit 28 set = SKIP of (t >> 16) & 0xFFF dwords,
+ * otherwise REG with the vertex register in the low 5 bits and the X_D3DVSDT
+ * data type in bits 23..16), 0 NOP, 3 TESSELLATOR, 4 CONSTMEM, 5 EXT --
+ * and 0xFFFFFFFF ends the stream. */
+static void note_declaration_tokens(uint32_t decl)
+{
+    static int notes, enabled = -1;
+    uint32_t stream = 0, offset = 0, i;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_DECL_TOKENS");
+        enabled = e && *e && *e != '0';
+    }
+    if (!enabled || notes >= 48 || !decl)
+        return;
+    notes++;
+    fprintf(stderr, "[DECL] raw declaration at 0x%08X\n", decl);
+    for (i = 0; i < 128u; i++) {
+        uint32_t t = HLE_MEM32(decl + i * 4u);
+        uint32_t type = (t >> 29) & 7u;
+
+        if (t == 0xFFFFFFFFu) {
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  END\n", i, t);
+            break;
+        }
+        if (type == 1u && !(t & 0x10000000u)) {
+            stream = t & 0x1FFFFFFFu;
+            offset = 0;
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  STREAM %u\n", i, t, stream);
+        } else if (type == 2u && (t & 0x10000000u)) {
+            uint32_t dwords = (t >> 16) & 0xFFFu;
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  SKIP %u dword(s), "
+                    "offset %u -> %u\n", i, t, dwords, offset,
+                    offset + dwords * 4u);
+            offset += dwords * 4u;
+        } else if (type == 2u) {
+            uint32_t reg = t & 0x1Fu;
+            uint32_t fmt = (t >> 16) & 0xFFu;
+            uint32_t count = fmt >> 4, kind = fmt & 0xFu, size;
+
+            switch (kind) {
+            case 0x0: size = 4; break;                 /* D3DCOLOR */
+            case 0x1: case 0x5: size = count * 2u; break; /* NORMSHORT / SHORT */
+            case 0x2: size = count * 4u; break;        /* FLOAT */
+            case 0x4: size = count; break;             /* PBYTE */
+            case 0x6: size = 4; break;                 /* NORMPACKED3 */
+            default:  size = 0; break;                 /* NONE and unknown */
+            }
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  REG v%u stream %u offset %u "
+                    "type 0x%02X size %u\n", i, t, reg, stream, offset, fmt, size);
+            offset += size;
+        } else {
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  token type %u\n", i, t, type);
+        }
+    }
+}
+
 /* HRESULT D3DDevice_CreateVertexShader(const DWORD *pDeclaration,
  *     const DWORD *pFunction, DWORD *pHandle, DWORD Usage)
  *
@@ -1338,12 +1400,14 @@ static void shadow_read_declaration(int slot, uint32_t handle)
 HLE_EXPORT(D3DDevice_CreateVertexShader)
 {
     static int seen;
+    uint32_t declaration = HLE_ARG(0);
     uint32_t function = HLE_ARG(1);
 #ifdef _WIN32
     uint32_t handle_va = HLE_ARG(2);
 #endif
 
     first_call(&seen, "D3DDevice_CreateVertexShader", function);
+    note_declaration_tokens(declaration);
     if (original_missing(hle_original_D3DDevice_CreateVertexShader,
                          "D3DDevice_CreateVertexShader"))
         HLE_RETURN(0x80004005u);
