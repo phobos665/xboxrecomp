@@ -1421,6 +1421,8 @@ static int wait_log_wanted(void)
     return wanted;
 }
 
+uint32_t g_kernel_caller;
+
 static void wait_log_note(const char *what, uint32_t object, uint32_t extra)
 {
     static uint32_t seen[64];
@@ -1486,7 +1488,7 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
 static void bridge_KeSetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);
-    wait_log_note("sets    ", guest_va, BRIDGE_MEM32(g_esp));
+    wait_log_note("sets    ", guest_va, g_kernel_caller);
 
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
@@ -1531,7 +1533,7 @@ static void bridge_KeWaitForSingleObject(void)
     volatile LONG *state = bridge_guest_event(object, &sync);
     HANDLE h;
 
-    wait_log_note("waits on", object, BRIDGE_MEM32(g_esp));
+    wait_log_note("waits on", object, g_kernel_caller);
     if (wait_log_wanted()) {
         /* The dispatcher header decides the semantics: Type 0 is a
          * notification event a waiter does not consume, Type 1 a
@@ -9481,6 +9483,14 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+
+    /* The guest return address, captured here and kept for the bridge body.
+     * At this point the caller's pushed return address is still on top of the
+     * guest stack; by the time a bridge reads its arguments esp has moved, so
+     * reading [esp] there gives the first argument instead. The [WAIT] log
+     * used to do exactly that and reported every wait as being called from
+     * the object it was waiting on. */
+    g_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
