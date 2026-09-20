@@ -1,12 +1,17 @@
 # Marvel vs Capcom 2: renders, but its textures are refused
 
 20 September 2026. The title boots, plays its intro audio and presents frames at
-about 25 ms each. The screen is essentially the clear colour, because the path
-it submits most of its geometry through is not implemented.
+about 25 ms each. The screen is essentially the clear colour, because **59% of
+its texture binds are refused**: its art is P8 and the shadow path drops P8.
+
+**Read "Measured: the blocker is P8" at the bottom first.** It supersedes the
+section immediately below, which was the first theory and is refuted — the
+inline vertex path is real but carries only start-up work. The section is kept
+because the reasoning in it was sound and only the conclusion was wrong.
 
 ---
 
-## The blocker: the inline immediate-mode vertex path
+## Superseded: the inline immediate-mode vertex path
 
 MvC2 submits geometry the Xbox inline way:
 
