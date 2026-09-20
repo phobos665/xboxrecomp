@@ -150,6 +150,29 @@ plain name, so `D3DDevice_LoadVertexShader` never matches
 code with no replacement. They are the shader path, which is exactly what had
 to be replaced to make TimeSplitters 2 draw.
 
-Matching the suffixed names, and reading their arguments from the registers
-the suffix names rather than from the stack, is the next piece of work. It is
-general: it applies to every LTCG title, including the upstream reference.
+**That is now done**, and it was not the cause.
+
+`tools/recomp/hle.py` parses the suffix, matches a plain implementation name
+against a single LTCG variant, and the generated thunk lays an ordinary
+argument frame just below the stack, fills it from the registers the name
+records and from the caller's stack for the rest, and points `g_esp` at it for
+the call. Implementations are unchanged and cannot tell the difference. Two
+more functions bind in Black as a result, including
+`D3DDevice_SelectVertexShader`, taking it from 46 replaced to 48.
+
+The picture is still black. Of the fifteen register-argument functions only
+two have implementations at all, so the rest still run as lifted code, but
+none of the thirteen is a pixel-shader entry point and `SetPixelShader` was
+already bound in Black exactly as it is in TimeSplitters 2.
+
+The real symptom is narrower than it looked:
+
+```
+[HLE-D3D8] shadow pixel shader: 0 draws with a combiner, 2594 without
+```
+
+**Not one of Black's draws carries a register combiner.** In TimeSplitters 2
+the combiners are what produce colour. So the title either never sets a pixel
+shader, or sets one the combiner layer declines to parse, and that is where
+the next session should start: instrument `D3DDevice_SetPixelShader` to say
+what it is handed and how often.

@@ -894,6 +894,51 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * Use this when the caller pushes arguments that the callee would
  * normally clean up (stdcall convention).
  */
+/* Calling an XDK replacement whose arguments the linker put in registers.
+ *
+ * A title built with link-time code generation gets rewritten calling
+ * conventions, and the signature database records what happened in the name:
+ * D3DDevice_SelectVertexShader_0__LTCG_eax1_ebx2 takes both arguments in
+ * registers and none on the stack. The replacements in src/hle are written
+ * against the ordinary convention and read everything with HLE_ARG, which
+ * reads the guest stack.
+ *
+ * Rather than write every implementation twice, the generated thunk lays out
+ * an ordinary argument frame just below the stack, fills it from the
+ * registers the name specifies and from the caller's own stack arguments for
+ * the rest, and points g_esp at it for the duration of the call. The
+ * implementation cannot tell the difference. The frame sits in stack space
+ * the callee would have used anyway, and g_esp is restored afterwards to
+ * exactly what an ordinary thunk would leave.
+ *
+ * tools/recomp/hle.py emits these; nothing else should use them.
+ */
+#define RECOMP_HLE_STACK(i) MEM32(_hle_stack + 4u * (uint32_t)(i))
+
+#define RECOMP_HLE_MAX_ARGS 24u
+
+#define RECOMP_HLE_LTCG_CALL(n, fn, total_pop) \
+    { \
+        uint32_t _hle_n     = (uint32_t)(n); \
+        uint32_t _hle_ret   = MEM32(g_esp); \
+        uint32_t _hle_stack = g_esp + 4u; \
+        uint32_t _hle_save  = g_esp; \
+        uint32_t _hle_frame = g_esp - 4u * (_hle_n + 4u); \
+        uint32_t _hle_pop   = (uint32_t)(total_pop); \
+        uint32_t a[RECOMP_HLE_MAX_ARGS]; \
+        uint32_t _hle_i; \
+        void (*_hle_fn)(void) = (fn); \
+        (void)_hle_stack;
+
+#define RECOMP_HLE_LTCG_END \
+        MEM32(_hle_frame) = _hle_ret; \
+        for (_hle_i = 0; _hle_i < _hle_n && _hle_i < RECOMP_HLE_MAX_ARGS; _hle_i++) \
+            MEM32(_hle_frame + 4u + 4u * _hle_i) = a[_hle_i]; \
+        g_esp = _hle_frame; \
+        _hle_fn(); \
+        g_esp = _hle_save + _hle_pop; \
+    }
+
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
