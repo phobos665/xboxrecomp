@@ -321,6 +321,13 @@ extern volatile uint64_t g_icall_count;
  * pushes nothing. Set here rather than passed, so a title whose generated
  * header predates this still compiles and simply reports no callers. */
 extern RECOMP_TLS uint32_t g_icall_saved_esp;
+/* 0 when a refused indirect *call* was refused, 1 for an indirect jump.
+ * The two mean different things and want different next steps: a call to
+ * an address nothing identified is a discovery gap, answered by seeding;
+ * a jump to one is usually the guest doing its own control flow, which no
+ * amount of seeding fixes. Saying "Failed to resolve" for both sent a
+ * Mortal Kombat coroutine three rounds through the seeding tool. */
+extern RECOMP_TLS uint32_t g_icall_was_tail;
 
 void recomp_icall_fail_log(uint32_t va);
 
@@ -922,7 +929,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           g_icall_saved_esp = g_esp; \
+           g_icall_saved_esp = g_esp; g_icall_was_tail = 0; \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
@@ -994,7 +1001,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           g_icall_saved_esp = g_esp; \
+           g_icall_saved_esp = g_esp; g_icall_was_tail = 0; \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
@@ -1013,7 +1020,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           g_icall_saved_esp = g_esp; \
+           g_icall_saved_esp = g_esp; g_icall_was_tail = 1; \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 

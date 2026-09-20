@@ -74,6 +74,8 @@ extern uint32_t g_xbox_code_hi;
  * a refused call is reported. Zero when the title's generated header predates
  * this, and the log then says it has no callers rather than inventing them. */
 extern RECOMP_MANUAL_TLS uint32_t g_icall_saved_esp;
+/* 1 when the refused dispatch was an indirect jump rather than a call. */
+extern RECOMP_MANUAL_TLS uint32_t g_icall_was_tail;
 
 /* ── Manual function overrides ─────────────────────────────── */
 
@@ -175,10 +177,17 @@ void recomp_icall_fail_log(uint32_t va)
             return;
     }
 
-    fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X -- %llu time(s) "
+    fprintf(stderr, "[ICALL] unresolved %s target 0x%08X -- %llu time(s) "
                     "(total calls: %llu)\n",
-            va, (unsigned long long)hits[i],
+            g_icall_was_tail ? "jump" : "call", va,
+            (unsigned long long)hits[i],
             (unsigned long long)g_icall_count);
+    if (g_icall_was_tail && hits[i] == 1)
+        fprintf(stderr, "  a jump, not a call: if this address is inside a "
+                        "function rather than at its start, the guest is doing "
+                        "its own control flow (a coroutine, a longjmp, or a "
+                        "switch arm) and seeding it as a function will not "
+                        "help\n");
 
     /*
      * Who called it. The lifted caller pushed its return address on the guest
