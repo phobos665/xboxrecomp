@@ -241,6 +241,82 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
 /* A texture whose texels are the frame buffer: created as a render target so
  * the host can draw the finished frame into it, refreshed once per frame, and
  * never uploaded from guest memory. */
+/* RECOMP_HLE_D3D8_FB_PROBE=<n>: every n swaps, read back what the screen copy
+ * actually landed in the texture the title samples, and say so.
+ *
+ * This exists because the question "does the frame buffer texture hold the
+ * frame?" could not be answered from a capture. src/replay never performs the
+ * copy -- it is done here, in the HLE -- so a replay samples the captured
+ * guest texels, which are zeros, and cannot tell a broken fill from an absent
+ * one. The answer has to be read out of the running title.
+ *
+ * TimeSplitters 2's three full-screen quads compute out = t0*a + dst*(1-a)
+ * with t0 this texture, so a correct copy makes them a no-op and a black one
+ * makes them multiply the picture by (1-a). That is the difference between a
+ * motion blur and the brightness bug, and it is one number.
+ *
+ * It must read through the surface, not the texture. IDirect3DTexture8's
+ * LockRect returns tex->sys_mem, the upload shadow that UnlockRect pushes to
+ * the GPU; the screen copy writes the GPU texture through a render target
+ * view and never touches it, so that buffer reads as zeros whether the copy
+ * works or not. The surface's LockRect is the one that copies the D3D11
+ * resource into a staging texture and maps it. The first version of this
+ * probe used the texture and "proved" the copy was broken. */
+static void framebuffer_probe(texture_entry *e, unsigned long now)
+{
+    static int every = -1;
+    static unsigned long last;
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    unsigned long long sum = 0;
+    unsigned samples = 0, nonzero = 0;
+    UINT x, y;
+
+    if (every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_FB_PROBE");
+        every = (v && atoi(v) > 0) ? atoi(v) : 0;
+    }
+    if (!every || (last && now - last < (unsigned long)every))
+        return;
+    last = now;
+
+    if (FAILED(e->host->lpVtbl->GetSurfaceLevel(e->host, 0, &surf)) || !surf) {
+        fprintf(stderr, "[HLE-D3D8] fb probe: no level 0 surface on texture "
+                "0x%08X; the fill cannot be checked this way\n", e->va);
+        fflush(stderr);
+        every = 0;
+        return;
+    }
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        fprintf(stderr, "[HLE-D3D8] fb probe: cannot read the copy back "
+                "(texture 0x%08X); the fill cannot be checked this way\n", e->va);
+        fflush(stderr);
+        surf->lpVtbl->Release(surf);
+        every = 0;               /* asking again every frame would say the same */
+        return;
+    }
+    /* A sparse grid: enough to tell black from a picture, cheap enough to
+     * leave on. Bytes, not pixels -- the format only has to be 32-bit for the
+     * mean to mean something, and every framebuffer format here is. */
+    for (y = 0; y < 480u; y += 16) {
+        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
+        for (x = 0; x < 640u * 4u; x += 64) {
+            sum += row[x];
+            samples++;
+            if (row[x])
+                nonzero++;
+        }
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+
+    fprintf(stderr, "[HLE-D3D8] fb probe swap %lu: texture 0x%08X holds mean %.1f/255, "
+            "%u of %u samples non-zero -- %s\n", now, e->va,
+            samples ? (double)sum / samples : 0.0, nonzero, samples,
+            nonzero * 4u < samples ? "the copy is not arriving" : "the copy has content");
+    fflush(stderr);
+}
+
 static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va,
                                               const texture_layout *t)
 {
@@ -283,6 +359,7 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
     if (e->checked_swap != now) {
         e->checked_swap = now;
         xbox_D3D8CopyBackBufferToTexture(e->host);
+        framebuffer_probe(e, now);
     }
     return e->host;
 }
