@@ -38,8 +38,16 @@
 extern "C" {
 #endif
 
-/** Maximum number of shader programs that can be stored. */
-#define NV2A_VS_MAX_SLOTS           128
+/** Maximum number of shader programs that can be stored.
+ *
+ * 128 was enough for the first four titles and is not enough for Panzer
+ * Dragoon Orta, which creates at least 183 vertex shaders during start-up and
+ * printed "No free shader slots" 55 times. A slot is about 2.5 KB (136
+ * instructions of microcode plus a declaration), so this table is roughly
+ * 640 KB of static data at 256 and the headroom is cheap. Running out is not:
+ * the shader is dropped, and the draws that use it are skipped silently
+ * apart from that one line. */
+#define NV2A_VS_MAX_SLOTS           256
 
 /** Shader cache size (hashed microcode -> compiled shader). */
 #define NV2A_VS_CACHE_SIZE          64

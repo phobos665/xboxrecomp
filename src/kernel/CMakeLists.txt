@@ -20,6 +20,7 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    xbox_watchpoint.c
     icall_feedback.c
     recomp_trace.c
     recomp_fps.c

@@ -127,20 +127,66 @@ def stack_cleanup(code, start_va):
     return pops.pop() if len(pops) == 1 else None
 
 
+# Link-time code generation renames the functions it rewrites.
+#
+# When a title is built with LTCG the linker is free to change a function's
+# calling convention, and the signature database records what it did in the
+# name: D3DDevice_LoadVertexShader_4__LTCG_eax1 is LoadVertexShader with four
+# bytes of stack arguments and its first argument in eax, and
+# D3DDevice_SelectVertexShader_0__LTCG_eax1_ebx2 takes both of its arguments
+# in registers and none on the stack.
+#
+# Matching only the plain name meant none of these was ever replaced. Black is
+# the first LTCG title here and carries fifteen of them, including the whole
+# vertex-shader path -- which is precisely what had to be replaced to make
+# TimeSplitters 2 draw.
+LTCG_RE = re.compile(r"^(?P<base>.+?)_(?P<stack>\d+)__LTCG_(?P<regs>[a-z0-9_]+)$")
+_LTCG_REG_RE = re.compile(r"(e[a-z]{2})(\d+)")
+
+
+def parse_ltcg(name):
+    """(base name, {1-based argument position: register}) or (name, {})."""
+    m = LTCG_RE.match(name)
+    if not m:
+        return name, {}
+    regs = {int(pos): reg for reg, pos in _LTCG_REG_RE.findall(m.group("regs"))}
+    return m.group("base"), regs
+
+
 def plan(symbols, implemented, known_addrs, manual, cleanup):
     """Decide which addresses to replace.
 
     `cleanup(addr)` returns the argument bytes that function's `ret` pops, or
-    None. Returns (replace, notes): `replace` maps address -> (name, pop);
+    None. Returns (replace, notes): `replace` maps address ->
+    (name, pop, regs), where regs maps a 1-based argument position to the
+    register that carries it in an LTCG build and is empty otherwise;
     `notes` lists why an implemented name was not used, so a silent miss is
     visible.
     """
     replace, notes = {}, []
-    by_name = {}
-    for s in symbols:
-        by_name.setdefault(s["name"], []).append(s["address"])
+    by_name, by_base = {}, {}
+    for sym in symbols:
+        by_name.setdefault(sym["name"], []).append(sym["address"])
+        base, regs = parse_ltcg(sym["name"])
+        if regs:
+            by_base.setdefault(base, []).append((sym["address"], regs,
+                                                 sym["name"]))
     for name in sorted(implemented):
         addrs = by_name.get(name)
+        regs = {}
+        if not addrs:
+            # No plain match. An LTCG build renames what it rewrites, so look
+            # for exactly one variant of this name before giving up.
+            variants = by_base.get(name, [])
+            if len(variants) == 1:
+                addr, regs, full = variants[0]
+                addrs = [addr]
+                notes.append(f"{name}: matched {full} (LTCG, "
+                             f"{len(regs)} register argument"
+                             f"{'' if len(regs) == 1 else 's'})")
+            elif len(variants) > 1:
+                notes.append(f"{name}: {len(variants)} LTCG variants, skipped")
+                continue
         if not addrs:
             notes.append(f"{name}: not found in this XBE")
             continue
@@ -161,7 +207,7 @@ def plan(symbols, implemented, known_addrs, manual, cleanup):
         if pop is None:
             notes.append(f"{name}: 0x{addr:08X} has no single `ret N`, skipped")
             continue
-        replace[addr] = (name, pop)
+        replace[addr] = (name, pop, regs)
     return replace, notes
 
 
@@ -203,7 +249,7 @@ def keep_originals(replace, wanted):
     Only replaced addresses qualify. An unreplaced function is lifted under
     its own name anyway, and needs nothing kept."""
     return {addr: original_name(addr)
-            for addr, (name, _) in replace.items() if name in wanted}
+            for addr, (name, _, _r) in replace.items() if name in wanted}
 
 
 def render_thunks(replace, variables=None, originals=None):
@@ -224,14 +270,41 @@ def render_thunks(replace, variables=None, originals=None):
         '#include "recomp_types.h"',
         "",
     ]
-    for addr, (name, _) in sorted(replace.items()):
+    for addr, (name, _, _r) in sorted(replace.items()):
         lines.append(f"void hle_{name}(void);")
     lines.append("")
-    for addr, (name, pop) in sorted(replace.items()):
+    for addr, (name, pop, regs) in sorted(replace.items()):
         # g_esp, not esp: `esp` is a shorthand local to each lifted chunk,
         # while recomp_types.h declares the real register for every file.
-        lines.append(f"void sub_{addr:08X}(void) {{ hle_{name}(); g_esp += {4 + pop}; }}"
-                     f"  /* {name}, ret {pop} */")
+        if not regs:
+            lines.append(f"void sub_{addr:08X}(void) {{ hle_{name}(); "
+                         f"g_esp += {4 + pop}; }}"
+                         f"  /* {name}, ret {pop} */")
+            continue
+
+        # An LTCG variant takes some arguments in registers. The
+        # implementation is written against the ordinary convention and reads
+        # everything with HLE_ARG, so the thunk lays a normal argument frame
+        # out below the stack and points g_esp at it for the duration of the
+        # call. Registers go to the positions their name records; the rest
+        # come off the caller's stack in order.
+        total = pop // 4 + len(regs)
+        fill = []
+        stack_i = 0
+        for pos in range(1, total + 1):
+            if pos in regs:
+                src = "g_" + regs[pos]
+            else:
+                src = f"RECOMP_HLE_STACK({stack_i})"
+                stack_i += 1
+            fill.append(f"a[{pos - 1}] = {src};")
+        lines.append(
+            f"void sub_{addr:08X}(void) {{ RECOMP_HLE_LTCG_CALL({total}, "
+            f"hle_{name}, {4 + pop}) {{ {' '.join(fill)} }} "
+            f"RECOMP_HLE_LTCG_END }}"
+            f"  /* {name}, ret {pop}, "
+            + ", ".join(f"arg{p} in {r}" for p, r in sorted(regs.items()))
+            + " */")
     lines.append("")
     if variables:
         lines.append("/* XDK variables the replacements import by name "

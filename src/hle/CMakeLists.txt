@@ -25,6 +25,7 @@ add_library(xbox_hle STATIC
     dsound_buffer_model.c
     xbox_adpcm.c
     hle_input.c
+    hle_xmv.c
     input_model.c
 )
 

@@ -74,6 +74,10 @@ static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
 
+/* Stage 0 currently holds the title's own frame; see SetTexture below and
+ * hle_d3d8_stage0_is_framebuffer(). */
+static int g_stage0_framebuffer;
+
 static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev);
 
 static unsigned long g_bound_count, g_uploads, g_reuploads, g_skip_type,
@@ -118,6 +122,21 @@ static int read_layout(uint32_t va, texture_layout *t)
     memset(t, 0, sizeof *t);
     t->fmt = (format >> 8) & 0xFF;
     if (t->fmt == XFMT_P8 || d3d8_format_bpp((D3DFORMAT)t->fmt) == 0) {
+        /* Say which format, once each. The count alone says a title's textures
+         * are being refused without saying what to implement, and "P8" and
+         * "a format d3d8_format_bpp does not know" are different jobs: the
+         * first needs the stage palette forwarded, the second needs the format
+         * added. Marvel vs Capcom 2 has 3172 of 4914 binds refused here and
+         * draws essentially untextured because of it. */
+        static uint8_t said[256];
+        if (!said[t->fmt]) {
+            said[t->fmt] = 1;
+            fprintf(stderr, "[HLE-D3D8] texture format 0x%02X refused (%s); "
+                    "draws using it are untextured\n", t->fmt,
+                    t->fmt == XFMT_P8 ? "P8, no palette is forwarded"
+                                      : "no bpp known for it");
+            fflush(stderr);
+        }
         g_skip_format++;
         return 0;
     }
@@ -241,6 +260,89 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
 /* A texture whose texels are the frame buffer: created as a render target so
  * the host can draw the finished frame into it, refreshed once per frame, and
  * never uploaded from guest memory. */
+/* RECOMP_HLE_D3D8_FB_PROBE=<n>: every n swaps, read back what the screen copy
+ * actually landed in the texture the title samples, and say so.
+ *
+ * This exists because the question "does the frame buffer texture hold the
+ * frame?" could not be answered from a capture. src/replay never performs the
+ * copy -- it is done here, in the HLE -- so a replay samples the captured
+ * guest texels, which are zeros, and cannot tell a broken fill from an absent
+ * one. The answer has to be read out of the running title.
+ *
+ * TimeSplitters 2's three full-screen quads compute out = t0*a + dst*(1-a)
+ * with t0 this texture, so a correct copy makes them a no-op and a black one
+ * makes them multiply the picture by (1-a). That is the difference between a
+ * motion blur and the brightness bug, and it is one number.
+ *
+ * It must read through the surface, not the texture. IDirect3DTexture8's
+ * LockRect returns tex->sys_mem, the upload shadow that UnlockRect pushes to
+ * the GPU; the screen copy writes the GPU texture through a render target
+ * view and never touches it, so that buffer reads as zeros whether the copy
+ * works or not. The surface's LockRect is the one that copies the D3D11
+ * resource into a staging texture and maps it. The first version of this
+ * probe used the texture and "proved" the copy was broken. */
+static void framebuffer_probe(texture_entry *e, unsigned long now)
+{
+    static int every = -1;
+    static unsigned long last;
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    unsigned long long sum = 0;
+    unsigned samples = 0, nonzero = 0;
+    UINT x, y;
+
+    if (every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_FB_PROBE");
+        every = (v && atoi(v) > 0) ? atoi(v) : 0;
+    }
+    if (!every || (last && now - last < (unsigned long)every))
+        return;
+    last = now;
+
+    if (FAILED(e->host->lpVtbl->GetSurfaceLevel(e->host, 0, &surf)) || !surf) {
+        fprintf(stderr, "[HLE-D3D8] fb probe: no level 0 surface on texture "
+                "0x%08X; the fill cannot be checked this way\n", e->va);
+        fflush(stderr);
+        every = 0;
+        return;
+    }
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        fprintf(stderr, "[HLE-D3D8] fb probe: cannot read the copy back "
+                "(texture 0x%08X); the fill cannot be checked this way\n", e->va);
+        fflush(stderr);
+        surf->lpVtbl->Release(surf);
+        every = 0;               /* asking again every frame would say the same */
+        return;
+    }
+    /* A sparse grid: enough to tell black from a picture, cheap enough to
+     * leave on. All three colour channels, because this number is meant to be
+     * compared against RECOMP_HLE_D3D8_BRIGHT's reading of the finished frame,
+     * which averages three -- sampling one channel here made the scene look
+     * brighter than the frame by the size of the blue cast alone. */
+    for (y = 0; y < 480u; y += 16) {
+        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
+        for (x = 0; x < 640u; x += 16) {
+            const uint8_t *p = row + (size_t)x * 4u;
+            sum += (unsigned)p[0] + p[1] + p[2];
+            samples += 3;
+            if (p[0] || p[1] || p[2])
+                nonzero++;
+        }
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+
+    /* "Not arriving" means near-enough nothing, not merely dark: a night level
+     * legitimately leaves plenty of black pixels, so the threshold is one in
+     * twenty rather than a majority. */
+    fprintf(stderr, "[HLE-D3D8] fb probe swap %lu: texture 0x%08X holds mean %.1f/255, "
+            "%u of %u pixels non-zero -- %s\n", now, e->va,
+            samples ? (double)sum / samples : 0.0, nonzero, samples / 3u,
+            nonzero * 20u < samples / 3u ? "the copy is not arriving"
+                                         : "the copy has content");
+    fflush(stderr);
+}
+
 static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va,
                                               const texture_layout *t)
 {
@@ -283,6 +385,7 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
     if (e->checked_swap != now) {
         e->checked_swap = now;
         xbox_D3D8CopyBackBufferToTexture(e->host);
+        framebuffer_probe(e, now);
     }
     return e->host;
 }
@@ -654,6 +757,18 @@ HLE_EXPORT(D3DDevice_SetTexture)
             host = host_texture(dev, texture);
         }
         g_bound[stage] = host;
+        if (stage == 0) {
+            /* Whether this draw is one of the title's full-screen passes over
+             * its own frame. Nothing else binds the frame buffer as stage 0,
+             * so it identifies them without matching a shader or a size. */
+            int i;
+            g_stage0_framebuffer = 0;
+            for (i = 0; host && i < g_texture_count; i++)
+                if (g_textures[i].host == host && g_textures[i].framebuffer) {
+                    g_stage0_framebuffer = 1;
+                    break;
+                }
+        }
         /* The host pixel shader samples every stage whatever its operation
          * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
          * stage with no host texture would turn the draw black once the
@@ -666,4 +781,14 @@ HLE_EXPORT(D3DDevice_SetTexture)
         report();
     }
 #endif
+}
+
+/* Does the draw about to be made sample the title's own frame at stage 0?
+ *
+ * That is what its full-screen passes do and what nothing else does, so it
+ * identifies them without having to match a shader hash or a vertex count.
+ * hle_d3d8.c uses it for RECOMP_HLE_D3D8_SKIP_FULLSCREEN. */
+int hle_d3d8_stage0_is_framebuffer(void)
+{
+    return g_stage0_framebuffer;
 }

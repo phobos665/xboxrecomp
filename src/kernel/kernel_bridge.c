@@ -1405,6 +1405,43 @@ static volatile LONG *bridge_guest_event(uint32_t va, int *sync)
 /* Wait for a guest event by watching its SignalState. The Xbox timeout is a
  * LARGE_INTEGER in 100 ns units: absent means forever, zero means poll,
  * negative is relative and positive is an absolute system time. */
+/* RECOMP_WAIT_LOG=1 -- every distinct object waited on and set, once each.
+ *
+ * A title that hangs is nearly always waiting for something nothing signals,
+ * and the two facts needed to see that are which objects it waits on and
+ * which it sets. Printing every call drowns the log; printing each object
+ * once fits on a screen and answers the question. */
+static int wait_log_wanted(void)
+{
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *v = getenv("RECOMP_WAIT_LOG");
+        wanted = v && *v && strcmp(v, "0") != 0;
+    }
+    return wanted;
+}
+
+uint32_t g_kernel_caller;
+
+static void wait_log_note(const char *what, uint32_t object, uint32_t extra)
+{
+    static uint32_t seen[64];
+    static int nseen;
+    int i;
+
+    if (!wait_log_wanted())
+        return;
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == (object ^ (uint32_t)what[0] << 24))
+            return;
+    if (nseen < 64) {
+        seen[nseen++] = object ^ (uint32_t)what[0] << 24;
+        fprintf(stderr, "  [WAIT] %s object 0x%08X (caller 0x%08X)\n",
+                what, object, extra);
+        fflush(stderr);
+    }
+}
+
 static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
                                         uint32_t timeout_va)
 {
@@ -1451,6 +1488,8 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
 static void bridge_KeSetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);
+    wait_log_note("sets    ", guest_va, g_kernel_caller);
+
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
     volatile LONG *state = bridge_guest_event(guest_va, NULL);
@@ -1494,6 +1533,21 @@ static void bridge_KeWaitForSingleObject(void)
     volatile LONG *state = bridge_guest_event(object, &sync);
     HANDLE h;
 
+    wait_log_note("waits on", object, g_kernel_caller);
+    if (wait_log_wanted()) {
+        /* The dispatcher header decides the semantics: Type 0 is a
+         * notification event a waiter does not consume, Type 1 a
+         * synchronisation event it does. Reading it wrong turns a
+         * handshake into a spin, so print it once. */
+        static int dumped;
+        if (!dumped++) {
+            const uint8_t *h = (const uint8_t *)(uintptr_t)(object + g_xbox_mem_offset);
+            fprintf(stderr, "  [WAIT] header at 0x%08X: type %u absolute %u size %u "
+                    "inserted %u signalstate %d\n", object, h[0], h[1], h[2], h[3],
+                    (int)BRIDGE_MEM32(object + 4));
+        }
+    }
+
     /* Same split as KeSetEvent: wait on the guest's own SignalState when the
      * object lives in guest memory, and fall through to the shadow handle
      * otherwise. */
@@ -1506,6 +1560,14 @@ static void bridge_KeWaitForSingleObject(void)
                     sync ? "synchronisation" : "notification", object);
         }
         g_eax = bridge_wait_guest_event(state, sync, timeout_ptr);
+        if (wait_log_wanted()) {
+            /* Success or timeout, and with what timeout asked for: the two
+             * say different things about why a loop goes round again. */
+            static int shown;
+            if (shown++ < 10)
+                fprintf(stderr, "  [WAIT] 0x%08X -> %s (timeout arg 0x%08X)\n",
+                        object, g_eax ? "TIMEOUT" : "signalled", timeout_ptr);
+        }
         return;
     }
 
@@ -2952,6 +3014,48 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     oa->Attributes    = 0;
 }
 
+/* RECOMP_SKIP_VIDEO: refuse to open full-motion video files.
+ *
+ * A title that opens with a logo movie decodes it with its own XMV or WMA
+ * code, which is lifted like everything else and is some of the least
+ * forgiving code in the image. Black crashes inside its XMV library in the
+ * first seconds, having got no further than the intro, and nothing past that
+ * point can be looked at until it is out of the way.
+ *
+ * Failing the open is what a title already has to cope with -- a missing
+ * video file is an ordinary condition on a scratched disc -- so a title that
+ * handles it at all handles it by skipping to the menu. That is a bring-up
+ * switch and nothing more: it is off by default, and it is not a fix for the
+ * decoder.
+ *
+ * RECOMP_FMV_HOST, just below, is the opposite choice: keep the title's
+ * decode and additionally show the video with the host's own player. Use that
+ * when the video matters; use this when it is in the way.
+ */
+static int recomp_skip_video(const char *xbox_path)
+{
+    static int on = -1;
+    static const char *const exts[] = { ".xmv", ".wmv", ".xbv", ".bik" };
+    size_t len, i, n;
+
+    if (on < 0)
+        on = getenv("RECOMP_SKIP_VIDEO") ? 1 : 0;
+    if (!on || !xbox_path)
+        return 0;
+
+    len = strlen(xbox_path);
+    for (i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        n = strlen(exts[i]);
+        if (len >= n && _stricmp(xbox_path + len - n, exts[i]) == 0) {
+            fprintf(stderr, "  [FILE] RECOMP_SKIP_VIDEO: refusing %s\n",
+                    xbox_path);
+            fflush(stderr);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -2965,6 +3069,10 @@ static NTSTATUS bridge_create_file_impl(
     NTSTATUS st;
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
+    if (recomp_skip_video(name.Buffer)) {
+        bridge_write_iostatus(iostatus_va, STATUS_OBJECT_NAME_NOT_FOUND, 0);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
     if (!name.Buffer) {
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -3238,7 +3346,18 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
 {
     if (event_token) {
         HANDLE ev = bridge_resolve_handle(event_token);
-        if (ev) SetEvent(ev);
+        if (ev) {
+            SetEvent(ev);
+        } else {
+            /* The title is waiting on this event for the read to finish,
+             * and nothing will ever signal it. Silence here is a title
+             * that hangs with no fault and no clue, so say it once. */
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [FILE] completion event 0x%08X does not "
+                        "resolve to a host handle; whoever waits on it waits "
+                        "forever\n", event_token);
+        }
     }
     if (apc_routine) {
         deliver_one_apc(apc_routine, apc_context, iostatus);
@@ -3483,7 +3602,11 @@ static void bridge_NtReadFile(void)
         fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> %s\n",
                 STACK_ARG(1), STACK_ARG(2),
                 STACK_ARG(2) ? "completed now" : "pending");
-        if (!STACK_ARG(2))
+        /* RECOMP_FILE_SYNC=1 reports the read finished, for a title whose
+         * loader does not come back for the result. Burnout 2 needs the
+         * opposite -- its stream reader only accepts a short count on the
+         * pending path -- so this is a switch, not a change. */
+        if (!STACK_ARG(2) && !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
             g_eax = 0x00000103u;           /* STATUS_PENDING */
     }
 }
@@ -7439,7 +7562,11 @@ static void bridge_KeGetCurrentIrql(void)
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
 static void bridge_KeGetCurrentThread(void)
 {
-    g_eax = 0;
+    /* The running thread's object, which fs:[0x28] points at and which is
+     * now per-thread. Returning 0 here made every caller that compared thread
+     * identities decide it was always the same thread. */
+    extern uint32_t xbox_CurrentThreadObject(void);
+    g_eax = xbox_CurrentThreadObject();
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */
@@ -9406,6 +9533,14 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+
+    /* The guest return address, captured here and kept for the bridge body.
+     * At this point the caller's pushed return address is still on top of the
+     * guest stack; by the time a bridge reads its arguments esp has moved, so
+     * reading [esp] there gives the first argument instead. The [WAIT] log
+     * used to do exactly that and reported every wait as being called from
+     * the object it was waiting on. */
+    g_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the

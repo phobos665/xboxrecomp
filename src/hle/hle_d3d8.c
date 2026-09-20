@@ -637,6 +637,15 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev);
 static unsigned long g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
                      g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                      g_draws_stride, g_draws_primitive, g_draws_failed;
+/* Dropped by RECOMP_HLE_D3D8_SKIP_FULLSCREEN; see the draw gate. */
+static unsigned long g_skipped_fullscreen;
+/* The inline immediate-mode vertex path, counted but not implemented; see the
+ * replacements for D3DDevice_Begin further down. */
+static unsigned long g_inline_begin, g_inline_end, g_inline_vdata;
+static unsigned long g_inline_begin_frame, g_inline_vdata_frame;
+static unsigned long g_inline_begin_max, g_inline_vdata_max;
+/* From hle_d3d8_texture.c: stage 0 holds the title's own frame. */
+int hle_d3d8_stage0_is_framebuffer(void);
 /* Draws arriving on a guest thread other than the one that swaps. A loader
  * thread drawing to warm caches puts geometry through the host that no
  * presented frame ever contains -- it would count as drawn and never show. */
@@ -695,6 +704,26 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
         }
         shadow_use_viewport(0);
     }
+    /* RECOMP_HLE_D3D8_SKIP_FULLSCREEN=1: drop the title's full-screen passes
+     * over its own frame -- the draws that sample the frame buffer at stage 0.
+     *
+     * This is a measurement, and a crude workaround. Those passes remove a
+     * fixed share of the light in every frame (0.62 of it on TimeSplitters 2's
+     * snow level, 0.367 on another, constant within a level to a standard
+     * deviation of 0.002), which is the brightness bug in
+     * docs/technical/timesplitters2-open-issues.md. Turning them off says
+     * whether they own that loss outright, and gives a bright picture without
+     * whatever they were for -- bloom or glow, on the evidence of a fixed
+     * one-texel offset repeated three times with descending alpha. */
+    {
+        static int skip = -1;
+        if (skip < 0)
+            skip = getenv("RECOMP_HLE_D3D8_SKIP_FULLSCREEN") ? 1 : 0;
+        if (skip && hle_d3d8_stage0_is_framebuffer()) {
+            g_skipped_fullscreen++;
+            return 0;
+        }
+    }
     /* The title's render and texture stage states as they stand now, read
      * from its own state arrays (hle_d3d8_state.c). */
     hle_d3d8_shadow_apply_states(g_shadow);
@@ -710,6 +739,61 @@ static int g_dump_requested;
 static void shadow_dump_next_frame(void)
 {
     g_dump_requested = 1;
+}
+
+/* RECOMP_HLE_D3D8_BRIGHT=<n>: every n swaps, say how bright the finished frame
+ * is, and how many draws made it.
+ *
+ * Pair it with RECOMP_HLE_D3D8_FB_PROBE at the same interval. That one reads
+ * the screen copy the title samples, which is the scene *before* its
+ * full-screen passes; this one reads the back buffer at Swap, which is the
+ * scene *after* them. Two numbers a few lines apart in the log, against the
+ * same swap number, are what those passes did to the picture -- measured in
+ * the running title.
+ *
+ * It has to be measured live. src/replay never performs the screen copy, so
+ * replaying these draws samples a black texture and answers a different
+ * question; two diagnoses of the TimeSplitters 2 brightness bug died of that.
+ * Standing still and then moving with this on is the whole experiment. */
+static void shadow_frame_brightness(void)
+{
+    static int every = -1;
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    unsigned long long sum = 0;
+    unsigned samples = 0;
+    UINT x, y;
+
+    if (every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_BRIGHT");
+        every = (v && atoi(v) > 0) ? atoi(v) : 0;
+    }
+    if (!every || !g_shadow || (g_shadow_swaps % (unsigned long)every) != 0)
+        return;
+
+    if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
+        return;
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        surf->lpVtbl->Release(surf);
+        return;
+    }
+    /* R8G8B8A8, sparsely sampled: enough for a mean, cheap enough that the
+     * readback stall does not change what is being measured. */
+    for (y = 0; y < g_shadow_height; y += 16) {
+        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
+        for (x = 0; x < g_shadow_width; x += 16) {
+            const uint8_t *p = row + (size_t)x * 4u;
+            sum += (unsigned)p[0] + p[1] + p[2];
+            samples += 3;
+        }
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+
+    fprintf(stderr, "[HLE-D3D8] frame brightness swap %lu: after everything, "
+            "mean %.1f/255 over %lu draws\n", g_shadow_swaps,
+            samples ? (double)sum / samples : 0.0, g_frame_draws);
+    fflush(stderr);
 }
 
 static void shadow_dump_frame(void)
@@ -848,15 +932,20 @@ HLE_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
  * XDK version, read them from D3D_BlockOnTime's own prologue, which is the
  * one place they are certainly right for this title:
  *
- *     56                push esi
- *     8B 35 <g_pDevice> mov  esi, [D3D_g_pDevice]
- *     8B 46 <A>         mov  eax, [esi + A]     ; pointer to the completed word
+ *     8B 3D <g_pDevice> mov  edi, [D3D_g_pDevice]
+ *     8B 47 <A>         mov  eax, [edi + A]     ; pointer to the completed word
  *     8B 08             mov  ecx, [eax]
- *     8B 46 <B>         mov  eax, [esi + B]     ; last submitted value
+ *     8B 47 <B>         mov  eax, [edi + B]     ; last submitted value
  *
- * Identical in both builds seen so far apart from A and B. A build whose
- * compiler laid it out differently gets a line saying so and no mirror,
- * which is the hang this replaces, not a wrong write.
+ * Which register holds the device varies. 5344 and 4721 load it into esi
+ * first thing; 4134 (Jet Set Radio Future) puts the `time` argument in esi
+ * and the device in edi, so the same three reads are 8B 47 rather than
+ * 8B 46. The scan below therefore looks for the load of D3D_g_pDevice
+ * wherever it sits in the prologue, takes the register from its ModRM, and
+ * reads A and B against that -- which also rejects a prologue reading some
+ * other global without a separate check. A build laid out differently still
+ * gets a line saying so and no mirror, which is the hang this replaces,
+ * not a wrong write.
  */
 HLE_IMPORT_VAR(D3D_g_pDevice);
 HLE_IMPORT_VAR(D3D_BlockOnTime);
@@ -877,29 +966,54 @@ static void mirror_gpu_time_fence(void)
         return;
     }
     code = (const uint8_t *)HLE_PTR(hle_var_D3D_BlockOnTime);
-    if (!(code[0] == 0x56 && code[1] == 0x8B && code[2] == 0x35 &&
-          code[7] == 0x8B && code[8] == 0x46 &&
-          code[10] == 0x8B && code[11] == 0x08 &&
-          code[12] == 0x8B && code[13] == 0x46)) {
-        fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: D3D_BlockOnTime "
-                        "at 0x%08X does not start as expected (%02X %02X %02X .. "
-                        "%02X %02X)\n", hle_var_D3D_BlockOnTime,
-                code[0], code[1], code[2], code[7], code[8]);
-        return;
-    }
     {
-        uint32_t device_global;
-        memcpy(&device_global, code + 3, 4);
-        if (device_global != hle_var_D3D_g_pDevice) {
+        /* Find `mov <reg>, [D3D_g_pDevice]` rather than assuming which
+         * register holds the device or where the load sits. ModRM for
+         * `mov r32, [disp32]` is (reg << 3) | 0x05, so the destination is
+         * (modrm >> 3) & 7 and the address follows it. Matching on the
+         * address means a prologue that reads some other global is rejected
+         * for free, which the separate check used to do. */
+        enum { SCAN = 24 };
+        int at = -1, reg = -1, i;
+
+        for (i = 0; i + 6 <= SCAN; i++) {
+            uint32_t addr;
+            if (code[i] != 0x8B || (code[i + 1] & 0xC7) != 0x05)
+                continue;
+            memcpy(&addr, code + i + 2, 4);
+            if (addr != hle_var_D3D_g_pDevice)
+                continue;
+            reg = (code[i + 1] >> 3) & 7;
+            at = i + 6;
+            break;
+        }
+        if (at < 0) {
             fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
-                            "D3D_BlockOnTime reads the device from 0x%08X, the "
-                            "symbols say 0x%08X\n",
-                    device_global, hle_var_D3D_g_pDevice);
+                            "D3D_BlockOnTime at 0x%08X does not load the device "
+                            "from 0x%08X in its first %d bytes (starts %02X %02X "
+                            "%02X %02X)\n",
+                    hle_var_D3D_BlockOnTime, hle_var_D3D_g_pDevice, (int)SCAN,
+                    code[0], code[1], code[2], code[3]);
             return;
         }
+        /* Then, against that register:
+         *     8B <40|reg> A   mov eax, [reg + A]   ; -> completed word
+         *     8B 08           mov ecx, [eax]
+         *     8B <40|reg> B   mov eax, [reg + B]   ; last submitted value */
+        if (code[at] != 0x8B || code[at + 1] != (uint8_t)(0x40 | reg) ||
+            code[at + 3] != 0x8B || code[at + 4] != 0x08 ||
+            code[at + 5] != 0x8B || code[at + 6] != (uint8_t)(0x40 | reg)) {
+            fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
+                            "D3D_BlockOnTime at 0x%08X loads the device into r%d "
+                            "but does not then read the fence as expected "
+                            "(%02X %02X .. %02X %02X)\n",
+                    hle_var_D3D_BlockOnTime, reg,
+                    code[at], code[at + 1], code[at + 5], code[at + 6]);
+            return;
+        }
+        get_ptr_off = code[at + 2];
+        put_off = code[at + 7];
     }
-    get_ptr_off = code[9];
-    put_off = code[14];
     if (xbox_Nv2aMirrorFence(hle_var_D3D_g_pDevice, put_off, get_ptr_off) == 0)
         fprintf(stderr, "[HLE-D3D8] GPU time fence mirrored: device +0x%02X -> "
                         "*(device +0x%02X), offsets read from D3D_BlockOnTime\n",
@@ -1132,6 +1246,13 @@ HLE_EXPORT(D3DDevice_Swap)
          * starts recording if this is the requested swap. */
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
         shadow_dump_frame();             /* before Present discards the buffer */
+        shadow_frame_brightness();       /* likewise: Present discards it */
+        if (g_inline_begin_frame > g_inline_begin_max)
+            g_inline_begin_max = g_inline_begin_frame;
+        if (g_inline_vdata_frame > g_inline_vdata_max)
+            g_inline_vdata_max = g_inline_vdata_frame;
+        g_inline_begin_frame = 0;
+        g_inline_vdata_frame = 0;
         g_frame_draws = 0;
         overlay_frame();                 /* after the dump: not in the captures */
         host_Swap(g_shadow, 0);
@@ -1148,6 +1269,16 @@ HLE_EXPORT(D3DDevice_Swap)
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
+            if (g_inline_begin || g_inline_vdata)
+                fprintf(stderr, "[HLE-D3D8] inline vertex path (not implemented, "
+                        "goes to the push buffer): %lu Begin, %lu End, %lu "
+                        "SetVertexData4f; peak per frame %lu Begin, %lu vertex "
+                        "data\n", g_inline_begin, g_inline_end, g_inline_vdata,
+                        g_inline_begin_max, g_inline_vdata_max);
+            if (g_skipped_fullscreen)
+                fprintf(stderr, "[HLE-D3D8] shadow: %lu full-screen passes over the "
+                        "title's own frame dropped (RECOMP_HLE_D3D8_SKIP_FULLSCREEN)\n",
+                        g_skipped_fullscreen);
             swap_timing_report();
             if (g_slot_reloads)
                 fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads answered from "
@@ -1327,6 +1458,68 @@ static void shadow_read_declaration(int slot, uint32_t handle)
 }
 #endif
 
+/* TEMPORARY DIAGNOSTIC (RECOMP_DECL_TOKENS=1): the declaration token stream
+ * exactly as the title supplies it, before anything here parses it, so the
+ * register numbers can be read from the title's own data rather than inferred
+ * from the XDK's parsed array. Xbox D3DVSD token form: bits 31..29 select the
+ * token type -- 1 STREAM (index in the low bits, bit 28 = tessellator
+ * stream), 2 STREAMDATA (bit 28 set = SKIP of (t >> 16) & 0xFFF dwords,
+ * otherwise REG with the vertex register in the low 5 bits and the X_D3DVSDT
+ * data type in bits 23..16), 0 NOP, 3 TESSELLATOR, 4 CONSTMEM, 5 EXT --
+ * and 0xFFFFFFFF ends the stream. */
+static void note_declaration_tokens(uint32_t decl)
+{
+    static int notes, enabled = -1;
+    uint32_t stream = 0, offset = 0, i;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_DECL_TOKENS");
+        enabled = e && *e && *e != '0';
+    }
+    if (!enabled || notes >= 48 || !decl)
+        return;
+    notes++;
+    fprintf(stderr, "[DECL] raw declaration at 0x%08X\n", decl);
+    for (i = 0; i < 128u; i++) {
+        uint32_t t = HLE_MEM32(decl + i * 4u);
+        uint32_t type = (t >> 29) & 7u;
+
+        if (t == 0xFFFFFFFFu) {
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  END\n", i, t);
+            break;
+        }
+        if (type == 1u && !(t & 0x10000000u)) {
+            stream = t & 0x1FFFFFFFu;
+            offset = 0;
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  STREAM %u\n", i, t, stream);
+        } else if (type == 2u && (t & 0x10000000u)) {
+            uint32_t dwords = (t >> 16) & 0xFFFu;
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  SKIP %u dword(s), "
+                    "offset %u -> %u\n", i, t, dwords, offset,
+                    offset + dwords * 4u);
+            offset += dwords * 4u;
+        } else if (type == 2u) {
+            uint32_t reg = t & 0x1Fu;
+            uint32_t fmt = (t >> 16) & 0xFFu;
+            uint32_t count = fmt >> 4, kind = fmt & 0xFu, size;
+
+            switch (kind) {
+            case 0x0: size = 4; break;                 /* D3DCOLOR */
+            case 0x1: case 0x5: size = count * 2u; break; /* NORMSHORT / SHORT */
+            case 0x2: size = count * 4u; break;        /* FLOAT */
+            case 0x4: size = count; break;             /* PBYTE */
+            case 0x6: size = 4; break;                 /* NORMPACKED3 */
+            default:  size = 0; break;                 /* NONE and unknown */
+            }
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  REG v%u stream %u offset %u "
+                    "type 0x%02X size %u\n", i, t, reg, stream, offset, fmt, size);
+            offset += size;
+        } else {
+            fprintf(stderr, "[DECL]  [%2u] 0x%08X  token type %u\n", i, t, type);
+        }
+    }
+}
+
 /* HRESULT D3DDevice_CreateVertexShader(const DWORD *pDeclaration,
  *     const DWORD *pFunction, DWORD *pHandle, DWORD Usage)
  *
@@ -1338,12 +1531,14 @@ static void shadow_read_declaration(int slot, uint32_t handle)
 HLE_EXPORT(D3DDevice_CreateVertexShader)
 {
     static int seen;
+    uint32_t declaration = HLE_ARG(0);
     uint32_t function = HLE_ARG(1);
 #ifdef _WIN32
     uint32_t handle_va = HLE_ARG(2);
 #endif
 
     first_call(&seen, "D3DDevice_CreateVertexShader", function);
+    note_declaration_tokens(declaration);
     if (original_missing(hle_original_D3DDevice_CreateVertexShader,
                          "D3DDevice_CreateVertexShader"))
         HLE_RETURN(0x80004005u);
@@ -1589,6 +1784,68 @@ HLE_EXPORT(D3DDevice_SetVertexData2f)
         host_vsh_set_vertex_data((int)reg, v);
     }
 #endif
+}
+
+/* The inline immediate-mode vertex path: Begin, then one SetVertexData* per
+ * attribute per vertex, then End.
+ *
+ * These are counted, not replaced. The bodies run, so the title's own D3D8
+ * writes its NV097_SET_BEGIN_END and vertex data into the push buffer exactly
+ * as before -- and nothing here reads the push buffer, so that geometry never
+ * reaches the host. The question these counters answer is how much of a
+ * title's scene goes this way, which decides whether implementing the path is
+ * worth it. Marvel vs Capcom 2 calls Begin from six sites and
+ * SetVertexData4f from sixteen, but a static call site says nothing about how
+ * often it runs.
+ *
+ * Reported per frame at the shadow summary, alongside the draws that do
+ * arrive, so the two can be compared directly. */
+static unsigned long g_inline_begin, g_inline_end, g_inline_vdata;
+static unsigned long g_inline_begin_frame, g_inline_vdata_frame;
+static unsigned long g_inline_begin_max, g_inline_vdata_max;
+
+HLE_ORIGINAL(D3DDevice_Begin);
+HLE_ORIGINAL(D3DDevice_End);
+HLE_ORIGINAL(D3DDevice_SetVertexData4f);
+
+/* void D3DDevice_Begin(X_D3DPRIMITIVETYPE PrimitiveType) */
+HLE_EXPORT(D3DDevice_Begin)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_Begin", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_Begin, "D3DDevice_Begin"))
+        return;
+    g_inline_begin++;
+    g_inline_begin_frame++;
+    HLE_CALL_ORIGINAL(D3DDevice_Begin);
+}
+
+/* void D3DDevice_End(void) */
+HLE_EXPORT(D3DDevice_End)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_End", 0);
+    if (original_missing(hle_original_D3DDevice_End, "D3DDevice_End"))
+        return;
+    g_inline_end++;
+    HLE_CALL_ORIGINAL(D3DDevice_End);
+}
+
+/* void D3DDevice_SetVertexData4f(INT Register, float a, float b, float c,
+ *     float d) -- one attribute of one inline vertex. */
+HLE_EXPORT(D3DDevice_SetVertexData4f)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_SetVertexData4f", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetVertexData4f,
+                         "D3DDevice_SetVertexData4f"))
+        return;
+    g_inline_vdata++;
+    g_inline_vdata_frame++;
+    HLE_CALL_ORIGINAL(D3DDevice_SetVertexData4f);
 }
 
 /* HRESULT D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE State,

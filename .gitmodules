@@ -2,3 +2,9 @@
 	path = third_party/XbSymbolDatabase
 	url = https://github.com/Cxbx-Reloaded/XbSymbolDatabase.git
 	ignore = untracked
+[submodule "third_party/Cxbx-Reloaded"]
+	path = third_party/Cxbx-Reloaded
+	url = https://github.com/Cxbx-Reloaded/Cxbx-Reloaded.git
+[submodule "third_party/xemu"]
+	path = third_party/xemu
+	url = https://github.com/xemu-project/xemu.git

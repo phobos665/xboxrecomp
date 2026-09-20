@@ -276,6 +276,13 @@ one bundled with VS 2019 Build Tools; there is no VS 2022 and none is needed.
 Build with `--game-only` → run → read stderr → classify → fix → rebuild. Most project time
 lives here.
 
+**Before reading a wild pointer as a memory-model problem, spend three runs on
+`docs/technical/memory-watchpoints.md`.** `RECOMP_TRAP_NULL`, `RECOMP_FIND_VALUE`
+and `RECOMP_WATCH_WRITE` answer "who holds this" and "what wrote this" in a
+plain lift with no trace hooks. Outrun 2's 0xF8604020 cost a day as an aperture
+question and turned out to be three overlapping stores near a null pointer,
+found in three runs once the tools existed.
+
 | stderr shows | Cause |
 |---|---|
 | `[ICALL] unknown target 0x... from RVA 0x...` | Target never detected as a function. Re-run discovery with `--seed-functions`, or add a manual override. |
@@ -290,6 +297,12 @@ lives here.
 | Main thread stops entering new functions right after the first `Swap`; ISR keeps ticking | `D3D_BlockOnTime` waiting for the GPU time fence. The HLE mirrors it from `D3D_BlockOnTime`'s prologue; a "not mirrored" line in the log means this XDK's prologue differs |
 | Stops in DirectSound start-up, watchdog shows `ebx = <block>+0x810` | The DSP doorbell. Found from `GPSADDR`/`EPSADDR` under `RECOMP_AC97_READY`; without that switch DirectSound never gets this far and the title dereferences a half-built sound object instead |
 | Draws keep coming but `Swap` slows to one every many seconds, no crash, `[FPS]` near 0 | Look at your own switches first. `--profile` (entry profiler) and a `--trace-all-entries` build printing `[TRACE]` lines both cost more per function entry than the title does; `RECOMP_SAMPLE=500` shows it as `NtWriteFile`/`prof_report`. Rerun with `RECOMP_TRACE_BUDGET=0` and no `--profile` before believing the title is stuck |
+| Fault through a pointer that is in no aperture, e.g. `0xF8604020` | Suspect debris before a missing memory window. `RECOMP_FIND_VALUE=<the value>` scans guest RAM at the crash and prints who holds it; a hit at a tiny address means a null pointer plus an offset. `RECOMP_TRAP_NULL=1` then moves the fault to the instruction that made the mistake |
+| A structure holds a value it should not, and you need to know who put it there | `RECOMP_WATCH_WRITE=<addr>` faults on every write to it and names the writer, in a plain lift. See `docs/technical/memory-watchpoints.md`. Trust its `callers:` line over its symbol, because the linker folds identical functions |
+| `[THROW] the title threw a C++ exception` | This runtime cannot unwind, so the throw **returns** and everything after it runs on a stack nothing cleaned up. Rerun with `RECOMP_THROW_FATAL=1` and treat that as the real stopping point. `docs/technical/cpp-exceptions.md` |
+| `[INT3] lifted code reached a debug trap` | The same thing seen one step later, when the throw helper was not identified. MSVC puts a trap after any call it thinks cannot return |
+| A hang with `[ICALL] target 0x... is not code` repeating | A skipped indirect call returns eax = 0, which is also S_OK, so a COM-shaped loop never exits. The runtime says so after 100,000 skips; `RECOMP_ICALL_SPIN_FATAL=1` stops there. Try `py -3 -m tools.seed_from_log` on the log |
+| A signed quantity is never negative — an axis saturates, a delta only grows, an abs is a no-op | A lifter sign-extension gap. `movsx r32, bp` was lifted as a zero extension until 20 Sep 2026, because `_lift_movsx`'s register list was missing `bp`/`sp` and the unmatched case fell through to the plain (zero-extended) read. Grep the generated C for `= LO16(` or `= LO8(` as a whole right-hand side: a bare narrow read where a `SX16`/`SX8` belongs. `movsx` now emits `/* movsx: unhandled source register */` rather than failing silently |
 
 Overrides live in `recomp_manual.c` and are checked before the auto-generated table, so they
 always win. `manual_scan.py` parses that file to decide what not to generate, so keep them

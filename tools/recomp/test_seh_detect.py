@@ -48,6 +48,24 @@ SEH_EPILOG_BYTES = bytes.fromhex(
     "c3"                # ret
 )
 
+# Real bytes from Outrun 2 default.xbe, 0x00185AD0: __EH_prolog, the C++
+# exception-handling flavour. It differs from __SEH_prolog above only in
+# pushing three dwords instead of four, so the frame lands at esp+0x0C rather
+# than esp+0x10. Matching only the 0x10 form left this one undetected and
+# every function with a try block running on an inherited frame pointer.
+EH_PROLOG_BYTES = bytes.fromhex(
+    "6aff"              # push   -1
+    "50"                # push   eax
+    "64a100000000"      # mov    eax, fs:[0]
+    "50"                # push   eax
+    "8b44240c"          # mov    eax, [esp+0xC]
+    "64892500000000"    # mov    fs:[0], esp
+    "896c240c"          # mov    [esp+0xC], ebp
+    "8d6c240c"          # lea    ebp, [esp+0xC]
+    "50"                # push   eax
+    "c3"                # ret
+)
+
 # An ordinary function that touches fs:[0] but is not a SEH helper.
 DECOY_BYTES = bytes.fromhex(
     "64a100000000"      # mov    eax, fs:[0]
@@ -94,9 +112,55 @@ def test_detects_both():
         d_va: _fn(d_va, len(DECOY_BYTES)),
     }
     prolog, epilog = detect_seh_helpers(func_db, data)
-    assert prolog == p_va, hex(prolog or 0)
-    assert epilog == e_va, hex(epilog or 0)
+    assert prolog == (p_va,), [hex(a) for a in prolog]
+    assert epilog == (e_va,), [hex(a) for a in epilog]
     print("ok  detects_both")
+
+
+def test_detects_the_cpp_eh_prolog():
+    """__EH_prolog lands the frame at esp+0x0C, not esp+0x10.
+
+    Outrun 2 is built with C++ exception handling, so this is the helper it
+    calls. Before this was matched the lifter found no prologue, never emitted
+    the read-back, and every caller used a frame pointer belonging to an outer
+    function -- writing its locals into somebody else's frame.
+    """
+    _layout()
+    p_va, e_va = BASE + 0x100, BASE + 0x200
+    data = _image([
+        (RAW + 0x100, EH_PROLOG_BYTES),
+        (RAW + 0x200, SEH_EPILOG_BYTES),
+    ])
+    func_db = {
+        p_va: _fn(p_va, len(EH_PROLOG_BYTES)),
+        e_va: _fn(e_va, len(SEH_EPILOG_BYTES)),
+    }
+    prolog, epilog = detect_seh_helpers(func_db, data)
+    assert prolog == (p_va,), [hex(a) for a in prolog]
+    assert epilog == (e_va,), [hex(a) for a in epilog]
+    print("ok  detects_the_cpp_eh_prolog")
+
+
+def test_finds_both_prolog_flavours_in_one_title():
+    """A title built from mixed sources links __SEH_prolog AND __EH_prolog.
+
+    Outrun 2 does: 0x00185434 and 0x00185AD0. Returning only the first left
+    the other treated as an ordinary call, so its callers never read their
+    frame pointer back and ran on an outer function's frame.
+    """
+    _layout()
+    seh_va, eh_va = BASE + 0x100, BASE + 0x400
+    data = _image([
+        (RAW + 0x100, SEH_PROLOG_BYTES),
+        (RAW + 0x400, EH_PROLOG_BYTES),
+    ])
+    func_db = {
+        seh_va: _fn(seh_va, len(SEH_PROLOG_BYTES)),
+        eh_va: _fn(eh_va, len(EH_PROLOG_BYTES)),
+    }
+    prolog, epilog = detect_seh_helpers(func_db, data)
+    assert prolog == (seh_va, eh_va), [hex(a) for a in prolog]
+    print("ok  finds_both_prolog_flavours_in_one_title")
 
 
 def test_decoy_alone_is_not_a_prolog():
@@ -105,8 +169,8 @@ def test_decoy_alone_is_not_a_prolog():
     d_va = BASE + 0x300
     data = _image([(RAW + 0x300, DECOY_BYTES)])
     prolog, epilog = detect_seh_helpers({d_va: _fn(d_va, len(DECOY_BYTES))}, data)
-    assert prolog is None
-    assert epilog is None
+    assert prolog == ()
+    assert epilog == ()
     print("ok  decoy_alone_is_not_a_prolog")
 
 
@@ -114,7 +178,7 @@ def test_absent_helpers_are_not_an_error():
     """A title whose CRT does not use these must detect cleanly as None."""
     _layout()
     prolog, epilog = detect_seh_helpers({}, b"")
-    assert prolog is None and epilog is None
+    assert prolog == () and epilog == ()
     print("ok  absent_helpers_are_not_an_error")
 
 
@@ -127,7 +191,7 @@ def test_accepts_int_end_from_batch_translator():
     info["end"] = p_va + len(SEH_PROLOG_BYTES)   # int, not hex string
     del info["size"]                             # force the end-based path
     prolog, _ = detect_seh_helpers({p_va: info}, data)
-    assert prolog == p_va
+    assert prolog == (p_va,)
     print("ok  accepts_int_end_from_batch_translator")
 
 
@@ -138,7 +202,7 @@ def test_oversized_match_is_rejected():
     padded = SEH_PROLOG_BYTES + b"\x90" * 400
     data = _image([(RAW + 0x100, padded)])
     prolog, _ = detect_seh_helpers({va: _fn(va, len(padded))}, data)
-    assert prolog is None
+    assert prolog == ()
     print("ok  oversized_match_is_rejected")
 
 
@@ -148,7 +212,7 @@ def test_unmapped_address_is_skipped():
     data = _image([(RAW + 0x100, SEH_PROLOG_BYTES)])
     prolog, epilog = detect_seh_helpers(
         {0x7FFFFFFF: _fn(0x7FFFFFFF, len(SEH_PROLOG_BYTES))}, data)
-    assert prolog is None and epilog is None
+    assert prolog == () and epilog == ()
     print("ok  unmapped_address_is_skipped")
 
 
@@ -157,12 +221,14 @@ def test_missing_xbe_data_is_skipped():
     _layout()
     p_va = BASE + 0x100
     func_db = {p_va: _fn(p_va, len(SEH_PROLOG_BYTES))}
-    assert detect_seh_helpers(func_db, None) == (None, None)
+    assert detect_seh_helpers(func_db, None) == ((), ())
     print("ok  missing_xbe_data_is_skipped")
 
 
 if __name__ == "__main__":
     test_detects_both()
+    test_detects_the_cpp_eh_prolog()
+    test_finds_both_prolog_flavours_in_one_title()
     test_decoy_alone_is_not_a_prolog()
     test_absent_helpers_are_not_an_error()
     test_accepts_int_end_from_batch_translator()

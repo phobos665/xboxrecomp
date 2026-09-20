@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>   /* getenv, exit: the spin verdict below */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -46,6 +47,10 @@ typedef void (*recomp_func_t)(void);
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
 extern uint32_t g_eax;
+/* The guest stack pointer. At the moment an indirect call is refused, the
+ * caller has already pushed its guest return address, so the top of the
+ * guest stack is the call site -- the one thing the old log did not say. */
+extern uint32_t g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── Manual function overrides ─────────────────────────────── */
@@ -137,10 +142,15 @@ void recomp_icall_fail_log(uint32_t va)
  */
 void recomp_icall_not_code_log(uint32_t va)
 {
-    enum { SLOTS = 16 };
+    /* A power of ten, because the rate limiter above only reaches this
+     * function body at 1, 10, 100 ... and the verdict has to land on one of
+     * those. A hundred thousand skips of one target is unambiguous: no title
+     * makes progress through that. */
+    enum { SLOTS = 16, SPIN_VERDICT = 100000 };
     static uint32_t seen[SLOTS];
     static uint64_t hits[SLOTS];
     static int count;
+    static int said_it;   /* the verdict below is said once, not once per target */
     int i;
 
     for (i = 0; i < count; i++)
@@ -165,10 +175,53 @@ void recomp_icall_not_code_log(uint32_t va)
         if (n != 1)
             return;
     }
-    fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped %llu time(s) "
-                    "(null or wild function pointer, at call #%llu)\n",
-            va, (unsigned long long)hits[i],
-            (unsigned long long)g_icall_count);
+    {
+        /* The call site, read off the guest stack. Without it the log
+         * says a wild pointer was skipped but not by whom, and the
+         * caller is the only thing that leads anywhere. */
+        uint32_t caller = 0;
+        if (g_esp && g_xbox_mem_offset)
+            caller = *(const uint32_t *)((const uint8_t *)g_xbox_mem_offset
+                                         + g_esp);
+        fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped "
+                        "%llu time(s) from 0x%08X (null or wild function "
+                        "pointer, at call #%llu)\n",
+                va, (unsigned long long)hits[i], caller,
+                (unsigned long long)g_icall_count);
+    }
+
+    /* Past a certain count this stops being a warning and becomes a verdict.
+     *
+     * A skipped call sets eax to 0 and returns. Zero is a fine answer for a
+     * null function pointer in most code -- it reads as NULL, false, or
+     * nothing -- but it is also S_OK, so in COM-shaped code a loop that
+     * repeats while the result is non-negative can never leave. Panzer
+     * Dragoon Orta hung exactly there, three billion skips in forty seconds,
+     * with no frame ever presented.
+     *
+     * The value is deliberately left alone: there is no return value that is
+     * right for both conventions, and guessing failure would break the
+     * callers for which zero is correct. What can be fixed is the silence.
+     * Say plainly that the title is hung, once, and say what to do about it.
+     */
+    if (hits[i] == SPIN_VERDICT && !said_it) {
+        said_it = 1;
+        fprintf(stderr,
+            "[ICALL] ^^ this is a hang, not slow progress. One target has been\n"
+            "        skipped %d times. The skip returns eax = 0, which is also\n"
+            "        S_OK, so a loop testing for a non-negative result will\n"
+            "        never exit. Try `py -3 -m tools.seed_from_log <log>` to\n"
+            "        recover the target as a function, and read\n"
+            "        docs/technical/memory-watchpoints.md for who wrote the\n"
+            "        pointer. Set RECOMP_ICALL_SPIN_FATAL=1 to stop here\n"
+            "        instead of spinning.\n", SPIN_VERDICT);
+        fflush(stderr);
+        if (getenv("RECOMP_ICALL_SPIN_FATAL")) {
+            fprintf(stderr, "[ICALL] RECOMP_ICALL_SPIN_FATAL is set; exiting.\n");
+            fflush(stderr);
+            exit(3);
+        }
+    }
     fflush(stderr);
 }
 
