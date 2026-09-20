@@ -7562,7 +7562,11 @@ static void bridge_KeGetCurrentIrql(void)
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
 static void bridge_KeGetCurrentThread(void)
 {
-    g_eax = 0;
+    /* The running thread's object, which fs:[0x28] points at and which is
+     * now per-thread. Returning 0 here made every caller that compared thread
+     * identities decide it was always the same thread. */
+    extern uint32_t xbox_CurrentThreadObject(void);
+    g_eax = xbox_CurrentThreadObject();
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */

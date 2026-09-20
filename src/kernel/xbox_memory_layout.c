@@ -978,6 +978,35 @@ uint32_t g_xbox_code_hi = 0;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
 RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 
+/* The current-thread object, reached through fs:[0x28].
+ *
+ * On the console fs points at the KPCR and the processor control block is
+ * embedded at 0x28, whose first field is the pointer to the running thread.
+ * Titles read it to find out which thread they are on: Black computes
+ * MEM32(MEM32(fs:[0x28]) + 0x12C), compares it against a table of thread ids
+ * it recorded earlier, and if they match it sets an error code and executes a
+ * deliberate `jmp $`. That is a re-entrancy assertion -- "this must not be
+ * the thread that already owns this" -- and it is a reasonable thing for a
+ * title to check.
+ *
+ * It used to be one fixed address shared by every guest thread, because
+ * xbox_AllocThreadTib copies the main thread's whole block. So every thread
+ * reported the same identity, every such comparison said yes, and Black hung
+ * itself on purpose after loading. Each thread now gets its own copy with a
+ * distinct id, and everything else in the block is inherited exactly as
+ * before so that nothing which already worked changes. */
+#define XBOX_THREAD_OBJ_MAIN 0x00760000u   /* the main thread's, in BSS */
+#define XBOX_THREAD_OBJ_SIZE 0x200u
+#define XBOX_THREAD_ID_OFF   0x12Cu
+
+static uint32_t g_next_guest_thread_id = 0x1000;
+
+uint32_t xbox_CurrentThreadObject(void)
+{
+    uintptr_t fs = (uintptr_t)g_fs_base + g_memory_offset;
+    return *(const uint32_t *)(fs + 0x28);
+}
+
 /* The shape of the TLS block the loader built, so a new thread can be
  * given one just like it: where the initialised image data starts, how
  * big the block is, and how big the per-thread structure slot 0 points
@@ -1695,6 +1724,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
         MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
+
+        /* The running thread's identity. Zero here made every guest thread
+         * look like the same thread; see XBOX_THREAD_OBJ_MAIN above. */
+        MEM32_INIT(FAKE_TLS_VA + XBOX_THREAD_ID_OFF, g_next_guest_thread_id++);
 
         /*
          * XBE TLS directory.
@@ -2461,6 +2494,24 @@ uint32_t xbox_AllocThreadTib(void)
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+
+    /* This thread's own current-thread object.
+     *
+     * The copy above inherited fs:[0x28] from the main thread, so without
+     * this every guest thread answers "which thread am I" with the same
+     * value. Copy the main thread's object so every field a title already
+     * relies on is inherited -- the RenderWare data pointer at +0x28 among
+     * them -- and change only the identity. */
+    {
+        uint32_t obj = xbox_HeapAlloc(XBOX_THREAD_OBJ_SIZE, 16);
+        if (obj) {
+            memcpy(TIB_VA(obj), TIB_VA(XBOX_THREAD_OBJ_MAIN),
+                   XBOX_THREAD_OBJ_SIZE);
+            *(uint32_t *)TIB_VA(obj + XBOX_THREAD_ID_OFF) =
+                g_next_guest_thread_id++;
+            *(uint32_t *)TIB_VA(tib + 0x28) = obj;
+        }
+    }
 
     return tib;
     #undef TIB_VA

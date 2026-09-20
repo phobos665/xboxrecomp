@@ -233,11 +233,64 @@ translating the title's shaders. It clears the screen every frame and has
 issued draws, but presents only three times, so it has not reached a state
 that produces frames yet. The hot function is `sub_0020A100` at 78%.
 
+## Every guest thread had the same identity
+
+Skipping the video does not get Black to a menu. It loads, compiles shaders,
+clears every frame, and then stops with 77% of the main thread in a
+three-line function that ends in a deliberate `jmp $`. That is not a hang the
+runtime caused; it is the title halting itself.
+
+The function reads the running thread's id and compares it against a table,
+and halts when they match. It gets the id the way the console does, through
+the processor control block at `fs:[0x28]`, whose first field is the pointer
+to the running thread.
+
+**That pointer was the same on every guest thread.** The loader pointed it at
+one fixed address, and `xbox_AllocThreadTib` copies the main thread's block
+wholesale when a thread is spawned, so every thread answered "which thread am
+I" with the same value. `KeGetCurrentThread` returned 0 as well. Any title
+that compares thread identities would fail, and the failure looks like a hang
+rather than a fault.
+
+Each thread now gets its own copy of that object with a distinct id, and
+everything else in the block is inherited exactly as before, so nothing that
+already worked changes. `KeGetCurrentThread` returns it.
+
+This did not unblock Black, because the halt turns out to be reached for a
+different reason (below), but it is a real gap and it would have bitten
+eventually on some title.
+
+## The intro video is the blocker, both ways round
+
+Black will not proceed without its opening movie, and cannot decode it.
+
+**With the video present**, the XMV decoder faults. The failing function is an
+MMX inner loop -- the colour-conversion or inverse-transform stage -- and the
+bad address is a *parameter* it was handed: 0xFFFFFFF0, which is null minus
+sixteen. So the decoder was given no destination surface to write into. The
+call chain above it is four more XMV functions.
+
+**With the video skipped**, the title takes its failure path instead.
+`RECOMP_SKIP_VIDEO` makes the open report the file missing, XMV reports the
+failure, and the engine calls the callback at offset 0x68 of its video object
+-- which is the panic handler that sets error code 3 and halts. So Black
+treats a missing intro as fatal. The switch is still right for titles that
+merely skip; Black is not one of them.
+
+A third thread spends the whole run calling through a function pointer that
+reads 0x10101010, a fill pattern rather than an address, 130,000 times. That
+value is not produced by anything in this runtime; it occurs six times in the
+title's own image.
+
+So the next real step for Black is the video path: either find why the
+decoder is handed no surface, which is probably a texture lock the HLE does
+not fulfil for this path, or stub XMV high enough that playback reports
+success immediately without decoding.
+
 ## What to look at next
 
-1. **Find out what `sub_0020A100` is doing.** It is 78% of the main thread
-   with the video skipped, the title clears every frame but presents only
-   three times, and that is the gap between "alive" and "playable".
+1. **The video path**, as above. It is the only thing between this title and
+   a menu, and both ways round it ends in the same place.
 2. **A second seeding round found only four more real targets**, and the rest
    of the 201 unresolved were rejected as not being in executable sections,
    so that seam is close to exhausted.
