@@ -192,13 +192,59 @@ rather than a wild value. 201 calls are still unresolved in this run, so the
 first thing to try is another seeding round before reading anything into the
 fault.
 
+## The crash is the intro video
+
+The write to 0xFFFFFFF0 is in `sub_00240F38`, and matching that against the
+section table places it in **XMV**, the Xbox video library
+(0x0023EB40..0x00266874). The log agrees:
+
+```
+  [PATH] \Device\CdRom0\videos\LO_N_US.xmv
+  [FILE] -> 0x00000000
+  [READ] @0 want=4096 got=4096 st=0x00000000
+```
+
+Black opens with a logo movie, decodes it with its own XMV code, and dies
+there. The survey flagged the related risk on day one: the image has a WMADEC
+section and WMA decoding is not implemented. The repeated `0x10101010`
+indirect-call targets in the same window are the same story: a fill pattern,
+not an address, read out of a table the decoder never populated.
+
+`RECOMP_SKIP_VIDEO=1` refuses to open `.xmv`, `.wmv`, `.xbv` and `.bik` and
+returns `STATUS_OBJECT_NAME_NOT_FOUND`. That is a condition every title
+already has to survive, because a scratched disc produces it, so a title that
+handles it at all handles it by skipping to the menu. It is a bring-up switch,
+off by default, and it is not a fix for the decoder. `RECOMP_FMV_HOST` is the
+opposite choice and already existed: keep the title's decode and additionally
+show the video with the host's own player. Use that when the video matters.
+
+With the video skipped, **the crash is gone**, and the title is alive rather
+than stuck:
+
+| | before | with the video skipped |
+| --- | --- | --- |
+| kernel calls in ~35s | 24,500,000 | 8,607 |
+| outcome | access violation | no crash |
+| vblank ISR ticks | — | 2,026, one per frame |
+
+The sampler shows the main thread 61% on-CPU with 78% of that in lifted game
+code and 14% in the host shader compiler, so it is loading assets and
+translating the title's shaders. It clears the screen every frame and has
+issued draws, but presents only three times, so it has not reached a state
+that produces frames yet. The hot function is `sub_0020A100` at 78%.
+
 ## What to look at next
 
-1. **Seed again from the latest run.** 201 calls are still unresolved. The
-   first round took the title from a dead spin to a rendering device, so this
-   is the cheapest thing to do and should be exhausted before anything else.
-2. **Then the write to 0xFFFFFFF0**, if it survives that.
+1. **Find out what `sub_0020A100` is doing.** It is 78% of the main thread
+   with the video skipped, the title clears every frame but presents only
+   three times, and that is the gap between "alive" and "playable".
+2. **A second seeding round found only four more real targets**, and the rest
+   of the 201 unresolved were rejected as not being in executable sections,
+   so that seam is close to exhausted.
 3. The three demand-loaded sections have not been exercised.
+4. XMV playback itself is untouched. Whether it is worth implementing depends
+   on whether any title needs the video rather than merely survives without
+   it.
 
 ## Fixed along the way
 

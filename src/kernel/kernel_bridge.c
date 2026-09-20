@@ -3014,6 +3014,48 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     oa->Attributes    = 0;
 }
 
+/* RECOMP_SKIP_VIDEO: refuse to open full-motion video files.
+ *
+ * A title that opens with a logo movie decodes it with its own XMV or WMA
+ * code, which is lifted like everything else and is some of the least
+ * forgiving code in the image. Black crashes inside its XMV library in the
+ * first seconds, having got no further than the intro, and nothing past that
+ * point can be looked at until it is out of the way.
+ *
+ * Failing the open is what a title already has to cope with -- a missing
+ * video file is an ordinary condition on a scratched disc -- so a title that
+ * handles it at all handles it by skipping to the menu. That is a bring-up
+ * switch and nothing more: it is off by default, and it is not a fix for the
+ * decoder.
+ *
+ * RECOMP_FMV_HOST, just below, is the opposite choice: keep the title's
+ * decode and additionally show the video with the host's own player. Use that
+ * when the video matters; use this when it is in the way.
+ */
+static int recomp_skip_video(const char *xbox_path)
+{
+    static int on = -1;
+    static const char *const exts[] = { ".xmv", ".wmv", ".xbv", ".bik" };
+    size_t len, i, n;
+
+    if (on < 0)
+        on = getenv("RECOMP_SKIP_VIDEO") ? 1 : 0;
+    if (!on || !xbox_path)
+        return 0;
+
+    len = strlen(xbox_path);
+    for (i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        n = strlen(exts[i]);
+        if (len >= n && _stricmp(xbox_path + len - n, exts[i]) == 0) {
+            fprintf(stderr, "  [FILE] RECOMP_SKIP_VIDEO: refusing %s\n",
+                    xbox_path);
+            fflush(stderr);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -3027,6 +3069,10 @@ static NTSTATUS bridge_create_file_impl(
     NTSTATUS st;
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
+    if (recomp_skip_video(name.Buffer)) {
+        bridge_write_iostatus(iostatus_va, STATUS_OBJECT_NAME_NOT_FOUND, 0);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
     if (!name.Buffer) {
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
