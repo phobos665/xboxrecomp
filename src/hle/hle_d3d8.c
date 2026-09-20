@@ -639,6 +639,11 @@ static unsigned long g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed
                      g_draws_stride, g_draws_primitive, g_draws_failed;
 /* Dropped by RECOMP_HLE_D3D8_SKIP_FULLSCREEN; see the draw gate. */
 static unsigned long g_skipped_fullscreen;
+/* The inline immediate-mode vertex path, counted but not implemented; see the
+ * replacements for D3DDevice_Begin further down. */
+static unsigned long g_inline_begin, g_inline_end, g_inline_vdata;
+static unsigned long g_inline_begin_frame, g_inline_vdata_frame;
+static unsigned long g_inline_begin_max, g_inline_vdata_max;
 /* From hle_d3d8_texture.c: stage 0 holds the title's own frame. */
 int hle_d3d8_stage0_is_framebuffer(void);
 /* Draws arriving on a guest thread other than the one that swaps. A loader
@@ -1242,6 +1247,12 @@ HLE_EXPORT(D3DDevice_Swap)
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
         shadow_dump_frame();             /* before Present discards the buffer */
         shadow_frame_brightness();       /* likewise: Present discards it */
+        if (g_inline_begin_frame > g_inline_begin_max)
+            g_inline_begin_max = g_inline_begin_frame;
+        if (g_inline_vdata_frame > g_inline_vdata_max)
+            g_inline_vdata_max = g_inline_vdata_frame;
+        g_inline_begin_frame = 0;
+        g_inline_vdata_frame = 0;
         g_frame_draws = 0;
         overlay_frame();                 /* after the dump: not in the captures */
         host_Swap(g_shadow, 0);
@@ -1258,6 +1269,12 @@ HLE_EXPORT(D3DDevice_Swap)
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
+            if (g_inline_begin || g_inline_vdata)
+                fprintf(stderr, "[HLE-D3D8] inline vertex path (not implemented, "
+                        "goes to the push buffer): %lu Begin, %lu End, %lu "
+                        "SetVertexData4f; peak per frame %lu Begin, %lu vertex "
+                        "data\n", g_inline_begin, g_inline_end, g_inline_vdata,
+                        g_inline_begin_max, g_inline_vdata_max);
             if (g_skipped_fullscreen)
                 fprintf(stderr, "[HLE-D3D8] shadow: %lu full-screen passes over the "
                         "title's own frame dropped (RECOMP_HLE_D3D8_SKIP_FULLSCREEN)\n",
@@ -1767,6 +1784,68 @@ HLE_EXPORT(D3DDevice_SetVertexData2f)
         host_vsh_set_vertex_data((int)reg, v);
     }
 #endif
+}
+
+/* The inline immediate-mode vertex path: Begin, then one SetVertexData* per
+ * attribute per vertex, then End.
+ *
+ * These are counted, not replaced. The bodies run, so the title's own D3D8
+ * writes its NV097_SET_BEGIN_END and vertex data into the push buffer exactly
+ * as before -- and nothing here reads the push buffer, so that geometry never
+ * reaches the host. The question these counters answer is how much of a
+ * title's scene goes this way, which decides whether implementing the path is
+ * worth it. Marvel vs Capcom 2 calls Begin from six sites and
+ * SetVertexData4f from sixteen, but a static call site says nothing about how
+ * often it runs.
+ *
+ * Reported per frame at the shadow summary, alongside the draws that do
+ * arrive, so the two can be compared directly. */
+static unsigned long g_inline_begin, g_inline_end, g_inline_vdata;
+static unsigned long g_inline_begin_frame, g_inline_vdata_frame;
+static unsigned long g_inline_begin_max, g_inline_vdata_max;
+
+HLE_ORIGINAL(D3DDevice_Begin);
+HLE_ORIGINAL(D3DDevice_End);
+HLE_ORIGINAL(D3DDevice_SetVertexData4f);
+
+/* void D3DDevice_Begin(X_D3DPRIMITIVETYPE PrimitiveType) */
+HLE_EXPORT(D3DDevice_Begin)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_Begin", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_Begin, "D3DDevice_Begin"))
+        return;
+    g_inline_begin++;
+    g_inline_begin_frame++;
+    HLE_CALL_ORIGINAL(D3DDevice_Begin);
+}
+
+/* void D3DDevice_End(void) */
+HLE_EXPORT(D3DDevice_End)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_End", 0);
+    if (original_missing(hle_original_D3DDevice_End, "D3DDevice_End"))
+        return;
+    g_inline_end++;
+    HLE_CALL_ORIGINAL(D3DDevice_End);
+}
+
+/* void D3DDevice_SetVertexData4f(INT Register, float a, float b, float c,
+ *     float d) -- one attribute of one inline vertex. */
+HLE_EXPORT(D3DDevice_SetVertexData4f)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_SetVertexData4f", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetVertexData4f,
+                         "D3DDevice_SetVertexData4f"))
+        return;
+    g_inline_vdata++;
+    g_inline_vdata_frame++;
+    HLE_CALL_ORIGINAL(D3DDevice_SetVertexData4f);
 }
 
 /* HRESULT D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE State,

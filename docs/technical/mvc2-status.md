@@ -1,4 +1,4 @@
-# Marvel vs Capcom 2: renders, but the scene is not drawn
+# Marvel vs Capcom 2: renders, but its textures are refused
 
 20 September 2026. The title boots, plays its intro audio and presents frames at
 about 25 ms each. The screen is essentially the clear colour, because the path
@@ -112,3 +112,73 @@ grep -oE "shadow: [0-9]+ swaps" run.err | grep -oE "[0-9]+" | sort -n | tail -1
 
 **Run length.** Give this title at least 200 s before concluding anything, and
 never draw a conclusion from one run.
+
+---
+
+## Measured: the blocker is P8, not the inline vertex path (20 Sep 2026)
+
+Both hypotheses in this file were tested with counters. One is refuted and the
+other is now the lead.
+
+### The inline vertex path is not it
+
+`D3DDevice_Begin`, `End` and `SetVertexData4f` are counted (replaced by name,
+each calling `HLE_CALL_ORIGINAL`, so the title's own code still runs). Two
+runs that reached rendering, at 487 and 510 swaps:
+
+```
+317 Begin, 317 End, 1268 SetVertexData4f; peak per frame 77 Begin, 308 vertex data
+```
+
+**Byte-identical across both**, despite different frame counts. Per-frame work
+would scale with frames; this does not move, so the inline calls all happen in
+a fixed start-up phase and stop. Implementing the path would not change
+gameplay output. `1268 / 317` is exactly 4, so they are quads — sprites or UI,
+submitted once.
+
+The mechanism is still real: those calls run the title's own XDK D3D8, which
+writes the push buffer, and nothing reads the push buffer. It will matter for a
+title that uses the path per frame. It is not MvC2's problem.
+
+### P8 textures are refused, and that is 59% of every bind
+
+```
+texture format 0x0B refused (P8, no palette is forwarded); draws using it are untextured
+shadow textures: 1106 binds, 1 cached, 0 uploads; skipped 656 format
+```
+
+**Exactly one format is refused, and it is P8.** 656 of 1106 binds. Whatever
+geometry arrives is drawn untextured, which is what "a bold colour, not the
+proper scene" looks like from a play session. MvC2 is a sprite fighter, so
+palettised art is most of what it has.
+
+`read_layout()` in `src/hle/hle_d3d8_texture.c` refuses it outright:
+
+```c
+if (t->fmt == XFMT_P8 || d3d8_format_bpp((D3DFORMAT)t->fmt) == 0) {
+    g_skip_format++;
+    return 0;
+}
+```
+
+### Why this is a bridge rather than new code
+
+The renderer already does P8. `src/d3d/d3d8_resources.c` has
+`case D3DFMT_P8: /* expanded to BGRA through the palette */`,
+`d3d8_convert_linear_pixels(fmt, w, h, src, dst, palette)` takes the stage's
+palette, and the device exposes
+`SetPalette(PaletteNumber, pEntries)`. Only the shadow path drops P8.
+
+The work is therefore:
+
+1. stop refusing P8 in `read_layout()` and let `upload()` run — the mip upload
+   already converts through a palette;
+2. forward the guest's palette, by replacing the XDK's palette entry point and
+   calling the host `SetPalette` for the matching stage.
+
+Point 2 is the part that does not exist yet, and is what the comment in that
+file's header means by "P8 (no palette is forwarded)".
+
+**Not yet verified**: that P8 is the *only* thing between here and a correct
+picture. Draw traffic is about 6 per frame, which is low for a fighting game
+even allowing for sprites, so there may be a second cause behind this one.

@@ -122,6 +122,21 @@ static int read_layout(uint32_t va, texture_layout *t)
     memset(t, 0, sizeof *t);
     t->fmt = (format >> 8) & 0xFF;
     if (t->fmt == XFMT_P8 || d3d8_format_bpp((D3DFORMAT)t->fmt) == 0) {
+        /* Say which format, once each. The count alone says a title's textures
+         * are being refused without saying what to implement, and "P8" and
+         * "a format d3d8_format_bpp does not know" are different jobs: the
+         * first needs the stage palette forwarded, the second needs the format
+         * added. Marvel vs Capcom 2 has 3172 of 4914 binds refused here and
+         * draws essentially untextured because of it. */
+        static uint8_t said[256];
+        if (!said[t->fmt]) {
+            said[t->fmt] = 1;
+            fprintf(stderr, "[HLE-D3D8] texture format 0x%02X refused (%s); "
+                    "draws using it are untextured\n", t->fmt,
+                    t->fmt == XFMT_P8 ? "P8, no palette is forwarded"
+                                      : "no bpp known for it");
+            fflush(stderr);
+        }
         g_skip_format++;
         return 0;
     }
