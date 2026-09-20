@@ -489,6 +489,7 @@ static int      g_ps_def_seen, g_ps_dirty;
  * Until then nothing here is trusted, because a title whose objects are laid
  * out differently would otherwise have every draw quietly demoted. */
 static int      g_ps_def_ok;
+static int      g_state_dumped;
 
 /* A guest heap pointer, roughly: inside the console's RAM, aligned, not a
  * small integer. HLE_MEM32 has no mapped-page check, so a handle that is a
@@ -762,6 +763,33 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
         }
     }
     forward_pixel_shader(dev);
+
+    /* RECOMP_HLE_D3D8_STATE_DUMP: what the title's own arrays actually hold,
+     * once, on the first draw that gets this far.
+     *
+     * A title drawing through the host's fixed-function pixel path lives or
+     * dies by these values -- the colour operation and its two arguments
+     * decide every pixel -- and when the frame comes out black there is no
+     * way to tell a state that was never set from one that was set to zero
+     * without looking. Black issues ten thousand draws a run, all of them
+     * accepted by the renderer, and produces nothing. */
+    if (!g_state_dumped && getenv("RECOMP_HLE_D3D8_STATE_DUMP")) {
+        g_state_dumped = 1;
+        fprintf(stderr, "[HLE-D3D8] state dump, guest values as forwarded:\n");
+        for (i = 0; i < sizeof g_rs_map / sizeof g_rs_map[0]; i++)
+            fprintf(stderr, "    rs[%2u] = 0x%08X\n",
+                    g_rs_map[i].xbox, guest_rs(g_rs_map[i].xbox));
+        for (s = 0; s < STAGES; s++) {
+            uint32_t base = hle_var_D3D_g_DeferredTextureState
+                          + (uint32_t)(s * STAGE_SIZE * 4);
+            fprintf(stderr, "    stage %d:", s);
+            for (i = 0; i < sizeof g_ts_map / sizeof g_ts_map[0]; i++)
+                fprintf(stderr, " ts[%u]=0x%X", g_ts_map[i].xbox,
+                        HLE_MEM32(base + 4 * g_ts_map[i].xbox));
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
     g_prev_valid = 1;
 }
 #endif /* _WIN32 */
