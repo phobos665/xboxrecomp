@@ -424,7 +424,15 @@ _EFLAGS_SETTERS = frozenset({
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
+    # "lock xadd" was here, described as complex flag behaviour. It is not:
+    # LOCK only makes the read-modify-write atomic and leaves xadd's flags
+    # exactly as the unlocked form sets them, from the sum. Listing it here
+    # cleared flag tracking, so the jcc that follows fell back to the _flags
+    # placeholder, which is always 0. In Jet Set Radio Future that turned
+    # every COM-style Release() -- lock xadd on the refcount, jne to return
+    # while it is still non-zero -- into an unconditional destroy, and the
+    # second Release() on an object double-freed it. The prefix is stripped
+    # where flags are tracked instead; see the LOCK note there.
     # popfd REPLACES every flag with whatever was pushed. Its flags are not
     # architecturally undefined -- they are simply not knowable from the
     # instruction stream -- but the tracking action is the same: whatever the
@@ -3838,17 +3846,28 @@ def lift_basic_block(lifter, bb, flag_state=None):
             results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
 
-        # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
-            last_flag_setter = curr.mnemonic
+        # Track flag-setting instructions.
+        #
+        # LOCK changes atomicity, not arithmetic: a locked instruction leaves
+        # exactly the flags its unlocked form does. Capstone keeps the prefix
+        # in the mnemonic, so it is stripped here and everything downstream
+        # sees the base instruction it already knows how to read. Matching the
+        # prefixed spelling instead loses the flags twice over -- "lock xadd"
+        # used to sit in _FLAGS_UNDEFINED and cleared tracking, and
+        # "lock cmpxchg" matched no list at all and so left the *previous*
+        # instruction's flags standing as if they were its own.
+        flag_mnem = (curr.mnemonic[5:] if curr.mnemonic.startswith("lock ")
+                     else curr.mnemonic)
+        if flag_mnem in FLAG_SETTERS:
+            last_flag_setter = flag_mnem
             last_flag_ops = list(curr.operands)
-        elif curr.mnemonic in _FLAGS_UNDEFINED:
+        elif flag_mnem in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
-        elif curr.mnemonic in _EFLAGS_SETTERS:
+        elif flag_mnem in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
-            last_flag_setter = curr.mnemonic
+            last_flag_setter = flag_mnem
             last_flag_ops = list(curr.operands)
         elif curr.mnemonic in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
