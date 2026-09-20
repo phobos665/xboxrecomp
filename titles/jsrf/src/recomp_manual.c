@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>   /* getenv, exit: the spin verdict below */
+#include <string.h>   /* strcmp: RECOMP_ICALL_FATAL */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -188,6 +189,29 @@ void recomp_icall_not_code_log(uint32_t va)
                         "pointer, at call #%llu)\n",
                 va, (unsigned long long)hits[i], caller,
                 (unsigned long long)g_icall_count);
+
+        /* RECOMP_ICALL_FATAL=1: fault here instead of skipping, so the crash
+         * handler prints the guest call stack that reached this call.
+         *
+         * The caller printed above is read from the top of the guest stack,
+         * which is right only when the lifted call site pushed a return
+         * address there and nothing has since moved esp. When it reads 0 --
+         * exactly the case where a null target most needs explaining -- the
+         * line says a wild pointer was skipped and nothing about by whom. A
+         * deliberate fault costs the run and buys the backtrace. */
+        {
+            static int fatal = -1;
+            if (fatal < 0) {
+                const char *v = getenv("RECOMP_ICALL_FATAL");
+                fatal = v && *v && strcmp(v, "0") != 0;
+            }
+            if (fatal) {
+                fprintf(stderr, "[ICALL] RECOMP_ICALL_FATAL: faulting here for "
+                                "a backtrace\n");
+                fflush(stderr);
+                *(volatile int *)0 = 1;
+            }
+        }
     }
 
     /* Past a certain count this stops being a warning and becomes a verdict.

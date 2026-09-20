@@ -195,3 +195,57 @@ Those two wild pointers are the next thing. The first is a heap address, which
 means a vtable slot or callback holding data rather than a function — the same
 shape as an object used after it was destroyed, so it is worth checking
 whether any premature destruction survives the fix before looking further.
+
+---
+
+## KTHREAD.TlsData pointed at a scratch buffer (20 Sep 2026)
+
+Chasing the null indirect call turned up a real bug, though not yet the one
+that stops this title.
+
+`fs:[0x28]` is `KPCR.PrcbData`, whose first field is the current thread, and
+`KTHREAD + 0x28` is `TlsData` — both confirmed against Cxbx-Reloaded's
+`types.h`. `xbox_memory_layout.c` set `TlsData` to `FAKE_RWDATA_VA`
+(0x00700000), a separate buffer that is only ever zeroed, while the image's
+TLS block — built from the XBE TLS directory — sat at 0x00770000 and was
+reachable only through `fs:[4]`. On hardware those are the same memory.
+
+So a title that keeps per-thread state in TLS read zeros. `TlsData` now points
+at the image block when the image has a TLS directory; without one the old
+buffer still stands. TimeSplitters 2 is unaffected (2069 swaps, 1.66M draws
+after the change).
+
+It moved JSRF's wild pointer from 0x00700010 to 0x00770010 and no further: the
+object at `TlsData + 0x10` still has a null vtable, so the title still
+relaunches itself rather than starting.
+
+**What Cxbx says the layout should be**, from `KiInitializeContextThread`:
+
+```cpp
+TlsDataSize = ALIGN_UP(TlsDataSize, ulong_xt);
+StackAddress -= TlsDataSize;          // carved off the top of the thread stack
+if (TlsDataSize) {
+    Thread->TlsData = StackAddress;   // the base of the block
+    // Title will process which section of TlsData will be fill with data
+    // and zero'd. So, we leave this untouched.
+}
+```
+
+Three differences from what this runtime does, each worth checking before
+chasing the null vtable further:
+
+- The block belongs at the **top of the thread's own stack**, not at a fixed
+  address shared by every thread. Per-thread TLS is the point of TLS.
+- Its size is `ALIGN_UP(TlsDataSize, 4)` — **12 bytes** for JSRF, whose TLS
+  directory has no initialised data and `SizeOfZeroFill = 12`. This runtime
+  builds 20: the zero-fill rounded up to 16, plus a 4-byte tail so `fs:[4]`
+  lands past the data. JSRF reads `TlsData + 0x10`, which is inside our 20 and
+  outside Cxbx's 12 — so either the size is wrong here, or the read is not a
+  TLS access and the address is a coincidence of both layouts.
+- Cxbx **does not initialise the block**; the title fills it. This runtime
+  zero-fills it and writes slot 0.
+
+**`RECOMP_ICALL_FATAL=1`** was added for this: it faults on a skipped indirect
+call so the crash handler prints the guest stack. The `from 0x...` in the
+ordinary `[ICALL]` line is read off the top of the guest stack and reads 0
+exactly when a null target most needs explaining.

@@ -1780,6 +1780,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_THREAD_VA);
                 MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
 
+                /* KTHREAD.TlsData, which is what fs:[0x28] leads to at +0x28
+                 * (Cxbx-Reloaded types.h: KPCR.PrcbData at 0x28, KTHREAD at
+                 * PrcbData+0 with TlsData at 0x28). On hardware that is this
+                 * block -- a thread's TLS data and the image's TLS block are
+                 * the same memory.
+                 *
+                 * It used to point at FAKE_RWDATA_VA instead, a separate
+                 * buffer that is only ever zeroed. The name came from the
+                 * first title that needed something there, and "somewhere
+                 * writable" was enough for RenderWare, but a title that keeps
+                 * real per-thread state in TLS reads zeros. Jet Set Radio
+                 * Future reads TlsData+0x10 -- the last dword of its 20-byte
+                 * block -- as a function pointer, called it through null, and
+                 * relaunched itself from \Device\Cdrom0 rather than start.
+                 *
+                 * Only when the image has a TLS directory; without one there
+                 * is no block to point at and the old buffer still stands. */
+                MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_TLS_BLOCK_VA);
+
                 g_tls_template_va = FAKE_TLS_BLOCK_VA;
                 g_tls_total       = total;
 
