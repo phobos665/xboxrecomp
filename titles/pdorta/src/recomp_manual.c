@@ -47,6 +47,10 @@ typedef void (*recomp_func_t)(void);
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
 extern uint32_t g_eax;
+/* The guest stack pointer. At the moment an indirect call is refused, the
+ * caller has already pushed its guest return address, so the top of the
+ * guest stack is the call site -- the one thing the old log did not say. */
+extern uint32_t g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── Manual function overrides ─────────────────────────────── */
@@ -171,10 +175,20 @@ void recomp_icall_not_code_log(uint32_t va)
         if (n != 1)
             return;
     }
-    fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped %llu time(s) "
-                    "(null or wild function pointer, at call #%llu)\n",
-            va, (unsigned long long)hits[i],
-            (unsigned long long)g_icall_count);
+    {
+        /* The call site, read off the guest stack. Without it the log
+         * says a wild pointer was skipped but not by whom, and the
+         * caller is the only thing that leads anywhere. */
+        uint32_t caller = 0;
+        if (g_esp && g_xbox_mem_offset)
+            caller = *(const uint32_t *)((const uint8_t *)g_xbox_mem_offset
+                                         + g_esp);
+        fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped "
+                        "%llu time(s) from 0x%08X (null or wild function "
+                        "pointer, at call #%llu)\n",
+                va, (unsigned long long)hits[i], caller,
+                (unsigned long long)g_icall_count);
+    }
 
     /* Past a certain count this stops being a warning and becomes a verdict.
      *
