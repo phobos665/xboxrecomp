@@ -712,6 +712,61 @@ static void shadow_dump_next_frame(void)
     g_dump_requested = 1;
 }
 
+/* RECOMP_HLE_D3D8_BRIGHT=<n>: every n swaps, say how bright the finished frame
+ * is, and how many draws made it.
+ *
+ * Pair it with RECOMP_HLE_D3D8_FB_PROBE at the same interval. That one reads
+ * the screen copy the title samples, which is the scene *before* its
+ * full-screen passes; this one reads the back buffer at Swap, which is the
+ * scene *after* them. Two numbers a few lines apart in the log, against the
+ * same swap number, are what those passes did to the picture -- measured in
+ * the running title.
+ *
+ * It has to be measured live. src/replay never performs the screen copy, so
+ * replaying these draws samples a black texture and answers a different
+ * question; two diagnoses of the TimeSplitters 2 brightness bug died of that.
+ * Standing still and then moving with this on is the whole experiment. */
+static void shadow_frame_brightness(void)
+{
+    static int every = -1;
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    unsigned long long sum = 0;
+    unsigned samples = 0;
+    UINT x, y;
+
+    if (every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_BRIGHT");
+        every = (v && atoi(v) > 0) ? atoi(v) : 0;
+    }
+    if (!every || !g_shadow || (g_shadow_swaps % (unsigned long)every) != 0)
+        return;
+
+    if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
+        return;
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        surf->lpVtbl->Release(surf);
+        return;
+    }
+    /* R8G8B8A8, sparsely sampled: enough for a mean, cheap enough that the
+     * readback stall does not change what is being measured. */
+    for (y = 0; y < g_shadow_height; y += 16) {
+        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
+        for (x = 0; x < g_shadow_width; x += 16) {
+            const uint8_t *p = row + (size_t)x * 4u;
+            sum += (unsigned)p[0] + p[1] + p[2];
+            samples += 3;
+        }
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+
+    fprintf(stderr, "[HLE-D3D8] frame brightness swap %lu: after everything, "
+            "mean %.1f/255 over %lu draws\n", g_shadow_swaps,
+            samples ? (double)sum / samples : 0.0, g_frame_draws);
+    fflush(stderr);
+}
+
 static void shadow_dump_frame(void)
 {
     static const char *prefix;
@@ -1132,6 +1187,7 @@ HLE_EXPORT(D3DDevice_Swap)
          * starts recording if this is the requested swap. */
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
         shadow_dump_frame();             /* before Present discards the buffer */
+        shadow_frame_brightness();       /* likewise: Present discards it */
         g_frame_draws = 0;
         overlay_frame();                 /* after the dump: not in the captures */
         host_Swap(g_shadow, 0);

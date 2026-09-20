@@ -296,24 +296,31 @@ static void framebuffer_probe(texture_entry *e, unsigned long now)
         return;
     }
     /* A sparse grid: enough to tell black from a picture, cheap enough to
-     * leave on. Bytes, not pixels -- the format only has to be 32-bit for the
-     * mean to mean something, and every framebuffer format here is. */
+     * leave on. All three colour channels, because this number is meant to be
+     * compared against RECOMP_HLE_D3D8_BRIGHT's reading of the finished frame,
+     * which averages three -- sampling one channel here made the scene look
+     * brighter than the frame by the size of the blue cast alone. */
     for (y = 0; y < 480u; y += 16) {
         const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
-        for (x = 0; x < 640u * 4u; x += 64) {
-            sum += row[x];
-            samples++;
-            if (row[x])
+        for (x = 0; x < 640u; x += 16) {
+            const uint8_t *p = row + (size_t)x * 4u;
+            sum += (unsigned)p[0] + p[1] + p[2];
+            samples += 3;
+            if (p[0] || p[1] || p[2])
                 nonzero++;
         }
     }
     surf->lpVtbl->UnlockRect(surf);
     surf->lpVtbl->Release(surf);
 
+    /* "Not arriving" means near-enough nothing, not merely dark: a night level
+     * legitimately leaves plenty of black pixels, so the threshold is one in
+     * twenty rather than a majority. */
     fprintf(stderr, "[HLE-D3D8] fb probe swap %lu: texture 0x%08X holds mean %.1f/255, "
-            "%u of %u samples non-zero -- %s\n", now, e->va,
-            samples ? (double)sum / samples : 0.0, nonzero, samples,
-            nonzero * 4u < samples ? "the copy is not arriving" : "the copy has content");
+            "%u of %u pixels non-zero -- %s\n", now, e->va,
+            samples ? (double)sum / samples : 0.0, nonzero, samples / 3u,
+            nonzero * 20u < samples / 3u ? "the copy is not arriving"
+                                         : "the copy has content");
     fflush(stderr);
 }
 
