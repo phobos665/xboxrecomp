@@ -48,7 +48,7 @@ whole story either.
 
 ---
 
-### Corrected, 20 September 2026: it is a motion blur, not a colour grade
+### Corrected, 20 September 2026: not a colour grade, and not the quads either
 
 **It is motion-dependent.** From a pad session: standing still the picture is
 right, and it darkens as soon as the camera or the player moves. That single
@@ -71,35 +71,42 @@ screen, `out = dst` exactly.** The pass blends the screen back over itself and
 is a no-op while nothing moves; it only shows when the copy stops matching the
 screen, which is to say it is a motion blur. The combiner program is right.
 
-`t0` samples as black. `RECOMP_D3D8_PS_SHOW=t0` on a capture renders the frame
-as its stage-0 texture, and the result is a mean of 0.5/255. So the quads
-blend black over the picture at weight `a`, three times, giving `dst*(1-a)`
-each — and the third quad's alpha rises with motion (0x0A–0x0F at rest,
-0x19 in a frame taken while moving), which is the motion dependence.
+**Do not measure these draws in a replay.** `src/replay` never calls
+`xbox_D3D8CopyBackBufferToTexture` — the copy is done in `src/hle` — so a
+replay samples the captured guest texels, which are zeros. Every replay A/B of
+these three draws is therefore measuring `t0 = black`, which the running title
+does not have. That includes the 0.38 factor quoted above, and a later
+measurement of 36.7% of the light kept at alpha 0x19 against 43.2% at 0x0A:
+real numbers, but numbers about a black source texture, not about the game.
 
-Predicted from the recorded alphas, `0.592 * 0.506 * 0.804` = 24% of the light
-kept at 0x19 and 28% at 0x0A; measured 36.7% and 43.2%. Same structure, same
-motion dependence, uniformly about 1.55x higher, so `t0` is near-black rather
-than exactly zero.
+**Live, the copy arrives.** `RECOMP_HLE_D3D8_FB_PROBE=<n>` reads the texture
+back every n swaps (`framebuffer_probe` in `src/hle/hle_d3d8_texture.c`). For
+TimeSplitters 2 it reports mean 85–128 of 255 with 1183–1192 of 1200 samples
+non-zero, once past the black loading screens. So `t0` is the screen, the
+quads are close to neutral, and the screen-copy path is working.
 
-So "the quads' output does not depend on their texture" was a correct
-observation with the wrong inference drawn from it. The output *does* depend on
-`t0`; `t0` never arrives. The screen-copy work is not groundwork beside the
-fix — it **is** the fix, and it is not reaching the sampler.
+That kills the obvious reading of this bug — that the quads blend black over
+the picture — and it kills it twice over, because the first version of that
+probe appeared to confirm it. That version called `IDirect3DTexture8::LockRect`,
+which returns `tex->sys_mem`, the upload shadow; the copy writes the GPU
+resource through a render target view and never touches it, so it reads zeros
+either way. Read a readback path before believing a readback.
 
-**Where to look next.** Why the filled framebuffer texture is not what the
-pixel shader samples. `framebuffer_texture()` creates it `D3DUSAGE_RENDERTARGET`
-and calls `xbox_D3D8CopyBackBufferToTexture()` once per swap on first bind; the
-copy reports no failure. Suspect the path between that render-target write and
-the shader-resource view the sampler reads.
+**So what is still unexplained.** The motion dependence is reported from a pad
+session and is not in doubt, but no mechanism for it survives yet. The quads
+sample the current frame, not the previous one, which makes them a no-op rather
+than the motion blur they are presumably meant to be — so a fair guess is that
+they are not the cause of the brightness change at all, and something else that
+correlates with movement is. The next measurement is the quads' *live*
+contribution: draw a frame with them and without, still and moving, from the
+same viewpoint. Nothing about this should be concluded from a capture.
 
-**Measure this live, not only in replay.** `src/replay` never calls
-`xbox_D3D8CopyBackBufferToTexture` — that lives in `src/hle` — so in a replay
-`t0` is the captured guest texels, which are zeros, and a replay cannot by
-itself tell a broken fill from an absent one. What makes the replay evidence
-usable here is that a live F11 frame and a replay of the same capture differ by
-0.4/255, i.e. the replay reproduces the live picture, so the live fill is not
-landing either.
+**Screenshots need the scene held constant.** The first still/moving pair
+collected for this was taken standing inside a tunnel versus out in the open,
+so the whole-frame means differed by 30–90% on scene content alone and said
+nothing about motion. A usable pair is the same view, one still and one moving;
+failing that, measure something at a fixed screen position, such as the weapon
+HUD.
 
 **Two claims above that no longer hold.** The colour cast is not gone: both
 frames from that pad session measure B > G > R on snow. And the headline "about
