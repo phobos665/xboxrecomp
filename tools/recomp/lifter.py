@@ -945,7 +945,21 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
 #                  lea ebp, [esp+0x10]    8D 6C 24 10
 #   __SEH_epilog   mov fs:[0], ecx        64 89 0D 00 00 00 00
 #                  leave; push ecx; ret   C9 51 C3
-_SEH_PROLOG_MARKERS = (b"\x64\xa1\x00\x00\x00\x00", b"\x8d\x6c\x24\x10")
+#
+# MSVC ships two of these, not one, and they differ only in how far up the
+# stack the frame lands. __SEH_prolog pushes four dwords and takes ebp to
+# esp+0x10; __EH_prolog -- the C++ exception-handling flavour, emitted for a
+# function with a try block -- pushes three and takes it to esp+0x0C. Matching
+# only the first meant a title built with C++ EH had no prologue detected at
+# all, so nothing ever read the frame back and every caller of it ran on an
+# inherited frame pointer belonging to some outer function. It does not crash
+# there: the caller writes [ebp-40] and reads [ebp-40] and looks fine, while
+# actually scribbling on another function's locals. Outrun 2 surfaced it as a
+# std::map pointer that became null with nothing having written a null --
+# docs/technical/eh-prolog-frames.md has the whole trail.
+_SEH_PROLOG_FS_READ = b"\x64\xa1\x00\x00\x00\x00"
+_SEH_PROLOG_LEAS = (b"\x8d\x6c\x24\x10",   # __SEH_prolog
+                    b"\x8d\x6c\x24\x0c")   # __EH_prolog
 _SEH_EPILOG_MARKERS = (b"\x64\x89\x0d\x00\x00\x00\x00", b"\xc9\x51\xc3")
 
 # Both are tiny; a large match is something else that happens to touch fs:[0].
@@ -956,12 +970,19 @@ _SEH_EPILOG_MAX_SIZE = 64
 def detect_seh_helpers(func_db, xbe_data, verbose=False):
     """Locate __SEH_prolog / __SEH_epilog in the target binary.
 
-    Returns (prolog_addr, epilog_addr); either may be None if not found, which
-    is normal for a title whose CRT does not use them.
+    Returns (prologs, epilogs) as tuples of addresses, either possibly empty,
+    which is normal for a title whose CRT does not use them.
+
+    A title can ship more than one of each. MSVC emits __SEH_prolog for a
+    function that only needs structured exception handling and __EH_prolog for
+    one with C++ exception handling, and anything built from mixed sources
+    links both. Outrun 2 has __SEH_prolog at 0x00185434 and __EH_prolog at
+    0x00185AD0. Returning only the first meant the second was treated as an
+    ordinary call, so none of its callers ever read their frame pointer back.
     """
     from .config import va_to_file_offset
 
-    prolog = epilog = None
+    prologs, epilogs = [], []
 
     def _size_of(info):
         # "end" is a hex string in functions.json but BatchTranslator rewrites
@@ -991,23 +1012,21 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
             continue
         body = xbe_data[offset:offset + size]
 
-        if (prolog is None and size <= _SEH_PROLOG_MAX_SIZE
-                and all(m in body for m in _SEH_PROLOG_MARKERS)):
-            prolog = addr
-        elif (epilog is None and size <= _SEH_EPILOG_MAX_SIZE
+        if (_SEH_PROLOG_FS_READ in body
+                and any(lea in body for lea in _SEH_PROLOG_LEAS)):
+            prologs.append(addr)
+        elif (size <= _SEH_EPILOG_MAX_SIZE
                 and all(m in body for m in _SEH_EPILOG_MARKERS)):
-            epilog = addr
-
-        if prolog is not None and epilog is not None:
-            break
+            epilogs.append(addr)
 
     if verbose:
         import sys
-        fmt = lambda a: f"0x{a:08X}" if a else "not found"
-        print(f"  SEH helpers: __SEH_prolog {fmt(prolog)}, "
-              f"__SEH_epilog {fmt(epilog)}", file=sys.stderr)
+        fmt = lambda xs: (", ".join(f"0x{a:08X}" for a in xs)
+                          if xs else "not found")
+        print(f"  SEH helpers: prologs {fmt(prologs)}, "
+              f"epilogs {fmt(epilogs)}", file=sys.stderr)
 
-    return prolog, epilog
+    return tuple(prologs), tuple(epilogs)
 
 
 # MSVC's setjmp/longjmp pair, found by the "VC20" cookie the CRT stamps into
@@ -1108,12 +1127,21 @@ class Lifter:
 
         # Detect if either is missing, so overriding one does not silently
         # leave the other unset -- that is the bug this whole path fixes.
+        found_prologs = found_epilogs = ()
         if (seh_prolog is None or seh_epilog is None) and self.func_db:
-            found_prolog, found_epilog = detect_seh_helpers(self.func_db, xbe_data)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
-            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.SEH_PROLOG = seh_prolog
-        self.SEH_EPILOG = seh_epilog
+            found_prologs, found_epilogs = detect_seh_helpers(
+                self.func_db, xbe_data)
+
+        def _as_set(override, found):
+            """An explicit address, a list of them, or whatever was detected."""
+            if override is None:
+                return frozenset(found)
+            if isinstance(override, int):
+                return frozenset((override,))
+            return frozenset(override)
+
+        self.SEH_PROLOGS = _as_set(seh_prolog, found_prologs)
+        self.SEH_EPILOGS = _as_set(seh_epilog, found_epilogs)
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
@@ -1933,8 +1961,8 @@ class Lifter:
     # Per-title addresses, detected from the binary by detect_seh_helpers()
     # and assigned to the instance. The class values are only a fallback for
     # callers that construct a Lifter without a function database.
-    SEH_PROLOG = None
-    SEH_EPILOG = None
+    SEH_PROLOGS = frozenset()
+    SEH_EPILOGS = frozenset()
 
     # The CRT's setjmp/longjmp, detected by detect_setjmp_helpers().
     SETJMP_FN = None
@@ -2073,7 +2101,8 @@ class Lifter:
             # stack address where the caller had just zeroed it, so an
             # "if (status < 0)" test against esi failed and XapiInitProcess
             # bailed to the dashboard.
-            if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
+            if (insn.call_target in self.SEH_PROLOGS
+                    or insn.call_target in self.SEH_EPILOGS):
                 lines.insert(0, "g_seh_ebp = ebp; /* publish frame to SEH helper */")
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
@@ -2099,7 +2128,8 @@ class Lifter:
         # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
         # so the caller can read back the frame pointer.
         prefix = ""
-        if self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG):
+        if (self.func_start in self.SEH_PROLOGS
+                or self.func_start in self.SEH_EPILOGS):
             prefix = "g_seh_ebp = ebp; "
         # Exit trace, for functions that return with a register the caller
         # relied on holding something else. Entry tracing alone cannot show

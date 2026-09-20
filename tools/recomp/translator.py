@@ -707,10 +707,10 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
-        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
-        if seh_prolog is None:
+        seh_prologs = getattr(self.lifter, "SEH_PROLOGS", frozenset())
+        if not seh_prologs:
             return False
-        return any(getattr(insn, "call_target", None) == seh_prolog
+        return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
     def translate_function(self, func_addr, func_info):
@@ -892,8 +892,8 @@ class FunctionTranslator:
         # hardcoded to one game's CRT here, so for every other title the forcing
         # silently never fired and the generated C failed to compile with
         # "'ebp': undeclared identifier".
-        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
-                     if a is not None}
+        seh_funcs = (getattr(self.lifter, "SEH_PROLOGS", frozenset())
+                     | getattr(self.lifter, "SEH_EPILOGS", frozenset()))
         if seh_funcs and any(insn.call_target in seh_funcs
                              for insn in instructions):
             used_regs.add("ebp")
