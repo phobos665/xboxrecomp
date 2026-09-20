@@ -131,6 +131,21 @@ Three runs, from "faults on a wild pointer" to "a std::map pointer is null
 and here is the parameter it came in on". The original 0xF8604020 was a red
 herring in its entirety.
 
+## It cannot watch a stack address
+
+Tried on 20 September 2026 and it does not work. The mechanism protects a
+4 KB page, and the guest stack page is touched by every call, every push and
+every local write. Each one faults and single-steps, and Outrun 2 did not
+reach a point 25 seconds into its start-up within 90 seconds of watching one
+stack slot. No reports came out, because the collateral traps are stepped over
+silently by design; it simply never got there.
+
+So a watch is for guest data: heap, globals, image data, device pages. For a
+local, the practical route is the one that worked here -- have the runtime
+print the frame pointer at the moment of interest, work the offset out from
+the lifted code, and read the value from a dump rather than trapping on it.
+The `[THROW]` report prints `esp`, `ebp` and `seh_ebp` for exactly that.
+
 ## What it does not do
 
 It cannot watch an address before guest memory is mapped, it cannot watch

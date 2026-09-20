@@ -141,6 +141,38 @@ Step 1 alone is worth doing before any of the rest, because it turns "the title
 threw and we carried on" into "the title threw and we stopped", which is a
 diagnosable failure instead of silent corruption.
 
+## Why Outrun 2 throws: as far as it is narrowed
+
+The throw is the last thing `sub_001C425B` does, and it is guarded:
+
+```c
+loc_001C47D7:  cmp  MEM32(ebp - 56), ebx      /* ebx is 0 */
+               jne  loc_001C442B              /* -> no throw */
+loc_001C47E0:  cmp  MEM32(ebp - 88), ebx
+               je   loc_001C486A              /* -> no throw */
+loc_001C47E9:  tail jmp the throw helper
+```
+
+So it throws when the local at `ebp - 88` is **non-zero**. The registers at
+the throw confirm `ebx = 0`, so that reading is exact and not a guess about
+what `ebx` held.
+
+The frame is locatable from the report. With `esp = 0x00F7F098` at the throw
+and the two vtable words `0x257398` sixteen bytes apart in the stack window,
+`sub_001C425B`'s `ebp` is `0x00F7F12C`, so the slot is `0x00F7F0D4`. It holds
+**8**, and the word below it at `ebp - 92` holds **0x8288E7C0**, a pointer
+into the contiguous window that `edx` is also carrying at the throw.
+
+Both words are set to zero at function entry and **nothing in the function's
+thousand lines writes either of them again**. So a callee fills them through
+a pointer it was given, and the pair reads like {buffer, count} or
+{data, size}: the function throws when the count is not zero at the end.
+
+That is where the next session should start. The watchpoint cannot help --
+see the note in `docs/technical/memory-watchpoints.md`, a stack page is far
+too hot to trap on -- so the route is to read the six calls that take
+`ecx = ebp - 84` and find which one is handed the pair.
+
 ## The general lesson
 
 A throw that does nothing is worse than a throw that crashes. Three separate

@@ -22,6 +22,11 @@
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* The frame pointers. Lifted functions keep ebp in a local and publish it
+ * here before every call, so at a throw or a fault these still name the frame
+ * of whoever is running -- which is what makes a watchpoint on one of its
+ * locals possible. */
+extern RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
 
 /* A run that recurses produces trace lines without limit, and the useful
  * window is rarely the first few thousand. The budget stops a diagnostic from
@@ -764,6 +769,39 @@ void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va)
         "        execution continues on a stack nothing cleaned up. Treat\n"
         "        anything odd after this line as a consequence, not a new\n"
         "        bug. RECOMP_THROW_FATAL=1 stops here instead.\n");
+    fflush(stderr);
+
+    /* The throwing function's frame is still live -- a throw is reached by a
+     * tail jump, so nothing has returned yet. Print the guest return-address
+     * chain and a window of raw stack, which is what turns "it threw" into
+     * "it threw because this field was set". The chain is recovered the way
+     * the crash handler does it: every lifted call pushes its guest return
+     * address, so code addresses on the stack are the callers. */
+    if (g_esp && guest_readable(g_esp, 64 * 4)) {
+        const uint32_t *sp = (const uint32_t *)(mem + g_esp);
+        int shown = 0;
+
+        /* The throwing function published its frame before the tail jump,
+         * so g_seh_ebp still names it. That is what makes a watchpoint on one
+         * of its locals possible: read the offset off the disassembly, add it
+         * to this, and RECOMP_WATCH_WRITE names whatever set it. */
+        fprintf(stderr, "        esp=0x%08X ebp=0x%08X seh_ebp=0x%08X\n",
+                g_esp, g_ebp, g_seh_ebp);
+        fprintf(stderr, "        eax=0x%08X ebx=0x%08X ecx=0x%08X edx=0x%08X esi=0x%08X edi=0x%08X\n",
+                g_eax, g_ebx, g_ecx, g_edx, g_esi, g_edi);
+        fprintf(stderr, "        callers:");
+        for (i = 0; i < 64 && shown < 6; i++) {
+            uint32_t v = sp[i];
+            if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "%s 0x%08X", shown ? " <-" : "", v);
+                shown++;
+            }
+        }
+        fprintf(stderr, "\n");
+        for (i = 0; i < 32; i += 4)
+            fprintf(stderr, "        [esp+%-3d] %08X %08X %08X %08X\n",
+                    i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
+    }
     fflush(stderr);
 
     if (getenv("RECOMP_THROW_FATAL")) {
