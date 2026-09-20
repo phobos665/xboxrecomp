@@ -338,3 +338,58 @@ a register value rather than from the call site -- is what cost the time.
 - **"`KTHREAD.TlsData` pointed at a scratch buffer."** True, and fixed -- see
   above -- but not the cause. The faulting address moved with the fix, which
   looked like confirmation and was not.
+
+### The null call is object cleanup, and the numbers do not yet reconcile
+
+Instrumenting the allocator (`sub_001497DC`, entry and exit) settled two
+things and opened a third.
+
+**`malloc` is fine.** The allocation in question is `operator new(0x8840)` =
+34,880 bytes, and it returns `0x01054A70` — inside the heap
+(`0x00F81000`–`0x01081000`). Every allocation in the run is in the arena; none
+is below `0x00F80000`. The earlier claim that malloc returned a pointer into
+the TLS region was wrong.
+
+**The constructor writes the vtable.** `RECOMP_WATCH_WRITE` on `0x01054A70`:
+
+```
+write to 0x01054A70 from sub_00012210+0x162
+  0x00000000 -> 0x001C4458
+```
+
+and `0x001C4458` in the image holds `0x00012BF0`, which disassembles to a
+scalar deleting destructor (`mov esi,ecx; call dtor; test [esp+8],1; je;
+push esi; call operator delete`). The call site is `push 1; call [eax]`.
+
+**So `0x0006FA4F` is ordinary cleanup**, not an error path — the function
+allocates an object, uses it, and destroys it through vtable slot 0. The
+string after the vtable, `Z:\Media\Cache\JSRF_FATAL.ERR`, is data belonging to
+that object and not evidence that an error occurred.
+
+### The open contradiction
+
+Two measurements from the same build disagree and have not been reconciled:
+
+- the heap probe says the 34,880-byte allocation returned `0x01054A70`;
+- `RECOMP_WATCH_WRITE` on the global `0x0022FCE0` — which the code sets from
+  that allocation's result — says it is written once, `0 -> 0x00770010`.
+
+`0x00770010` is never returned by any allocation in the run; the probe flags
+anything below `0x00F80000` and printed nothing. So either the global is
+written from a path other than `mov [0x22fce0], eax` at `0x0006FA2C`, or two
+different objects are involved and the destructor runs on the wrong one.
+
+**Resolve that before anything else.** Watch `0x0022FCE0` and the allocator in
+the same run, and print the guest return address on each write to the global.
+Every theory built on top of one of these two numbers without the other has
+been wrong so far.
+
+### Method note
+
+Six hypotheses were measured and rejected in this session: TLS block size, TLS
+index, a subtraction behind a branch that never runs, "the address is an object
+in TLS", `KTHREAD.TlsData` (a real bug, fixed, but not this one), and "malloc
+returns a pointer outside the heap". Each came from reasoning about a register
+value rather than from measuring the thing itself. The two measurements that
+actually moved this forward were a trace build naming the call site and a
+watchpoint naming the writer.
