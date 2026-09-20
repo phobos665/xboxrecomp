@@ -27,6 +27,8 @@ files, so it stays beside the XBE and out of Git, like the analysis JSON.
 """
 
 import argparse
+import pathlib
+import struct
 import collections
 import glob
 import json
@@ -111,12 +113,65 @@ def find_cli(explicit=None):
     return hits[0] if hits else None
 
 
+def title_id(xbe_path):
+    """The XBE certificate's title id, or None.
+
+    Read straight out of the header rather than through tools.xbe_parser: this
+    runs before the pipeline and should not need it. The base address is at
+    +0x104, the certificate pointer at +0x118, and the id 8 bytes into the
+    certificate.
+    """
+    try:
+        data = pathlib.Path(xbe_path).read_bytes()
+        base = struct.unpack_from("<I", data, 0x104)[0]
+        cert = struct.unpack_from("<I", data, 0x118)[0]
+        return struct.unpack_from("<I", data, cert - base + 0x08)[0]
+    except Exception:
+        return None
+
+
+def load_extra(xbe_path, explicit):
+    """Symbols the database cannot provide, supplied by hand.
+
+    XbSymbolDatabase covers Direct3D, DirectSound and the application library.
+    It does not cover the video library, the networking library, or several
+    others, so a title that needs one of those replaced has addresses and no
+    names. This is where those names live: a JSON file in the same shape as
+    the generated one, keyed by title id under config/extra_symbols, holding
+    entries that `scripts/section_calls.py` found and a person then named.
+
+    Per title rather than per XDK version deliberately. A statically linked
+    library lands wherever the linker put it, so its addresses differ between
+    two titles built against the same SDK; only the behaviour is shared.
+    """
+    paths = []
+    if explicit:
+        paths.append(explicit)
+    tid = title_id(xbe_path)
+    if tid is not None:
+        root = pathlib.Path(__file__).resolve().parents[2]
+        paths.append(root / "config" / "extra_symbols" / ("%08X.json" % tid))
+    for path in paths:
+        path = pathlib.Path(path)
+        if not path.is_file():
+            continue
+        data = json.loads(path.read_text(encoding="utf-8"))
+        extra = data.get("symbols", [])
+        print("%d hand-supplied symbol(s) from %s" % (len(extra), path),
+              file=sys.stderr)
+        return extra
+    return []
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("xbe", help="the title's default.xbe")
     ap.add_argument("--cli", help="path to XbSymbolDatabaseCLI")
     ap.add_argument("--out", help="output JSON (default: <xbe stem>_xdk_symbols.json "
                                   "beside the XBE)")
+    ap.add_argument("--extra", help="JSON of hand-supplied symbols to merge, for "
+                                    "libraries the database does not cover "
+                                    "(default: config/extra_symbols/<title id>.json)")
     args = ap.parse_args(argv)
 
     cli = find_cli(args.cli)
@@ -128,7 +183,12 @@ def main(argv=None):
     if run.returncode != 0:
         sys.exit(f"{cli} exited {run.returncode}: {run.stderr.strip()[:400]}")
 
-    symbols = sorted(parse_output(run.stdout), key=lambda s: s["address"])
+    symbols = parse_output(run.stdout)
+    known = {s["address"] for s in symbols}
+    for sym in load_extra(args.xbe, args.extra):
+        if sym.get("address") not in known:
+            symbols.append(sym)
+    symbols.sort(key=lambda s: s["address"])
     if not symbols:
         sys.exit("no symbols recognised -- is this an XBE the database covers?")
 
