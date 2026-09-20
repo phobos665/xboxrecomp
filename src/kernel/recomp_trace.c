@@ -597,11 +597,21 @@ void recomp_trace_esp(const char *name, const char *tag)
  * kernel_bridge.c and nv2a_pb_replay.c already do. */
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* Set by recomp_debug_service and consumed by recomp_int3_reached.
+ *
+ * The kernel debug trap is `int 0x2d` followed by an int3 that the kernel
+ * skips over. That int3 is not a breakpoint and must not be reported. Every
+ * other int3 lifted code actually reaches is real, and used to vanish into a
+ * comment. */
+static RECOMP_TLS int g_after_debug_service;
+
 void recomp_debug_service(uint32_t service, uint32_t arg_va)
 {
     const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
     uint16_t length;
     uint32_t buffer_va;
+
+    g_after_debug_service = 1;
 
     if (service != 1) {
         fprintf(stderr, "[GUEST] DebugService %u (arg 0x%08X), ignored\n",
@@ -621,5 +631,56 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
     fprintf(stderr, "[GUEST] %.*s", (int)length, (const char *)(mem + buffer_va));
     if (length && ((const char *)(mem + buffer_va))[length - 1] != '\n')
         fputc('\n', stderr);
+    fflush(stderr);
+}
+
+/* ---------------------------------------------------------------------------
+ * An int3 that lifted code actually executed.
+ *
+ * Most int3 bytes in an image are padding between functions and are never
+ * reached, and the one after `int 0x2d` is the kernel debug trap's slide byte,
+ * which the kernel skips. Those are handled above and stay silent.
+ *
+ * The rest matter, and used to be emitted as a comment and nothing else. MSVC
+ * puts an int3 after any call it believes cannot return, and the most common
+ * of those is `_CxxThrowException`. So a title that throws a C++ exception
+ * runs off the end of the throw helper, over the trap, and carries on with a
+ * stack the throw never unwound. Nothing says a word.
+ *
+ * Outrun 2 does exactly that during start-up: sub_001C425B tail-jumps to a
+ * helper that throws a `char` of value 0x21, and every strange thing after it
+ * is downstream of that. See docs/technical/cpp-exceptions.md.
+ *
+ * Reported once per address, because a throw inside a loop is still one bug.
+ * ------------------------------------------------------------------------- */
+void recomp_int3_reached(uint32_t va)
+{
+    enum { SLOTS = 32 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    int i;
+
+    /* The slide byte after a kernel debug print. Expected, not a breakpoint. */
+    if (g_after_debug_service) {
+        g_after_debug_service = 0;
+        return;
+    }
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            return;
+    if (count < SLOTS)
+        seen[count++] = va;
+
+    fprintf(stderr,
+        "[INT3] lifted code reached a debug trap at 0x%08X and stepped over "
+        "it.\n"
+        "       MSVC emits one after a call it thinks cannot return, so this "
+        "is\n"
+        "       usually a C++ throw that this runtime did not unwind. "
+        "Execution\n"
+        "       continues on a stack nothing cleaned up, so treat anything "
+        "odd\n"
+        "       after this line as a consequence, not a new bug.\n", va);
     fflush(stderr);
 }

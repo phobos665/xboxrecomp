@@ -78,6 +78,10 @@
  * with STATUS_BREAKPOINT the first time a title tried to print. */
 void recomp_debug_service(uint32_t service, uint32_t arg_va);
 
+/* An int3 that lifted code actually executed: almost always an un-unwound
+ * C++ throw. Silent before; see docs/technical/cpp-exceptions.md. */
+void recomp_int3_reached(uint32_t va);
+
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
  * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
 #if !defined(_MSC_VER) && !defined(__debugbreak)

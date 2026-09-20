@@ -1338,7 +1338,14 @@ class Lifter:
         if m == "int" and ops and ops[0].type == "imm" and ops[0].imm == 0x2D:
             return ["recomp_debug_service(eax, ecx); /* int 0x2d */"]
         if m == "int3":
-            return ["/* int3: debug-trap slide byte, stepped over */"]
+            # Still stepped over -- a __debugbreak() here kills the process
+            # with STATUS_BREAKPOINT and no message, which is how Wreckless
+            # died after a full boot. But say so. The slide byte after
+            # `int 0x2d` is filtered at run time, so what gets reported is a
+            # trap the title genuinely reached, which is nearly always a C++
+            # throw this runtime cannot unwind.
+            return [f"recomp_int3_reached(0x{insn.address:08X}U);"
+                    " /* int3, stepped over */"]
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
         if m in ("cld", "std"):
