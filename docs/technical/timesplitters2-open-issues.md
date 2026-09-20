@@ -48,12 +48,12 @@ whole story either.
 
 ---
 
-### Corrected, 20 September 2026: not a colour grade, and not the quads either
+### Measured live, 20 September 2026: the heading above is right, and constant
 
-**It is motion-dependent.** From a pad session: standing still the picture is
-right, and it darkens as soon as the camera or the player moves. That single
-observation reframes everything above, because it says what *correct* looks
-like.
+**There is no motion dependence.** It was reported from a pad session — the
+picture looking right standing still and darkening on the move — and most of
+this section was written around it. Measured, it is not there. What follows is
+what the running title actually does.
 
 The quads' shader was identified properly rather than guessed (see
 `RECOMP_D3D8_PS_DUMP=<n>` and the `binding shader <hash>` line it now prints;
@@ -66,10 +66,17 @@ result.rgb = saturate(2 * v0.rgb * t0.rgb)   /* v0 = 0x7F7F7F, so ~ t0 */
 result.a   = 2 * v0.a                        /* the blend weight */
 ```
 
-With SRCALPHA/INVSRCALPHA that is `out = t0*a + dst*(1-a)`. **If `t0` is the
-screen, `out = dst` exactly.** The pass blends the screen back over itself and
-is a no-op while nothing moves; it only shows when the copy stops matching the
-screen, which is to say it is a motion blur. The combiner program is right.
+With SRCALPHA/INVSRCALPHA that is `out = t0*a + dst*(1-a)`. On paper, if `t0`
+were the finished screen this would be a no-op — which is what suggested a
+motion blur. It is not a no-op in practice, and that gap is the live lead: the
+passes remove a third to two thirds of the light every frame.
+
+The texture coordinates say what the pass more likely is. The offsets on those
+quads are `3ACCCCCD` and `3B088889`, which are exactly `1/640` and `1/480` — a
+fixed one-texel step. Three passes at a fixed small offset with descending
+alpha (0x34, 0x3F, then 0x0A–0x19) is the shape of a bloom or glow, not of a
+velocity-driven motion blur, and nothing here samples depth, so it is not depth
+of field either. Stage 1 is a 1x1 white texture.
 
 **Do not measure these draws in a replay.** `src/replay` never calls
 `xbox_D3D8CopyBackBufferToTexture` — the copy is done in `src/hle` — so a
@@ -92,26 +99,46 @@ which returns `tex->sys_mem`, the upload shadow; the copy writes the GPU
 resource through a render target view and never touches it, so it reads zeros
 either way. Read a readback path before believing a readback.
 
-**So what is still unexplained.** The motion dependence is reported from a pad
-session and is not in doubt, but no mechanism for it survives yet. The quads
-sample the current frame, not the previous one, which makes them a no-op rather
-than the motion blur they are presumably meant to be — so a fair guess is that
-they are not the cause of the brightness change at all, and something else that
-correlates with movement is. The next measurement is the quads' *live*
-contribution: draw a frame with them and without, still and moving, from the
-same viewpoint. Nothing about this should be concluded from a capture.
+**The loss is constant, and that is the measurement to keep.** With both probes
+at the same interval, over a driven session holding still and then moving in
+one level:
 
-**Screenshots need the scene held constant.** The first still/moving pair
-collected for this was taken standing inside a tunnel versus out in the open,
-so the whole-frame means differed by 30–90% on scene content alone and said
-nothing about motion. A usable pair is the same view, one still and one moving;
-failing that, measure something at a fixed screen position, such as the weapon
-HUD.
+| block | scene before | frame after | ratio | stdev |
+| --- | --- | --- | --- | --- |
+| still, 2200 swaps | 57.2 | 20.8 | 0.363 | **0.0016** |
+| moving | 110–138 | 43–48 | 0.35–0.42 | 0.02–0.04 |
 
-**Two claims above that no longer hold.** The colour cast is not gone: both
-frames from that pad session measure B > G > R on snow. And the headline "about
-a third of xemu's brightness" is a figure taken while moving; standing still it
-is much closer.
+The ratio does not step. It holds 0.363 standing still, to within a standard
+deviation of 0.0016, and wanders without direction between 0.35 and 0.42 on the
+move. What changes is the scene feeding the passes — 57 still against 110–138
+moving, a 2.4x swing — which is the view changing as the player looks around,
+not motion acting on the rendering. That is also why the reported direction
+flipped from "moving is darker" to "moving is lighter" mid-investigation: both
+were readings of where the camera happened to point.
+
+The size of the loss is level-specific: ratio about 0.62 on the snow level,
+0.53 on another, 0.367 on a third. Constant within a level, different between
+them.
+
+**So the heading of this section was right all along**, and the motion framing
+added earlier today was wrong. The bug is a fixed 36–63% of the light removed
+by three full-screen passes in every frame. That is a better bug than an
+intermittent one, and it is now two numbers in a log rather than a screenshot
+argument.
+
+**Next.** A switch to skip those three draws. If the frame goes from 20.8 back
+to about 57 with them gone, they own the loss outright and the question becomes
+what they are meant to compute — bloom or glow being the working theory. It
+doubles as a temporary workaround: no glow, correct brightness.
+
+**Screenshots need the scene held constant, and are the wrong tool here.** The
+first still/moving pair collected for this was taken standing inside a tunnel
+versus out in the open, so the whole-frame means differed by 30–90% on scene
+content alone and said nothing about motion. The probes answer the same
+question without the confound; prefer them.
+
+**One claim above that no longer holds.** The colour cast is not gone: frames
+from the pad session measure B > G > R on snow.
 
 ## 2. A grey line across part of the screen
 

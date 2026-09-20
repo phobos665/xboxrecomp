@@ -74,6 +74,10 @@ static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
 
+/* Stage 0 currently holds the title's own frame; see SetTexture below and
+ * hle_d3d8_stage0_is_framebuffer(). */
+static int g_stage0_framebuffer;
+
 static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev);
 
 static unsigned long g_bound_count, g_uploads, g_reuploads, g_skip_type,
@@ -738,6 +742,18 @@ HLE_EXPORT(D3DDevice_SetTexture)
             host = host_texture(dev, texture);
         }
         g_bound[stage] = host;
+        if (stage == 0) {
+            /* Whether this draw is one of the title's full-screen passes over
+             * its own frame. Nothing else binds the frame buffer as stage 0,
+             * so it identifies them without matching a shader or a size. */
+            int i;
+            g_stage0_framebuffer = 0;
+            for (i = 0; host && i < g_texture_count; i++)
+                if (g_textures[i].host == host && g_textures[i].framebuffer) {
+                    g_stage0_framebuffer = 1;
+                    break;
+                }
+        }
         /* The host pixel shader samples every stage whatever its operation
          * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
          * stage with no host texture would turn the draw black once the
@@ -750,4 +766,14 @@ HLE_EXPORT(D3DDevice_SetTexture)
         report();
     }
 #endif
+}
+
+/* Does the draw about to be made sample the title's own frame at stage 0?
+ *
+ * That is what its full-screen passes do and what nothing else does, so it
+ * identifies them without having to match a shader hash or a vertex count.
+ * hle_d3d8.c uses it for RECOMP_HLE_D3D8_SKIP_FULLSCREEN. */
+int hle_d3d8_stage0_is_framebuffer(void)
+{
+    return g_stage0_framebuffer;
 }

@@ -637,6 +637,10 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev);
 static unsigned long g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
                      g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                      g_draws_stride, g_draws_primitive, g_draws_failed;
+/* Dropped by RECOMP_HLE_D3D8_SKIP_FULLSCREEN; see the draw gate. */
+static unsigned long g_skipped_fullscreen;
+/* From hle_d3d8_texture.c: stage 0 holds the title's own frame. */
+int hle_d3d8_stage0_is_framebuffer(void);
 /* Draws arriving on a guest thread other than the one that swaps. A loader
  * thread drawing to warm caches puts geometry through the host that no
  * presented frame ever contains -- it would count as drawn and never show. */
@@ -694,6 +698,26 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
             return 0;
         }
         shadow_use_viewport(0);
+    }
+    /* RECOMP_HLE_D3D8_SKIP_FULLSCREEN=1: drop the title's full-screen passes
+     * over its own frame -- the draws that sample the frame buffer at stage 0.
+     *
+     * This is a measurement, and a crude workaround. Those passes remove a
+     * fixed share of the light in every frame (0.62 of it on TimeSplitters 2's
+     * snow level, 0.367 on another, constant within a level to a standard
+     * deviation of 0.002), which is the brightness bug in
+     * docs/technical/timesplitters2-open-issues.md. Turning them off says
+     * whether they own that loss outright, and gives a bright picture without
+     * whatever they were for -- bloom or glow, on the evidence of a fixed
+     * one-texel offset repeated three times with descending alpha. */
+    {
+        static int skip = -1;
+        if (skip < 0)
+            skip = getenv("RECOMP_HLE_D3D8_SKIP_FULLSCREEN") ? 1 : 0;
+        if (skip && hle_d3d8_stage0_is_framebuffer()) {
+            g_skipped_fullscreen++;
+            return 0;
+        }
     }
     /* The title's render and texture stage states as they stand now, read
      * from its own state arrays (hle_d3d8_state.c). */
@@ -1204,6 +1228,10 @@ HLE_EXPORT(D3DDevice_Swap)
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
+            if (g_skipped_fullscreen)
+                fprintf(stderr, "[HLE-D3D8] shadow: %lu full-screen passes over the "
+                        "title's own frame dropped (RECOMP_HLE_D3D8_SKIP_FULLSCREEN)\n",
+                        g_skipped_fullscreen);
             swap_timing_report();
             if (g_slot_reloads)
                 fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads answered from "
