@@ -1024,8 +1024,8 @@ RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
  * than inventing a caller. */
 RECOMP_TLS uint32_t g_icall_saved_esp = 0;
 
-/* 1 when the refused dispatch was an indirect jump rather than a call. */
-RECOMP_TLS uint32_t g_icall_was_tail = 0;
+/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump. */
+RECOMP_TLS uint32_t g_icall_dispatch_form = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 #ifdef RECOMP_ABI_CHECK
