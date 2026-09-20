@@ -1015,10 +1015,26 @@ static void bridge_NtFreeVirtualMemory(void)
      * the pages to stay reserved but unbacked, which a bump allocator that
      * commits everything cannot express -- so it succeeds and keeps the
      * block, which is the conservative answer. */
-    if (free_type & 0x8000u) {
-        xbox_HeapFree(base_va);
-        if (base_ptr) BRIDGE_MEM32(base_ptr) = 0;
-        if (size_ptr) BRIDGE_MEM32(size_ptr) = 0;
+    /* RECOMP_NTFREE_LEGACY=1 keeps the block instead of returning it, which is
+     * what this did before it called xbox_HeapFree at all. Reclaiming memory
+     * is correct, but it makes the guest heap reuse addresses it never reused
+     * before, so a title that was quietly surviving a use-after-free stops
+     * surviving it. When a title regresses right after this landed, this
+     * switch says whether this is why in one run. */
+    {
+        static int legacy = -1;
+        if (legacy < 0) {
+            const char *v = getenv("RECOMP_NTFREE_LEGACY");
+            legacy = v && *v && *v != '0';
+            if (legacy)
+                fprintf(stderr, "  [KERNEL] RECOMP_NTFREE_LEGACY: "
+                                "NtFreeVirtualMemory keeps the block\n");
+        }
+        if (!legacy && (free_type & 0x8000u)) {
+            xbox_HeapFree(base_va);
+            if (base_ptr) BRIDGE_MEM32(base_ptr) = 0;
+            if (size_ptr) BRIDGE_MEM32(size_ptr) = 0;
+        }
     }
 
     g_eax = 0; /* STATUS_SUCCESS */
