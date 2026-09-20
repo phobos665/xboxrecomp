@@ -18,5 +18,9 @@
  {
   "start": "0x00307525",
   "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000AD230",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
  }
 ]

@@ -142,15 +142,56 @@ sub_0015FCC0 -> sub_0015FC40 -> sub_0015FD40 -> sub_00160EA0
   and the code path in one go, after the symbol had sent two attempts the wrong
   way.
 
-### Where to pick it up
+### Found: a LOCK prefix cost the refcount its branch
 
-Find out why the block is freed twice. The sharpest next step is to instrument
-the entry of `sub_0017C965` — the `free` in the chain above — to record every
-pointer it is given and report the second free of the same one with both call
-sites. That distinguishes one call site freeing twice from two sites freeing
-the same block, which are different bugs.
+Instrumenting `free`'s entry gave both call sites, and from there the answer
+was one line of generated code. The objects are reference counted through the
+COM idiom:
 
-Worth holding in mind: nothing yet proves the double free is the title's own
-logic rather than a consequence of a wrong value from somewhere. The first
-theory here (the C++ exception) was exactly that shape and turned out to be a
-real bug that was not the cause.
+```
+lock xadd [this+8], edx   ; edx = -1, so refcount--
+jne  still_referenced     ; sum non-zero: somebody else still holds it
+push 1
+call [vtable+0x48]        ; deleting destructor, flags=1: destruct AND delete
+```
+
+which lifted to `if (_flags) goto still_referenced;` — and `_flags` is declared
+`int _flags = 0` in every generated function and assigned nowhere. The branch
+could never be taken, so **every `Release()` destroyed the object however many
+references remained**, and the next `Release()` freed it a second time.
+
+The cause was `"lock xadd"` sitting in the lifter's `_FLAGS_UNDEFINED`,
+described as "complex flag behavior". LOCK changes atomicity, not arithmetic:
+a locked instruction leaves exactly the flags its unlocked form leaves. The
+prefix is now stripped where flags are tracked. `"lock cmpxchg"` had the
+quieter half of the same bug — it matched no list at all, so the *previous*
+instruction's flags were left standing as if they were its own.
+
+**It was never JSRF-specific.** Counting locked atomics across the titles
+lifted here: 87 in JSRF, 56 in Panzer Dragoon Orta, 50 in Marvel vs Capcom 2,
+5 each in Black and Burnout 2, and **none at all in TimeSplitters 2 or Outrun
+2** — which is why TimeSplitters 2 was unaffected and could never have
+revealed this.
+
+### Where it stops now
+
+Past the hang, and a long way past it. The title runs through XAPI start-up,
+loads its input bindings, opens a pad, starts the APU, finds both DSP
+doorbells and has DirectSound playing four buffers at 48 kHz. It then makes
+two indirect calls through pointers that are not code —
+
+```
+[ICALL] target 0x01054A70 is not code (call #1297)
+[ICALL] target 0x00000000 is not code (call #1298)
+```
+
+— and writes a launch data page naming its own title ID with an empty path,
+which `HalReturnToFirmware` routine 2 turns into an exit. The header layout is
+confirmed against Cxbx-Reloaded's `LAUNCH_DATA_HEADER`
+(`dwLaunchDataType`, `dwTitleId`, `szLaunchPath[520]`), so the fields are being
+read correctly; `type=1` is not one of its four documented constants.
+
+Those two wild pointers are the next thing. The first is a heap address, which
+means a vtable slot or callback holding data rather than a function — the same
+shape as an object used after it was destroyed, so it is worth checking
+whether any premature destruction survives the fix before looking further.
