@@ -29,6 +29,11 @@
  * data in edx, and for the NotInline pair a count of floats on the stack.
  * The register is already 0..191, the host's range; Cxbx-Reloaded subtracts
  * 96 on the way in only because its shared setter adds it back.
+ *
+ * XDK 3925 has only that shared setter, D3DDevice_SetVertexShaderConstant,
+ * and it is the exception to the line above: its register is -96-based and
+ * the XDK biases it itself, so the replacement at the bottom of this file
+ * adds 96 to reach the same range the fastcall ones already arrive in.
  */
 #include "platform/xbox_winnt.h"
 #include <stdio.h>
