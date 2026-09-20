@@ -118,6 +118,16 @@ is 5 ms now and its shape has changed; the old ranking was taken at 21 ms.
   apparently the level's opening cutscene. This is why walking to a reported
   spot has to be done by hand.
 
+  **Re-test this (20 Sep 2026).** A lifter bug found while chasing the right
+  stick fits this description better than a cutscene does: `movsx r32, bp` was
+  lifted as a zero extension, and this title's pad handler is the one place
+  that reads right-stick X through `bp`. A zero-extended axis saturates and
+  defeats the title's own deadzone, which looks exactly like "the pad is read
+  and the camera does not move". The 32767 in the note above was read from the
+  binding layer, which was never wrong -- the sign was dropped afterwards, in
+  the title's own lifted code, where no input log can see it. Fixed and
+  re-lifted; nobody has re-run the scripted path since.
+
 ---
 
 ## What is worth knowing before touching any of it

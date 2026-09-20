@@ -302,6 +302,7 @@ found in three runs once the tools existed.
 | `[THROW] the title threw a C++ exception` | This runtime cannot unwind, so the throw **returns** and everything after it runs on a stack nothing cleaned up. Rerun with `RECOMP_THROW_FATAL=1` and treat that as the real stopping point. `docs/technical/cpp-exceptions.md` |
 | `[INT3] lifted code reached a debug trap` | The same thing seen one step later, when the throw helper was not identified. MSVC puts a trap after any call it thinks cannot return |
 | A hang with `[ICALL] target 0x... is not code` repeating | A skipped indirect call returns eax = 0, which is also S_OK, so a COM-shaped loop never exits. The runtime says so after 100,000 skips; `RECOMP_ICALL_SPIN_FATAL=1` stops there. Try `py -3 -m tools.seed_from_log` on the log |
+| A signed quantity is never negative — an axis saturates, a delta only grows, an abs is a no-op | A lifter sign-extension gap. `movsx r32, bp` was lifted as a zero extension until 20 Sep 2026, because `_lift_movsx`'s register list was missing `bp`/`sp` and the unmatched case fell through to the plain (zero-extended) read. Grep the generated C for `= LO16(` or `= LO8(` as a whole right-hand side: a bare narrow read where a `SX16`/`SX8` belongs. `movsx` now emits `/* movsx: unhandled source register */` rather than failing silently |
 
 Overrides live in `recomp_manual.c` and are checked before the auto-generated table, so they
 always win. `manual_scan.py` parses that file to decide what not to generate, so keep them

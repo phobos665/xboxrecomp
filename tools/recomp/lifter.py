@@ -1824,8 +1824,16 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
+            else:
+                # movsx's source is always narrower than its destination, so a
+                # register that matches neither list is a gap in these lists and
+                # not a legitimate case. Say so in the output: the bug this
+                # replaces was silent, because falling through here emits the
+                # plain LO16()/LO8() read and drops the sign without a trace.
+                return [_fmt_operand_write(ops[0], src)
+                        + f" /* movsx: unhandled source register {r}, sign NOT extended */"]
         return [_fmt_operand_write(ops[0], src)]
 
     def _lift_lea(self, insn, ops):
