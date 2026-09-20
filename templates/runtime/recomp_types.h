@@ -314,6 +314,14 @@ extern volatile uint64_t g_icall_count;
  * Implement this in your game-specific code to log diagnostics.
  * The va parameter is the Xbox VA that failed to resolve.
  */
+/* The guest esp at the moment an indirect call was refused, so the log can
+ * name the call site. The top of the guest stack is a return address in
+ * every form: the one the call site just pushed for RECOMP_ICALL and
+ * RECOMP_ICALL_SAFE, and the current frame's own for RECOMP_ITAIL, which
+ * pushes nothing. Set here rather than passed, so a title whose generated
+ * header predates this still compiles and simply reports no callers. */
+extern RECOMP_TLS uint32_t g_icall_saved_esp;
+
 void recomp_icall_fail_log(uint32_t va);
 
 /* Report an indirect call whose target is not code (a null or wild
@@ -914,6 +922,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
@@ -985,6 +994,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
@@ -1003,6 +1013,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 

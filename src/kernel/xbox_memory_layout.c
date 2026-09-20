@@ -1014,6 +1014,15 @@ uint32_t xbox_CurrentThreadObject(void)
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+
+/* The guest esp an indirect-call dispatch captured, for the diagnostics that
+ * need the call site. g_esp is not it: a lifted caller pushes its return
+ * address onto a *local* esp and only syncs g_esp at certain points, so by
+ * the time a refused call is reported g_esp is stale and reads as 0. The
+ * dispatch macros set this to the esp they were handed; a title whose
+ * generated header predates them leaves it 0, and the log says so rather
+ * than inventing a caller. */
+RECOMP_TLS uint32_t g_icall_saved_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 #ifdef RECOMP_ABI_CHECK
