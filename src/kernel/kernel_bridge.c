@@ -977,14 +977,51 @@ static void bridge_NtQueryVirtualMemory(void)
     g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
+/*
+ * The allocating side of this pair hands out guest VAs from xbox_HeapAlloc.
+ * This used to free them through the host path in kernel_memory.c, which
+ * calls VirtualFree on the address -- and guest RAM is a file mapping, so
+ * VirtualFree always fails there. The allocation was therefore never
+ * reclaimed and the call reported STATUS_UNSUCCESSFUL.
+ *
+ * That is not a slow leak, it is a hard stop. The XDK's RtlFreeHeap frees a
+ * large block by calling NtFreeVirtualMemory and returns FALSE when it fails,
+ * so the CRT's free() silently does nothing. Mortal Kombat: Deadly Alliance
+ * sizes its heaps by allocating 29 MB, freeing it, and allocating it again:
+ * the second allocation returned NULL, every heap it then built was empty,
+ * and the title spun forever waiting on a load that could never be queued.
+ *
+ * MmFreeContiguousMemory next door always did the right thing. Match it.
+ */
 static void bridge_NtFreeVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+    uint32_t base_va = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    if (KERNEL_LOG_ON()) {
+        fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X type=0x%X\n",
+                base_va, free_type);
+        fflush(stderr);
+    }
+
+    if (!base_va) {
+        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
+    /* MEM_RELEASE (0x8000) returns the block. MEM_DECOMMIT (0x4000) asks for
+     * the pages to stay reserved but unbacked, which a bump allocator that
+     * commits everything cannot express -- so it succeeds and keeps the
+     * block, which is the conservative answer. */
+    if (free_type & 0x8000u) {
+        xbox_HeapFree(base_va);
+        if (base_ptr) BRIDGE_MEM32(base_ptr) = 0;
+        if (size_ptr) BRIDGE_MEM32(size_ptr) = 0;
+    }
+
+    g_eax = 0; /* STATUS_SUCCESS */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
@@ -9511,6 +9548,68 @@ static void kernel_watch_arm_once(void)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
 
+/* ── RECOMP_KERNEL_CALLERS=<ordinal> ──────────────────────────────────────
+ * "Which ordinal" is answered by the periodic summary; "from where" was not.
+ * A title that sits still is usually spinning on one kernel call from one or
+ * two call sites, and the call sites are what turn a hot ordinal into a
+ * function to read. Tally the guest return address for one chosen ordinal
+ * and rank the sites alongside the summary. */
+#define KCALLER_SLOTS 16
+static uint32_t g_kcaller_ordinal = 0xFFFFFFFFu;
+static uint32_t g_kcaller_va[KCALLER_SLOTS];
+static unsigned long long g_kcaller_hits[KCALLER_SLOTS];
+static unsigned long long g_kcaller_other;
+
+static void kcaller_arm_once(void)
+{
+    static int done;
+    const char *env;
+    if (done)
+        return;
+    done = 1;
+    env = getenv("RECOMP_KERNEL_CALLERS");
+    if (env && *env)
+        g_kcaller_ordinal = (uint32_t)strtoul(env, NULL, 0);
+}
+
+static void kcaller_record(uint32_t va)
+{
+    int i;
+    for (i = 0; i < KCALLER_SLOTS; i++) {
+        if (g_kcaller_va[i] == va) { g_kcaller_hits[i]++; return; }
+        if (g_kcaller_hits[i] == 0) {
+            g_kcaller_va[i] = va; g_kcaller_hits[i] = 1; return;
+        }
+    }
+    g_kcaller_other++;
+}
+
+static void kcaller_report(void)
+{
+    static unsigned char shown[KCALLER_SLOTS];
+    int r, n;
+
+    if (g_kcaller_ordinal == 0xFFFFFFFFu)
+        return;
+    memset(shown, 0, sizeof shown);
+    for (n = 0; n < 6; n++) {
+        int best = -1;
+        for (r = 0; r < KCALLER_SLOTS; r++)
+            if (g_kcaller_hits[r] && !shown[r]
+                && (best < 0 || g_kcaller_hits[r] > g_kcaller_hits[best]))
+                best = r;
+        if (best < 0)
+            break;
+        shown[best] = 1;
+        fprintf(stderr, "  [KERNEL]   ordinal %u called from 0x%08X x%llu\n",
+                g_kcaller_ordinal, g_kcaller_va[best],
+                (unsigned long long)g_kcaller_hits[best]);
+    }
+    if (g_kcaller_other)
+        fprintf(stderr, "  [KERNEL]   ordinal %u from %llu more sites (table full)\n",
+                g_kcaller_ordinal, (unsigned long long)g_kcaller_other);
+}
+
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
@@ -9541,6 +9640,10 @@ static void kernel_thunk_dispatch(void)
      * used to do exactly that and reported every wait as being called from
      * the object it was waiting on. */
     g_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+
+    kcaller_arm_once();
+    if (ordinal == g_kcaller_ordinal)
+        kcaller_record(g_kernel_caller);
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -9583,6 +9686,7 @@ static void kernel_thunk_dispatch(void)
                             (unsigned long long)g_ordinal_calls[best]);
                 }
             }
+            kcaller_report();
             fflush(stderr);
             last_summary_tick = now;
         }
