@@ -115,6 +115,21 @@ static BOOL combiner_state_equal(const NV2ACombinerState *a,
     return memcmp(a, b, NV2A_COMBINER_KEY_BYTES) == 0;
 }
 
+/* How many generated shaders RECOMP_D3D8_PS_DUMP asks to see, and whether it
+ * was asked for at all. The switch used to be a flag that meant "two"; a
+ * count is what it always wanted to be, and a bare RECOMP_D3D8_PS_DUMP=1
+ * still gives a useful dump, just of one shader rather than two. */
+static int ps_dump_limit(void)
+{
+    const char *v = getenv("RECOMP_D3D8_PS_DUMP");
+    int n;
+
+    if (!v || !*v)
+        return 0;
+    n = atoi(v);
+    return n > 0 ? n : 2;
+}
+
 /* The shader for g_combiner_state as last parsed. The lookup hashes ~1.5 KB
  * per call and was the largest host-side symbol in TimeSplitters 2's
  * profile; the state only changes when a PS render state does, so the
@@ -951,18 +966,28 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
     }
 
     {
-        /* Debug switch, RECOMP_D3D8_PS_DUMP=1: prints the first two
-         * shaders built. The source is otherwise only printed when the
-         * compile fails, which says nothing about a shader that compiles and
-         * draws the wrong colour. */
-        static int dumps = -1;
+        /* Debug switch, RECOMP_D3D8_PS_DUMP=<n>: prints the source of the
+         * first n shaders built (n defaults to 2). The source is otherwise
+         * only printed when the compile fails, which says nothing about a
+         * shader that compiles and draws the wrong colour.
+         *
+         * This is called on a cache miss, so the order here is the order
+         * shaders are *built*, which is not the order they are drawn with and
+         * not the title's own pixel shader numbering. Reading a dump as
+         * belonging to a particular draw is therefore a guess -- one that
+         * cost a wrong diagnosis of the TimeSplitters 2 brightness bug. The
+         * hash below is the same value d3d8_combiners_apply() prints when it
+         * binds a shader, so draw and source can be matched instead. */
+        static int dumped, limit = -1;
 
-        if (dumps < 0)
-            dumps = getenv("RECOMP_D3D8_PS_DUMP") ? 0 : 99;
-        if (dumps < 2) {
-            dumps++;
-            fprintf(stderr, "NV2A combiners: state stages %d, tex_mode %d %d %d %d, "
+        if (limit < 0)
+            limit = ps_dump_limit();
+        if (dumped < limit) {
+            dumped++;
+            fprintf(stderr, "NV2A combiners: shader %08lX: state stages %d, "
+                    "tex_mode %d %d %d %d, "
                     "c0[0] 0x%08lX c1[0] 0x%08lX, final_c0 0x%08lX final_c1 0x%08lX\n",
+                    (unsigned long)combiner_state_hash(state),
                     state->num_stages, (int)state->tex_mode[0], (int)state->tex_mode[1],
                     (int)state->tex_mode[2], (int)state->tex_mode[3],
                     (unsigned long)state->c0[0], (unsigned long)state->c1[0],
@@ -1181,6 +1206,29 @@ BOOL d3d8_combiners_prepare_draw(void)
     if (!g_last_shader)
         g_last_shader = d3d8_combiners_get_shader(&g_combiner_state);
     ps = g_last_shader;
+
+    /* Under RECOMP_D3D8_PS_DUMP, say which shader each draw actually binds.
+     * Printed only when it changes, so the log stays readable and still
+     * interleaves with the replay's own per-draw lines: that pairing is what
+     * identifies the shader behind a particular draw, which the dump order
+     * on its own does not. */
+    if (ps) {
+        static int want = -1;
+        static uint32_t last_printed;
+        uint32_t hash;
+
+        if (want < 0)
+            want = ps_dump_limit() > 0;
+        if (want) {
+            hash = combiner_state_hash(&g_combiner_state);
+            if (hash != last_printed) {
+                last_printed = hash;
+                fprintf(stderr, "NV2A combiners: binding shader %08lX\n",
+                        (unsigned long)hash);
+                fflush(stderr);
+            }
+        }
+    }
     if (!ps) {
         fprintf(stderr, "NV2A combiners: Failed to get shader, "
                 "falling back to FFP\n");
