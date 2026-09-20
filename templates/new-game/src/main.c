@@ -240,7 +240,7 @@ static void print_guest_context(void *rip)
          * loaded out of is usually sitting in the frame -- invisible in
          * the filtered list above, which keeps only code addresses. */
         fprintf(stderr, "  guest stack (raw):\n");
-        for (i = 0; i < 16; i += 4)
+        for (i = 0; i < 48; i += 4)
             fprintf(stderr, "    [esp+%-3d] %08X %08X %08X %08X\n",
                     i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
     }
