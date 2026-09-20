@@ -53,10 +53,36 @@ static int input_log_wanted(void)
     return wanted;
 }
 
+/* RECOMP_INPUT_CAPS=zero -- report the pad's controls as absent, the way this
+ * file did before September 2026. Kept as a switch because "does this title
+ * believe XInputGetCapabilities?" is a question worth being able to ask
+ * again without a rebuild. */
+static int zeroed_capabilities_wanted(void)
+{
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *v = getenv("RECOMP_INPUT_CAPS");
+        wanted = v && strcmp(v, "zero") == 0;
+    }
+    return wanted;
+}
+
 HLE_IMPORT_VAR(g_DeviceType_Gamepad);
 
+/* XINPUT_CAPABILITIES is
+ *      BYTE Type; BYTE SubType; WORD Reserved;   -- 4 bytes
+ *      union { XINPUT_GAMEPAD Gamepad; ... } In; -- 18 bytes, at offset 4
+ *      union { XINPUT_RUMBLE Rumble; }      Out; --  4 bytes, at offset 22
+ * so 26 bytes, not 25. In and Out are not a *state*: each field is a mask
+ * saying whether that control exists and at what resolution, so 0xFF there
+ * means "present, full range" and 0 means "this pad has no such control".
+ * Cxbx-Reloaded fills the whole In+Out block with 0xFF for the same reason. */
 enum {
-    CAPABILITIES_SIZE = 25u,          /* XINPUT_CAPABILITIES */
+    CAPABILITIES_SIZE = 26u,          /* XINPUT_CAPABILITIES */
+    CAPABILITIES_IN = 4u,             /* In.Gamepad, then Out.Rumble */
+    CAPABILITIES_MASKED = 22u,        /* 18 + 4 bytes of "this control exists" */
+    DEVTYPE_GAMEPAD = 1u,             /* XINPUT_DEVTYPE_GAMEPAD */
+    DEVSUBTYPE_GC_GAMEPAD = 1u,       /* XINPUT_DEVSUBTYPE_GC_GAMEPAD */
     STATE_SIZE = 22u,                 /* XINPUT_STATE */
     FEEDBACK_LEFT_MOTOR = 0x42u,      /* after the 66-byte feedback header */
     FEEDBACK_RIGHT_MOTOR = 0x44u,
@@ -191,16 +217,39 @@ HLE_EXPORT(XInputGetCapabilities)
     uint32_t handle = HLE_ARG(0), out = HLE_ARG(1), packet;
     RecompInputGamepad pad;
     uint32_t result = ERR_DEVICE_NOT_CONNECTED;
+    static int said;
 
     if (!out)
         HLE_RETURN(ERR_INVALID_PARAMETER);
     lock();
     if (recomp_input_get_state(&g_model, handle, &packet, &pad)) {
-        memset(HLE_PTR(out), 0, CAPABILITIES_SIZE);
-        *(uint8_t *)HLE_PTR(out) = 1u;         /* XINPUT_DEVSUBTYPE_GC_GAMEPAD */
+        uint8_t *p = (uint8_t *)HLE_PTR(out);
+
+        memset(p, 0, CAPABILITIES_SIZE);
+        p[0] = (uint8_t)DEVTYPE_GAMEPAD;
+        p[1] = (uint8_t)DEVSUBTYPE_GC_GAMEPAD;
+        /* Every control present, at full resolution. Zeroing this block told
+         * the title its pad had no sticks, no analog buttons and no motors,
+         * which a title is entitled to believe. TimeSplitters 2 asks once,
+         * immediately after XInputOpen, and was not visibly harmed by the
+         * old answer -- so this is a latent defect found while chasing a
+         * different one, not a fix for it. */
+        if (!zeroed_capabilities_wanted())
+            memset(p + CAPABILITIES_IN, 0xFF, CAPABILITIES_MASKED);
         result = ERR_SUCCESS;
     }
     unlock();
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[INPUT] XInputGetCapabilities(handle 0x%08X) -> %s\n",
+                handle, result == ERR_SUCCESS
+                    ? (zeroed_capabilities_wanted()
+                       ? "a gamepad with every control reported absent "
+                         "(RECOMP_INPUT_CAPS=zero)"
+                       : "a gamepad with every control present")
+                    : "device not connected");
+        fflush(stderr);
+    }
     HLE_RETURN(result);
 }
 
