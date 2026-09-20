@@ -118,6 +118,25 @@ def _func_ident(addr, name):
 
 # ── Operand formatting ──────────────────────────────────────
 
+# Debug (dr0-dr15), control (cr0-cr15) and test (tr0-tr7) registers. Capstone
+# names them, guest code can reach them because an Xbox title runs at ring 0,
+# and there is nothing behind them here -- no breakpoint hardware, no paging,
+# no cache control. They used to fall through _fmt_reg's `return name`, which
+# put a bare `dr0` into the generated C: not a stub but an undeclared
+# identifier, so one instruction failed the whole translation unit and with it
+# the whole title. Panzer Dragoon Orta hit it at sub_0021118E, in a region the
+# disassembler had walked as code but is data.
+#
+# They degrade like the segment registers just below: a read is a defined 0, a
+# write is a no-op, and both carry a comment naming what they were, so they
+# read as deliberate in the output instead of looking like a missing case.
+_SYSTEM_REGS = frozenset(
+    [f"dr{i}" for i in range(16)]
+    + [f"cr{i}" for i in range(16)]
+    + [f"tr{i}" for i in range(8)]
+)
+
+
 def _fmt_reg(name, size=4):
     """Format a register name as a C expression."""
     if not name:
@@ -126,6 +145,10 @@ def _fmt_reg(name, size=4):
     # Segment registers → constants
     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
         return f"0 /* seg:{name} */"
+
+    # Debug / control / test registers → constants
+    if name in _SYSTEM_REGS:
+        return f"0 /* {name}: system register, not modelled */"
 
     # Map sub-registers to expressions on 32-bit locals
     SUB_REGS = {
@@ -146,6 +169,10 @@ def _fmt_set_reg(name, value_expr):
     # Segment registers → no-op
     if name in ("fs", "gs", "cs", "ds", "es", "ss"):
         return f"/* mov {name}, {value_expr} - segment register */;"
+
+    # Debug / control / test registers → no-op. See _SYSTEM_REGS.
+    if name in _SYSTEM_REGS:
+        return f"/* mov {name}, {value_expr} - system register */;"
 
     SET_MAP = {
         "al": f"SET_LO8(eax, {value_expr})",
