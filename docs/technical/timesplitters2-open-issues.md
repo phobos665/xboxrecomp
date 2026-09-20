@@ -38,20 +38,73 @@ d3d8_replay games/_pipeline/timesplitters2/cap_sh/sh_05900.d3dcap --out after
 
 **What was ruled out.** The textures those quads sample are all zeros in the
 capture, so the obvious theory was that the title reads its own screen back
-and got black. That theory is dead: the title makes a texture whose texels
-*are* the frame buffer, that is now recognised and filled with the host's own
-frame (`src/d3d/d3d8_screencopy.c`, `framebuffer_texture` in
+and got black. That theory was recorded as dead: the title makes a texture
+whose texels *are* the frame buffer, that is now recognised and filled with
+the host's own frame (`src/d3d/d3d8_screencopy.c`, `framebuffer_texture` in
 `src/hle/hle_d3d8_texture.c`), the log confirms both textures are found and
-filled, **and the brightness does not change**. So the quads' output does not
-depend on their texture. Replaying with `--no-combiners` gives (26, 28, 33),
-so the register combiners are not the whole story either.
+filled, **and the brightness does not change**. Replaying with
+`--no-combiners` gives (26, 28, 33), so the register combiners are not the
+whole story either.
 
-**Where to look next.** What those three draws compute, and how they blend.
-They use pixel shader token 2 and SRCALPHA/INVSRCALPHA with vertex colour
-0x7F7F7F at alphas 0x34, 0x3F and 0x19. Work out what the combiner program
-for token 2 should produce, and compare it with what `d3d8_combiners.c`
-generates for it. The screen-copy work is groundwork and correct on its own
-terms; it is not the fix.
+---
+
+### Corrected, 20 September 2026: it is a motion blur, not a colour grade
+
+**It is motion-dependent.** From a pad session: standing still the picture is
+right, and it darkens as soon as the camera or the player moves. That single
+observation reframes everything above, because it says what *correct* looks
+like.
+
+The quads' shader was identified properly rather than guessed (see
+`RECOMP_D3D8_PS_DUMP=<n>` and the `binding shader <hash>` line it now prints;
+the previous guess picked the wrong shader, because the dump order is the
+order shaders are *compiled*). For TimeSplitters 2 it is `6C0A8FCA`, and it
+computes
+
+```
+result.rgb = saturate(2 * v0.rgb * t0.rgb)   /* v0 = 0x7F7F7F, so ~ t0 */
+result.a   = 2 * v0.a                        /* the blend weight */
+```
+
+With SRCALPHA/INVSRCALPHA that is `out = t0*a + dst*(1-a)`. **If `t0` is the
+screen, `out = dst` exactly.** The pass blends the screen back over itself and
+is a no-op while nothing moves; it only shows when the copy stops matching the
+screen, which is to say it is a motion blur. The combiner program is right.
+
+`t0` samples as black. `RECOMP_D3D8_PS_SHOW=t0` on a capture renders the frame
+as its stage-0 texture, and the result is a mean of 0.5/255. So the quads
+blend black over the picture at weight `a`, three times, giving `dst*(1-a)`
+each — and the third quad's alpha rises with motion (0x0A–0x0F at rest,
+0x19 in a frame taken while moving), which is the motion dependence.
+
+Predicted from the recorded alphas, `0.592 * 0.506 * 0.804` = 24% of the light
+kept at 0x19 and 28% at 0x0A; measured 36.7% and 43.2%. Same structure, same
+motion dependence, uniformly about 1.55x higher, so `t0` is near-black rather
+than exactly zero.
+
+So "the quads' output does not depend on their texture" was a correct
+observation with the wrong inference drawn from it. The output *does* depend on
+`t0`; `t0` never arrives. The screen-copy work is not groundwork beside the
+fix — it **is** the fix, and it is not reaching the sampler.
+
+**Where to look next.** Why the filled framebuffer texture is not what the
+pixel shader samples. `framebuffer_texture()` creates it `D3DUSAGE_RENDERTARGET`
+and calls `xbox_D3D8CopyBackBufferToTexture()` once per swap on first bind; the
+copy reports no failure. Suspect the path between that render-target write and
+the shader-resource view the sampler reads.
+
+**Measure this live, not only in replay.** `src/replay` never calls
+`xbox_D3D8CopyBackBufferToTexture` — that lives in `src/hle` — so in a replay
+`t0` is the captured guest texels, which are zeros, and a replay cannot by
+itself tell a broken fill from an absent one. What makes the replay evidence
+usable here is that a live F11 frame and a replay of the same capture differ by
+0.4/255, i.e. the replay reproduces the live picture, so the live fill is not
+landing either.
+
+**Two claims above that no longer hold.** The colour cast is not gone: both
+frames from that pad session measure B > G > R on snow. And the headline "about
+a third of xemu's brightness" is a figure taken while moving; standing still it
+is much closer.
 
 ## 2. A grey line across part of the screen
 
