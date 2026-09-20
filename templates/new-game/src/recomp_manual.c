@@ -141,7 +141,7 @@ void recomp_icall_fail_log(uint32_t va)
  * Rate-limited per address: a spin can produce millions of these, and the
  * useful information is which addresses occur, not how often.
  */
-void recomp_icall_not_code_log(uint32_t va)
+void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp)
 {
     /* A power of ten, because the rate limiter above only reaches this
      * function body at 1, 10, 100 ... and the verdict has to land on one of
@@ -179,11 +179,19 @@ void recomp_icall_not_code_log(uint32_t va)
     {
         /* The call site, read off the guest stack. Without it the log
          * says a wild pointer was skipped but not by whom, and the
-         * caller is the only thing that leads anywhere. */
+         * caller is the only thing that leads anywhere.
+         *
+         * It comes from the esp the dispatch macro captured, not from
+         * g_esp. The lifted call site pushes its return address onto the
+         * *local* esp and only syncs g_esp at certain points, so g_esp is
+         * stale here -- it read 0 exactly when a null target most needed
+         * explaining, which sent three rounds of Jet Set Radio Future
+         * chasing inferences instead of a call site. saved_esp is the value
+         * before that push, so the return address is the dword below it. */
         uint32_t caller = 0;
-        if (g_esp && g_xbox_mem_offset)
+        if (saved_esp >= 4 && g_xbox_mem_offset)
             caller = *(const uint32_t *)((const uint8_t *)g_xbox_mem_offset
-                                         + g_esp);
+                                         + (saved_esp - 4));
         fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped "
                         "%llu time(s) from 0x%08X (null or wild function "
                         "pointer, at call #%llu)\n",

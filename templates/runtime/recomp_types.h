@@ -321,7 +321,7 @@ void recomp_icall_fail_log(uint32_t va);
  * because these usually arrive inside a loop -- which is exactly why
  * they must be reported: silently skipping one turns a diagnosable null
  * vtable call into an unexplained hang. */
-void recomp_icall_not_code_log(uint32_t va);
+void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp);
 
 /* Report a direct call or jump into an address that was never recompiled --
  * the generated stub in recomp_stubs_unresolved.c. The stub keeps esp
@@ -905,7 +905,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
-        recomp_icall_not_code_log(_va); \
+        recomp_icall_not_code_log(_va, g_esp + 4); \
         g_esp += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -976,7 +976,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
-        recomp_icall_not_code_log(_va); \
+        recomp_icall_not_code_log(_va, (saved_esp)); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
