@@ -249,3 +249,92 @@ chasing the null vtable further:
 call so the crash handler prints the guest stack. The `from 0x...` in the
 ordinary `[ICALL]` line is read off the top of the guest stack and reads 0
 exactly when a null target most needs explaining.
+
+---
+
+## The null call, traced to the instruction (20 Sep 2026)
+
+`--trace-all-entries` plus a corrected call-site report named it in one run,
+after four inferences in a row had failed. The instruction is `0x0006FA4F`:
+
+```
+0x0006F9F6  push 0x8840        ; 34,880 bytes
+0x0006F9FB  call 0x4a8f0       ; operator new -> jmp malloc (0x17c953)
+0x0006FA07  test eax, eax
+0x0006FA11  je  skip           ; non-null, so construction runs
+0x0006FA19  call 0x12210       ; constructor(this = eax)
+0x0006FA2C  mov [0x22fce0], eax
+...
+0x0006FA41  mov ecx, [0x22fce0]
+0x0006FA47  test ecx, ecx
+0x0006FA49  je  skip           ; non-null
+0x0006FA4B  mov eax, [ecx]     ; its vtable -> 0
+0x0006FA4F  call [eax]         ; the null call
+```
+
+### What is measured
+
+- `[0x0022FCE0]` is written exactly once, `0 -> 0x00770010`, on the path from
+  the CRT into main (`RECOMP_WATCH_WRITE`).
+- That value is what `operator new(0x8840)` returned, so the title's own
+  `malloc` produced it.
+- **No kernel allocation ever returns an address in `0x0077xxxx`.** Every
+  `NtAllocateVirtualMemory` and every `[HEAP]` line in the run is at
+  `0x00F80000` or above; the title's CRT heap is the 1 MB reserve at
+  `0x00F81000`.
+- Nothing ever writes `[0x00770010]`, the vtable slot, so the object was never
+  constructed there despite the constructor being called.
+- `0x00770010` is `TlsData + 0x10`, and the CRT's own thread start-up leaves
+  `edi` at exactly that address.
+
+### The CRT builds the TLS block itself
+
+`sub_00147EBB`, the CRT thread start-up, does:
+
+```
+mov eax, fs:[0x28]      ; current thread
+mov edx, [eax + 0x28]   ; TlsData
+add edx, 4
+mov [edx - 4], edx      ; *(TlsData) = TlsData + 4
+mov esi, [0x1e0c2c]     ; image TLS data start
+rep movsd               ; copy the init data to TlsData + 4
+lea edi, [ebx + edx]
+rep stosd               ; zero-fill the rest
+```
+
+So `TlsData` must point at writable memory of at least `4 + init + zero_fill`
+— 16 bytes here — and the CRT, not the kernel, fills it. That matches
+Cxbx-Reloaded's `KiInitializeContextThread`, which carves the block off the
+thread's stack and leaves the contents to the title.
+
+### What is not established
+
+**Why `malloc` returns a pointer into the TLS region rather than the heap.**
+That is the open question and everything else is downstream of it.
+
+The next step is to instrument `malloc` (`sub_0017C953`) at entry and exit to
+log the requested size against the returned pointer, and to dump the heap
+state on the call that returns `0x00770010`. That distinguishes a corrupted
+free list from a heap whose arena was never set to the region the kernel
+actually gave it.
+
+### Hypotheses measured and rejected
+
+Recorded because each was plausible, and because the pattern -- reasoning from
+a register value rather than from the call site -- is what cost the time.
+
+- **"The TLS block is the wrong size."** Cxbx sizes it 12 bytes for JSRF
+  against the 20 built here, but the CRT only needs 16 and writes its own
+  contents, so 20 is sufficient.
+- **"The TLS index is wrong."** The title stores `-5` at `0x00264850` from
+  `xbe_entry_point+0x1A4`, exactly what this runtime assumes.
+- **"The title subtracts TlsData from the TLS slot, so the slot must be
+  in-block."** That code is at `loc_00147FD4`, reached only from
+  `loc_00147FD0` with a non-null register, and the path through it sets that
+  register to zero first. It does not run.
+- **"`0x00770010` is an object the title placed in TLS."** It is the address
+  the CRT's zero-fill loop ends on, left in `edi`, and separately what malloc
+  returned. Two unrelated things at one address.
+- **"`KTHREAD.TlsData` pointed at a scratch buffer."** True, and fixed -- see
+  above -- but not the cause. The faulting address moved with the fix, which
+  looked like confirmation and was not.
