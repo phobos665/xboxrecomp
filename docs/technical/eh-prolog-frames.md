@@ -131,16 +131,51 @@ The narrow one is worth doing first because it is testable against two titles
 today. The general one should be folded into the register-model work rather
 than done twice.
 
-## What is still unexplained
+## The counterpart, and what it shows
 
-Three violations in the list are not accounted for and were not investigated:
+`sub_0018546F` is `__EH_epilog`, the other half of the pair. It restores the
+exception registration, pops `edi`, `esi` and `ebx` **for its caller**, and
+unwinds the frame:
 
 ```
-[ABI] sub_0018546F: ebx esi edi esp-too-high
+mov  ecx, [ebp-16]    ; the saved fs:[0]
+mov  fs:[0], ecx
+pop  ecx              ; its own return address
+pop  edi              ; the caller's saved registers
+pop  esi
+pop  ebx
+mov  esp, ebp
+pop  ebp
+push ecx
+ret
+```
+
+So `[ABI] sub_0018546F: ebx esi edi esp-too-high` is entirely by design, the
+same way `__EH_prolog`'s `esp-too-low` is. Both helpers exist to break the
+convention on the caller's behalf.
+
+What matters is the last line of the lifted version:
+
+```c
+    POP32(esp, ebp); /* leave */
+    PUSH32(esp, ecx);
+    g_seh_ebp = ebp; esp += 4; return; /* ret */
+```
+
+It **does** publish the frame pointer. The epilogue half of the pair was
+handled and the prologue half was not, and `g_ebp` is not published even
+here. That makes this a gap rather than a design decision, and it is why the
+narrow fix is the right first move: the lifter already knows these helpers
+are special, it just does not finish the job in one of them.
+
+## What is still unexplained
+
+One violation in the list is not accounted for and was not investigated:
+
+```
 [ABI] sub_0018B960: ebx
 ```
 
-`sub_0018546F` losing all three callee-saved registers *and* returning with
-the stack too high is the signature of an epilogue the lifter got wrong, and
-it is in the same CRT band, so it is probably `__EH_epilog` or a local
-unwinder. It deserves the same reading `__EH_prolog` just got.
+It loses `ebx` only, keeps the stack balanced, and is in the same CRT band.
+It may be another helper that restores registers on a caller's behalf, or a
+real epilogue bug. It deserves the same reading the other two just got.
