@@ -168,6 +168,41 @@ here. That makes this a gap rather than a design decision, and it is why the
 narrow fix is the right first move: the lifter already knows these helpers
 are special, it just does not finish the job in one of them.
 
+## The same family, one layer down
+
+With the probe in, Outrun 2 runs further and stops again, and the `[ABI]`
+list has moved with it:
+
+```
+[ABI] sub_001C425B: edi esp-too-low
+[ABI] sub_001C48FE: esi edi esp(epilogue never ran)
+```
+
+These are not a new problem. `sub_001C48FE` is eleven lines long and provably
+correct: it pushes `esi`, makes two calls, pops `esi`, and its `esp += 8`
+matches its `ret 4` exactly. Its violation is **inherited** — it calls
+`sub_001C425B`, which returns with the stack low, so the `pop esi` reads the
+wrong slot. Read the `[ABI]` list innermost-first, the way you would a stack.
+
+`sub_001C425B` is the interesting one, and it is the same function that
+produced the garbage pointer this whole investigation started with. It calls
+`__EH_prolog`, pushes `ebx`, `esi` and `edi`, and then has exactly one exit in
+250 lines of C:
+
+```c
+    g_seh_ebp = ebp; sub_001BB79F(); return; /* tail jmp 0x001BB79F */
+```
+
+A tail `jmp` into a shared epilogue. The real function never returns at all —
+it hands control to a helper that pops its registers and does the `ret` on its
+behalf. The lifter turns that into an ordinary C call followed by a return,
+so the helper's stack effects land in the wrong frame.
+
+That is the third variant of one problem: **MSVC shares prologue, epilogue and
+unwind code between functions, and the lifter models each of those shared
+helpers as an ordinary call.** Any fix should cover all three together rather
+than special-casing `__EH_prolog` alone.
+
 ## What is still unexplained
 
 One violation in the list is not accounted for and was not investigated:
