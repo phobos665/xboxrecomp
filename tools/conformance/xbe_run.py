@@ -293,6 +293,10 @@ volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
+/* rdtsc. A function that reads it cannot be compared -- the two sides run
+   at different times -- but it has to link for the rest of the corpus to
+   run at all, and one unresolved symbol was taking the whole harness down. */
+uint64_t xbox_ReadTimeStampCounter(void) { return 0; }
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t va) { (void)va; return 0; }
 recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return 0; }
