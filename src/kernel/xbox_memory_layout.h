@@ -220,6 +220,10 @@ void xbox_Nv2aFlipGateRelease(void);
 const char *xbox_Nv2aFlipGateModeName(void);
 void        xbox_Nv2aFlipGateCycle(void);
 
+/* The running title's own name, from its XBE certificate, as UTF-8; NULL
+ * when the headers carried none. Valid once the layout has been set up. */
+const char *xbox_XbeTitleName(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

@@ -11,6 +11,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_display.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -349,6 +350,26 @@ void d3d8_states_apply_sampler(DWORD stage)
     sd.AddressV = d3d8_to_d3d11_address(tss[D3DTSS_ADDRESSV] ? tss[D3DTSS_ADDRESSV] : D3DTADDRESS_WRAP);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
     sd.MaxAnisotropy = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
+
+    /* Forced anisotropy, and only where the title already minifies
+     * linearly. A stage filtering by nearest texel is almost always the
+     * 2D layer -- fonts, HUD art, anything authored to land on exact
+     * pixels -- and smoothing that blurs it for no gain. Textures on a
+     * floor or a wall seen at a glancing angle are what this is for, and
+     * they are the ones asking for a linear filter. */
+    {
+        UINT forced = d3d8_display_policy()->anisotropy;
+
+        if (forced > 1 &&
+            (sd.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR ||
+             sd.Filter == D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT ||
+             sd.Filter == D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT ||
+             sd.Filter == D3D11_FILTER_ANISOTROPIC)) {
+            sd.Filter = D3D11_FILTER_ANISOTROPIC;
+            if (sd.MaxAnisotropy < forced)
+                sd.MaxAnisotropy = forced;
+        }
+    }
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
 

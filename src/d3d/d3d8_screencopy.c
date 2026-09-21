@@ -83,13 +83,14 @@ static int create(void)
     g.tried = 1;
     if (!dev || !swap) { g.failed = 1; return 0; }
 
-    /* The swap chain is created with DXGI_USAGE_SHADER_INPUT so this works. */
-    hr = IDXGISwapChain_GetBuffer(swap, 0, &IID_ID3D11Texture2D, (void **)&back);
-    if (FAILED(hr)) { fail("GetBuffer", hr); return 0; }
-    hr = ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)back, NULL,
-                                               &g.back_srv);
-    ID3D11Texture2D_Release(back);
-    if (FAILED(hr)) { fail("CreateShaderResourceView(back buffer)", hr); return 0; }
+    /* The scene the title has been drawing into, which is the swap chain's
+     * own back buffer only while nothing is scaled. Reading the back
+     * buffer directly would be wrong above scale 1: the resolve that fills
+     * it has not run yet this frame, so it still holds the last one. */
+    g.back_srv = d3d8_GetSceneSRV();
+    if (!g.back_srv) { fail("GetSceneSRV", E_FAIL); return 0; }
+    ID3D11ShaderResourceView_AddRef(g.back_srv);
+    (void)back;
 
     hr = D3DCompile(kSource, sizeof kSource - 1, "screencopy", NULL, NULL,
                     "vs_main", "vs_4_0", 0, 0, &code, &err);
