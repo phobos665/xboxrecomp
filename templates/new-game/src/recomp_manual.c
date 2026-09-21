@@ -47,12 +47,36 @@ typedef void (*recomp_func_t)(void);
 
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
-extern uint32_t g_eax;
+/* These are defined thread-local in xbox_memory_layout.c. Declaring them
+ * without the same storage class here does not fail to link -- it silently
+ * resolves to different storage, so every read gets 0. That is why the log
+ * below reported no call site: not because the guest esp was stale, but
+ * because this file was not reading the guest esp at all. */
+#if defined(_MSC_VER)
+#  define RECOMP_MANUAL_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define RECOMP_MANUAL_TLS __thread
+#else
+#  define RECOMP_MANUAL_TLS _Thread_local
+#endif
+
+extern RECOMP_MANUAL_TLS uint32_t g_eax;
 /* The guest stack pointer. At the moment an indirect call is refused, the
  * caller has already pushed its guest return address, so the top of the
  * guest stack is the call site -- the one thing the old log did not say. */
-extern uint32_t g_esp;
+extern RECOMP_MANUAL_TLS uint32_t g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
+/* The lifted code sections, so a value on the guest stack can be told
+ * apart from data when naming the callers of a refused call. */
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
+/* The esp the dispatch macro captured. Not g_esp, which is stale by the time
+ * a refused call is reported. Zero when the title's generated header predates
+ * this, and the log then says it has no callers rather than inventing them. */
+extern RECOMP_MANUAL_TLS uint32_t g_icall_saved_esp;
+/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump. Unknown
+ * means this title was lifted before the macros published it. */
+extern RECOMP_MANUAL_TLS uint32_t g_icall_dispatch_form;
 
 /* ── Manual function overrides ─────────────────────────────── */
 
@@ -119,19 +143,93 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
  */
 void recomp_icall_fail_log(uint32_t va)
 {
-    fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X (total calls: %llu)\n",
-            va, (unsigned long long)g_icall_count);
+    /*
+     * Rate-limited per target, reporting at 1, 10, 100 ...
+     *
+     * An unresolved target inside a loop is the normal case, not the rare
+     * one: Mortal Kombat: Deadly Alliance produced 46843 of these for a
+     * single address in one 30-second run, seventeen lines each. That buries
+     * every other diagnostic in the log and says nothing the first report did
+     * not. The progression is the useful part -- one line says a target was
+     * never identified, a run of them says the title is stuck on it.
+     */
+    enum { SLOTS = 16 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS];
+    static int count;
+    int i;
 
-    /* Dump last 16 call targets from the ring buffer */
-    fprintf(stderr, "  Recent ICALL targets:\n");
-    for (int i = 0; i < 16; i++) {
-        int idx = (g_icall_trace_idx - 16 + i) & 15;
-        if (g_icall_trace[idx])
-            fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            break;
+    if (i == count) {
+        if (count == SLOTS)
+            return;
+        seen[count] = va;
+        hits[count] = 0;
+        count++;
+    }
+    hits[i]++;
+    {
+        uint64_t n = hits[i];
+        while (n >= 10 && n % 10 == 0)
+            n /= 10;
+        if (n != 1)
+            return;
+    }
+
+    fprintf(stderr, "[ICALL] unresolved %starget 0x%08X -- %llu time(s) "
+                    "(total calls: %llu)\n",
+            g_icall_dispatch_form == 1 ? "call " :
+            g_icall_dispatch_form == 2 ? "jump " : "",
+            va, (unsigned long long)hits[i],
+            (unsigned long long)g_icall_count);
+    if (g_icall_dispatch_form == 2 && hits[i] == 1)
+        fprintf(stderr, "  a jump, not a call: if this address is inside a "
+                        "function rather than at its start, the guest is doing "
+                        "its own control flow (a coroutine, a longjmp, or a "
+                        "switch arm) and seeding it as a function will not "
+                        "help\n");
+
+    /*
+     * Who called it. The lifted caller pushed its return address on the guest
+     * stack, so code-range values above esp name the chain -- the same scan
+     * the memory watchpoints use. It is a heuristic: stale return addresses
+     * from earlier frames show up too, and the first entry is the reliable
+     * one. It is still the difference between an address with no context and
+     * a function to open, which is what an unresolved target needs.
+     */
+    {
+        const uint8_t *stack = (const uint8_t *)g_xbox_mem_offset
+                             + g_icall_saved_esp;
+        int shown = 0;
+        fprintf(stderr, "  callers:");
+        for (i = 0; g_xbox_mem_offset && g_icall_saved_esp
+                    && i < 160 && shown < 6; i++) {
+            uint32_t v;
+            memcpy(&v, stack + (size_t)i * 4, sizeof v);
+            if (v >= g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "%s 0x%08X", shown ? " <-" : "", v);
+                shown++;
+            }
+        }
+        if (!shown)
+            fprintf(stderr, " (none on the stack)");
+        fprintf(stderr, "\n");
+    }
+
+    /* The recent-target ring buffer, once per address. What ran just before
+     * an unresolved call is context for the first report and noise after. */
+    if (hits[i] == 1) {
+        fprintf(stderr, "  Recent ICALL targets:\n");
+        for (i = 0; i < 16; i++) {
+            int idx = (g_icall_trace_idx - 16 + i) & 15;
+            if (g_icall_trace[idx])
+                fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
+        }
     }
     fflush(stderr);
 }
-
 /* An indirect call whose target is not code: a null or wild function pointer.
  *
  * Skipping these is right -- calling a data address is worse -- but skipping
