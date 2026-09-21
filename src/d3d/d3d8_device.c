@@ -1220,6 +1220,14 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
+
+    /* A screen-space draw covering the whole width is a backdrop or a
+     * fade, and must span the widescreen picture rather than be squeezed
+     * into the middle of it with the HUD. After prepare_draw, which is
+     * what decides whether this is a screen-space draw at all. */
+    if (d3d8_GetTwoDSqueeze() &&
+        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, vertex_count))
+        d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -1250,6 +1258,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
     if (index_count == 0) return E_INVALIDARG;
 
+
     idx_bytes = (IndexDataFormat == D3DFMT_INDEX32) ? 4 : 2;
     ib_fmt = (IndexDataFormat == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     vb_size = NumVertices * VertexStreamZeroStride;
@@ -1270,6 +1279,14 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
+
+    /* A screen-space draw covering the whole width is a backdrop or a
+     * fade, and must span the widescreen picture rather than be squeezed
+     * into the middle of it with the HUD. After prepare_draw, which is
+     * what decides whether this is a screen-space draw at all. */
+    if (d3d8_GetTwoDSqueeze() &&
+        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, NumVertices))
+        d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -1609,6 +1626,84 @@ void d3d8_SetTwoDSqueeze(BOOL on)
         return;
     g_2d_squeeze = on ? TRUE : FALSE;
     apply_host_viewport();
+}
+
+BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
+
+/* Does this draw cover the guest's full width?
+ *
+ * A screen-space draw that spans the screen is a backdrop, a fade, a
+ * letterbox bar or a video frame, and squeezing it leaves the sides of a
+ * widescreen picture showing whatever was behind. One that does not is a
+ * HUD element, which belongs in the centred box. The difference is the
+ * draw's own extent, so measure it rather than keep a list of elements.
+ *
+ * The vertices are the ones handed to the draw: everything reaches this
+ * device as DrawPrimitiveUP, including the draws the title sourced from
+ * a vertex buffer -- the HLE reads those itself and passes the bytes.
+ * Position sits at the offset the program's own declaration gives for
+ * the register it copies oPos from.
+ *
+ * When any of that is unavailable the answer is FALSE, which keeps the
+ * squeeze. That is the safe way to be wrong: a squeezed backdrop is
+ * visibly odd in one place, a stretched HUD is subtly wrong everywhere.
+ */
+BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
+{
+    const unsigned char *p = (const unsigned char *)vertices;
+    UINT offset = 0, i, guest_w;
+    int reg = d3d8_vsh_bound_pos_input();
+    float lo = 3.4e38f, hi = -3.4e38f;
+
+    if (reg < 0 || !p || !stride || !count)
+        return FALSE;
+    if (!d3d8_vsh_bound_input_offset(reg, &offset))
+        return FALSE;
+    if (offset + sizeof(float) > stride)
+        return FALSE;
+
+    guest_w = d3d8_GetGuestWidth();
+    if (!guest_w)
+        return FALSE;
+
+    /* Every vertex, not a sample of them. A backdrop is not always a
+     * quad -- this title builds several out of long strips -- and
+     * measuring only the first few of those reported an extent that
+     * stopped short of the edge, so the draw was squeezed and the seam
+     * it was supposed to remove stayed. The bound is a sanity limit, not
+     * a sample: screen-space draws are small, and this runs only for
+     * them. */
+    if (count > 8192)
+        count = 8192;
+
+    for (i = 0; i < count; i++) {
+        float x;
+
+        memcpy(&x, p + (size_t)i * stride + offset, sizeof x);
+        if (x < lo) lo = x;
+        if (x > hi) hi = x;
+    }
+
+    /* How much of the width the draw covers, in the title's own screen
+     * pixels. Coverage rather than "touches both edges": this title
+     * builds its backdrop from overlapping strips, and the ones that run
+     * off the left edge stop a little short of the right. Measured on a
+     * menu the pieces fall into two groups with a gap between them:
+     * backdrop from 77% of the width upwards, and everything smaller at
+     * 70% and below. The threshold sits in that gap.
+     *
+     * It was 85% first, which split the backdrop rather than separating
+     * it from the HUD: the widest strips passed and the rest did not, so
+     * the tiling came apart and left an edge partway across where one
+     * stopped and the squeezed next one began. A backdrop only looks
+     * right if all of it is treated the same way.
+     *
+     * 75% is a measurement of one title's menu, not a principle, and the
+     * gap it sits in is about six points wide. Another title may not
+     * leave one. */
+    {
+        return ((hi - lo) >= (float)guest_w * 0.75f) ? TRUE : FALSE;
+    }
 }
 
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPORT8 *pViewport)
