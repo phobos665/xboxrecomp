@@ -43,6 +43,11 @@ UINT                 d3d8_GetGuestWidth(void);
  * the host renders larger than the guest, the swap chain's back buffer
  * when it does not. NULL before the device exists. */
 ID3D11ShaderResourceView *d3d8_GetSceneSRV(void);
+/* Tell the device whether the next draw is positioned in screen
+ * coordinates of the title's own making rather than through its
+ * projection. Only matters in widescreen, where the two need different
+ * horizontal treatment. */
+void d3d8_SetTwoDSqueeze(BOOL on);
 /* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
 BOOL                 d3d8_GetScissor(D3D11_RECT *out);
 UINT                 d3d8_GetGuestHeight(void);

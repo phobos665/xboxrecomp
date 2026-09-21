@@ -240,6 +240,11 @@ BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
  */
 BOOL d3d8_vsh_prepare_draw(DWORD handle);
 
+/* Whether the program bound by the last prepare_draw transforms through
+ * the projection's first column. False means it draws in screen
+ * coordinates of its own -- the HUD, a menu, a full-screen quad. */
+int  d3d8_vsh_bound_uses_projection(void);
+
 /**
  * Generate HLSL vertex shader source from parsed program.
  *

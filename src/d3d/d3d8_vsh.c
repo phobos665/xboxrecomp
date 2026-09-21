@@ -85,6 +85,7 @@ typedef struct {
     uint32_t            decl_keys[16];     /* NV2AVshSlot.decl_hash */
     int                 decl_layout_count;
     uint16_t            inputs_read;  /* Which v registers are read */
+    int                 uses_proj;    /* reads the projection's first column */
 } VshCacheEntry;
 
 static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
@@ -92,6 +93,14 @@ static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
 /* ================================================================
  * Hash Function (FNV-1a)
  * ================================================================ */
+
+/* Set while a program's HLSL is generated; see the constant emitter. */
+static int g_emit_uses_proj;
+
+/* The same fact about the program currently bound, for the draw path. */
+static int g_bound_uses_proj;
+
+int d3d8_vsh_bound_uses_projection(void) { return g_bound_uses_proj; }
 
 static uint32_t fnv1a_hash(const void *data, size_t len)
 {
@@ -195,8 +204,18 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
     case NV2A_VSH_REG_CONST:
         if (src->rel_addr)
             sb_append(sb, "c[a0 + %d]", src->reg_index);
-        else
+        else {
             sb_append(sb, "c[%d]", src->reg_index);
+            /* A program that reads the register holding the first column of
+             * the title's projection is transforming geometry through it,
+             * which is what makes it 3D. One that never does is drawing in
+             * screen coordinates it worked out itself -- the HUD, menus,
+             * a full-screen quad -- and is not widened by Hor+, so it needs
+             * the compensating squeeze instead. Relative addressing is not
+             * counted: an indexed read is a bone or a light, never this. */
+            if (src->reg_index == d3d8_vsh_hor_plus_reg())
+                g_emit_uses_proj = 1;
+        }
         break;
     default:
         sb_append(sb, "float4(0,0,0,0)");
@@ -940,6 +959,7 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     /* Generate HLSL. A source that fills the buffer was cut off. */
     if (!hlsl_buf)
         return NULL;
+    g_emit_uses_proj = 0;
     hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, HLSL_BUF);
     if (hlsl_len <= 0 || hlsl_len >= HLSL_BUF - 1) {
         fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d bytes)\n", hlsl_len);
@@ -999,6 +1019,7 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
     entry->vs_blob     = code;
     entry->inputs_read = program.inputs_read;
+    entry->uses_proj   = g_emit_uses_proj;
     entry->layout_count = 0;
 
     fprintf(stderr, "D3D8 VSH: Compiled shader (hash 0x%08X, %d insns, inputs 0x%04X)\n",
@@ -1499,6 +1520,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
 
     /* Bind the vertex shader */
     ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
+    g_bound_uses_proj = entry->uses_proj;
 
     /* Bind the input layout: the program's declaration when it has one,
      * otherwise sized from the bound stream FVF */
