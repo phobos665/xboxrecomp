@@ -48,6 +48,8 @@
 #include "xbox_adpcm.h"
 #include "audio_output.h"
 
+void hle_dsound_stream_tick(uint64_t now);   /* hle_dsound_stream.c */
+
 enum {
     SET_FORMAT     = 0x0Cu,   /* tag | channels << 16 | bits << 24 */
     SET_RATE       = 0x10u,
@@ -513,5 +515,6 @@ HLE_EXPORT(DirectSoundDoWork)
         }
     }
     unlock();
+    hle_dsound_stream_tick(now);      /* streams: feed the host, complete packets */
     HLE_RETURN(0);
 }

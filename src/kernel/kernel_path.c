@@ -43,6 +43,16 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* The DVD drive itself, with nothing after it. A title whose certificate
+     * allows only the DVD-X2 media type (TimeSplitters 2: AllowedMedia 0x2)
+     * has XAPI open the bare device at start-up and send it a SCSI mode
+     * sense for the disc's security page before main ever runs; with no
+     * rule this returned STATUS_OBJECT_PATH_NOT_FOUND and the title went
+     * back to the dashboard after fifteen kernel calls. Listed after the
+     * slashed form so paths under the device keep their own mapping; the
+     * empty remainder makes it the game directory, which NtCreateFile opens
+     * as a directory handle. */
+    { "\\Device\\CdRom0",                     0, NULL,         NULL          },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.

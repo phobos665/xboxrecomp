@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -462,9 +463,12 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         break;
 
     case AV_OPTION_QUERY_AV_CAPABILITIES:
-        /* Report support for 480i, 480p, 720p, and widescreen */
+        /* Widescreen follows the same setting the EEPROM answer uses
+         * (kernel_xbox.c, XC_VIDEO). A title that asks both ways must not
+         * be told the console is widescreen here and 4:3 there. */
         *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
-                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
+                | AV_FLAGS_HDTV_720p
+                | (xbox_EnvSwitch("RECOMP_WIDESCREEN", 0) ? AV_FLAGS_WIDESCREEN : 0)
                 | AV_FLAGS_60Hz;
         break;
 
@@ -476,7 +480,8 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
     case AV_OPTION_QUERY_MODE_CAPS:
         /* Same as capabilities for our purposes */
         *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
-                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
+                | AV_FLAGS_HDTV_720p
+                | (xbox_EnvSwitch("RECOMP_WIDESCREEN", 0) ? AV_FLAGS_WIDESCREEN : 0)
                 | AV_FLAGS_60Hz;
         break;
 

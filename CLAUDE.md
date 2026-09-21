@@ -41,7 +41,7 @@ Verify against the repo rather than trusting the README. Known discrepancies as 
 |---|---|
 | NV2A push-buffer interception is a core feature | Push-buffer parsing is a **stub**, marked "N/A — D3D8 API intercept instead". The project already does D3D8 HLE. |
 | "115 of 366 ordinals resolved, 55 bridged" | Do not trust any number written down; the useful question is per-title, not global. Run `py -3 -m tools.kernel_audit.coverage <analysis.json> --list`, which splits what is missing into "needs a bridge wrapper", "is a data export", and "does not exist yet". Note an ordinal with an `xbox_*` implementation but no bridge silently returns 0. |
-| Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. Win32-only in practice. |
+| Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. **"Win32-only in practice" is out of date (Sep 2026):** `src/platform/win32_compat.c` implements those on POSIX, with `MAP_FIXED_NOREPLACE` and a returned-address check, because `xbox_memory_layout.c` depends on a failed placement failing. What is untested is whether the 28 mirror views and the apertures actually place on Linux — no title has ever linked there. The lifted output is portable too: `templates/runtime/recomp_types.h` guards every x86 intrinsic and keeps the MMX/SSE helpers as lane-wise C. See `docs/technical/vulkan-backend.md` §6.5 for the rest of the Linux/Android gap. |
 | Burnout 3 is the proven target | True, and it is a **D3D8LTCG** build on XDK 5849 — so LTCG is not disqualifying. |
 
 **Corrected Sep 2026:** that "17 of 66 formats, mipmap level 0 only, no P8 palette, no
@@ -63,6 +63,80 @@ the gaps that remain (cube render targets, `CopyRects`, lighting). A path for ti
 fill push buffers through `BeginPush` is still the next piece of work: those draws reach no
 replacement at all.
 
+**Second title (Sep 2026): TimeSplitters 2, XDK 4721.** Boots through XAPI start-up,
+DirectSound and its first frames with **no overrides**; see
+`docs/technical/second-title-bringup.md` for the six things it proved were wrongly
+universal (retail disc check, GPU time fence offsets, DSP doorbell, the APU's physical
+view, two template gaps) and what is next. Its draws reach the shadow renderer and are
+skipped: 4721 loads vertex programs through `LoadVertexShaderProgram` /
+`SelectVertexShaderDirect`, which `src/hle` does not replace yet, so no program is ever
+known. Both titles need `RECOMP_VBLANK=1 RECOMP_AC97_READY=1` to pace and to get through
+audio init; the DSP doorbell is found from the scratch page table, so `RECOMP_APU_DSP_ACK`
+is only an override now.
+
+**Update, 18 Sep 2026 evening:** the 4721 shader paths are replaced (`LoadVertexShaderProgram`,
+`SelectVertexShaderDirect`, pointer-form pixel shaders), and with a scripted menu path
+(`RECOMP_INPUT_SEQ`, see the bring-up doc) TimeSplitters 2 loads the Siberia level and renders
+its opening cutscene, at 85-145 fps uncapped. Not yet playable: the level is dark and ~15% of
+in-level draws are skipped as "program without layout". Two of the three blockers on the way
+were not the title: the entry profiler at a 100-call interval (now capped at one report a
+second) and a switch table the disassembler never measured (`resync_jump_tables()` now runs
+before every function rebuild). When a title "hangs" after drawing, suspect the diagnostics
+first, and when it spins on an `[ICALL] unknown target` a few bytes past a function end, look
+for a `jmp [reg*4 + table]` just before it.
+
+**Update, 19 Sep 2026:** TimeSplitters 2 plays. The dark level was stale blend and depth
+state (`SetRenderState_Simple` is now stored), the black story intro was a DirectSound
+stream status word (`DSSTREAMSTATUS_PLAYING` is 0x10000), the last unresolved indirect
+call was a switch arm the translator lost after a re-sync, and both titles are lifted
+without `--trace-all-entries`. The level runs 80 fps uncapped on this machine, so the
+**flip gate is on by default in adaptive mode** (`RECOMP_FPS_CAP=0` to switch it off,
+`=60`/`=30` for the strict console cadence); the measurements behind that are in
+`docs/technical/resolution-and-framerate.md`. The performance plan in
+`docs/technical/ts2-performance-plan.md`, items 1-7, took the level from 12.4 ms a frame to
+5.0 ms (branch `perf/ts2-items-1-7`). From the user's first pad session: `D3DDevice_SetScissors`
+is forwarded (the briefing text was spilling out of its box), and closing the game window
+exits the process. **F9 shows the frame rate on screen and F10 steps the frame cap**
+(adaptive/60/30/off) while a title runs; `RECOMP_FPS_OVERLAY=1` starts with the counter on.
+**The built executable runs the game on its own** (Sep 2026): double-click it, or shortcut it
+from anywhere. It looks for the game in a `game` folder beside itself, then at `games/<title>/`
+relative to itself, then `RECOMP_GAME_DIR`; and the vblank, the emulated audio hardware and the
+shadow renderer are **on unless turned off** (`RECOMP_VBLANK=0`, `RECOMP_AC97_READY=0`,
+`RECOMP_HLE_D3D8=off`; `xbox_EnvSwitch` reads them). The `run.bat` files are debugging launchers
+now, not a requirement. It is a windowed program, so a double-click gives it no console:
+diagnostics go to whatever redirected them, else to the terminal it was started from, else to
+`<executable>.log` beside it (`setup_output` in the template). Note the switch a title needs is read in **five** places including the
+title's own `main.c` (from `templates/new-game/src/main.c`), so change the template and
+regenerate with `scripts/regen_title_main.py`.
+
+**F11 captures the frame on screen** -- a BMP and a replayable capture, beside the executable --
+which is how a player reports a rendering bug that only happens somewhere specific.
+`RECOMP_INPUT_SEQ` can now hold stick directions (`lstick_up`, `rstick_left`, ...) as well as
+buttons, and `RECOMP_INPUT_LOG=1` prints what the title actually reads from the pad.
+
+**Audio de-sync was dropped sound, not a clock (19 Sep 2026).** The host audio queue held four
+submissions and a DirectSound stream was feeding it a tick's worth at a time against a 400 ms
+lead, so most submissions were refused and the stream stepped over them: TimeSplitters 2's
+cutscene lost 42 seconds of music in two minutes. A refused chunk is now retried, the chunks
+are whole, the queue is deeper, and a stream's packets complete when the host has actually
+played them (`RECOMP_DSOUND_WALLCLOCK=1` for the old wall clock). If a title's sound ever
+drifts again, read `[audio-output] dropped=` and the `[DSOUND] ... from the host's play
+position` line before suspecting anything else.
+
+**Widescreen and internal resolution** are investigated in
+`docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or
+game-specific. Two things to know before touching either: `XGetVideoFlags` returns 0 today
+because the kernel puts the video flags in the low half-word and XAPI reads the high one, and
+Xbox widescreen is anamorphic, so a title that has a 16:9 mode needs no stretching anywhere
+while a title that has none (TimeSplitters 2) cannot be given one natively.
+
+**Input is bound, not hard-coded (Sep 2026):** all four ports read
+`src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
+`%APPDATA%\xboxrecomp\input_bindings.json`, else one beside the executable — and falls
+back to exactly the old behaviour when there is none. `py -3 -m tools.input_ui` is the UI
+that writes it. See `docs/technical/input-binding.md`. `RECOMP_FAKE_INPUT` and
+`RECOMP_INPUT_SEQ` still apply to controller 1 and ignore the bindings.
+
 Two things that cost days and are worth knowing before touching this code. The title's
 **deferred render state arrays do not follow its pixel shader** — `SetPixelShader` selects
 an object carrying a `D3DPIXELSHADERDEF`, and the arrays hold whichever shader last went
@@ -76,6 +150,12 @@ The shader generators stay as they are: `d3d8_combiners.c`, `d3d8_vsh.c` and
 survive the move. Do **not** rewrite them to GLSL. Vulkan's costs here are the Y-flip and
 front-face winding inversion (a negative viewport height; note `d3d8_states.c` already
 carries one hand-annotated winding fix, so do not stack a second).
+
+**The plan behind that paragraph is `docs/technical/vulkan-backend.md`** (Sep 2026): only
+7% of `src/d3d` touches D3D11 at all (814 lines of 11.3k, 58 distinct entry points), so the
+seam goes *inside* `src/d3d` as an RHI, not at the COM vtable — `d3d8_gl.c` is the in-tree
+proof of what the vtable seam costs, and it should be deleted once Vulkan can replay a
+frame. Read §4.4 before touching the winding, and §4.10 before choosing a present mode.
 
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
@@ -174,12 +254,40 @@ it. Keep it beside the XBE.
 Use `--game-only` when bringing up a new title. Lifting CRT and XDK code you intend to HLE away
 wastes compile time and debugging attention. Switch to `--all` only when needed.
 
+**Two titles at once (this fork):** every stage defaults to one shared `tools/*/output`,
+and the recompiler's title guard compares file names only, so two `default.xbe`s overwrite
+each other silently. Give each title its own outputs and project:
+
+```bash
+py -3 scripts/recompile.py "games/<title>/default.xbe" \
+    --work-dir games/_pipeline/<name>/out --project titles/<name>
+```
+
+Add `--trace-all-entries` only while bringing a title up: it puts a hook at every lifted
+function's entry (for `[TRACE]` lines, `RECOMP_TRACE_ONLY`, the entry profiler and the
+"main thread stops entering new functions" diagnosis) and costs a few percent of frame
+time. A plain lift keeps `RECOMP_SAMPLE` and the kernel log. Both titles are lifted plain
+now; TimeSplitters 2 was re-lifted plain on 19 Sep 2026 with no change in behaviour.
+
+Projects live in `titles/<name>/` (committed: CMakeLists, `main.c`, `recomp_manual.c`),
+game data in `games/<title>/` and stage output in `games/_pipeline/<name>/out` (both
+ignored). Regenerate a title's `main.c` from the template with
+`scripts/regen_title_main.py` rather than editing the copy. On this machine CMake is the
+one bundled with VS 2019 Build Tools; there is no VS 2022 and none is needed.
+
 ---
 
 ## Debug loop
 
 Build with `--game-only` → run → read stderr → classify → fix → rebuild. Most project time
 lives here.
+
+**Before reading a wild pointer as a memory-model problem, spend three runs on
+`docs/technical/memory-watchpoints.md`.** `RECOMP_TRAP_NULL`, `RECOMP_FIND_VALUE`
+and `RECOMP_WATCH_WRITE` answer "who holds this" and "what wrote this" in a
+plain lift with no trace hooks. Outrun 2's 0xF8604020 cost a day as an aperture
+question and turned out to be three overlapping stores near a null pointer,
+found in three runs once the tools existed.
 
 | stderr shows | Cause |
 |---|---|
@@ -190,6 +298,17 @@ lives here.
 | Infinite loop | Waiting on hardware state — stub the wait or fake the state |
 | Stack overflow | Wrong ESP at entry, or runaway recursion |
 | **Subtly wrong physics or RNG, no crash** | **x87 precision divergence — suspect this first when behaviour differs from xemu without a fault** |
+| A key or pad does nothing, and no `[INPUT] port N first press` line appears | The binding, not the title. `[INPUT] bindings from ...` at start-up names the config that was loaded and the device on each port; `py -3 -m tools.input_ui --print` shows what it holds |
+| Exits via `HalReturnToFirmware` after ~15 kernel calls | XAPI's retail disc check failed (certificate `AllowedMedia` is DVD-X2 only). The kernel answers it since Sep 2026; if it recurs, look at the mode-sense reply in `kernel_bridge.c` |
+| Main thread stops entering new functions right after the first `Swap`; ISR keeps ticking | `D3D_BlockOnTime` waiting for the GPU time fence. The HLE mirrors it from `D3D_BlockOnTime`'s prologue; a "not mirrored" line in the log means this XDK's prologue differs |
+| Stops in DirectSound start-up, watchdog shows `ebx = <block>+0x810` | The DSP doorbell. Found from `GPSADDR`/`EPSADDR` under `RECOMP_AC97_READY`; without that switch DirectSound never gets this far and the title dereferences a half-built sound object instead |
+| Draws keep coming but `Swap` slows to one every many seconds, no crash, `[FPS]` near 0 | Look at your own switches first. `--profile` (entry profiler) and a `--trace-all-entries` build printing `[TRACE]` lines both cost more per function entry than the title does; `RECOMP_SAMPLE=500` shows it as `NtWriteFile`/`prof_report`. Rerun with `RECOMP_TRACE_BUDGET=0` and no `--profile` before believing the title is stuck |
+| Fault through a pointer that is in no aperture, e.g. `0xF8604020` | Suspect debris before a missing memory window. `RECOMP_FIND_VALUE=<the value>` scans guest RAM at the crash and prints who holds it; a hit at a tiny address means a null pointer plus an offset. `RECOMP_TRAP_NULL=1` then moves the fault to the instruction that made the mistake |
+| A structure holds a value it should not, and you need to know who put it there | `RECOMP_WATCH_WRITE=<addr>` faults on every write to it and names the writer, in a plain lift. See `docs/technical/memory-watchpoints.md`. Trust its `callers:` line over its symbol, because the linker folds identical functions |
+| `[THROW] the title threw a C++ exception` | This runtime cannot unwind, so the throw **returns** and everything after it runs on a stack nothing cleaned up. Rerun with `RECOMP_THROW_FATAL=1` and treat that as the real stopping point. `docs/technical/cpp-exceptions.md` |
+| `[INT3] lifted code reached a debug trap` | The same thing seen one step later, when the throw helper was not identified. MSVC puts a trap after any call it thinks cannot return |
+| A hang with `[ICALL] target 0x... is not code` repeating | A skipped indirect call returns eax = 0, which is also S_OK, so a COM-shaped loop never exits. The runtime says so after 100,000 skips; `RECOMP_ICALL_SPIN_FATAL=1` stops there. Try `py -3 -m tools.seed_from_log` on the log |
+| A signed quantity is never negative — an axis saturates, a delta only grows, an abs is a no-op | A lifter sign-extension gap. `movsx r32, bp` was lifted as a zero extension until 20 Sep 2026, because `_lift_movsx`'s register list was missing `bp`/`sp` and the unmatched case fell through to the plain (zero-extended) read. Grep the generated C for `= LO16(` or `= LO8(` as a whole right-hand side: a bare narrow read where a `SX16`/`SX8` belongs. `movsx` now emits `/* movsx: unhandled source register */` rather than failing silently |
 
 Overrides live in `recomp_manual.c` and are checked before the auto-generated table, so they
 always win. `manual_scan.py` parses that file to decide what not to generate, so keep them

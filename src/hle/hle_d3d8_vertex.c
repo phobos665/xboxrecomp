@@ -29,6 +29,11 @@
  * data in edx, and for the NotInline pair a count of floats on the stack.
  * The register is already 0..191, the host's range; Cxbx-Reloaded subtracts
  * 96 on the way in only because its shared setter adds it back.
+ *
+ * XDK 3925 has only that shared setter, D3DDevice_SetVertexShaderConstant,
+ * and it is the exception to the line above: its register is -96-based and
+ * the XDK biases it itself, so the replacement at the bottom of this file
+ * adds 96 to reach the same range the fastcall ones already arrive in.
  */
 #include "platform/xbox_winnt.h"
 #include <stdio.h>
@@ -109,6 +114,8 @@ HLE_ORIGINAL(D3DDevice_SetStreamSource);
 HLE_ORIGINAL(CDevice_SetStateVB);
 HLE_ORIGINAL(D3DDevice_DrawVertices);
 HLE_ORIGINAL(D3DDevice_DrawIndexedVertices);
+/* The one generic setter, on XDKs that predate the specialised forms. */
+HLE_ORIGINAL(D3DDevice_SetVertexShaderConstant);
 HLE_ORIGINAL(D3DDevice_SetVertexShaderConstant1);
 HLE_ORIGINAL(D3DDevice_SetVertexShaderConstant4);
 HLE_ORIGINAL(D3DDevice_SetVertexShaderConstantNotInline);
@@ -332,5 +339,58 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstantNotInlineFast)
 #ifdef _WIN32
     if (!g_in_notinline)
         forward_constants(reg, data, floats / 4u);
+#endif
+}
+
+/* void __stdcall D3DDevice_SetVertexShaderConstant(INT Register,
+ *     const void *pConstantData, DWORD ConstantCount)
+ *
+ * The one generic setter, on an XDK that predates the specialised forms.
+ * Max Payne is XDK 3925: its D3D8 exports this and none of Constant1,
+ * Constant4, NotInline or NotInlineFast, so a title there sets every vertex
+ * shader constant through a function nothing replaced, and the host saw none
+ * of them.
+ *
+ * ConstantCount counts registers here, not floats -- it is the plain D3D8
+ * signature. NotInline's float count is the odd one out, not this.
+ *
+ * Register is -96-based and biased here, which the specialised forms are not.
+ * 3925 starts `mov edx,[ebp+8]; add edx,0x60`, applying the bias itself, while
+ * 4721's Constant4 writes its ecx straight into the push buffer and indexes
+ * its shadow array with it unchanged. host_vsh_set_constant wants the same
+ * 0-based index the specialised forms hand it, so the bias has to be added
+ * here or every constant lands 96 registers low -- silently, because the
+ * range check below would still pass for most of them.
+ *
+ * The arguments are logged for the first few calls: this has not yet been
+ * seen to run (Max Payne reaches no vertex shader in the frames it renders),
+ * so the log is the evidence that the reading above is right.
+ */
+#define XBOX_VSH_CONSTANT_BIAS 96u
+
+HLE_EXPORT(D3DDevice_SetVertexShaderConstant)
+{
+    static int seen;
+    uint32_t reg   = HLE_ARG(0) + XBOX_VSH_CONSTANT_BIAS;
+    uint32_t data  = HLE_ARG(1);
+    uint32_t count = HLE_ARG(2);
+
+    first_call(&seen, "D3DDevice_SetVertexShaderConstant", reg);
+    {
+        static int notes;
+        if (notes < 4) {
+            notes++;
+            fprintf(stderr, "[HLE-D3D8] SetVertexShaderConstant(reg=%d, data=0x%08X,"
+                    " count=%u) -> host register %u; ecx=0x%08X edx=0x%08X\n",
+                    (int)HLE_ARG(0), data, count, reg, g_ecx, g_edx);
+            fflush(stderr);
+        }
+    }
+    if (original_missing(hle_original_D3DDevice_SetVertexShaderConstant,
+                         "D3DDevice_SetVertexShaderConstant"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant);
+#ifdef _WIN32
+    forward_constants(reg, data, count);
 #endif
 }

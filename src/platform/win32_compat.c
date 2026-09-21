@@ -1007,11 +1007,17 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
     void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
                    flags, -1, 0);
     if (p == MAP_FAILED) { SetLastError(8); return NULL; }
-#if !defined(MAP_FIXED_NOREPLACE)
-    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
-     * MAP_FIXED would silently unmap whatever already lives there. Getting a
-     * different address means the range was taken: fail as Linux does. */
-#endif
+    /* Getting a different address means the range was taken, which Windows
+     * reports as a failure rather than quietly relocating the allocation. An
+     * older kernel without MAP_FIXED_NOREPLACE ignores the flag and places it
+     * elsewhere, so this check is what makes the two behave alike -- and it
+     * never destroys an existing mapping to get there, which is why the flag
+     * is a hint here and never bare MAP_FIXED. */
+    if (address && p != address) {
+        munmap(p, size);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
     return p;
 }
 
@@ -1463,10 +1469,39 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
+    int flags  = MAP_SHARED;
+
+    /* A requested address must either be honoured exactly or refused.
+     *
+     * This used to pass bare MAP_FIXED, which does the opposite of what the
+     * caller wants: it silently unmaps whatever already lives there and
+     * reports success. Windows fails instead, and the runtime depends on that
+     * failing -- xbox_memory_layout.c tries a list of preferred bases for the
+     * 64 MB view and checks which one it got, and maps up to 28 mirror views
+     * plus the contiguous, tiled, NV2A, MCPX and flash apertures at fixed
+     * offsets, printing "Mirror N: FAILED" when one cannot be placed. With
+     * MAP_FIXED those never fail; they quietly destroy a live mapping and
+     * carry on, and the damage surfaces later as memory that changed by
+     * itself.
+     *
+     * MAP_FIXED_NOREPLACE (Linux 4.17+) asks for exactly this. Without it,
+     * pass the address as a hint only and check what came back, which never
+     * destroys anything -- the cost is that a hint may be ignored, and the
+     * check below turns that into the same clean failure. */
+#if defined(MAP_FIXED_NOREPLACE)
+    if (baseAddr) flags |= MAP_FIXED_NOREPLACE;
+#endif
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (baseAddr && p != baseAddr) {
+        /* The range was taken. An older kernel ignores MAP_FIXED_NOREPLACE
+         * and places it elsewhere, so this check is what makes the behaviour
+         * the same on both. */
+        munmap(p, len);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
     view_register(p, len);
     return p;
 }

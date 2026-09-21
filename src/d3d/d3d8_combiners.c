@@ -38,6 +38,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -98,16 +99,43 @@ static uint32_t fnv1a_hash(const void *data, size_t len)
     return h;
 }
 
+/* Only the structural part of the state is the key: the constant colours
+ * that follow it are uploaded per draw and are not in the HLSL, and keying
+ * on them made every distinct colour a new entry and a new D3DCompile in a
+ * 128-entry table that then evicted and recompiled the same shaders in
+ * steady state. */
 static uint32_t combiner_state_hash(const NV2ACombinerState *state)
 {
-    return fnv1a_hash(state, sizeof(NV2ACombinerState));
+    return fnv1a_hash(state, NV2A_COMBINER_KEY_BYTES);
 }
 
 static BOOL combiner_state_equal(const NV2ACombinerState *a,
                                  const NV2ACombinerState *b)
 {
-    return memcmp(a, b, sizeof(NV2ACombinerState)) == 0;
+    return memcmp(a, b, NV2A_COMBINER_KEY_BYTES) == 0;
 }
+
+/* How many generated shaders RECOMP_D3D8_PS_DUMP asks to see, and whether it
+ * was asked for at all. The switch used to be a flag that meant "two"; a
+ * count is what it always wanted to be, and a bare RECOMP_D3D8_PS_DUMP=1
+ * still gives a useful dump, just of one shader rather than two. */
+static int ps_dump_limit(void)
+{
+    const char *v = getenv("RECOMP_D3D8_PS_DUMP");
+    int n;
+
+    if (!v || !*v)
+        return 0;
+    n = atoi(v);
+    return n > 0 ? n : 2;
+}
+
+/* The shader for g_combiner_state as last parsed. The lookup hashes ~1.5 KB
+ * per call and was the largest host-side symbol in TimeSplitters 2's
+ * profile; the state only changes when a PS render state does, so the
+ * result is kept until the next parse. Only this path calls the lookup in
+ * the runtime, so the entry cannot be evicted while it is held. */
+static ID3D11PixelShader *g_last_shader;
 
 /* ================================================================
  * Color Helpers
@@ -299,6 +327,21 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
          * COMPLEMENT_V1 0x40, COMPLEMENT_R0 0x20), which is not applied yet: a
          * title relying on those flags gets the uncomplemented, unclamped
          * value. */
+        /* A shader that never programs the final combiner leaves both words
+         * zero, and every one of TimeSplitters 2's front-end shaders does
+         * (count 0x11101, one stage writing r0). Read literally that is
+         * A = B = C = D = ZERO and G = ZERO: out = 0 + 0*0 + 1*0 = black with
+         * alpha 0, which is what the shadow renderer drew -- a black frame
+         * over a progress bar the fixed-function path showed plainly. The
+         * console's D3D gives an unprogrammed final combiner the pass-through
+         * the shader assembler documents as its default, `xfc r0.a, zero,
+         * zero, zero, zero, zero, r0`: colour D = r0, alpha G = r0.a. Do the
+         * same. A title that wants black writes ZERO into D explicitly, which
+         * is a different word from "nothing written". */
+        if (abcd == 0 && efg == 0) {
+            abcd = 0x0000000Cu;              /* D = R0 */
+            efg  = 0x00001C00u;              /* G = R0 alpha */
+        }
         parse_combiner_input((abcd >> 24) & 0xFF, &state->final_input[0]); /* A */
         parse_combiner_input((abcd >> 16) & 0xFF, &state->final_input[1]); /* B */
         parse_combiner_input((abcd >>  8) & 0xFF, &state->final_input[2]); /* C */
@@ -923,18 +966,28 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
     }
 
     {
-        /* Debug switch, RECOMP_D3D8_PS_DUMP=1: prints the first two
-         * shaders built. The source is otherwise only printed when the
-         * compile fails, which says nothing about a shader that compiles and
-         * draws the wrong colour. */
-        static int dumps = -1;
+        /* Debug switch, RECOMP_D3D8_PS_DUMP=<n>: prints the source of the
+         * first n shaders built (n defaults to 2). The source is otherwise
+         * only printed when the compile fails, which says nothing about a
+         * shader that compiles and draws the wrong colour.
+         *
+         * This is called on a cache miss, so the order here is the order
+         * shaders are *built*, which is not the order they are drawn with and
+         * not the title's own pixel shader numbering. Reading a dump as
+         * belonging to a particular draw is therefore a guess -- one that
+         * cost a wrong diagnosis of the TimeSplitters 2 brightness bug. The
+         * hash below is the same value d3d8_combiners_apply() prints when it
+         * binds a shader, so draw and source can be matched instead. */
+        static int dumped, limit = -1;
 
-        if (dumps < 0)
-            dumps = getenv("RECOMP_D3D8_PS_DUMP") ? 0 : 99;
-        if (dumps < 2) {
-            dumps++;
-            fprintf(stderr, "NV2A combiners: state stages %d, tex_mode %d %d %d %d, "
+        if (limit < 0)
+            limit = ps_dump_limit();
+        if (dumped < limit) {
+            dumped++;
+            fprintf(stderr, "NV2A combiners: shader %08lX: state stages %d, "
+                    "tex_mode %d %d %d %d, "
                     "c0[0] 0x%08lX c1[0] 0x%08lX, final_c0 0x%08lX final_c1 0x%08lX\n",
+                    (unsigned long)combiner_state_hash(state),
                     state->num_stages, (int)state->tex_mode[0], (int)state->tex_mode[1],
                     (int)state->tex_mode[2], (int)state->tex_mode[3],
                     (unsigned long)state->c0[0], (unsigned long)state->c1[0],
@@ -1051,6 +1104,7 @@ HRESULT d3d8_combiners_init(void)
     memset(&g_combiner_state, 0, sizeof(g_combiner_state));
     g_ps_token = 0;
     g_dirty = TRUE;
+    g_last_shader = NULL;
     g_frame_counter = 0;
 
     /* Create the PS constant buffer for combiner shaders.
@@ -1085,6 +1139,7 @@ void d3d8_combiners_shutdown(void)
         }
     }
     memset(g_cache, 0, sizeof(g_cache));
+    g_last_shader = NULL;
 
     if (g_combiner_cb) {
         ID3D11Buffer_Release(g_combiner_cb);
@@ -1144,10 +1199,36 @@ BOOL d3d8_combiners_prepare_draw(void)
     if (g_dirty) {
         d3d8_combiners_parse_token(g_ps_token, rs, &g_combiner_state);
         g_dirty = FALSE;
+        g_last_shader = NULL;
     }
 
     /* Get or compile the pixel shader for this combiner state */
-    ps = d3d8_combiners_get_shader(&g_combiner_state);
+    if (!g_last_shader)
+        g_last_shader = d3d8_combiners_get_shader(&g_combiner_state);
+    ps = g_last_shader;
+
+    /* Under RECOMP_D3D8_PS_DUMP, say which shader each draw actually binds.
+     * Printed only when it changes, so the log stays readable and still
+     * interleaves with the replay's own per-draw lines: that pairing is what
+     * identifies the shader behind a particular draw, which the dump order
+     * on its own does not. */
+    if (ps) {
+        static int want = -1;
+        static uint32_t last_printed;
+        uint32_t hash;
+
+        if (want < 0)
+            want = ps_dump_limit() > 0;
+        if (want) {
+            hash = combiner_state_hash(&g_combiner_state);
+            if (hash != last_printed) {
+                last_printed = hash;
+                fprintf(stderr, "NV2A combiners: binding shader %08lX\n",
+                        (unsigned long)hash);
+                fflush(stderr);
+            }
+        }
+    }
     if (!ps) {
         fprintf(stderr, "NV2A combiners: Failed to get shader, "
                 "falling back to FFP\n");

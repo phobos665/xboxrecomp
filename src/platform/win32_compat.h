@@ -387,6 +387,9 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_INVALID_HANDLE          6u
 #define ERROR_NOT_ENOUGH_MEMORY       8u
 #define ERROR_NO_MORE_FILES           18u
+/* Windows reports a requested mapping address that is already taken this way,
+ * rather than relocating the mapping. The POSIX shims match that. */
+#define ERROR_INVALID_ADDRESS         487u
 #define ERROR_GEN_FAILURE             31u
 #define ERROR_HANDLE_EOF              38u
 #define ERROR_NOT_SUPPORTED           50u

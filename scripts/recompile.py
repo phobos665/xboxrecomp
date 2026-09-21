@@ -22,6 +22,13 @@ Re-run a later stage on its own after changing something:
 
     python3 scripts/recompile.py game.xbe --from identify
     python3 scripts/recompile.py game.xbe --only lift --all
+
+Working on more than one title: give each its own stage outputs and its own
+project, or the second title silently lifts from the first one's disassembly
+(every retail XBE is called default.xbe, and that name is all the guard checks):
+
+    python3 scripts/recompile.py games/ts2/default.xbe \
+        --work-dir games/_pipeline/ts2 --project titles/timesplitters2
 """
 
 import argparse
@@ -77,6 +84,14 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     disasm = [sys.executable, "-m", "tools.disasm", str(xbe)]
     if args.text_only:
         disasm.append("--text-only")
+    # Every stage defaults to one shared tools/*/output directory, and the
+    # recompiler's guard against mixing titles compares file names only --
+    # every retail disc is default.xbe, so two titles worked on side by side
+    # silently lift one game's code from the other's disassembly. --work-dir
+    # gives a title its own set of stage outputs.
+    work = Path(args.work_dir).resolve() if args.work_dir else None
+    if work:
+        disasm += ["-o", str(work / "disasm")]
     # Seeds are entry points nothing in the image references -- vtable slots
     # and indirect-call targets recovered from a run. Discovery cannot find
     # them by construction, so omitting the file here silently undoes every
@@ -89,6 +104,11 @@ def build_commands(args, xbe: Path, analysis_json: Path):
         disasm.append("-v")
 
     identify = [sys.executable, "-m", "tools.func_id", str(xbe)]
+    if work:
+        identify += ["--functions", str(work / "disasm" / "functions.json"),
+                     "--strings", str(work / "disasm" / "strings.json"),
+                     "--xrefs", str(work / "disasm" / "xrefs.json"),
+                     "-o", str(work / "func_id")]
     if args.verbose:
         identify.append("-v")
 
@@ -96,8 +116,24 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     lift.append("--all" if args.all else "--game-only")
     if args.split:
         lift += ["--split", str(args.split)]
-    if args.gen_dir:
-        lift += ["--gen-dir", args.gen_dir]
+    if work:
+        lift += ["--disasm-dir", str(work / "disasm"),
+                 "--func-id-dir", str(work / "func_id"),
+                 "-o", str(work / "recomp")]
+    # A title project copied from templates/new-game: the generated sources
+    # go where its CMakeLists globs them, and the functions its
+    # recomp_manual.c defines by hand are left out of the generated set so
+    # the two never define the same symbol. --gen-dir still wins if both
+    # are given.
+    project = Path(args.project).resolve() if args.project else None
+    gen_dir = args.gen_dir or (str(project / "src" / "recomp" / "gen")
+                               if project else None)
+    if gen_dir:
+        lift += ["--gen-dir", gen_dir]
+    if project and (project / "src" / "recomp_manual.c").is_file():
+        lift += ["--exclude-manual", str(project / "src" / "recomp_manual.c")]
+    if args.game_name:
+        lift += ["--game-name", args.game_name]
     if args.trace_all_entries:
         lift.append("--trace-all-entries")
     # XDK functions with a name-keyed replacement (tools/recomp/hle.py), used
@@ -169,6 +205,18 @@ def main() -> int:
                     help="Functions per generated .c file (default: 1000)")
     ap.add_argument("--gen-dir", metavar="DIR",
                     help="Output directory for generated sources")
+    ap.add_argument("--work-dir", metavar="DIR",
+                    help="Per-title directory for the stage outputs "
+                         "(disasm/, func_id/, recomp/). Without it every "
+                         "stage writes to the shared tools/*/output, and two "
+                         "titles both called default.xbe overwrite each other.")
+    ap.add_argument("--project", metavar="DIR",
+                    help="A title project made from templates/new-game. "
+                         "Generated sources go to DIR/src/recomp/gen and the "
+                         "functions DIR/src/recomp_manual.c defines by hand "
+                         "are not generated.")
+    ap.add_argument("--game-name", metavar="NAME",
+                    help="Name stamped into the generated-code banners")
     ap.add_argument("--json", metavar="FILE",
                     help="Where to write the stage-1 analysis JSON "
                          "(default: <xbe stem>_analysis.json beside the XBE)")

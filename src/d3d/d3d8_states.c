@@ -11,6 +11,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_display.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -114,10 +115,11 @@ static DWORD hash_blend_states(const DWORD *rs)
            (rs[D3DRS_COLORWRITEENABLE] << 16);
 }
 
-static DWORD hash_raster_states(const DWORD *rs)
+static DWORD hash_raster_states(const DWORD *rs, BOOL scissor)
 {
     return rs[D3DRS_CULLMODE] ^
-           (rs[D3DRS_FILLMODE] << 4);
+           (rs[D3DRS_FILLMODE] << 4) ^
+           (scissor ? 0x100u : 0u);
 }
 
 /* ================================================================
@@ -188,9 +190,9 @@ static void update_depth_stencil_state(const DWORD *rs)
         memcpy(&g_last_ds_desc, &dsd, sizeof(dsd));
 }
 
-static void update_rasterizer_state(const DWORD *rs)
+static void update_rasterizer_state(const DWORD *rs, BOOL scissor)
 {
-    DWORD hash = hash_raster_states(rs);
+    DWORD hash = hash_raster_states(rs, scissor);
     D3D11_RASTERIZER_DESC rd;
     HRESULT hr;
 
@@ -219,7 +221,7 @@ static void update_rasterizer_state(const DWORD *rs)
 
     rd.FrontCounterClockwise = FALSE;
     rd.DepthClipEnable = TRUE;
-    rd.ScissorEnable = FALSE;
+    rd.ScissorEnable = scissor;
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
 
@@ -266,22 +268,78 @@ static D3D11_FILTER d3d8_to_d3d11_filter(DWORD mag, DWORD min, DWORD mip)
     return D3D11_FILTER_MIN_MAG_MIP_POINT;
 }
 
+/* Sampler objects, kept by descriptor. Every draw applies all four stages,
+ * and a title's stages mostly keep their filter and addressing from one
+ * draw to the next, so a stage whose descriptor has not changed keeps its
+ * object and is not re-bound; a descriptor seen before gets its object
+ * back. Creating a sampler takes the device lock, and this used to be four
+ * creates and four releases per draw. The cache owns one reference to each
+ * object and each bound stage owns another, so replacing a cache entry can
+ * never pull an object from under a stage. */
+#define SAMPLER_CACHE_SIZE 32
+
+typedef struct SamplerCacheEntry {
+    D3D11_SAMPLER_DESC  desc;
+    ID3D11SamplerState *state;
+} SamplerCacheEntry;
+
+static SamplerCacheEntry  g_sampler_cache[SAMPLER_CACHE_SIZE];
+static int                g_sampler_cache_count;
+static int                g_sampler_cache_next;       /* replacement cursor */
+static D3D11_SAMPLER_DESC g_sampler_bound_desc[4];    /* what each stage holds */
+
+static ID3D11SamplerState *sampler_cache_get(const D3D11_SAMPLER_DESC *sd)
+{
+    SamplerCacheEntry *e;
+    HRESULT hr;
+    int i;
+
+    for (i = 0; i < g_sampler_cache_count; i++)
+        if (memcmp(&g_sampler_cache[i].desc, sd, sizeof(*sd)) == 0)
+            return g_sampler_cache[i].state;
+
+    if (g_sampler_cache_count < SAMPLER_CACHE_SIZE) {
+        e = &g_sampler_cache[g_sampler_cache_count++];
+    } else {
+        e = &g_sampler_cache[g_sampler_cache_next];
+        g_sampler_cache_next = (g_sampler_cache_next + 1) % SAMPLER_CACHE_SIZE;
+        if (e->state) {
+            ID3D11SamplerState_Release(e->state);
+            e->state = NULL;
+        }
+    }
+    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), sd, &e->state);
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: CreateSamplerState failed: 0x%08lX\n", hr);
+        e->state = NULL;
+    }
+    memcpy(&e->desc, sd, sizeof(*sd));
+    return e->state;
+}
+
+static void sampler_cache_shutdown(void)
+{
+    int i;
+    for (i = 0; i < g_sampler_cache_count; i++) {
+        if (g_sampler_cache[i].state)
+            ID3D11SamplerState_Release(g_sampler_cache[i].state);
+        g_sampler_cache[i].state = NULL;
+    }
+    g_sampler_cache_count = 0;
+    g_sampler_cache_next = 0;
+    memset(g_sampler_bound_desc, 0, sizeof(g_sampler_bound_desc));
+}
+
 void d3d8_states_apply_sampler(DWORD stage)
 {
     const DWORD *tss;
     D3D11_SAMPLER_DESC sd;
-    HRESULT hr;
+    ID3D11SamplerState *state;
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
 
     if (stage >= 4) return;
     tss = d3d8_GetTSS(stage);
     if (!tss) return;
-
-    /* Release old sampler */
-    if (g_sampler_states[stage]) {
-        ID3D11SamplerState_Release(g_sampler_states[stage]);
-        g_sampler_states[stage] = NULL;
-    }
 
     memset(&sd, 0, sizeof(sd));
     sd.Filter = d3d8_to_d3d11_filter(
@@ -292,13 +350,43 @@ void d3d8_states_apply_sampler(DWORD stage)
     sd.AddressV = d3d8_to_d3d11_address(tss[D3DTSS_ADDRESSV] ? tss[D3DTSS_ADDRESSV] : D3DTADDRESS_WRAP);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
     sd.MaxAnisotropy = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
+
+    /* Forced anisotropy, and only where the title already minifies
+     * linearly. A stage filtering by nearest texel is almost always the
+     * 2D layer -- fonts, HUD art, anything authored to land on exact
+     * pixels -- and smoothing that blurs it for no gain. Textures on a
+     * floor or a wall seen at a glancing angle are what this is for, and
+     * they are the ones asking for a linear filter. */
+    {
+        UINT forced = d3d8_display_policy()->anisotropy;
+
+        if (forced > 1 &&
+            (sd.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR ||
+             sd.Filter == D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT ||
+             sd.Filter == D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT ||
+             sd.Filter == D3D11_FILTER_ANISOTROPIC)) {
+            sd.Filter = D3D11_FILTER_ANISOTROPIC;
+            if (sd.MaxAnisotropy < forced)
+                sd.MaxAnisotropy = forced;
+        }
+    }
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
 
-    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_sampler_states[stage]);
-    if (SUCCEEDED(hr)) {
-        ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
-    }
+    /* Unchanged since it was bound: nothing to do. */
+    if (g_sampler_states[stage] &&
+        memcmp(&sd, &g_sampler_bound_desc[stage], sizeof(sd)) == 0)
+        return;
+
+    state = sampler_cache_get(&sd);
+    if (!state) return;
+
+    if (g_sampler_states[stage])
+        ID3D11SamplerState_Release(g_sampler_states[stage]);
+    ID3D11SamplerState_AddRef(state);
+    g_sampler_states[stage] = state;
+    memcpy(&g_sampler_bound_desc[stage], &sd, sizeof(sd));
+    ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
 }
 
 /* ================================================================
@@ -323,6 +411,7 @@ void d3d8_states_shutdown(void)
             g_sampler_states[i] = NULL;
         }
     }
+    sampler_cache_shutdown();
     g_last_blend_hash = 0;
     g_last_raster_hash = 0;
 }
@@ -332,12 +421,17 @@ void d3d8_states_apply(void)
     const DWORD *rs = d3d8_GetRenderStates();
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     float blend_factor[4] = { 1, 1, 1, 1 };
+    static D3D11_RECT last_scissor;
+    static BOOL last_scissor_on;
+    D3D11_RECT scissor;
+    BOOL scissor_on;
 
     if (!rs || !ctx) return;
 
+    scissor_on = d3d8_GetScissor(&scissor);
     update_blend_state(rs);
     update_depth_stencil_state(rs);
-    update_rasterizer_state(rs);
+    update_rasterizer_state(rs, scissor_on);
 
     if (g_blend_state)
         ID3D11DeviceContext_OMSetBlendState(ctx, g_blend_state, blend_factor, 0xFFFFFFFF);
@@ -345,6 +439,13 @@ void d3d8_states_apply(void)
         ID3D11DeviceContext_OMSetDepthStencilState(ctx, g_ds_state, rs[D3DRS_STENCILREF]);
     if (g_raster_state)
         ID3D11DeviceContext_RSSetState(ctx, g_raster_state);
+    /* The rectangle only matters while the rasterizer state has scissoring
+     * on, and is re-sent only when it changes. */
+    if (scissor_on && (!last_scissor_on || memcmp(&scissor, &last_scissor, sizeof scissor) != 0)) {
+        ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &scissor);
+        last_scissor = scissor;
+    }
+    last_scissor_on = scissor_on;
 
     /* Apply samplers for all 4 texture stages */
     {

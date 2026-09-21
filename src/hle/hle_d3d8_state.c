@@ -489,6 +489,7 @@ static int      g_ps_def_seen, g_ps_dirty;
  * Until then nothing here is trusted, because a title whose objects are laid
  * out differently would otherwise have every draw quietly demoted. */
 static int      g_ps_def_ok;
+static int      g_state_dumped;
 
 /* A guest heap pointer, roughly: inside the console's RAM, aligned, not a
  * small integer. HLE_MEM32 has no mapped-page check, so a handle that is a
@@ -502,24 +503,39 @@ void hle_d3d8_pixel_shader_selected(uint32_t handle)
 {
     uint32_t def = 0;
 
-    /* The object carries a pointer to its own definition just in front of it
-     * (+0x08). Without that, this is a layout this code has not seen: say so
-     * once, and leave the combiners alone rather than guessing. */
+    /* The object carries a pointer to its definition at +0x08. A shader made
+     * by CreatePixelShader (Burnout 2, XDK 5344) embeds the definition and the
+     * pointer is to its own +0x0C. XDK 4721's SetPixelShaderProgram(pPSDef)
+     * makes no copy: it fills a static three-word object in the device,
+     * {1, 0, pPSDef}, and selects that, so the pointer leads outside the
+     * object to the title's own D3DPIXELSHADERDEF. Both are the same
+     * definition layout, a public XDK structure. Anything else is a layout
+     * this code has not seen: say so once, and leave the combiners alone. */
     if (handle) {
-        if (!plausible_va(handle) ||
-            HLE_MEM32(handle + PSDEF_SELF_PTR) != handle + PSDEF_AT_HANDLE) {
+        uint32_t ptr = plausible_va(handle) ? HLE_MEM32(handle + PSDEF_SELF_PTR) : 0;
+
+        if (ptr == handle + PSDEF_AT_HANDLE) {
+            def = ptr;
+        } else if (plausible_va(ptr)) {
+            static int said;
+            def = ptr;
+            if (!said++)
+                fprintf(stderr, "[HLE-D3D8] shadow pixel shader: SetPixelShader(0x%08X) "
+                        "points at a definition outside the object (0x%08X), the "
+                        "SetPixelShaderProgram form\n", handle, ptr);
+        } else {
             static int warned;
 
             if (!warned) {
                 warned = 1;
                 fprintf(stderr, "[HLE-D3D8] shadow pixel shader: SetPixelShader(0x%08X) "
-                        "is not a shader object with a definition at +0x%02X; pixel "
-                        "shaders are left off (RECOMP_HLE_D3D8_PS=1 forwards the "
-                        "render states instead)\n", handle, PSDEF_AT_HANDLE);
+                        "is not a shader object with a definition at +0x%02X or a "
+                        "pointer to one; pixel shaders are left off "
+                        "(RECOMP_HLE_D3D8_PS=1 forwards the render states instead)\n",
+                        handle, PSDEF_AT_HANDLE);
             }
             return;
         }
-        def = handle + PSDEF_AT_HANDLE;
     }
     if (def && !g_ps_def_seen) {
         g_ps_def_seen = 1;
@@ -747,6 +763,103 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
         }
     }
     forward_pixel_shader(dev);
+
+    /* RECOMP_HLE_D3D8_STATE_DUMP: what the title's own arrays actually hold,
+     * once, on the first draw that gets this far.
+     *
+     * A title drawing through the host's fixed-function pixel path lives or
+     * dies by these values -- the colour operation and its two arguments
+     * decide every pixel -- and when the frame comes out black there is no
+     * way to tell a state that was never set from one that was set to zero
+     * without looking. Black issues ten thousand draws a run, all of them
+     * accepted by the renderer, and produces nothing. */
+    if (!g_state_dumped && getenv("RECOMP_HLE_D3D8_STATE_DUMP")) {
+        g_state_dumped = 1;
+        fprintf(stderr, "[HLE-D3D8] state dump, guest values as forwarded:\n");
+        for (i = 0; i < sizeof g_rs_map / sizeof g_rs_map[0]; i++)
+            fprintf(stderr, "    rs[%2u] = 0x%08X\n",
+                    g_rs_map[i].xbox, guest_rs(g_rs_map[i].xbox));
+        for (s = 0; s < STAGES; s++) {
+            uint32_t base = hle_var_D3D_g_DeferredTextureState
+                          + (uint32_t)(s * STAGE_SIZE * 4);
+            fprintf(stderr, "    stage %d:", s);
+            for (i = 0; i < sizeof g_ts_map / sizeof g_ts_map[0]; i++)
+                fprintf(stderr, " ts[%u]=0x%X", g_ts_map[i].xbox,
+                        HLE_MEM32(base + 4 * g_ts_map[i].xbox));
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
     g_prev_valid = 1;
 }
 #endif /* _WIN32 */
+
+/* void __fastcall D3DDevice_SetRenderState_Simple(DWORD Method, DWORD Value)
+ *
+ * The XDK's inline SetRenderState for the "simple" states (57-91) writes the
+ * NV2A method and value into the push buffer and nothing else; the state
+ * array this file reads is written by SetRenderStateNotInline, which calls
+ * this and then stores the value. A title that calls the simple form directly
+ * -- TimeSplitters 2's renderer does, 1,384 times a minute, for z test, alpha
+ * blend, blend factors and z write -- leaves the array stale, and every draw
+ * reached the host with whatever blend and depth state the previous path
+ * left. Cxbx-Reloaded replaces this function for the same reason
+ * (EMUPATCH(D3DDevice_SetRenderState_Simple)).
+ *
+ * Run the title's own body, then store the value in the slot whose method
+ * this is. The method numbers are the hardware's (NV097_SET_*) and so the
+ * same in every XDK; the slots are the 4627+ layout the rest of this file
+ * assumes. The table is the one SetRenderStateNotInline itself indexes,
+ * read out of TimeSplitters 2's .rdata at 0x00222100. */
+HLE_ORIGINAL(D3DDevice_SetRenderState_Simple);
+
+HLE_EXPORT(D3DDevice_SetRenderState_Simple)
+{
+    static const struct { uint16_t method; uint8_t state; } map[] = {
+        { 0x0354, 57 },  /* ZFUNC              NV097_SET_DEPTH_FUNC */
+        { 0x033C, 58 },  /* ALPHAFUNC          NV097_SET_ALPHA_FUNC */
+        { 0x0304, 59 },  /* ALPHABLENDENABLE   NV097_SET_BLEND_ENABLE */
+        { 0x0300, 60 },  /* ALPHATESTENABLE    NV097_SET_ALPHA_TEST_ENABLE */
+        { 0x0340, 61 },  /* ALPHAREF           NV097_SET_ALPHA_REF */
+        { 0x0344, 62 },  /* SRCBLEND           NV097_SET_BLEND_FUNC_SFACTOR */
+        { 0x0348, 63 },  /* DESTBLEND          NV097_SET_BLEND_FUNC_DFACTOR */
+        { 0x035C, 64 },  /* ZWRITEENABLE       NV097_SET_DEPTH_MASK */
+        { 0x0310, 65 },  /* DITHERENABLE       NV097_SET_DITHER_ENABLE */
+        { 0x037C, 66 },  /* SHADEMODE          NV097_SET_SHADE_MODE */
+        { 0x0358, 67 },  /* COLORWRITEENABLE   NV097_SET_COLOR_MASK */
+        { 0x0374, 68 },  /* STENCILZFAIL       NV097_SET_STENCIL_OP_ZFAIL */
+        { 0x0378, 69 },  /* STENCILPASS        NV097_SET_STENCIL_OP_ZPASS */
+        { 0x0364, 70 },  /* STENCILFUNC        NV097_SET_STENCIL_FUNC */
+        { 0x0368, 71 },  /* STENCILREF         NV097_SET_STENCIL_FUNC_REF */
+        { 0x036C, 72 },  /* STENCILMASK        NV097_SET_STENCIL_FUNC_MASK */
+        { 0x0360, 73 },  /* STENCILWRITEMASK   NV097_SET_STENCIL_MASK */
+        { 0x0350, 74 },  /* BLENDOP            NV097_SET_BLEND_EQUATION */
+        { 0x034C, 75 },  /* BLENDCOLOR         NV097_SET_BLEND_COLOR */
+        { 0x09F8, 76 },  /* SWATHWIDTH         NV097_SET_SWATH_WIDTH */
+        { 0x0384, 77 },  /* POLYGONOFFSETZSLOPESCALE */
+        { 0x0388, 78 },  /* POLYGONOFFSETZOFFSET */
+        { 0x0330, 79 },  /* POINTOFFSETENABLE */
+        { 0x0334, 80 },  /* WIREFRAMEOFFSETENABLE */
+        { 0x0338, 81 },  /* SOLIDOFFSETENABLE */
+    };
+    uint32_t method = g_ecx & 0x1FFCu, value = g_edx;
+    size_t i;
+    /* RECOMP_HLE_D3D8_RS_SIMPLE=0 leaves the array stale, as before this
+     * replacement, to tell a wrong state apart from a wrong draw. */
+    static int store = -1;
+
+    if (hle_original_D3DDevice_SetRenderState_Simple)
+        HLE_CALL_ORIGINAL(D3DDevice_SetRenderState_Simple);
+    if (store < 0) {
+        const char *e = getenv("RECOMP_HLE_D3D8_RS_SIMPLE");
+        store = !(e && *e == '0');
+    }
+    if (!hle_var_D3D_g_RenderState || !store)
+        return;
+    for (i = 0; i < sizeof map / sizeof map[0]; i++) {
+        if (map[i].method == method) {
+            HLE_MEM32(hle_var_D3D_g_RenderState + 4u * map[i].state) = value;
+            return;
+        }
+    }
+}

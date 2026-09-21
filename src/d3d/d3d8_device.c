@@ -16,6 +16,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_display.h"
 #include <stdio.h>
 #include <string.h>
 /* malloc: without <stdlib.h> its pointer is truncated to int. */
@@ -45,8 +46,26 @@ typedef struct D3D8DeviceState {
 
     /* Window */
     HWND                    hwnd;
+    /* The size the scene is rendered at. Everything downstream -- the
+     * device depth buffer, the default viewport, what clip space maps
+     * onto -- follows these, so raising them is the whole of
+     * supersampling. */
     UINT                    width;
     UINT                    height;
+    /* The swap chain's own size, which is what the guest asked to present
+     * at. Equal to width/height while nothing is scaled, and then the
+     * scene target is the back buffer itself and no resolve runs. */
+    UINT                    present_width;
+    UINT                    present_height;
+    /* The swap chain's real size, which follows the window. Separate from
+     * present_width/height because that is the guest's presentation size
+     * and must not move when someone drags a corner: the scene is still
+     * rendered for a 640x480 guest, and only where it lands changes. */
+    UINT                    swap_width;
+    UINT                    swap_height;
+    ID3D11Texture2D          *scene_texture;  /* NULL while unscaled */
+    ID3D11ShaderResourceView *scene_srv;      /* the finished frame, to read */
+    ID3D11RenderTargetView   *present_rtv;    /* the back buffer; NULL unscaled */
     D3DFORMAT               backbuffer_format;
 
     /* State tracking */
@@ -124,6 +143,8 @@ const DWORD *d3d8_GetPalette(DWORD stage)
 /* Forward declarations */
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
+static void present_resolve(void);
+#include "d3d8_overlay.h"
 
 /* ================================================================
  * Public frame pump (called from recompiled game code)
@@ -139,8 +160,10 @@ void d3d8_PresentFrame(void)
     }
 
     /* Present the backbuffer (VSync = 1) */
-    if (g_device_state.swap_chain)
+    if (g_device_state.swap_chain) {
+        present_resolve();
         IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    }
 }
 
 /* ================================================================
@@ -152,9 +175,177 @@ ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_dev
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
+UINT d3d8_GetBackBufferWidth(void)  { return g_device_state.width; }
+UINT d3d8_GetBackBufferHeight(void) { return g_device_state.height; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
+
+/* The size the guest believes it presents at, which is what its
+ * pre-transformed (XYZRHW) vertices are measured in. The same as the back
+ * buffer until a host renders larger than the guest asked; then every
+ * screen-space quad must still be divided by the guest's 640x480, or a
+ * scaled-up window draws its menus in the top-left quarter. Set by the HLE
+ * from the title's own present parameters; unset means the back buffer. */
+static UINT g_guest_width, g_guest_height;
+void xbox_D3D8SetGuestSize(UINT width, UINT height)
+{
+    g_guest_width = width;
+    g_guest_height = height;
+}
+/* Falls back to the presentation size rather than the scene size: those
+ * were the same thing before the host could render larger, and a caller
+ * that never set a guest size wants the smaller of the two -- dividing a
+ * screen-space quad by the scene size would shrink it. */
+UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.present_width; }
+
+ID3D11ShaderResourceView *d3d8_GetSceneSRV(void) { return g_device_state.scene_srv; }
+
+/* Guest render-target pixels to host pixels, for the viewport and the
+ * scissor rectangle -- the two pieces of state a title hands us measured
+ * in pixels rather than normalised.
+ *
+ * Only the scene target is scaled today. A title's own offscreen target is
+ * still created at the size it asked for, so anything bound there keeps a
+ * factor of one; that is what lets render-target scaling be a later step
+ * rather than a precondition. */
+static float rt_scale_x(void)
+{
+    if (g_cur_rt || !g_device_state.present_width)
+        return 1.0f;
+    return (float)g_device_state.width / (float)g_device_state.present_width;
+}
+
+static float rt_scale_y(void)
+{
+    if (g_cur_rt || !g_device_state.present_height)
+        return 1.0f;
+    return (float)g_device_state.height / (float)g_device_state.present_height;
+}
+
+/* Put the scene on the back buffer, immediately before presenting it.
+ * Nothing to do while unscaled: the scene target is the back buffer, and
+ * this is the one call that has to stay free in that case. */
+static void present_resolve(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+    D3D8DisplayFit fit;
+    RECT rc;
+
+    if (!s->present_rtv || !s->scene_srv)
+        return;
+
+    /* Follow the window. DXGI stretches the back buffer to the client
+     * rectangle whatever shape it is, which is the one way a scene that is
+     * right all the way through still reaches the screen distorted. Keep
+     * the buffer the size of the window and the stretch is the identity;
+     * the fit below then puts bars around the picture instead. */
+    if (s->hwnd && GetClientRect(s->hwnd, &rc)) {
+        UINT w = (UINT)(rc.right - rc.left), h = (UINT)(rc.bottom - rc.top);
+
+        if (w && h && (w != s->swap_width || h != s->swap_height)) {
+            ID3D11RenderTargetView *saved_rtv = NULL;
+            ID3D11DepthStencilView *saved_dsv = NULL;
+            ID3D11Texture2D *bb = NULL;
+
+            /* ResizeBuffers wants every reference to the old back buffer
+             * gone, including any the context still holds. */
+            ID3D11DeviceContext_OMGetRenderTargets(s->d3d11_context, 1,
+                                                    &saved_rtv, &saved_dsv);
+            ID3D11DeviceContext_OMSetRenderTargets(s->d3d11_context, 0, NULL, NULL);
+            ID3D11RenderTargetView_Release(s->present_rtv);
+            s->present_rtv = NULL;
+
+            if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(s->swap_chain, 0, w, h,
+                                                        DXGI_FORMAT_UNKNOWN, 0)) &&
+                SUCCEEDED(IDXGISwapChain_GetBuffer(s->swap_chain, 0,
+                                                    &IID_ID3D11Texture2D, (void **)&bb))) {
+                ID3D11Device_CreateRenderTargetView(s->d3d11_device,
+                                                     (ID3D11Resource *)bb, NULL,
+                                                     &s->present_rtv);
+                ID3D11Texture2D_Release(bb);
+                s->swap_width = w;
+                s->swap_height = h;
+            }
+
+            ID3D11DeviceContext_OMSetRenderTargets(s->d3d11_context, 1,
+                                                    &saved_rtv, saved_dsv);
+            if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
+            if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
+            if (!s->present_rtv)
+                return;                 /* try again on the next frame */
+        }
+    }
+
+    {
+        UINT shape_w, shape_h;
+
+        d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
+        fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
+    }
+    d3d8_display_resolve(s->scene_srv, s->width, s->height, s->present_rtv, fit);
+}
+
+/* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
+ * keeps one: D3D11 applies one scissor per viewport, and what titles clip
+ * with it -- a scrolling text box, a minimap -- is one rectangle. More than
+ * one, or an exclusive scissor (draw outside the rectangles), cannot be
+ * expressed here and is applied as no scissor, said once. Coordinates are
+ * render-target pixels, as on the Xbox; when the host renders larger than
+ * the guest they will need scaling, like the viewport. */
+static BOOL       g_scissor_enabled;
+static D3D11_RECT g_scissor;
+static UINT       g_scissor_count;
+static BOOL       g_scissor_exclusive;
+static D3DRECT    g_scissor_rect;
+
+void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
+{
+    static int said;
+
+    if (!rects)
+        count = 0;
+    g_scissor_count = count;
+    g_scissor_exclusive = exclusive;
+    memset(&g_scissor_rect, 0, sizeof g_scissor_rect);
+    if (count)
+        g_scissor_rect = rects[0];
+    g_scissor_enabled = count >= 1 && !exclusive;
+    if (g_scissor_enabled) {
+        g_scissor.left   = rects[0].x1;
+        g_scissor.top    = rects[0].y1;
+        g_scissor.right  = rects[0].x2;
+        g_scissor.bottom = rects[0].y2;
+    }
+    if ((count > 1 || (count && exclusive)) && !said++)
+        fprintf(stderr, "D3D8: SetScissors with %u rectangle(s)%s: the host applies at most "
+                        "one inclusive rectangle\n", count, exclusive ? ", exclusive" : "");
+}
+
+BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
+{
+    if (count)     *count = g_scissor_count;
+    if (exclusive) *exclusive = g_scissor_exclusive;
+    if (rect)      *rect = g_scissor_rect;
+    return g_scissor_count != 0;
+}
+
+BOOL d3d8_GetScissor(D3D11_RECT *out)
+{
+    if (out) {
+        float sx = rt_scale_x(), sy = rt_scale_y();
+
+        /* Stored as the title gave them, converted here, so the stored
+         * rectangle stays comparable with anything else in guest pixels
+         * and GetScissors keeps answering in the title's own units. */
+        out->left   = (LONG)(g_scissor.left   * sx);
+        out->top    = (LONG)(g_scissor.top    * sy);
+        out->right  = (LONG)(g_scissor.right  * sx);
+        out->bottom = (LONG)(g_scissor.bottom * sy);
+    }
+    return g_scissor_enabled;
+}
+UINT d3d8_GetGuestHeight(void) { return g_guest_height ? g_guest_height : g_device_state.present_height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return (stage < 4) ? g_cur_textures[stage] : NULL; }
@@ -206,7 +397,9 @@ static HRESULT d3d11_create_device_and_swap_chain(
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    /* SHADER_INPUT as well: a title that post-processes its own image reads
+     * the finished frame back (d3d8_screencopy.c), and that reads this. */
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
     scd.OutputWindow = pp->hDeviceWindow;
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
@@ -244,8 +437,15 @@ static HRESULT d3d11_create_device_and_swap_chain(
     }
 
     state->hwnd = pp->hDeviceWindow;
-    state->width = scd.BufferDesc.Width;
-    state->height = scd.BufferDesc.Height;
+
+    /* The swap chain matches the window and the guest's presentation size;
+     * the scene is whatever the display policy makes of it. */
+    state->present_width = scd.BufferDesc.Width;
+    state->present_height = scd.BufferDesc.Height;
+    state->swap_width = scd.BufferDesc.Width;
+    state->swap_height = scd.BufferDesc.Height;
+    d3d8_display_scene_size(state->present_width, state->present_height,
+                            &state->width, &state->height);
 
     return S_OK;
 }
@@ -256,15 +456,54 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
     D3D11_TEXTURE2D_DESC depth_desc;
     HRESULT hr;
 
-    /* Create render target view from swap chain back buffer */
     hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
                                    &IID_ID3D11Texture2D,
                                    (void **)&back_buffer);
     if (FAILED(hr)) return hr;
 
-    hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
-                                              (ID3D11Resource *)back_buffer,
-                                              NULL, &state->default_rtv);
+    {
+        D3D11_TEXTURE2D_DESC sd;
+
+        /* An offscreen colour target the size of the scene, always, even
+         * when that is the size the guest asked for. The swap chain
+         * belongs to the window and the window can be any shape, so the
+         * step that puts one on the other is where the picture is kept
+         * from stretching -- and a path that only exists above scale 1 is
+         * a path that is only right above scale 1. The cost when nothing
+         * is scaled is one full-screen copy of a frame that was about to
+         * be presented anyway.
+         *
+         * SHADER_RESOURCE because both the resolve and a title reading
+         * back its own screen sample it. */
+        memset(&sd, 0, sizeof sd);
+        sd.Width = state->width;
+        sd.Height = state->height;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.Usage = D3D11_USAGE_DEFAULT;
+        sd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &sd, NULL,
+                                          &state->scene_texture);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
+                                                      (ID3D11Resource *)state->scene_texture,
+                                                      NULL, &state->default_rtv);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateShaderResourceView(state->d3d11_device,
+                                                        (ID3D11Resource *)state->scene_texture,
+                                                        NULL, &state->scene_srv);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
+                                                      (ID3D11Resource *)back_buffer,
+                                                      NULL, &state->present_rtv);
+        if (FAILED(hr))
+            fprintf(stderr, "D3D8 display: the %ux%u scene target could not be "
+                    "made (0x%08lX); nothing will be drawn\n",
+                    state->width, state->height, (unsigned long)hr);
+    }
     ID3D11Texture2D_Release(back_buffer);
     if (FAILED(hr)) return hr;
 
@@ -317,11 +556,14 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     state->render_states[D3DRS_STENCILENABLE]     = FALSE;
     state->render_states[D3DRS_COLORWRITEENABLE]  = 0x0F;
 
-    /* Default viewport */
+    /* Default viewport. In guest pixels, like every viewport a title sets
+     * and reads back: the conversion to host pixels happens in
+     * dev_SetViewport, and the initial host viewport is set explicitly at
+     * the end of CreateDevice. */
     state->viewport.X = 0;
     state->viewport.Y = 0;
-    state->viewport.Width = state->width;
-    state->viewport.Height = state->height;
+    state->viewport.Width = state->present_width;
+    state->viewport.Height = state->present_height;
     state->viewport.MinZ = 0.0f;
     state->viewport.MaxZ = 1.0f;
 
@@ -378,6 +620,9 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     if (ref <= 0) {
         /* Cleanup subsystems first */
         up_ring_shutdown();
+        d3d8_overlay_shutdown();
+        xbox_D3D8ScreenCopyShutdown();
+        d3d8_display_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
@@ -391,6 +636,9 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         if (s->default_dsv) { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
         if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
         if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
+        if (s->scene_srv) { ID3D11ShaderResourceView_Release(s->scene_srv); s->scene_srv = NULL; }
+        if (s->scene_texture) { ID3D11Texture2D_Release(s->scene_texture); s->scene_texture = NULL; }
+        if (s->present_rtv) { ID3D11RenderTargetView_Release(s->present_rtv); s->present_rtv = NULL; }
         if (s->swap_chain) { IDXGISwapChain_Release(s->swap_chain); s->swap_chain = NULL; }
         if (s->d3d11_context) { ID3D11DeviceContext_Release(s->d3d11_context); s->d3d11_context = NULL; }
         if (s->d3d11_device) { ID3D11Device_Release(s->d3d11_device); s->d3d11_device = NULL; }
@@ -479,6 +727,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
         DispatchMessageA(&msg);
     }
 
+    present_resolve();
     return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
 }
 
@@ -490,10 +739,18 @@ static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuff
 
     if (!ppSurface) return E_INVALIDARG;
 
-    hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
-                                   &IID_ID3D11Texture2D,
-                                   (void **)&back_buffer);
-    if (FAILED(hr)) return hr;
+    /* The scene target, not the swap chain: that is what every draw went
+     * to, and its size is the one the rest of the device reports. They are
+     * the same object while unscaled. */
+    if (g_device_state.scene_texture) {
+        back_buffer = g_device_state.scene_texture;
+        ID3D11Texture2D_AddRef(back_buffer);
+    } else {
+        hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
+                                       &IID_ID3D11Texture2D,
+                                       (void **)&back_buffer);
+        if (FAILED(hr)) return hr;
+    }
 
     *ppSurface = d3d8_surface_create(back_buffer, 0, 0,
                                      g_device_state.width,
@@ -775,70 +1032,89 @@ static void *convert_fan_or_quad(D3DPRIMITIVETYPE pt, const void *src,
 }
 
 /* ================================================================
- * DrawPrimitiveUP ring buffer
+ * DrawPrimitiveUP ring buffers
  *
- * Instead of creating and destroying a D3D11 buffer on every
- * DrawPrimitiveUP call, use a persistent ring buffer.
+ * Instead of creating and destroying a D3D11 buffer on every UP draw,
+ * append into a persistent dynamic buffer with the discard /
+ * no-overwrite discipline: NO_OVERWRITE while there is room, DISCARD
+ * at the wrap, which renames the buffer underneath draws already
+ * submitted so they keep their data. One ring holds vertices, one
+ * holds indices; the indexed draw used to create and release two
+ * immutable buffers per call, ~700 a frame in TimeSplitters 2's level.
  * ================================================================ */
 
-#define UP_RING_BUFFER_SIZE (4 * 1024 * 1024)  /* 4MB ring buffer */
+#define UP_RING_BUFFER_SIZE (4 * 1024 * 1024)  /* 4MB per ring */
 
-static ID3D11Buffer *g_up_ring_buffer = NULL;
-static UINT          g_up_ring_offset = 0;
+typedef struct UpRing {
+    ID3D11Buffer *buffer;
+    UINT          offset;
+    UINT          bind;      /* D3D11_BIND_VERTEX_BUFFER or D3D11_BIND_INDEX_BUFFER */
+    UINT          wraps;     /* how often the ring started over */
+} UpRing;
 
-static HRESULT up_ring_init(void)
+static UpRing g_up_vertex_ring = { NULL, 0, D3D11_BIND_VERTEX_BUFFER, 0 };
+static UpRing g_up_index_ring  = { NULL, 0, D3D11_BIND_INDEX_BUFFER, 0 };
+
+static HRESULT up_ring_init(UpRing *ring)
 {
     D3D11_BUFFER_DESC bd;
     memset(&bd, 0, sizeof(bd));
     bd.ByteWidth = UP_RING_BUFFER_SIZE;
     bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.BindFlags = ring->bind;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &g_up_ring_buffer);
+    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &ring->buffer);
+}
+
+static void up_ring_release(UpRing *ring)
+{
+    if (ring->buffer) {
+        ID3D11Buffer_Release(ring->buffer);
+        ring->buffer = NULL;
+    }
+    ring->offset = 0;
 }
 
 static void up_ring_shutdown(void)
 {
-    if (g_up_ring_buffer) {
-        ID3D11Buffer_Release(g_up_ring_buffer);
-        g_up_ring_buffer = NULL;
-    }
-    g_up_ring_offset = 0;
+    up_ring_release(&g_up_vertex_ring);
+    up_ring_release(&g_up_index_ring);
 }
 
-/* Upload vertex data to ring buffer, returns offset. Returns (UINT)-1 on failure. */
-static UINT up_ring_upload(const void *data, UINT size)
+/* Append data to a ring, returns its byte offset. Returns (UINT)-1 on failure. */
+static UINT up_ring_upload(UpRing *ring, const void *data, UINT size)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
     D3D11_MAP map_type;
     HRESULT hr;
     UINT offset;
 
-    if (!g_up_ring_buffer) {
-        if (FAILED(up_ring_init())) return (UINT)-1;
+    if (!ring->buffer) {
+        if (FAILED(up_ring_init(ring))) return (UINT)-1;
     }
 
     if (size > UP_RING_BUFFER_SIZE) return (UINT)-1;
 
     /* Wrap around if not enough space */
-    if (g_up_ring_offset + size > UP_RING_BUFFER_SIZE) {
-        g_up_ring_offset = 0;
+    if (ring->offset + size > UP_RING_BUFFER_SIZE) {
+        ring->offset = 0;
+        ring->wraps++;
         map_type = D3D11_MAP_WRITE_DISCARD;
     } else {
         map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
     }
 
     hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
-        (ID3D11Resource *)g_up_ring_buffer, 0, map_type, 0, &mapped);
+        (ID3D11Resource *)ring->buffer, 0, map_type, 0, &mapped);
     if (FAILED(hr)) return (UINT)-1;
 
-    offset = g_up_ring_offset;
+    offset = ring->offset;
     memcpy((BYTE *)mapped.pData + offset, data, size);
 
     ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
-        (ID3D11Resource *)g_up_ring_buffer, 0);
+        (ID3D11Resource *)ring->buffer, 0);
 
-    g_up_ring_offset = (offset + size + 15) & ~15;  /* 16-byte align */
+    ring->offset = (offset + size + 15) & ~15;  /* 16-byte align */
     return offset;
 }
 
@@ -853,8 +1129,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     if (vertex_count == 0) return E_INVALIDARG;
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -873,8 +1148,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     if (index_count == 0) return E_INVALIDARG;
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -935,18 +1209,25 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     vb_size = vertex_count * VertexStreamZeroStride;
 
     /* Upload to ring buffer */
-    ring_offset = up_ring_upload(draw_data, vb_size);
+    ring_offset = up_ring_upload(&g_up_vertex_ring, draw_data, vb_size);
     if (converted) free(converted);
 
     if (ring_offset == (UINT)-1) return E_OUTOFMEMORY;
 
     /* Bind ring buffer at the right offset */
     ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-        0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
+        0, 1, &g_up_vertex_ring.buffer, &VertexStreamZeroStride, &ring_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
+
+    /* A screen-space draw covering the whole width is a backdrop or a
+     * fade, and must span the widescreen picture rather than be squeezed
+     * into the middle of it with the HUD. After prepare_draw, which is
+     * what decides whether this is a screen-space draw at all. */
+    if (d3d8_GetTwoDSqueeze() &&
+        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, vertex_count))
+        d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -967,58 +1248,49 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     (void)self; (void)MinVertexIndex;
     g_d3d_draw_count++;
     D3D11_PRIMITIVE_TOPOLOGY topology;
-    D3D11_BUFFER_DESC bd;
-    D3D11_SUBRESOURCE_DATA sd;
-    ID3D11Buffer *tmp_vb = NULL, *tmp_ib = NULL;
     UINT index_count, vb_size, ib_size, offset = 0;
+    UINT vb_offset, ib_offset;
     UINT idx_bytes;
     DXGI_FORMAT ib_fmt;
-    HRESULT hr;
 
     if (!pVertexData || !pIndexData || !VertexStreamZeroStride) return E_INVALIDARG;
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
     if (index_count == 0) return E_INVALIDARG;
 
+
     idx_bytes = (IndexDataFormat == D3DFMT_INDEX32) ? 4 : 2;
     ib_fmt = (IndexDataFormat == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     vb_size = NumVertices * VertexStreamZeroStride;
     ib_size = index_count * idx_bytes;
 
-    /* Create temp vertex buffer */
-    memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = vb_size;
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    memset(&sd, 0, sizeof(sd));
-    sd.pSysMem = pVertexData;
-    hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, &sd, &tmp_vb);
-    if (FAILED(hr)) return hr;
-
-    /* Create temp index buffer */
-    bd.ByteWidth = ib_size;
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    sd.pSysMem = pIndexData;
-    hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, &sd, &tmp_ib);
-    if (FAILED(hr)) { ID3D11Buffer_Release(tmp_vb); return hr; }
+    /* Append vertices and indices to their rings; the draw reads them at
+     * the returned offsets. */
+    vb_offset = up_ring_upload(&g_up_vertex_ring, pVertexData, vb_size);
+    if (vb_offset == (UINT)-1) return E_OUTOFMEMORY;
+    ib_offset = up_ring_upload(&g_up_index_ring, pIndexData, ib_size);
+    if (ib_offset == (UINT)-1) return E_OUTOFMEMORY;
 
     /* Bind, prepare, draw */
     ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-        0, 1, &tmp_vb, &VertexStreamZeroStride, &offset);
+        0, 1, &g_up_vertex_ring.buffer, &VertexStreamZeroStride, &vb_offset);
     ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
-        tmp_ib, ib_fmt, 0);
+        g_up_index_ring.buffer, ib_fmt, ib_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
-    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
+    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
+
+    /* A screen-space draw covering the whole width is a backdrop or a
+     * fade, and must span the widescreen picture rather than be squeezed
+     * into the middle of it with the HUD. After prepare_draw, which is
+     * what decides whether this is a screen-space draw at all. */
+    if (d3d8_GetTwoDSqueeze() &&
+        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, NumVertices))
+        d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
     ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
-
-    /* Cleanup temp buffers */
-    ID3D11Buffer_Release(tmp_ib);
-    ID3D11Buffer_Release(tmp_vb);
 
     /* Restore previous bindings */
     if (g_cur_vb) {
@@ -1300,20 +1572,146 @@ static HRESULT __stdcall dev_GetDepthStencilSurface(IDirect3DDevice8 *self, IDir
     return S_OK;
 }
 
+/* Set while drawing something positioned in screen coordinates the title
+ * worked out itself, rather than through its projection. See
+ * d3d8_SetTwoDSqueeze. */
+static BOOL g_2d_squeeze;
+
+static void apply_host_viewport(void)
+{
+    const D3DVIEWPORT8 *vp = &g_device_state.viewport;
+    float sx = rt_scale_x(), sy = rt_scale_y();
+    D3D11_VIEWPORT hv;
+
+    if (!g_device_state.d3d11_context)
+        return;
+
+    hv.TopLeftX = (FLOAT)vp->X * sx;
+    hv.TopLeftY = (FLOAT)vp->Y * sy;
+    hv.Width    = (FLOAT)vp->Width * sx;
+    hv.Height   = (FLOAT)vp->Height * sy;
+    hv.MinDepth = vp->MinZ;
+    hv.MaxDepth = vp->MaxZ;
+
+    /* In widescreen the whole scene is stretched horizontally at present,
+     * which is right for geometry that went through a widened projection
+     * and wrong for everything else. Squeezing the 2D viewport by the same
+     * factor, about the middle of the scene, means the stretch puts it
+     * back: a HUD laid out for 4:3 keeps its proportions and sits in the
+     * centre. Nothing is resampled twice -- the squeeze is a viewport, so
+     * the draw is simply rasterised narrower. */
+    if (g_2d_squeeze && g_device_state.height && !g_cur_rt) {
+        float k = ((float)g_device_state.width * 9.0f) /
+                  ((float)g_device_state.height * 16.0f);
+
+        if (k > 0.0f && k < 1.0f) {
+            float cx = (float)g_device_state.width * 0.5f;
+
+            hv.TopLeftX = cx + (hv.TopLeftX - cx) * k;
+            hv.Width   *= k;
+        }
+    }
+
+    ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &hv);
+}
+
+/* Called once per draw, from the shader path that knows which kind of
+ * draw it is. Cheap when nothing changes, which is the common case: a
+ * frame is a run of 3D draws and then a run of 2D ones. */
+void d3d8_SetTwoDSqueeze(BOOL on)
+{
+    if (!d3d8_display_policy()->widescreen)
+        on = FALSE;
+    if (g_2d_squeeze == (on ? TRUE : FALSE))
+        return;
+    g_2d_squeeze = on ? TRUE : FALSE;
+    apply_host_viewport();
+}
+
+BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
+
+/* Does this draw cover the guest's full width?
+ *
+ * A screen-space draw that spans the screen is a backdrop, a fade, a
+ * letterbox bar or a video frame, and squeezing it leaves the sides of a
+ * widescreen picture showing whatever was behind. One that does not is a
+ * HUD element, which belongs in the centred box. The difference is the
+ * draw's own extent, so measure it rather than keep a list of elements.
+ *
+ * The vertices are the ones handed to the draw: everything reaches this
+ * device as DrawPrimitiveUP, including the draws the title sourced from
+ * a vertex buffer -- the HLE reads those itself and passes the bytes.
+ * Position sits at the offset the program's own declaration gives for
+ * the register it copies oPos from.
+ *
+ * When any of that is unavailable the answer is FALSE, which keeps the
+ * squeeze. That is the safe way to be wrong: a squeezed backdrop is
+ * visibly odd in one place, a stretched HUD is subtly wrong everywhere.
+ */
+BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
+{
+    const unsigned char *p = (const unsigned char *)vertices;
+    UINT offset = 0, i, guest_w;
+    int reg = d3d8_vsh_bound_pos_input();
+    float lo = 3.4e38f, hi = -3.4e38f;
+
+    if (reg < 0 || !p || !stride || !count)
+        return FALSE;
+    if (!d3d8_vsh_bound_input_offset(reg, &offset))
+        return FALSE;
+    if (offset + sizeof(float) > stride)
+        return FALSE;
+
+    guest_w = d3d8_GetGuestWidth();
+    if (!guest_w)
+        return FALSE;
+
+    /* Every vertex, not a sample of them. A backdrop is not always a
+     * quad -- this title builds several out of long strips -- and
+     * measuring only the first few of those reported an extent that
+     * stopped short of the edge, so the draw was squeezed and the seam
+     * it was supposed to remove stayed. The bound is a sanity limit, not
+     * a sample: screen-space draws are small, and this runs only for
+     * them. */
+    if (count > 8192)
+        count = 8192;
+
+    for (i = 0; i < count; i++) {
+        float x;
+
+        memcpy(&x, p + (size_t)i * stride + offset, sizeof x);
+        if (x < lo) lo = x;
+        if (x > hi) hi = x;
+    }
+
+    /* How much of the width the draw covers, in the title's own screen
+     * pixels. Coverage rather than "touches both edges": this title
+     * builds its backdrop from overlapping strips, and the ones that run
+     * off the left edge stop a little short of the right. Measured on a
+     * menu the pieces fall into two groups with a gap between them:
+     * backdrop from 77% of the width upwards, and everything smaller at
+     * 70% and below. The threshold sits in that gap.
+     *
+     * It was 85% first, which split the backdrop rather than separating
+     * it from the HUD: the widest strips passed and the rest did not, so
+     * the tiling came apart and left an edge partway across where one
+     * stopped and the squeezed next one began. A backdrop only looks
+     * right if all of it is treated the same way.
+     *
+     * 75% is a measurement of one title's menu, not a principle, and the
+     * gap it sits in is about six points wide. Another title may not
+     * leave one. */
+    {
+        return ((hi - lo) >= (float)guest_w * 0.75f) ? TRUE : FALSE;
+    }
+}
+
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPORT8 *pViewport)
 {
     (void)self;
     if (pViewport) {
         g_device_state.viewport = *pViewport;
-
-        D3D11_VIEWPORT d3d11_vp;
-        d3d11_vp.TopLeftX = (FLOAT)pViewport->X;
-        d3d11_vp.TopLeftY = (FLOAT)pViewport->Y;
-        d3d11_vp.Width    = (FLOAT)pViewport->Width;
-        d3d11_vp.Height   = (FLOAT)pViewport->Height;
-        d3d11_vp.MinDepth = pViewport->MinZ;
-        d3d11_vp.MaxDepth = pViewport->MaxZ;
-        ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &d3d11_vp);
+        apply_host_viewport();
     }
     return S_OK;
 }
@@ -1482,6 +1880,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
         DispatchMessageA(&msg);
     }
 
+    present_resolve();
     return IDXGISwapChain_Present(g_device_state.swap_chain, g_present_interval, 0);
 }
 

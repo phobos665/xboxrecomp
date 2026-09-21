@@ -32,8 +32,29 @@ ID3D11Device        *d3d8_GetD3D11Device(void);
 ID3D11DeviceContext *d3d8_GetD3D11Context(void);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
+/* The host back buffer's size, which is what clip space maps onto. */
+UINT                 d3d8_GetBackBufferWidth(void);
+UINT                 d3d8_GetBackBufferHeight(void);
 HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
+/* The guest's presentation size (d3d8_device.c); the back buffer's when unset. */
+UINT                 d3d8_GetGuestWidth(void);
+/* The finished frame as a shader input: the offscreen scene target when
+ * the host renders larger than the guest, the swap chain's back buffer
+ * when it does not. NULL before the device exists. */
+ID3D11ShaderResourceView *d3d8_GetSceneSRV(void);
+/* Tell the device whether the next draw is positioned in screen
+ * coordinates of the title's own making rather than through its
+ * projection. Only matters in widescreen, where the two need different
+ * horizontal treatment. */
+void d3d8_SetTwoDSqueeze(BOOL on);
+BOOL d3d8_GetTwoDSqueeze(void);
+/* Whether a draw's own vertices span the guest's full width, which is
+ * what separates a backdrop or a fade from a HUD element. */
+BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count);
+/* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
+BOOL                 d3d8_GetScissor(D3D11_RECT *out);
+UINT                 d3d8_GetGuestHeight(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 
 /* Current render state array accessor */

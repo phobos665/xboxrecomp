@@ -276,5 +276,85 @@ class StillRejectsNonTables(unittest.TestCase):
                          table_va + 3 * 4)
 
 
+class DispatchExposedAfterTheSweep(unittest.TestCase):
+    """TimeSplitters 2's sub_000DDD70: the sweep arrived at the function out
+    of phase, so its `jmp [eax*4+0xDDEB8]` was junk until _pass_call_targets
+    realigned the call target with decode_at(). By then resync_jump_tables()
+    had already run, the new candidate was never measured, and the five case
+    bodies (which the same misphase had covered) were never decoded. The
+    function ended on the dispatch and the title span on the lifted jump's
+    unknown target."""
+
+    def _build(self):
+        size = 0x400
+        img = _Image(BASE, bytes(size))
+        jmp_off = 0x20
+        table_va = BASE + 0x100
+        # Odd addresses: the sweep over zero bytes decodes 2-byte `add` at
+        # every even address, so nothing starts an instruction at an odd one
+        # unless something decodes there on purpose.
+        targets = [BASE + 0x201 + i * 0x10 for i in range(5)]
+        for i, target in enumerate(targets):
+            img.code[0x100 + i * 4:0x100 + i * 4 + 4] = struct.pack("<I", target)
+            img.code[target - BASE] = 0xC3
+        img.code[jmp_off:jmp_off + 3] = b"\xff\x24\x8d"
+        img.code[jmp_off + 3:jmp_off + 7] = struct.pack("<I", table_va)
+        # `00 B8 <imm32>` at 0x1E swallows the first bytes of the dispatch,
+        # which puts the sweep out of phase exactly where the title's was.
+        img.code[0x1F] = 0xB8
+        return img, table_va, BASE + jmp_off, targets
+
+    def test_a_dispatch_the_sweep_missed_is_measured_on_the_next_pass(self):
+        img, table_va, jmp_va, targets = self._build()
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.resync_jump_tables()
+        self.assertNotIn(table_va, engine.jump_tables,
+                         "the sweep must really be out of phase at the dispatch")
+        self.assertIsNone(engine.instructions.get(jmp_va))
+
+        engine.decode_at(jmp_va)               # what _pass_call_targets does
+        self.assertIsNotNone(engine.instructions.get(jmp_va))
+        self.assertEqual(engine.resync_jump_tables(), 1)
+        self.assertIn(table_va, engine.jump_tables)
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+
+    def test_the_case_bodies_are_decoded_with_the_table(self):
+        img, table_va, jmp_va, targets = self._build()
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.decode_at(jmp_va)
+        engine.resync_jump_tables()
+        for target in targets:
+            insn = engine.instructions.get(target)
+            self.assertIsNotNone(insn, f"case body at 0x{target:08X} not decoded")
+            self.assertTrue(insn.is_ret)
+
+    def test_a_second_pass_does_not_measure_a_table_twice(self):
+        img, table_va, jmp_va, targets = self._build()
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.decode_at(jmp_va)
+        self.assertEqual(engine.resync_jump_tables(), 1)
+        self.assertEqual(engine.resync_jump_tables(), 0)
+        self.assertEqual(engine.jump_tables[table_va], table_va + len(targets) * 4)
+
+
+class EntriesByDisplacement(unittest.TestCase):
+    """_find_function_end asks for a table's entries by the displacement in
+    the dispatch instruction. When the table starts below that displacement
+    (memcpy's downward count) the two differ, and the lookup found nothing."""
+
+    def test_a_shifted_table_is_found_by_the_displacement_it_was_named_by(self):
+        targets = [BASE + 0x200 + i * 8 for i in range(8)]
+        img, table_va, _ = build(targets, disp_index=len(targets) - 1)
+        disp = table_va + (len(targets) - 1) * 4
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.resync_jump_tables()
+        self.assertEqual(engine.jump_table_entries(disp), targets)
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+
+
 if __name__ == "__main__":
     unittest.main()

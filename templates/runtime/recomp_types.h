@@ -78,6 +78,14 @@
  * with STATUS_BREAKPOINT the first time a title tried to print. */
 void recomp_debug_service(uint32_t service, uint32_t arg_va);
 
+/* An int3 that lifted code actually executed: almost always an un-unwound
+ * C++ throw. Silent before; see docs/technical/cpp-exceptions.md. */
+void recomp_int3_reached(uint32_t va);
+
+/* A C++ throw, reported at the throw with the type that was thrown. This
+ * runtime cannot unwind, so it returns; see docs/technical/cpp-exceptions.md. */
+void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va);
+
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
  * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
 #if !defined(_MSC_VER) && !defined(__debugbreak)
@@ -247,6 +255,16 @@ extern RECOMP_TLS int g_df;
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
+extern RECOMP_TLS uint16_t g_fp_cc;
+#define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
+/* Values in the existing double-backed stack are all representable as normal
+ * x87 extended values, including binary64 subnormals. Empty stack tags and
+ * unsupported extended encodings are not represented by this stack model. */
+static inline uint16_t recomp_fxam(double value) {
+    return (uint16_t)((signbit(value) ? 0x0200u : 0u) |
+        (isnan(value) ? 0x0100u : isinf(value) ? 0x0500u :
+         value == 0.0 ? 0x4000u : 0x0400u));
+}
 
 /* Result of an x87 compare, in the shape the status word wants:
  *   -1 less, 0 equal, 1 greater, 2 unordered (either operand is NaN).
@@ -254,6 +272,26 @@ extern RECOMP_TLS int g_fp_cmp;
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+/* x87 integer stores use the guest RC bits, independently of host rounding.
+ * Masked invalid conversions store the signed integer-indefinite value. */
+static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+    double rounded;
+    switch((control>>10)&3) {
+    case 1: rounded=floor(value); break;
+    case 2: rounded=ceil(value); break;
+    case 3: rounded=trunc(value); break;
+    default: {
+        double lo=floor(value), fraction=value-lo;
+        rounded=lo;
+        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
+        break;
+    }
+    }
+    double limit=ldexp(1.0,(int)bits-1);
+    if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
+        return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
+    return (int64_t)rounded;
+}
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -276,6 +314,27 @@ extern volatile uint64_t g_icall_count;
  * Implement this in your game-specific code to log diagnostics.
  * The va parameter is the Xbox VA that failed to resolve.
  */
+/* The guest esp at the moment an indirect call was refused, so the log can
+ * name the call site. The top of the guest stack is a return address in
+ * every form: the one the call site just pushed for RECOMP_ICALL and
+ * RECOMP_ICALL_SAFE, and the current frame's own for RECOMP_ITAIL, which
+ * pushes nothing. Set here rather than passed, so a title whose generated
+ * header predates this still compiles and simply reports no callers. */
+extern RECOMP_TLS uint32_t g_icall_saved_esp;
+/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump.
+ *
+ * The two mean different things and want different next steps. A call to
+ * an address nothing identified is a discovery gap, answered by seeding;
+ * a jump to one is usually the guest doing its own control flow, which no
+ * amount of seeding fixes. Saying "Failed to resolve" for both sent a
+ * Mortal Kombat coroutine three rounds through the seeding tool.
+ *
+ * Zero rather than a boolean because a title whose generated header
+ * predates this never assigns it, and a two-valued flag would then read
+ * as "call" for every refusal including the jumps -- the exact wrong
+ * answer this exists to stop giving. Unknown is reported as unknown. */
+extern RECOMP_TLS uint32_t g_icall_dispatch_form;
+
 void recomp_icall_fail_log(uint32_t va);
 
 /* Report an indirect call whose target is not code (a null or wild
@@ -283,7 +342,7 @@ void recomp_icall_fail_log(uint32_t va);
  * because these usually arrive inside a loop -- which is exactly why
  * they must be reported: silently skipping one turns a diagnosable null
  * vtable call into an unexplained hang. */
-void recomp_icall_not_code_log(uint32_t va);
+void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp);
 
 /* Report a direct call or jump into an address that was never recompiled --
  * the generated stub in recomp_stubs_unresolved.c. The stub keeps esp
@@ -590,14 +649,45 @@ static inline uint32_t SUB32_CF(uint32_t a, uint32_t b, int *cf) {
  * Rotation / shift helpers
  * ================================================================ */
 
+/* x86 masks the rotate count to 5 bits, and THEN the rotate is modulo the
+ * operand's own width -- so `rol al, 16` is a rotate by zero and `rol ax, 31`
+ * is a rotate by 15. A narrow rotate performed at 32 bits is not a rotate at
+ * all: the bits that should wrap around at bit 7 or 15 land above the operand
+ * and are discarded by the store, which turns `ror al, 2` on 0x01 into 0x00
+ * where x86 gives 0x40.
+ *
+ * The zero case is separated out because `val >> (32 - 0)` is a shift of a
+ * uint32_t by 32, which is undefined behaviour -- it happened to survive
+ * because x86 masks shift counts to 5 bits and gives back `val`, but the
+ * compiler is under no obligation to agree, least of all at -O2. */
 static inline uint32_t ROL32(uint32_t val, int n) {
     n &= 31;
-    return (val << n) | (val >> (32 - n));
+    return n ? ((val << n) | (val >> (32 - n))) : val;
 }
 
 static inline uint32_t ROR32(uint32_t val, int n) {
     n &= 31;
-    return (val >> n) | (val << (32 - n));
+    return n ? ((val >> n) | (val << (32 - n))) : val;
+}
+
+static inline uint8_t ROL8(uint8_t val, int n) {
+    n = (n & 31) % 8;
+    return n ? (uint8_t)((val << n) | (val >> (8 - n))) : val;
+}
+
+static inline uint8_t ROR8(uint8_t val, int n) {
+    n = (n & 31) % 8;
+    return n ? (uint8_t)((val >> n) | (val << (8 - n))) : val;
+}
+
+static inline uint16_t ROL16(uint16_t val, int n) {
+    n = (n & 31) % 16;
+    return n ? (uint16_t)((val << n) | (val >> (16 - n))) : val;
+}
+
+static inline uint16_t ROR16(uint16_t val, int n) {
+    n = (n & 31) % 16;
+    return n ? (uint16_t)((val >> n) | (val << (16 - n))) : val;
 }
 
 /* ================================================================
@@ -836,7 +926,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
-        recomp_icall_not_code_log(_va); \
+        recomp_icall_not_code_log(_va, g_esp + 4); \
         g_esp += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -845,6 +935,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
            recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
@@ -856,13 +947,58 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * Use this when the caller pushes arguments that the callee would
  * normally clean up (stdcall convention).
  */
+/* Calling an XDK replacement whose arguments the linker put in registers.
+ *
+ * A title built with link-time code generation gets rewritten calling
+ * conventions, and the signature database records what happened in the name:
+ * D3DDevice_SelectVertexShader_0__LTCG_eax1_ebx2 takes both arguments in
+ * registers and none on the stack. The replacements in src/hle are written
+ * against the ordinary convention and read everything with HLE_ARG, which
+ * reads the guest stack.
+ *
+ * Rather than write every implementation twice, the generated thunk lays out
+ * an ordinary argument frame just below the stack, fills it from the
+ * registers the name specifies and from the caller's own stack arguments for
+ * the rest, and points g_esp at it for the duration of the call. The
+ * implementation cannot tell the difference. The frame sits in stack space
+ * the callee would have used anyway, and g_esp is restored afterwards to
+ * exactly what an ordinary thunk would leave.
+ *
+ * tools/recomp/hle.py emits these; nothing else should use them.
+ */
+#define RECOMP_HLE_STACK(i) MEM32(_hle_stack + 4u * (uint32_t)(i))
+
+#define RECOMP_HLE_MAX_ARGS 24u
+
+#define RECOMP_HLE_LTCG_CALL(n, fn, total_pop) \
+    { \
+        uint32_t _hle_n     = (uint32_t)(n); \
+        uint32_t _hle_ret   = MEM32(g_esp); \
+        uint32_t _hle_stack = g_esp + 4u; \
+        uint32_t _hle_save  = g_esp; \
+        uint32_t _hle_frame = g_esp - 4u * (_hle_n + 4u); \
+        uint32_t _hle_pop   = (uint32_t)(total_pop); \
+        uint32_t a[RECOMP_HLE_MAX_ARGS]; \
+        uint32_t _hle_i; \
+        void (*_hle_fn)(void) = (fn); \
+        (void)_hle_stack;
+
+#define RECOMP_HLE_LTCG_END \
+        MEM32(_hle_frame) = _hle_ret; \
+        for (_hle_i = 0; _hle_i < _hle_n && _hle_i < RECOMP_HLE_MAX_ARGS; _hle_i++) \
+            MEM32(_hle_frame + 4u + 4u * _hle_i) = a[_hle_i]; \
+        g_esp = _hle_frame; \
+        _hle_fn(); \
+        g_esp = _hle_save + _hle_pop; \
+    }
+
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
-        recomp_icall_not_code_log(_va); \
+        recomp_icall_not_code_log(_va, (saved_esp)); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -871,6 +1007,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
@@ -889,6 +1026,7 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 2; \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 

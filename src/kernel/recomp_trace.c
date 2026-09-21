@@ -16,11 +16,17 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
 
 #include "xbox_memory_layout.h"
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* The frame pointers. Lifted functions keep ebp in a local and publish it
+ * here before every call, so at a throw or a fault these still name the frame
+ * of whoever is running -- which is what makes a watchpoint on one of its
+ * locals possible. */
+extern RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
 
 /* A run that recurses produces trace lines without limit, and the useful
  * window is rarely the first few thousand. The budget stops a diagnostic from
@@ -179,9 +185,22 @@ static void prof_count(const char *name, uint32_t va)
 
     /* A title being profiled for a hang or a slowdown is a title that gets
      * killed rather than exited, and a kill does not reach atexit. Report as
-     * it goes, so there is always a recent one. */
-    if (++g_prof_calls % prof_interval() == 0)
-        prof_report();
+     * it goes, so there is always a recent one.
+     *
+     * At most once a second, whatever the interval. A report walks the whole
+     * table forty times and rewrites the dump file, which is milliseconds; at
+     * an interval of 100 calls (the run_and_report.py default) a title
+     * entering a few thousand functions per frame spent 85% of its main
+     * thread in that report and drew one frame every twenty seconds. That
+     * looked exactly like a hang in the title, and cost a day. */
+    if (++g_prof_calls % prof_interval() == 0) {
+        static time_t last;
+        time_t now = time(NULL);
+        if (now != last) {
+            last = now;
+            prof_report();
+        }
+    }
 
     for (n = 0; n < PROF_SLOTS; n++) {
         unsigned k = (i + n) & (PROF_SLOTS - 1);
@@ -285,16 +304,25 @@ static void watch_check(const char *name)
 static void dump_va_once(void)
 {
     static int done;
-    const char *spec;
+    static const char *spec = (const char *)-1;
     const uint8_t *mem;
     uint32_t va, n, i;
     char *colon;
 
     if (done)
         return;
-    spec = getenv("RECOMP_DUMP_VA");
-    if (!spec || !*spec)
+    /* Read the switch once. This used to call getenv on every function entry
+     * of a --trace-all-entries build, and the CRT's getenv takes a lock and
+     * walks the environment block: sampled at 1 kHz, Burnout 2's main thread
+     * spent 83% of its time here, and the title ran at a third of the speed
+     * it does with the switch cached. The other getenv calls in this file are
+     * behind static caches or the trace budget already. */
+    if (spec == (const char *)-1)
+        spec = getenv("RECOMP_DUMP_VA");
+    if (!spec || !*spec) {
+        done = 1;
         return;
+    }
 
     va = (uint32_t)strtoul(spec, &colon, 0);
     n = (colon && *colon == ':') ? (uint32_t)strtoul(colon + 1, NULL, 0) : 16;
@@ -574,11 +602,21 @@ void recomp_trace_esp(const char *name, const char *tag)
  * kernel_bridge.c and nv2a_pb_replay.c already do. */
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* Set by recomp_debug_service and consumed by recomp_int3_reached.
+ *
+ * The kernel debug trap is `int 0x2d` followed by an int3 that the kernel
+ * skips over. That int3 is not a breakpoint and must not be reported. Every
+ * other int3 lifted code actually reaches is real, and used to vanish into a
+ * comment. */
+static RECOMP_TLS int g_after_debug_service;
+
 void recomp_debug_service(uint32_t service, uint32_t arg_va)
 {
     const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
     uint16_t length;
     uint32_t buffer_va;
+
+    g_after_debug_service = 1;
 
     if (service != 1) {
         fprintf(stderr, "[GUEST] DebugService %u (arg 0x%08X), ignored\n",
@@ -599,4 +637,176 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
     if (length && ((const char *)(mem + buffer_va))[length - 1] != '\n')
         fputc('\n', stderr);
     fflush(stderr);
+}
+
+/* ---------------------------------------------------------------------------
+ * An int3 that lifted code actually executed.
+ *
+ * Most int3 bytes in an image are padding between functions and are never
+ * reached, and the one after `int 0x2d` is the kernel debug trap's slide byte,
+ * which the kernel skips. Those are handled above and stay silent.
+ *
+ * The rest matter, and used to be emitted as a comment and nothing else. MSVC
+ * puts an int3 after any call it believes cannot return, and the most common
+ * of those is `_CxxThrowException`. So a title that throws a C++ exception
+ * runs off the end of the throw helper, over the trap, and carries on with a
+ * stack the throw never unwound. Nothing says a word.
+ *
+ * Outrun 2 does exactly that during start-up: sub_001C425B tail-jumps to a
+ * helper that throws a `char` of value 0x21, and every strange thing after it
+ * is downstream of that. See docs/technical/cpp-exceptions.md.
+ *
+ * Reported once per address, because a throw inside a loop is still one bug.
+ * ------------------------------------------------------------------------- */
+void recomp_int3_reached(uint32_t va)
+{
+    enum { SLOTS = 32 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    int i;
+
+    /* The slide byte after a kernel debug print. Expected, not a breakpoint. */
+    if (g_after_debug_service) {
+        g_after_debug_service = 0;
+        return;
+    }
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            return;
+    if (count < SLOTS)
+        seen[count++] = va;
+
+    fprintf(stderr,
+        "[INT3] lifted code reached a debug trap at 0x%08X and stepped over "
+        "it.\n"
+        "       MSVC emits one after a call it thinks cannot return, so this "
+        "is\n"
+        "       usually a C++ throw that this runtime did not unwind. "
+        "Execution\n"
+        "       continues on a stack nothing cleaned up, so treat anything "
+        "odd\n"
+        "       after this line as a consequence, not a new bug.\n", va);
+    fflush(stderr);
+}
+
+/* ---------------------------------------------------------------------------
+ * A C++ throw, reported where it happens.
+ *
+ * MSVC compiles `throw x` into _CxxThrowException(&object, &throwinfo), which
+ * never returns. This runtime has no exception support: the call does nothing
+ * useful and control falls through the int3 the compiler put after it, so the
+ * throw *returns*, on a stack nothing unwound and with callee-saved registers
+ * nobody restored. Everything afterwards is wreckage, and none of it mentions
+ * an exception.
+ *
+ * Reporting here costs nothing and turns that into one legible line. The
+ * _ThrowInfo hanging off the second argument names the type, which is usually
+ * enough to recognise what the title was doing:
+ *
+ *   _ThrowInfo      { attributes, pmfnUnwind, pForwardCompat, pCatchableTypeArray }
+ *   CatchableTypeArray { nCatchableTypes, arrayOfCatchableTypes[] }
+ *   CatchableType   { properties, pType, thisDisplacement, ... }
+ *   type_info       { vfptr, _M_data, _M_d_name[] }   <- the mangled name
+ *
+ * MSVC's mangling for the built-ins is a leading '.': ".D" is char, ".H" int,
+ * ".M" float, ".PAX" void*. A class is ".?AVname@@".
+ *
+ * Reported once per throw site. A throw in a loop is still one bug, and the
+ * first one is the one that matters -- everything after it happened on a
+ * broken stack.
+ * ------------------------------------------------------------------------- */
+void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va)
+{
+    enum { SLOTS = 8 };
+    static uint32_t seen[SLOTS];
+    static int count;
+    const uint8_t *mem = (const uint8_t *)g_xbox_mem_offset;
+    const char *type_name = NULL;
+    uint32_t caller = 0;
+    int i;
+
+    if (!mem)
+        return;
+
+    /* The throw site, not the throw helper: at entry esp still points at the
+     * return address the caller pushed. */
+    if (g_esp && guest_readable(g_esp, 4))
+        caller = *(const uint32_t *)(mem + g_esp);
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == caller)
+            return;
+    if (count < SLOTS)
+        seen[count++] = caller;
+
+    /* _ThrowInfo -> CatchableTypeArray -> first CatchableType -> type_info.
+     * Every hop is guest data and may be anything, so every hop is checked. */
+    if (throwinfo_va && guest_readable(throwinfo_va, 16)) {
+        uint32_t cta = *(const uint32_t *)(mem + throwinfo_va + 12);
+        if (cta && guest_readable(cta, 8)) {
+            uint32_t n = *(const uint32_t *)(mem + cta);
+            uint32_t ct = *(const uint32_t *)(mem + cta + 4);
+            if (n && ct && guest_readable(ct, 8)) {
+                uint32_t ti = *(const uint32_t *)(mem + ct + 4);
+                if (ti && guest_readable(ti + 8, 32))
+                    type_name = (const char *)(mem + ti + 8);
+            }
+        }
+    }
+
+    fprintf(stderr,
+        "[THROW] the title threw a C++ exception from 0x%08X",
+        caller);
+    if (type_name && *type_name)
+        fprintf(stderr, ", type \"%.48s\"", type_name);
+    fprintf(stderr, "\n");
+    if (object_va && guest_readable(object_va, 4))
+        fprintf(stderr, "        object at 0x%08X, first dword 0x%08X\n",
+                object_va, *(const uint32_t *)(mem + object_va));
+    fprintf(stderr,
+        "        This runtime cannot unwind, so the throw will RETURN and\n"
+        "        execution continues on a stack nothing cleaned up. Treat\n"
+        "        anything odd after this line as a consequence, not a new\n"
+        "        bug. RECOMP_THROW_FATAL=1 stops here instead.\n");
+    fflush(stderr);
+
+    /* The throwing function's frame is still live -- a throw is reached by a
+     * tail jump, so nothing has returned yet. Print the guest return-address
+     * chain and a window of raw stack, which is what turns "it threw" into
+     * "it threw because this field was set". The chain is recovered the way
+     * the crash handler does it: every lifted call pushes its guest return
+     * address, so code addresses on the stack are the callers. */
+    if (g_esp && guest_readable(g_esp, 64 * 4)) {
+        const uint32_t *sp = (const uint32_t *)(mem + g_esp);
+        int shown = 0;
+
+        /* The throwing function published its frame before the tail jump,
+         * so g_seh_ebp still names it. That is what makes a watchpoint on one
+         * of its locals possible: read the offset off the disassembly, add it
+         * to this, and RECOMP_WATCH_WRITE names whatever set it. */
+        fprintf(stderr, "        esp=0x%08X ebp=0x%08X seh_ebp=0x%08X\n",
+                g_esp, g_ebp, g_seh_ebp);
+        fprintf(stderr, "        eax=0x%08X ebx=0x%08X ecx=0x%08X edx=0x%08X esi=0x%08X edi=0x%08X\n",
+                g_eax, g_ebx, g_ecx, g_edx, g_esi, g_edi);
+        fprintf(stderr, "        callers:");
+        for (i = 0; i < 64 && shown < 6; i++) {
+            uint32_t v = sp[i];
+            if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "%s 0x%08X", shown ? " <-" : "", v);
+                shown++;
+            }
+        }
+        fprintf(stderr, "\n");
+        for (i = 0; i < 32; i += 4)
+            fprintf(stderr, "        [esp+%-3d] %08X %08X %08X %08X\n",
+                    i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
+    }
+    fflush(stderr);
+
+    if (getenv("RECOMP_THROW_FATAL")) {
+        fprintf(stderr, "[THROW] RECOMP_THROW_FATAL is set; exiting.\n");
+        fflush(stderr);
+        exit(4);
+    }
 }

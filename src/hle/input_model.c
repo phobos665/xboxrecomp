@@ -2,7 +2,9 @@
  * input_model.c -- controller state behind the replaced XAPI input functions.
  *
  * From doaxbv-re (https://github.com/NoRain211/doaxbv-re,
- * recomp-runtime/input_model.c), GPL-3.0. Unchanged apart from this header.
+ * recomp-runtime/input_model.c), GPL-3.0. Added here:
+ * recomp_input_port_for_handle, which publishes what port_for_handle already
+ * knew.
  */
 #include "input_model.h"
 
@@ -102,6 +104,11 @@ bool recomp_input_get_device_changes(
     *insertions = inserted;
     *removals = removed;
     return (inserted | removed) != 0u;
+}
+
+bool recomp_input_port_for_handle(uint32_t handle, uint32_t *port)
+{
+    return port != NULL && port_for_handle(handle, port);
 }
 
 uint32_t recomp_input_open(RecompInputModel *model, uint32_t port)

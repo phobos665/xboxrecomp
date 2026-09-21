@@ -52,7 +52,7 @@ class Plan(unittest.TestCase):
     def test_an_implemented_detected_function_is_replaced(self):
         replace, notes = plan([sym("D3DDevice_Swap", 0x1000)],
                               {"D3DDevice_Swap"}, {0x1000}, set(), lambda a: 4)
-        self.assertEqual(replace, {0x1000: ("D3DDevice_Swap", 4)})
+        self.assertEqual(replace, {0x1000: ("D3DDevice_Swap", 4, {})})
         self.assertEqual(notes, [])
 
     def test_hand_written_title_code_wins(self):
@@ -86,7 +86,7 @@ class Plan(unittest.TestCase):
 
 class Render(unittest.TestCase):
     def test_thunk_calls_the_implementation_then_pops_like_the_original(self):
-        src = render_thunks({0x002158D0: ("D3DDevice_SetFlickerFilter", 4)})
+        src = render_thunks({0x002158D0: ("D3DDevice_SetFlickerFilter", 4, {})})
         self.assertIn("void hle_D3DDevice_SetFlickerFilter(void);", src)
         self.assertIn("void sub_002158D0(void) { hle_D3DDevice_SetFlickerFilter(); g_esp += 8; }",
                       src)
@@ -110,14 +110,14 @@ class Originals(unittest.TestCase):
 
     def test_only_replaced_functions_keep_a_body(self):
         from tools.recomp.hle import keep_originals
-        replace = {0x0021CA20: ("D3DDevice_Clear", 24),
-                   0x002224A0: ("D3DDevice_Swap", 4)}
+        replace = {0x0021CA20: ("D3DDevice_Clear", 24, {}),
+                   0x002224A0: ("D3DDevice_Swap", 4, {})}
         self.assertEqual(
             keep_originals(replace, {"D3DDevice_Clear", "Direct3D_CreateDevice"}),
             {0x0021CA20: "sub_0021CA20_hle_original"})
 
     def test_render_points_each_original_at_its_body(self):
-        src = render_thunks({0x0021CA20: ("D3DDevice_Clear", 24)},
+        src = render_thunks({0x0021CA20: ("D3DDevice_Clear", 24, {})},
                             originals={"D3DDevice_Clear": 0x0021CA20,
                                        "Direct3D_CreateDevice": None})
         # The address itself is still the replacement.
@@ -129,7 +129,7 @@ class Originals(unittest.TestCase):
         self.assertIn("void (*const hle_original_Direct3D_CreateDevice)(void) = 0;", src)
 
     def test_no_originals_renders_as_before(self):
-        replace = {0x10: ("D3DDevice_Swap", 4)}
+        replace = {0x10: ("D3DDevice_Swap", 4, {})}
         plain = render_thunks(replace)
         self.assertEqual(plain, render_thunks(replace, originals={}))
         self.assertNotIn("hle_original", plain)
@@ -141,3 +141,28 @@ class Originals(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Imports(unittest.TestCase):
+    """HLE_IMPORT_VAR resolves functions as well as variables.
+
+    The D3D replacement imports D3D_BlockOnTime to read the device-struct
+    offsets out of its prologue; the address of a function is as good an
+    import as the address of a variable, and was refused before.
+    """
+
+    def test_a_function_symbol_resolves_like_a_variable(self):
+        from tools.recomp.hle import resolve_variables
+        symbols = [{"name": "D3D_g_pDevice", "address": 0x1E9238, "kind": "variable"},
+                   sym("D3D_BlockOnTime", 0x1E03F0)]
+        values, notes = resolve_variables(["D3D_BlockOnTime", "D3D_g_pDevice"], symbols)
+        self.assertEqual(values, {"D3D_BlockOnTime": 0x1E03F0,
+                                  "D3D_g_pDevice": 0x1E9238})
+        self.assertEqual(notes, [])
+
+    def test_a_name_at_two_addresses_is_not_guessed(self):
+        from tools.recomp.hle import resolve_variables
+        symbols = [sym("D3D_BlockOnTime", 0x1000), sym("D3D_BlockOnTime", 0x2000)]
+        values, notes = resolve_variables(["D3D_BlockOnTime"], symbols)
+        self.assertEqual(values, {"D3D_BlockOnTime": 0})
+        self.assertEqual(len(notes), 1)

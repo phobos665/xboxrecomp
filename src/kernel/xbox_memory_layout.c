@@ -42,6 +42,11 @@
 #define XBE_SECTION_HEADERS_OFFSET 0x0120
 #define XBE_TLS_ADDR_OFFSET     0x012C
 
+/* XBE certificate field offsets (per xboxdevwiki.net/Xbe). The certificate
+ * address itself is at header+0x0118 and is read inline below. */
+#define CERT_TITLE_NAME         0x000C   /* UTF-16, fixed width, see below */
+#define CERT_TITLE_NAME_CHARS   40
+
 /* XBE section header layout (56 bytes each) */
 #define SECTHDR_FLAGS       0x00
 #define SECTHDR_VA          0x04
@@ -50,6 +55,53 @@
 #define SECTHDR_RAW_SIZE    0x10
 #define SECTHDR_NAME_ADDR   0x14
 #define SECTHDR_SIZE        56
+
+/* The running title's own name, out of its XBE certificate, so the window
+ * says what is being played rather than what is playing it. UTF-8, empty
+ * until the headers below are parsed and empty for a certificate that does
+ * not fit in the file -- callers fall back to a generic caption. */
+static char g_xbe_title_name[128];
+
+const char *xbox_XbeTitleName(void)
+{
+    return g_xbe_title_name[0] ? g_xbe_title_name : NULL;
+}
+
+/* wszTitleName is a fixed 40 UTF-16 code units, padded rather than
+ * terminated on some discs, so the decode stops at a NUL or at the field's
+ * end and then trims. BMP only: a surrogate pair would encode as CESU-8
+ * here, which is not UTF-8, and no title name needs one. */
+static void xbe_title_name_store(const unsigned char *field)
+{
+    char *out = g_xbe_title_name;
+    char *end = g_xbe_title_name + sizeof g_xbe_title_name - 1;   /* room for NUL */
+    int i;
+
+    for (i = 0; i < CERT_TITLE_NAME_CHARS; i++) {
+        unsigned c = (unsigned)field[i * 2] | ((unsigned)field[i * 2 + 1] << 8);
+
+        if (c == 0)
+            break;
+        if (c >= 0xD800 && c <= 0xDFFF)
+            continue;
+        if (c < 0x80) {
+            if (end - out < 1) break;
+            *out++ = (char)c;
+        } else if (c < 0x800) {
+            if (end - out < 2) break;
+            *out++ = (char)(0xC0 | (c >> 6));
+            *out++ = (char)(0x80 | (c & 0x3F));
+        } else {
+            if (end - out < 3) break;
+            *out++ = (char)(0xE0 | (c >> 12));
+            *out++ = (char)(0x80 | ((c >> 6) & 0x3F));
+            *out++ = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    while (out > g_xbe_title_name && (out[-1] == ' ' || out[-1] == '\t'))
+        out--;
+    *out = '\0';
+}
 
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
@@ -521,6 +573,174 @@ static void frame_counters_tick(void)
     }
 }
 
+/* The flip gate (xbox_memory_layout.h).
+ *
+ * The HLE Swap calls xbox_Nv2aFlipGateArm() before it runs the title's own
+ * Swap, and that call sleeps until the kernel's vblank tick releases it. So
+ * there is one Swap per vblank, the guest thread sleeps for the rest of the
+ * frame instead of spinning, and the title's own fence wait is not involved.
+ *
+ * It is not involved on purpose. The first version held the fence mirror
+ * instead, so that the title's wait inside Swap would block; but a title
+ * waits for the *previous* frame's fence there (its flips are double
+ * buffered), which the mirror had already completed at the last vblank, and
+ * two Swaps got through per vblank: TimeSplitters 2's menus measured 120-140
+ * fps with a 60 Hz vblank.
+ *
+ * The gate only holds once a vblank has ever been delivered -- without
+ * RECOMP_VBLANK nothing would release it -- and never for more than a quarter
+ * of a second, so a vblank thread that stops cannot hang the title; the first
+ * timeout is logged, because it means pacing is not happening. A vblank that
+ * arrived while the title was still drawing does not count: the wait is for
+ * the next one, or the frame after it could present again in the same period.
+ *
+ * Adaptive by default: a Swap that arrives after the vblank it should have
+ * waited for presents at once, and only a frame that finished inside the
+ * period is held for the next vblank. RECOMP_FPS_CAP=<fps> is the strict
+ * console cadence instead -- every Swap waits for the next release, and the
+ * release comes every (vblank rate / fps)th vblank; 30 with a 60 Hz vblank
+ * is what a title sees on hardware when it misses every other frame, fine
+ * for a fixed-30 title and half speed for one that steps its logic per
+ * presented frame. RECOMP_FPS_CAP=0 switches the gate off, for measuring.
+ *
+ * Why adaptive won (TimeSplitters 2's Siberia, 19 Sep 2026, quiet machine,
+ * three scripted runs of each, docs/technical/resolution-and-framerate.md):
+ * uncapped the level ran 79-89 fps with a 12.4 ms frame, so the title was
+ * not paced at all; adaptive held 59.9-60.2 in every five-second window with
+ * 3.7 ms of gate wait per frame; strict 60 held 60 most of the time but
+ * dipped to 55-58 and once to 45 at the same points in all three runs,
+ * because a frame that just misses its vblank waits out a whole extra one.
+ * Burnout 2's front end, 1 ms of work a frame, holds 60.0 under either. */
+static HANDLE        g_flip_gate_event;
+static volatile LONG g_flip_gate_vblanks;
+static int           g_flip_gate_divisor = -1;      /* -1: not configured */
+static int           g_flip_gate_strict;            /* RECOMP_FPS_CAP given */
+
+/* What the on-screen toggle cycles through: the settings a player picks
+ * between, in that order. A RECOMP_FPS_CAP outside this list still works --
+ * it is simply not one of the stops, and the first press moves to the
+ * first one. */
+static const struct { int divisor, strict; const char *name; } g_gate_modes[] = {
+    { 1, 0, "adaptive" },
+    { 1, 1, "60" },
+    { 2, 1, "30" },
+    { 0, 0, "off" },
+};
+
+/* A switch that is on unless it is turned off, or off unless turned on.
+ *
+ * The things a title needs in order to run at all -- the vblank, the audio
+ * codec's ready bit, the replacement renderer -- began as experiments, and an
+ * experiment is off until asked for. They are not experiments any more: a
+ * player double-clicking the executable should get the game, not a black
+ * window, so they default on and the variable turns them off. "0", "off",
+ * "no" and "false" mean off; anything else, including an empty value, means
+ * on. */
+int xbox_EnvSwitch(const char *name, int default_on)
+{
+    const char *v = name ? getenv(name) : NULL;
+
+    if (!v)
+        return default_on;
+    if (!*v)
+        return 1;
+    return !(strcmp(v, "0") == 0 || _stricmp(v, "off") == 0 ||
+             _stricmp(v, "no") == 0 || _stricmp(v, "false") == 0);
+}
+
+static int flip_gate_divisor(void)
+{
+    if (g_flip_gate_divisor < 0) {
+        const char *cap = getenv("RECOMP_FPS_CAP");
+        const char *hz = getenv("RECOMP_VBLANK_HZ");
+        int vblank = hz && atoi(hz) > 0 ? atoi(hz) : 60;
+        int d = 1;                                      /* adaptive unless asked */
+
+        if (cap && *cap) {
+            int fps = atoi(cap);
+            if (strcmp(cap, "adaptive") == 0)
+                d = 1;
+            else if (strcmp(cap, "0") == 0 || strcmp(cap, "off") == 0)
+                d = 0;
+            else if (fps > 0) {
+                d = (vblank + fps / 2) / fps;
+                if (d < 1) d = 1;
+                g_flip_gate_strict = 1;
+            }
+        }
+        g_flip_gate_divisor = d;
+        fprintf(stderr, "  [NV2A] flip gate: %s\n",
+                d == 0 ? "off, Swap never waits (RECOMP_FPS_CAP=adaptive or 60 to pace)"
+                       : !g_flip_gate_strict ? "adaptive, at most one Swap per vblank (RECOMP_FPS_CAP=0 to switch off)"
+                       : d == 1 ? "strict, one Swap per vblank" : "strict, one Swap per N vblanks");
+        if (d > 1)
+            fprintf(stderr, "  [NV2A] flip gate divisor %d (RECOMP_FPS_CAP=%s at %d Hz)\n",
+                    d, cap, vblank);
+        fflush(stderr);
+    }
+    return g_flip_gate_divisor;
+}
+
+/* Where the current setting sits in that list, or -1 for one that is not in
+ * it. */
+static int flip_gate_mode_index(void)
+{
+    int d = flip_gate_divisor(), i;
+
+    for (i = 0; i < (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]); i++)
+        if (g_gate_modes[i].divisor == d &&
+            (d == 0 || g_gate_modes[i].strict == g_flip_gate_strict))
+            return i;
+    return -1;
+}
+
+const char *xbox_Nv2aFlipGateModeName(void)
+{
+    int i = flip_gate_mode_index();
+    return i < 0 ? "custom" : g_gate_modes[i].name;
+}
+
+void xbox_Nv2aFlipGateCycle(void)
+{
+    int i = flip_gate_mode_index();
+
+    i = i < 0 ? 0 : (i + 1) % (int)(sizeof g_gate_modes / sizeof g_gate_modes[0]);
+    g_flip_gate_divisor = g_gate_modes[i].divisor;
+    g_flip_gate_strict = g_gate_modes[i].strict;
+    fprintf(stderr, "  [NV2A] flip gate: %s\n", g_gate_modes[i].name);
+    fflush(stderr);
+}
+
+void xbox_Nv2aFlipGateArm(void)
+{
+    static int said;
+
+    if (flip_gate_divisor() == 0)
+        return;
+    if (!InterlockedCompareExchange(&g_flip_gate_vblanks, 0, 0))
+        return;                                         /* no vblank has ever come */
+    if (!g_flip_gate_event)
+        return;
+    if (g_flip_gate_strict)
+        ResetEvent(g_flip_gate_event);                  /* the next vblank, not a past one */
+    if (WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
+        fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "
+                        "the title is not being paced\n");
+        fflush(stderr);
+    }
+}
+
+void xbox_Nv2aFlipGateRelease(void)
+{
+    LONG n = InterlockedIncrement(&g_flip_gate_vblanks);
+    int d = flip_gate_divisor();
+
+    if (!g_flip_gate_event)
+        g_flip_gate_event = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset */
+    if (g_flip_gate_event && (d <= 1 || n % d == 0))
+        SetEvent(g_flip_gate_event);
+}
+
 static void fence_mirrors_tick(void)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
@@ -612,6 +832,7 @@ static void framebuffer_probe_tick(void)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xbox_NameCurrentThread(L"nv2a ack");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
@@ -809,6 +1030,35 @@ uint32_t g_xbox_code_hi = 0;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
 RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 
+/* The current-thread object, reached through fs:[0x28].
+ *
+ * On the console fs points at the KPCR and the processor control block is
+ * embedded at 0x28, whose first field is the pointer to the running thread.
+ * Titles read it to find out which thread they are on: Black computes
+ * MEM32(MEM32(fs:[0x28]) + 0x12C), compares it against a table of thread ids
+ * it recorded earlier, and if they match it sets an error code and executes a
+ * deliberate `jmp $`. That is a re-entrancy assertion -- "this must not be
+ * the thread that already owns this" -- and it is a reasonable thing for a
+ * title to check.
+ *
+ * It used to be one fixed address shared by every guest thread, because
+ * xbox_AllocThreadTib copies the main thread's whole block. So every thread
+ * reported the same identity, every such comparison said yes, and Black hung
+ * itself on purpose after loading. Each thread now gets its own copy with a
+ * distinct id, and everything else in the block is inherited exactly as
+ * before so that nothing which already worked changes. */
+#define XBOX_THREAD_OBJ_MAIN 0x00760000u   /* the main thread's, in BSS */
+#define XBOX_THREAD_OBJ_SIZE 0x200u
+#define XBOX_THREAD_ID_OFF   0x12Cu
+
+static uint32_t g_next_guest_thread_id = 0x1000;
+
+uint32_t xbox_CurrentThreadObject(void)
+{
+    uintptr_t fs = (uintptr_t)g_fs_base + g_memory_offset;
+    return *(const uint32_t *)(fs + 0x28);
+}
+
 /* The shape of the TLS block the loader built, so a new thread can be
  * given one just like it: where the initialised image data starts, how
  * big the block is, and how big the per-thread structure slot 0 points
@@ -816,6 +1066,18 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
+
+/* The guest esp an indirect-call dispatch captured, for the diagnostics that
+ * need the call site. g_esp is not it: a lifted caller pushes its return
+ * address onto a *local* esp and only syncs g_esp at certain points, so by
+ * the time a refused call is reported g_esp is stale and reads as 0. The
+ * dispatch macros set this to the esp they were handed; a title whose
+ * generated header predates them leaves it 0, and the log says so rather
+ * than inventing a caller. */
+RECOMP_TLS uint32_t g_icall_saved_esp = 0;
+
+/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump. */
+RECOMP_TLS uint32_t g_icall_dispatch_form = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
 #ifdef RECOMP_ABI_CHECK
@@ -916,6 +1178,7 @@ RECOMP_TLS int g_fp_top = 0;
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;
@@ -1442,6 +1705,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             uint32_t region = *(const uint32_t *)(xbe + cert_off + 0xA0);
             xbox_kernel_set_xbe_game_region(region);
             fprintf(stderr, "  XBE certificate: game region 0x%08X\n", region);
+
+            /* The bound above reaches past the region word, so the title
+             * name at +0x0C is already known to be inside the file. */
+            xbe_title_name_store((const unsigned char *)xbe + cert_off + CERT_TITLE_NAME);
+            if (g_xbe_title_name[0])
+                fprintf(stderr, "  XBE certificate: title \"%s\"\n", g_xbe_title_name);
         }
     }
 
@@ -1526,6 +1795,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* TLS[0x28] = pointer to RW data area */
         MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
 
+        /* The running thread's identity. Zero here made every guest thread
+         * look like the same thread; see XBOX_THREAD_OBJ_MAIN above. */
+        MEM32_INIT(FAKE_TLS_VA + XBOX_THREAD_ID_OFF, g_next_guest_thread_id++);
+
         /*
          * XBE TLS directory.
          *
@@ -1576,6 +1849,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
                 MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_THREAD_VA);
                 MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
+
+                /* KTHREAD.TlsData, which is what fs:[0x28] leads to at +0x28
+                 * (Cxbx-Reloaded types.h: KPCR.PrcbData at 0x28, KTHREAD at
+                 * PrcbData+0 with TlsData at 0x28). On hardware that is this
+                 * block -- a thread's TLS data and the image's TLS block are
+                 * the same memory.
+                 *
+                 * It used to point at FAKE_RWDATA_VA instead, a separate
+                 * buffer that is only ever zeroed. The name came from the
+                 * first title that needed something there, and "somewhere
+                 * writable" was enough for RenderWare, but a title that keeps
+                 * real per-thread state in TLS reads zeros. Jet Set Radio
+                 * Future reads TlsData+0x10 -- the last dword of its 20-byte
+                 * block -- as a function pointer, called it through null, and
+                 * relaunched itself from \Device\Cdrom0 rather than start.
+                 *
+                 * Only when the image has a TLS directory; without one there
+                 * is no block to point at and the old buffer still stands. */
+                MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_TLS_BLOCK_VA);
 
                 g_tls_template_va = FAKE_TLS_BLOCK_VA;
                 g_tls_total       = total;
@@ -1688,7 +1980,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Only when RECOMP_VBLANK is set, because that is the only thing that
          * raises an interrupt for anyone to acknowledge.
          */
-        if (g_nv2a_memory && getenv("RECOMP_VBLANK")) {
+        if (g_nv2a_memory && xbox_EnvSwitch("RECOMP_VBLANK", 1)) {
             DWORD old_nv;
             if (VirtualProtect((char *)g_nv2a_memory + XBOX_NV2A_PCRTC_PAGE,
                                4096, PAGE_READONLY, &old_nv))
@@ -1775,7 +2067,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * init. Until the DSP handshake is answered, the honest default is
              * the failure that gets further, with the correct behaviour one
              * variable away. */
-            if (getenv("RECOMP_AC97_READY")) {
+            if (xbox_EnvSwitch("RECOMP_AC97_READY", 1)) {
                 /* The APU's registers have to fault so they can be routed to
                  * the emulated APU, which is the half that answers the DSP
                  * handshake. Backed as plain memory the guest's writes go
@@ -2055,6 +2347,26 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                             XBOX_TILED_BASE, XBOX_CONTIG_BASE);
                 *via_contig = saved;
             }
+            /* RECOMP_ALIAS_HIGH=1: a second alias of the same window at
+             * 0xF8000000, for finding out whether a title that dereferences
+             * an address there means physical memory or is simply holding a
+             * bad pointer. Outrun 2 faults on a this-pointer of 0xF8604020,
+             * which is a valid cached pointer 0x80604020 biased by
+             * 0x78000000 -- suggestive, but suggestive is not evidence, and
+             * mapping it settles the question in one run: real memory and
+             * the title carries on, garbage and it faults again at once.
+             *
+             * Off by default. Nothing is known to need it, and silently
+             * backing an address no console ever had would hide the next
+             * title's bad pointer instead of reporting it. */
+            if (xbox_EnvSwitch("RECOMP_ALIAS_HIGH", 0) && g_contig_mapping) {
+                void *high = MapViewOfFileEx(
+                    g_contig_mapping, FILE_MAP_ALL_ACCESS, 0, 0, tiled_size,
+                    (LPVOID)(uintptr_t)(0xF8000000u + g_memory_offset));
+                fprintf(stderr, "  RECOMP_ALIAS_HIGH: 0x%08X %s\n", 0xF8000000u,
+                        high ? "aliased to the contiguous window (an experiment)"
+                             : "could not be mapped");
+            }
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
                     " (aliases the contiguous window)\n",
                     (unsigned)(g_memory_size / (1024 * 1024)),
@@ -2271,6 +2583,24 @@ uint32_t xbox_AllocThreadTib(void)
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+
+    /* This thread's own current-thread object.
+     *
+     * The copy above inherited fs:[0x28] from the main thread, so without
+     * this every guest thread answers "which thread am I" with the same
+     * value. Copy the main thread's object so every field a title already
+     * relies on is inherited -- the RenderWare data pointer at +0x28 among
+     * them -- and change only the identity. */
+    {
+        uint32_t obj = xbox_HeapAlloc(XBOX_THREAD_OBJ_SIZE, 16);
+        if (obj) {
+            memcpy(TIB_VA(obj), TIB_VA(XBOX_THREAD_OBJ_MAIN),
+                   XBOX_THREAD_OBJ_SIZE);
+            *(uint32_t *)TIB_VA(obj + XBOX_THREAD_ID_OFF) =
+                g_next_guest_thread_id++;
+            *(uint32_t *)TIB_VA(tib + 0x28) = obj;
+        }
+    }
 
     return tib;
     #undef TIB_VA
