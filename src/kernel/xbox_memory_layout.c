@@ -42,6 +42,11 @@
 #define XBE_SECTION_HEADERS_OFFSET 0x0120
 #define XBE_TLS_ADDR_OFFSET     0x012C
 
+/* XBE certificate field offsets (per xboxdevwiki.net/Xbe). The certificate
+ * address itself is at header+0x0118 and is read inline below. */
+#define CERT_TITLE_NAME         0x000C   /* UTF-16, fixed width, see below */
+#define CERT_TITLE_NAME_CHARS   40
+
 /* XBE section header layout (56 bytes each) */
 #define SECTHDR_FLAGS       0x00
 #define SECTHDR_VA          0x04
@@ -50,6 +55,53 @@
 #define SECTHDR_RAW_SIZE    0x10
 #define SECTHDR_NAME_ADDR   0x14
 #define SECTHDR_SIZE        56
+
+/* The running title's own name, out of its XBE certificate, so the window
+ * says what is being played rather than what is playing it. UTF-8, empty
+ * until the headers below are parsed and empty for a certificate that does
+ * not fit in the file -- callers fall back to a generic caption. */
+static char g_xbe_title_name[128];
+
+const char *xbox_XbeTitleName(void)
+{
+    return g_xbe_title_name[0] ? g_xbe_title_name : NULL;
+}
+
+/* wszTitleName is a fixed 40 UTF-16 code units, padded rather than
+ * terminated on some discs, so the decode stops at a NUL or at the field's
+ * end and then trims. BMP only: a surrogate pair would encode as CESU-8
+ * here, which is not UTF-8, and no title name needs one. */
+static void xbe_title_name_store(const unsigned char *field)
+{
+    char *out = g_xbe_title_name;
+    char *end = g_xbe_title_name + sizeof g_xbe_title_name - 1;   /* room for NUL */
+    int i;
+
+    for (i = 0; i < CERT_TITLE_NAME_CHARS; i++) {
+        unsigned c = (unsigned)field[i * 2] | ((unsigned)field[i * 2 + 1] << 8);
+
+        if (c == 0)
+            break;
+        if (c >= 0xD800 && c <= 0xDFFF)
+            continue;
+        if (c < 0x80) {
+            if (end - out < 1) break;
+            *out++ = (char)c;
+        } else if (c < 0x800) {
+            if (end - out < 2) break;
+            *out++ = (char)(0xC0 | (c >> 6));
+            *out++ = (char)(0x80 | (c & 0x3F));
+        } else {
+            if (end - out < 3) break;
+            *out++ = (char)(0xE0 | (c >> 12));
+            *out++ = (char)(0x80 | ((c >> 6) & 0x3F));
+            *out++ = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    while (out > g_xbe_title_name && (out[-1] == ' ' || out[-1] == '\t'))
+        out--;
+    *out = '\0';
+}
 
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
@@ -1641,6 +1693,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             uint32_t region = *(const uint32_t *)(xbe + cert_off + 0xA0);
             xbox_kernel_set_xbe_game_region(region);
             fprintf(stderr, "  XBE certificate: game region 0x%08X\n", region);
+
+            /* The bound above reaches past the region word, so the title
+             * name at +0x0C is already known to be inside the file. */
+            xbe_title_name_store((const unsigned char *)xbe + cert_off + CERT_TITLE_NAME);
+            if (g_xbe_title_name[0])
+                fprintf(stderr, "  XBE certificate: title \"%s\"\n", g_xbe_title_name);
         }
     }
 

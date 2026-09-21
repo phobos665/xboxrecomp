@@ -202,6 +202,21 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               r.right - r.left, r.bottom - r.top,
                               NULL, NULL, wc.hInstance, NULL);
+
+    /* Say what is being played, not what is playing it. The name is the
+     * title's own, out of its XBE certificate, and it is set through the
+     * wide call because a certificate may hold one that no ANSI code page
+     * can spell -- CreateWindowA above would render that as mojibake. A
+     * title whose headers carried no name keeps the caption it was made
+     * with. */
+    if (req->hwnd) {
+        const char *name = xbox_XbeTitleName();
+        WCHAR wide[128];
+
+        if (name && MultiByteToWideChar(CP_UTF8, 0, name, -1, wide,
+                                        (int)(sizeof wide / sizeof wide[0])) > 0)
+            SetWindowTextW(req->hwnd, wide);
+    }
     if (!req->hwnd)
         fprintf(stderr, "[HLE-D3D8] shadow: CreateWindow failed (%lu)\n", GetLastError());
     SetEvent(req->ready);                /* req lives on the waiting caller's stack */
