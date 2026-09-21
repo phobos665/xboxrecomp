@@ -35,6 +35,7 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
         const char *v = getenv("RECOMP_RES_SCALE");
         long n = 1;
 
+
         g_policy_read = 1;
         g_policy.scale = 1;
 
@@ -50,9 +51,25 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
             g_policy.scale = (UINT)n;
         }
 
+        g_policy.anisotropy = 1;
+        v = getenv("RECOMP_ANISO");
+        if (v && *v) {
+            long a = strtol(v, NULL, 10);
+
+            if (a < 1 || a > 16) {
+                fprintf(stderr, "D3D8 display: RECOMP_ANISO=%s is not a whole number "
+                        "from 1 to 16; leaving the title's own filtering\n", v);
+                a = 1;
+            }
+            g_policy.anisotropy = (UINT)a;
+        }
+
         if (g_policy.scale > 1)
             fprintf(stderr, "D3D8 display: supersampling %ux, box filtered at present\n",
                     g_policy.scale);
+        if (g_policy.anisotropy > 1)
+            fprintf(stderr, "D3D8 display: anisotropic filtering forced to %ux where the "
+                    "title filters linearly\n", g_policy.anisotropy);
     }
     return &g_policy;
 }

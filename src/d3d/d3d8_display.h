@@ -28,6 +28,10 @@
  */
 typedef struct D3D8DisplayPolicy {
     UINT scale;
+    /* RECOMP_ANISO=<1..16>, the anisotropy to force on textures the title
+     * already filters linearly. 1 leaves every sampler as the title asked
+     * for it. */
+    UINT anisotropy;
 } D3D8DisplayPolicy;
 
 const D3D8DisplayPolicy *d3d8_display_policy(void);

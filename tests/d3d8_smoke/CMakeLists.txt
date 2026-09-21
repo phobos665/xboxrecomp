@@ -17,12 +17,16 @@ if(WIN32)
     endif()
 
     # Exercise bound state objects on D3D11's software device (no window/GPU).
+    # d3d8_display.c comes along because the sampler path asks it whether
+    # anisotropy is forced. Nothing here reaches its resolve pass, which is
+    # the only part that wants a device.
     add_executable(d3d8_states_smoke
         test_states.c
         ../../src/d3d/d3d8_states.c
+        ../../src/d3d/d3d8_display.c
     )
     target_include_directories(d3d8_states_smoke PRIVATE ../../src/d3d)
-    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11)
+    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11 d3dcompiler)
 
     add_executable(d3d8_a8
         test_a8.c
