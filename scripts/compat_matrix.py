@@ -145,7 +145,7 @@ DRAW_RE = re.compile(
     r"shader, (\d+) stride, (\d+) primitive, (\d+) failed")
 
 
-def summarise(err_text, exit_code):
+def summarise(err_text, exit_code, seconds):
     s = {k: 0 for k in MARKERS}
     for key, (pat, agg) in MARKERS.items():
         vals = [int(v) for v in re.findall(pat, err_text)]
@@ -163,12 +163,31 @@ def summarise(err_text, exit_code):
     s["icalls"] = len(set(re.findall(r"unresolved (?:call |jump )?target 0x([0-9A-F]{8})",
                                      err_text)))
     s["exit"] = exit_code
+    s["seconds"] = seconds
     # Verdict, coarsest first: the point is to spot a title falling off a
     # rung, not to grade it.
+    #
+    # "no frames" names the window it did not produce them in, because for a
+    # slow starter that is the whole story rather than a verdict. Max Payne
+    # takes about 45 seconds to reach its first frame and renders 122 of them
+    # after that; measured for exactly 45 seconds it reports zero, which reads
+    # as a regression and is an artefact of the clock. The MvC2 notes record
+    # six runs lost to the same mistake, and this harness reproduced it on its
+    # first outing.
+    # The swap *count* comes from a summary printed five seconds after the
+    # first swap, so a title whose first frame lands near the end of the
+    # window renders and still counts zero. The one-off "Swap on guest thread"
+    # notice fires immediately, and separates "never rendered" from "rendered
+    # too late to measure" -- Max Payne reached its first frame at about 45
+    # seconds once and at about 95 the next time, so for it the difference is
+    # the whole answer rather than a footnote.
+    s["swapped"] = "shadow: Swap on guest thread" in err_text
     if s["swaps"] > 0:
         s["verdict"] = "renders"
+    elif s["swapped"]:
+        s["verdict"] = f"first frame late (>{seconds - 5}s)"
     elif s["device"]:
-        s["verdict"] = "device, no frames"
+        s["verdict"] = f"no frames in {seconds}s"
     elif s["boot"]:
         s["verdict"] = "boots"
     else:
@@ -181,7 +200,7 @@ def run_title(t, seconds, out_dir, extra_env=None):
         return {"verdict": "not built", "exit": None, "boot": False,
                 "device": False, "swaps": 0, "draws": 0, "draws_skipped": 0,
                 "tex_binds": 0, "tex_refused": 0, "icalls": 0, "kernel": 0,
-                "clears": 0}
+                "clears": 0, "seconds": None}
     env = dict(os.environ)
     env.setdefault("RECOMP_VBLANK", "1")
     env.setdefault("RECOMP_AC97_READY", "1")
@@ -197,27 +216,31 @@ def run_title(t, seconds, out_dir, extra_env=None):
             p.wait()
             code = "timeout"
     text = err_path.read_text(encoding="utf-8", errors="replace")
-    s = summarise(text, code)
+    s = summarise(text, code, seconds)
     s["log"] = str(err_path.relative_to(ROOT))
     return s
 
 
-COLUMNS = [("verdict", 18, None), ("swaps", 7, "higher"), ("draws", 8, "higher"),
+# (name, minimum width, which direction is better). The width is widened to
+# the header itself below, because a column narrower than its own name runs
+# into the next one and the table stops being readable.
+COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher"),
            ("draws_skipped", 8, "lower"), ("tex_binds", 10, "higher"),
            ("tex_refused", 8, "lower"), ("icalls", 7, "lower"),
-           ("kernel", 10, None)]
+           ("exit", 9, None), ("kernel", 11, None)]
 
 
 def print_table(rows, baseline=None):
-    head = f"{'title':<16}" + "".join(f"{c:>{w}}" for c, w, _ in COLUMNS)
+    widths = {c: max(w, len(c) + 1) for c, w, _ in COLUMNS}
+    head = f"{'title':<16}" + "".join(f"{c:>{widths[c]}}" for c, _w, _ in COLUMNS)
     print(head)
     print("-" * len(head))
     regressions = []
     for name, s in rows.items():
         line = f"{name:<16}"
-        for col, w, better in COLUMNS:
+        for col, _w, better in COLUMNS:
             cur = s.get(col, 0)
-            line += f"{str(cur):>{w}}"
+            line += f"{str(cur):>{widths[col]}}"
             if baseline and name in baseline and better:
                 was = baseline[name].get(col, 0)
                 if isinstance(cur, int) and isinstance(was, int) and cur != was:
@@ -237,6 +260,14 @@ def print_table(rows, baseline=None):
         print(line)
     if baseline:
         print()
+        windows = {r.get("seconds") for r in rows.values() if r.get("seconds")}
+        was = {b.get("seconds") for b in baseline.values() if b.get("seconds")}
+        if windows and was and windows != was:
+            print(f"MEASURED DIFFERENTLY: this run gave each title "
+                  f"{sorted(windows)}s, the baseline {sorted(was)}s. A title "
+                  f"that starts slowly reports fewer frames for that reason "
+                  f"alone -- the columns below are not comparable.")
+            print()
         if regressions:
             print("REGRESSED:")
             for r in regressions:
