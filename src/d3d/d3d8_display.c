@@ -15,6 +15,7 @@
 #if defined(_WIN32)
 
 #include <d3dcompiler.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,18 +66,53 @@ void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
     if (scene_h) *scene_h = guest_h * p->scale;
 }
 
+D3D8DisplayFit d3d8_display_fit(UINT scene_w, UINT scene_h, UINT bb_w, UINT bb_h)
+{
+    D3D8DisplayFit f;
+
+    f.x = f.y = 0;
+    f.w = bb_w;
+    f.h = bb_h;
+    if (!scene_w || !scene_h || !bb_w || !bb_h)
+        return f;
+
+    /* Compare shapes in integers: scene_w/scene_h against bb_w/bb_h. */
+    if ((uint64_t)scene_w * bb_h > (uint64_t)bb_w * scene_h) {
+        /* The window is taller than the scene: bars above and below. */
+        f.h = (UINT)(((uint64_t)bb_w * scene_h) / scene_w);
+        if (!f.h) f.h = 1;
+        f.y = (bb_h - f.h) / 2;
+    } else if ((uint64_t)scene_w * bb_h < (uint64_t)bb_w * scene_h) {
+        /* The window is wider: bars to the left and right. */
+        f.w = (UINT)(((uint64_t)bb_h * scene_w) / scene_h);
+        if (!f.w) f.w = 1;
+        f.x = (bb_w - f.w) / 2;
+    }
+    return f;
+}
+
 /* ================================================================
  * Resolve
  * ================================================================ */
 
-/* Source pixel = destination pixel * ratio, then TAPS x TAPS of them
- * averaged. The ratio is a float because a scene that is not an exact
- * multiple of the output -- which widescreen will bring -- still has to
- * land on the right texels. */
-typedef struct { float ratio_x, ratio_y, inv_taps, pad; } ResolveConstants;
+/* origin: where the picture starts inside the back buffer, subtracted
+ * because SV_Position counts from the buffer's corner and not the
+ * viewport's. ratio: scene texels per output pixel. texel: one over the
+ * scene size, for normalised sampling.
+ *
+ * TAPS x TAPS bilinear samples spread across each output pixel's
+ * footprint. Bilinear rather than Load so a ratio that is not a whole
+ * number -- which is most window sizes -- still resolves smoothly, and so
+ * a window larger than the scene magnifies cleanly instead of blocking
+ * up. At a whole-number ratio with taps to match, this is the box filter
+ * that makes the supersampling exact. */
+typedef struct {
+    float origin_x, origin_y, ratio_x, ratio_y;
+    float texel_x, texel_y, inv_taps, pad;
+} ResolveConstants;
 
 static const char kSource[] =
-    "cbuffer Resolve : register(b7) { float4 p; };\n"
+    "cbuffer Resolve : register(b7) { float4 p; float4 q; };\n"
     "struct VSOut { float4 pos : SV_Position; };\n"
     "VSOut vs_main(uint id : SV_VertexID) {\n"
     "    float2 c = float2((id << 1) & 2, id & 2);\n"   /* one oversized triangle */
@@ -85,13 +121,16 @@ static const char kSource[] =
     "    return o;\n"
     "}\n"
     "Texture2D<float4> scene : register(t9);\n"
+    "SamplerState smp : register(s9);\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
-    "    int2 base = int2(i.pos.xy * p.xy);\n"
+    "    float2 base = (i.pos.xy - p.xy) * p.zw;\n"
+    "    float2 step = p.zw / TAPS;\n"
     "    float4 sum = 0;\n"
     "    [unroll] for (int y = 0; y < TAPS; y++)\n"
     "        [unroll] for (int x = 0; x < TAPS; x++)\n"
-    "            sum += scene.Load(int3(base + int2(x, y), 0));\n"
-    "    return sum * p.z;\n"
+    "            sum += scene.SampleLevel(smp,\n"
+    "                       (base + (float2(x, y) + 0.5) * step) * q.xy, 0);\n"
+    "    return sum * q.z;\n"
     "}\n";
 
 static struct {
@@ -101,6 +140,7 @@ static struct {
     ID3D11BlendState        *blend;
     ID3D11DepthStencilState *depth;
     ID3D11RasterizerState   *raster;
+    ID3D11SamplerState      *sampler;
     UINT                     taps;       /* what the shaders were built for */
     int                      tried, failed;
 } g;
@@ -158,10 +198,18 @@ static int create(UINT taps)
 
     if (g.failed) return 0;
     if (g.tried && g.taps == taps) return g.ps != NULL;
-    if (g.tried) return 0;              /* the scale does not change mid-run */
+    if (!dev) { g.failed = 1; return 0; }
+
+    /* The tap count follows the window, not the scale: a window of a
+     * different shape from the scene gets a different ratio, and one
+     * that is resized gets a new one mid-run. Rebuild the two shaders
+     * for it and keep everything else. */
+    if (g.tried) {
+        if (g.vs) { ID3D11VertexShader_Release(g.vs); g.vs = NULL; }
+        if (g.ps) { ID3D11PixelShader_Release(g.ps);  g.ps = NULL; }
+    }
     g.tried = 1;
     g.taps = taps;
-    if (!dev) { g.failed = 1; return 0; }
 
     snprintf(taps_text, sizeof taps_text, "%u", taps);
     macros[0].Name = "TAPS";
@@ -171,6 +219,9 @@ static int create(UINT taps)
 
     if (!compile_one(dev, "vs_main", "vs_4_0", macros, (void **)&g.vs)) return 0;
     if (!compile_one(dev, "ps_main", "ps_4_0", macros, (void **)&g.ps)) return 0;
+
+    if (g.cb)
+        return 1;                       /* rebuild: the rest already exists */
 
     memset(&bd, 0, sizeof bd);
     bd.ByteWidth = sizeof(ResolveConstants);
@@ -197,13 +248,25 @@ static int create(UINT taps)
     hr = ID3D11Device_CreateRasterizerState(dev, &rd, &g.raster);
     if (FAILED(hr)) { fail("CreateRasterizerState", hr); return 0; }
 
+    {
+        D3D11_SAMPLER_DESC sm;
+
+        memset(&sm, 0, sizeof sm);
+        sm.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sm.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sm.MaxLOD = D3D11_FLOAT32_MAX;
+        hr = ID3D11Device_CreateSamplerState(dev, &sm, &g.sampler);
+        if (FAILED(hr)) { fail("CreateSamplerState", hr); return 0; }
+    }
+
     return 1;
 }
 
 HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
                              UINT scene_w, UINT scene_h,
                              ID3D11RenderTargetView *out,
-                             UINT out_w, UINT out_h)
+                             D3D8DisplayFit fit)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     ID3D11RenderTargetView *saved_rtv = NULL;
@@ -215,14 +278,17 @@ HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
     float blend_factor[4] = { 1, 1, 1, 1 };
     UINT taps;
 
-    if (!ctx || !scene || !out || !out_w || !out_h || !scene_h)
+    if (!ctx || !scene || !out || !fit.w || !fit.h || !scene_h)
         return E_INVALIDARG;
 
-    /* Square taps, from the vertical ratio: the horizontal one may differ
-     * once the scene is a different shape from the output, and averaging a
-     * non-square block would soften one axis more than the other. */
-    taps = scene_h / out_h;
+    /* Square taps, from the vertical ratio: the horizontal one is the
+     * same whenever the fit preserved the scene's shape, which it does,
+     * and averaging a non-square block would soften one axis more than
+     * the other. Rounded rather than truncated so a ratio just under a
+     * whole number keeps the taps that ratio deserves. */
+    taps = (scene_h + fit.h / 2) / fit.h;
     if (taps < 1) taps = 1;
+    if (taps > 8) taps = 8;
     if (!create(taps)) return E_FAIL;
 
     ID3D11DeviceContext_RSGetViewports(ctx, &saved_vps, saved_vp);
@@ -231,20 +297,31 @@ HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
     if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g.cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         ResolveConstants c;
-        c.ratio_x = (float)scene_w / (float)out_w;
-        c.ratio_y = (float)scene_h / (float)out_h;
+        c.origin_x = (float)fit.x;
+        c.origin_y = (float)fit.y;
+        c.ratio_x = (float)scene_w / (float)fit.w;
+        c.ratio_y = (float)scene_h / (float)fit.h;
+        c.texel_x = 1.0f / (float)scene_w;
+        c.texel_y = 1.0f / (float)scene_h;
         c.inv_taps = 1.0f / (float)(taps * taps);
         c.pad = 0.0f;
         memcpy(mapped.pData, &c, sizeof c);
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g.cb, 0);
     }
 
-    vp.TopLeftX = vp.TopLeftY = 0.0f;
-    vp.Width = (float)out_w;
-    vp.Height = (float)out_h;
+    vp.TopLeftX = (float)fit.x;
+    vp.TopLeftY = (float)fit.y;
+    vp.Width = (float)fit.w;
+    vp.Height = (float)fit.h;
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &out, NULL);
+    /* The bars. Cheaper than tracking whether the window changed shape,
+     * and it costs one clear of a buffer that is about to be presented. */
+    {
+        float black[4] = { 0, 0, 0, 1 };
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, out, black);
+    }
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -252,6 +329,7 @@ HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
     ID3D11DeviceContext_PSSetShader(ctx, g.ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(ctx, 7, 1, &g.cb);
     ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &scene);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 9, 1, &g.sampler);
     ID3D11DeviceContext_OMSetBlendState(ctx, g.blend, blend_factor, 0xFFFFFFFF);
     ID3D11DeviceContext_OMSetDepthStencilState(ctx, g.depth, 0);
     ID3D11DeviceContext_RSSetState(ctx, g.raster);
@@ -279,6 +357,7 @@ void d3d8_display_shutdown(void)
     if (g.blend)  { ID3D11BlendState_Release(g.blend);          g.blend = NULL; }
     if (g.depth)  { ID3D11DepthStencilState_Release(g.depth);   g.depth = NULL; }
     if (g.raster) { ID3D11RasterizerState_Release(g.raster);    g.raster = NULL; }
+    if (g.sampler){ ID3D11SamplerState_Release(g.sampler);      g.sampler = NULL; }
     g.tried = 0;
     g.failed = 0;
 }

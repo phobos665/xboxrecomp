@@ -57,6 +57,12 @@ typedef struct D3D8DeviceState {
      * scene target is the back buffer itself and no resolve runs. */
     UINT                    present_width;
     UINT                    present_height;
+    /* The swap chain's real size, which follows the window. Separate from
+     * present_width/height because that is the guest's presentation size
+     * and must not move when someone drags a corner: the scene is still
+     * rendered for a 640x480 guest, and only where it lands changes. */
+    UINT                    swap_width;
+    UINT                    swap_height;
     ID3D11Texture2D          *scene_texture;  /* NULL while unscaled */
     ID3D11ShaderResourceView *scene_srv;      /* the finished frame, to read */
     ID3D11RenderTargetView   *present_rtv;    /* the back buffer; NULL unscaled */
@@ -222,13 +228,57 @@ static float rt_scale_y(void)
  * this is the one call that has to stay free in that case. */
 static void present_resolve(void)
 {
-    if (!g_device_state.present_rtv || !g_device_state.scene_srv)
+    D3D8DeviceState *s = &g_device_state;
+    D3D8DisplayFit fit;
+    RECT rc;
+
+    if (!s->present_rtv || !s->scene_srv)
         return;
 
-    d3d8_display_resolve(g_device_state.scene_srv,
-                         g_device_state.width, g_device_state.height,
-                         g_device_state.present_rtv,
-                         g_device_state.present_width, g_device_state.present_height);
+    /* Follow the window. DXGI stretches the back buffer to the client
+     * rectangle whatever shape it is, which is the one way a scene that is
+     * right all the way through still reaches the screen distorted. Keep
+     * the buffer the size of the window and the stretch is the identity;
+     * the fit below then puts bars around the picture instead. */
+    if (s->hwnd && GetClientRect(s->hwnd, &rc)) {
+        UINT w = (UINT)(rc.right - rc.left), h = (UINT)(rc.bottom - rc.top);
+
+        if (w && h && (w != s->swap_width || h != s->swap_height)) {
+            ID3D11RenderTargetView *saved_rtv = NULL;
+            ID3D11DepthStencilView *saved_dsv = NULL;
+            ID3D11Texture2D *bb = NULL;
+
+            /* ResizeBuffers wants every reference to the old back buffer
+             * gone, including any the context still holds. */
+            ID3D11DeviceContext_OMGetRenderTargets(s->d3d11_context, 1,
+                                                    &saved_rtv, &saved_dsv);
+            ID3D11DeviceContext_OMSetRenderTargets(s->d3d11_context, 0, NULL, NULL);
+            ID3D11RenderTargetView_Release(s->present_rtv);
+            s->present_rtv = NULL;
+
+            if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(s->swap_chain, 0, w, h,
+                                                        DXGI_FORMAT_UNKNOWN, 0)) &&
+                SUCCEEDED(IDXGISwapChain_GetBuffer(s->swap_chain, 0,
+                                                    &IID_ID3D11Texture2D, (void **)&bb))) {
+                ID3D11Device_CreateRenderTargetView(s->d3d11_device,
+                                                     (ID3D11Resource *)bb, NULL,
+                                                     &s->present_rtv);
+                ID3D11Texture2D_Release(bb);
+                s->swap_width = w;
+                s->swap_height = h;
+            }
+
+            ID3D11DeviceContext_OMSetRenderTargets(s->d3d11_context, 1,
+                                                    &saved_rtv, saved_dsv);
+            if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
+            if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
+            if (!s->present_rtv)
+                return;                 /* try again on the next frame */
+        }
+    }
+
+    fit = d3d8_display_fit(s->width, s->height, s->swap_width, s->swap_height);
+    d3d8_display_resolve(s->scene_srv, s->width, s->height, s->present_rtv, fit);
 }
 
 /* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
@@ -387,6 +437,8 @@ static HRESULT d3d11_create_device_and_swap_chain(
      * the scene is whatever the display policy makes of it. */
     state->present_width = scd.BufferDesc.Width;
     state->present_height = scd.BufferDesc.Height;
+    state->swap_width = scd.BufferDesc.Width;
+    state->swap_height = scd.BufferDesc.Height;
     d3d8_display_scene_size(state->present_width, state->present_height,
                             &state->width, &state->height);
 

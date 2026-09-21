@@ -37,14 +37,23 @@ const D3D8DisplayPolicy *d3d8_display_policy(void);
 void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
                              UINT *scene_w, UINT *scene_h);
 
-/* Draw `scene` over the whole of `out`, box filtered down to out_w by
- * out_h. Binds `out` itself and puts back the render target and viewport
- * it found, which is why the caller must not bind the output first: the
- * state this restores is the scene the next frame draws into. */
+/* Where the scene lands inside a back buffer of bb_w by bb_h: the largest
+ * centred rectangle with the scene's own shape. Equal to the whole buffer
+ * when the two already agree; otherwise the difference is the bars. */
+typedef struct D3D8DisplayFit { UINT x, y, w, h; } D3D8DisplayFit;
+
+D3D8DisplayFit d3d8_display_fit(UINT scene_w, UINT scene_h, UINT bb_w, UINT bb_h);
+
+/* Draw `scene` into `fit` inside `out`, box filtered, painting everything
+ * outside `fit` black so a window of a different shape gets bars rather
+ * than a stretched picture. Binds `out` itself and puts back the render
+ * target and viewport it found, which is why the caller must not bind the
+ * output first: the state this restores is the scene the next frame draws
+ * into. */
 HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
                              UINT scene_w, UINT scene_h,
                              ID3D11RenderTargetView *out,
-                             UINT out_w, UINT out_h);
+                             D3D8DisplayFit fit);
 
 void d3d8_display_shutdown(void);
 
