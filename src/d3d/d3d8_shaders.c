@@ -1108,8 +1108,16 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     HRESULT hr;
 
     if (!ctx) return;
-    if (!d3d8_vsh_prepare_draw(handle))
+    if (d3d8_vsh_prepare_draw(handle)) {
+        /* A program that never reads the projection's first column is
+         * placing vertices in screen coordinates it worked out itself. */
+        d3d8_SetTwoDSqueeze(!d3d8_vsh_bound_uses_projection());
+    } else {
         ff_vs_prepare_draw(handle);
+        /* The fixed-function equivalent: pre-transformed vertices arrive
+         * already in screen pixels. */
+        d3d8_SetTwoDSqueeze(d3d8_fvf_transformed(d3d8_GetCurrentFVF()));
+    }
 
     /* Pixel state is independent of whether the vertex shader is programmable.
      * A combiner shader, when one is active, binds its own pixel shader and

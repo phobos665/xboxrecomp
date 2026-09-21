@@ -1555,22 +1555,68 @@ static HRESULT __stdcall dev_GetDepthStencilSurface(IDirect3DDevice8 *self, IDir
     return S_OK;
 }
 
+/* Set while drawing something positioned in screen coordinates the title
+ * worked out itself, rather than through its projection. See
+ * d3d8_SetTwoDSqueeze. */
+static BOOL g_2d_squeeze;
+
+static void apply_host_viewport(void)
+{
+    const D3DVIEWPORT8 *vp = &g_device_state.viewport;
+    float sx = rt_scale_x(), sy = rt_scale_y();
+    D3D11_VIEWPORT hv;
+
+    if (!g_device_state.d3d11_context)
+        return;
+
+    hv.TopLeftX = (FLOAT)vp->X * sx;
+    hv.TopLeftY = (FLOAT)vp->Y * sy;
+    hv.Width    = (FLOAT)vp->Width * sx;
+    hv.Height   = (FLOAT)vp->Height * sy;
+    hv.MinDepth = vp->MinZ;
+    hv.MaxDepth = vp->MaxZ;
+
+    /* In widescreen the whole scene is stretched horizontally at present,
+     * which is right for geometry that went through a widened projection
+     * and wrong for everything else. Squeezing the 2D viewport by the same
+     * factor, about the middle of the scene, means the stretch puts it
+     * back: a HUD laid out for 4:3 keeps its proportions and sits in the
+     * centre. Nothing is resampled twice -- the squeeze is a viewport, so
+     * the draw is simply rasterised narrower. */
+    if (g_2d_squeeze && g_device_state.height && !g_cur_rt) {
+        float k = ((float)g_device_state.width * 9.0f) /
+                  ((float)g_device_state.height * 16.0f);
+
+        if (k > 0.0f && k < 1.0f) {
+            float cx = (float)g_device_state.width * 0.5f;
+
+            hv.TopLeftX = cx + (hv.TopLeftX - cx) * k;
+            hv.Width   *= k;
+        }
+    }
+
+    ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &hv);
+}
+
+/* Called once per draw, from the shader path that knows which kind of
+ * draw it is. Cheap when nothing changes, which is the common case: a
+ * frame is a run of 3D draws and then a run of 2D ones. */
+void d3d8_SetTwoDSqueeze(BOOL on)
+{
+    if (!d3d8_display_policy()->widescreen)
+        on = FALSE;
+    if (g_2d_squeeze == (on ? TRUE : FALSE))
+        return;
+    g_2d_squeeze = on ? TRUE : FALSE;
+    apply_host_viewport();
+}
+
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPORT8 *pViewport)
 {
     (void)self;
     if (pViewport) {
-        float sx = rt_scale_x(), sy = rt_scale_y();
-
         g_device_state.viewport = *pViewport;
-
-        D3D11_VIEWPORT d3d11_vp;
-        d3d11_vp.TopLeftX = (FLOAT)pViewport->X * sx;
-        d3d11_vp.TopLeftY = (FLOAT)pViewport->Y * sy;
-        d3d11_vp.Width    = (FLOAT)pViewport->Width * sx;
-        d3d11_vp.Height   = (FLOAT)pViewport->Height * sy;
-        d3d11_vp.MinDepth = pViewport->MinZ;
-        d3d11_vp.MaxDepth = pViewport->MaxZ;
-        ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &d3d11_vp);
+        apply_host_viewport();
     }
     return S_OK;
 }

@@ -146,6 +146,8 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
  * @param count      Number of float4 registers to set
  */
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
+/* Which constant register the experimental Hor+ scale applies to. */
+int  d3d8_vsh_hor_plus_reg(void);
 
 /**
  * The whole constant bank, as NV2A_VS_MAX_CONSTANTS float4 registers laid out
@@ -237,6 +239,11 @@ BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
  * @return TRUE if a programmable VS was bound, FALSE on fallback
  */
 BOOL d3d8_vsh_prepare_draw(DWORD handle);
+
+/* Whether the program bound by the last prepare_draw transforms through
+ * the projection's first column. False means it draws in screen
+ * coordinates of its own -- the HUD, a menu, a full-screen quad. */
+int  d3d8_vsh_bound_uses_projection(void);
 
 /**
  * Generate HLSL vertex shader source from parsed program.

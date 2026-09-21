@@ -85,6 +85,7 @@ typedef struct {
     uint32_t            decl_keys[16];     /* NV2AVshSlot.decl_hash */
     int                 decl_layout_count;
     uint16_t            inputs_read;  /* Which v registers are read */
+    int                 uses_proj;    /* reads the projection's first column */
 } VshCacheEntry;
 
 static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
@@ -92,6 +93,14 @@ static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
 /* ================================================================
  * Hash Function (FNV-1a)
  * ================================================================ */
+
+/* Set while a program's HLSL is generated; see the constant emitter. */
+static int g_emit_uses_proj;
+
+/* The same fact about the program currently bound, for the draw path. */
+static int g_bound_uses_proj;
+
+int d3d8_vsh_bound_uses_projection(void) { return g_bound_uses_proj; }
 
 static uint32_t fnv1a_hash(const void *data, size_t len)
 {
@@ -195,8 +204,18 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
     case NV2A_VSH_REG_CONST:
         if (src->rel_addr)
             sb_append(sb, "c[a0 + %d]", src->reg_index);
-        else
+        else {
             sb_append(sb, "c[%d]", src->reg_index);
+            /* A program that reads the register holding the first column of
+             * the title's projection is transforming geometry through it,
+             * which is what makes it 3D. One that never does is drawing in
+             * screen coordinates it worked out itself -- the HUD, menus,
+             * a full-screen quad -- and is not widened by Hor+, so it needs
+             * the compensating squeeze instead. Relative addressing is not
+             * counted: an indexed read is a bone or a light, never this. */
+            if (src->reg_index == d3d8_vsh_hor_plus_reg())
+                g_emit_uses_proj = 1;
+        }
         break;
     default:
         sb_append(sb, "float4(0,0,0,0)");
@@ -940,6 +959,7 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     /* Generate HLSL. A source that fills the buffer was cut off. */
     if (!hlsl_buf)
         return NULL;
+    g_emit_uses_proj = 0;
     hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, HLSL_BUF);
     if (hlsl_len <= 0 || hlsl_len >= HLSL_BUF - 1) {
         fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d bytes)\n", hlsl_len);
@@ -999,6 +1019,7 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
     entry->vs_blob     = code;
     entry->inputs_read = program.inputs_read;
+    entry->uses_proj   = g_emit_uses_proj;
     entry->layout_count = 0;
 
     fprintf(stderr, "D3D8 VSH: Compiled shader (hash 0x%08X, %d insns, inputs 0x%04X)\n",
@@ -1289,9 +1310,58 @@ const float *d3d8_vsh_constants(void)
     return &g_vsh_constants.c[0][0];
 }
 
+/* Hor+ widescreen, experimental: RECOMP_HOR_PLUS=<factor> scales one
+ * constant register as it is uploaded, and RECOMP_HOR_PLUS_REG=<n> says
+ * which (60 by default, which is what TimeSplitters 2 uses).
+ *
+ * A title whose vertex program transforms by a matrix in constant
+ * registers keeps that matrix transposed for dp4, so the register that
+ * produces oPos.x holds column 0 of the matrix. Scaling that column is
+ * exactly equivalent to scaling the projection's [0][0], because the
+ * projection is the rightmost factor of whatever composite the title
+ * built: M * diag(k,1,1,1) scales the product's first column whether M
+ * is a bare projection or a world-view-projection. 0.75, which is
+ * (4/3)/(16/9), widens the horizontal field of view and leaves the
+ * vertical alone -- more of the scene rather than the same scene
+ * stretched.
+ *
+ * This is the 3D half only. A title's pre-transformed 2D layer never
+ * goes through this register and is not widened by it. */
+static float hor_plus_factor(void)
+{
+    static float factor = -1.0f;
+
+    if (factor < 0.0f) {
+        const char *v = getenv("RECOMP_HOR_PLUS");
+
+        factor = (v && *v) ? (float)atof(v) : 1.0f;
+        if (factor <= 0.0f || factor > 4.0f)
+            factor = 1.0f;
+        if (factor != 1.0f)
+            fprintf(stderr, "D3D8 VSH: Hor+ scaling c[%d] by %.4f (experimental)\n",
+                    d3d8_vsh_hor_plus_reg(), (double)factor);
+    }
+    return factor;
+}
+
+int d3d8_vsh_hor_plus_reg(void)
+{
+    static int reg = -1;
+
+    if (reg < 0) {
+        const char *v = getenv("RECOMP_HOR_PLUS_REG");
+
+        reg = (v && *v) ? atoi(v) : 60;
+        if (reg < 0 || reg >= NV2A_VS_MAX_CONSTANTS)
+            reg = 60;
+    }
+    return reg;
+}
+
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
 {
     int end_reg;
+    float hp;
 
     if (!data || start_reg < 0)
         return;
@@ -1306,6 +1376,18 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
         g_vsh_constants.c[i][1] = data[src_offset + 1];
         g_vsh_constants.c[i][2] = data[src_offset + 2];
         g_vsh_constants.c[i][3] = data[src_offset + 3];
+    }
+
+    hp = hor_plus_factor();
+    if (hp != 1.0f) {
+        int reg = d3d8_vsh_hor_plus_reg();
+
+        if (reg >= start_reg && reg < end_reg) {
+            g_vsh_constants.c[reg][0] *= hp;
+            g_vsh_constants.c[reg][1] *= hp;
+            g_vsh_constants.c[reg][2] *= hp;
+            g_vsh_constants.c[reg][3] *= hp;
+        }
     }
 
     g_vsh_constants_dirty = TRUE;
@@ -1438,6 +1520,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
 
     /* Bind the vertex shader */
     ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
+    g_bound_uses_proj = entry->uses_proj;
 
     /* Bind the input layout: the program's declaration when it has one,
      * otherwise sized from the bound stream FVF */

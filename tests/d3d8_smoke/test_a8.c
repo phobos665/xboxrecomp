@@ -33,6 +33,9 @@ const D3DLIGHT8 *d3d8_GetLight(DWORD index) { (void)index; return NULL; }
 BOOL d3d8_GetLightEnable(DWORD index) { (void)index; return FALSE; }
 const D3DMATERIAL8 *d3d8_GetMaterial(void) { return NULL; }
 UINT d3d8_GetNumLights(void) { return 0; }
+int  d3d8_vsh_bound_uses_projection(void) { return 1; }
+void d3d8_SetTwoDSqueeze(BOOL on) { (void)on; }
+DWORD d3d8_GetCurrentFVF(void) { return 0; }
 
 /* Model successful programmable-VS preparation without Xbox microcode.
  * Bind real D3D11 vertex state so pixel preparation must preserve it. */
