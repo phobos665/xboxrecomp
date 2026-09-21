@@ -41,7 +41,7 @@ Verify against the repo rather than trusting the README. Known discrepancies as 
 |---|---|
 | NV2A push-buffer interception is a core feature | Push-buffer parsing is a **stub**, marked "N/A — D3D8 API intercept instead". The project already does D3D8 HLE. |
 | "115 of 366 ordinals resolved, 55 bridged" | Do not trust any number written down; the useful question is per-title, not global. Run `py -3 -m tools.kernel_audit.coverage <analysis.json> --list`, which splits what is missing into "needs a bridge wrapper", "is a data export", and "does not exist yet". Note an ordinal with an `xbox_*` implementation but no bridge silently returns 0. |
-| Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. Win32-only in practice. |
+| Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. **"Win32-only in practice" is out of date (Sep 2026):** `src/platform/win32_compat.c` implements those on POSIX, with `MAP_FIXED_NOREPLACE` and a returned-address check, because `xbox_memory_layout.c` depends on a failed placement failing. What is untested is whether the 28 mirror views and the apertures actually place on Linux — no title has ever linked there. The lifted output is portable too: `templates/runtime/recomp_types.h` guards every x86 intrinsic and keeps the MMX/SSE helpers as lane-wise C. See `docs/technical/vulkan-backend.md` §6.5 for the rest of the Linux/Android gap. |
 | Burnout 3 is the proven target | True, and it is a **D3D8LTCG** build on XDK 5849 — so LTCG is not disqualifying. |
 
 **Corrected Sep 2026:** that "17 of 66 formats, mipmap level 0 only, no P8 palette, no
@@ -150,6 +150,12 @@ The shader generators stay as they are: `d3d8_combiners.c`, `d3d8_vsh.c` and
 survive the move. Do **not** rewrite them to GLSL. Vulkan's costs here are the Y-flip and
 front-face winding inversion (a negative viewport height; note `d3d8_states.c` already
 carries one hand-annotated winding fix, so do not stack a second).
+
+**The plan behind that paragraph is `docs/technical/vulkan-backend.md`** (Sep 2026): only
+7% of `src/d3d` touches D3D11 at all (814 lines of 11.3k, 58 distinct entry points), so the
+seam goes *inside* `src/d3d` as an RHI, not at the COM vtable — `d3d8_gl.c` is the in-tree
+proof of what the vtable seam costs, and it should be deleted once Vulkan can replay a
+frame. Read §4.4 before touching the winding, and §4.10 before choosing a present mode.
 
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
