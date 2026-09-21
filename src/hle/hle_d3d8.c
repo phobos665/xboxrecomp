@@ -897,6 +897,8 @@ static void shadow_dump_frame(void)
 HLE_ORIGINAL(Direct3D_CreateDevice);
 HLE_ORIGINAL(D3DDevice_Clear);
 HLE_ORIGINAL(D3DDevice_Swap);
+/* The pre-Swap flip, for XDKs that have only this one. */
+HLE_ORIGINAL(D3DDevice_Present);
 HLE_ORIGINAL(D3DDevice_CreateVertexShader);
 HLE_ORIGINAL(D3DDevice_SetVertexShader);
 HLE_ORIGINAL(D3DDevice_SelectVertexShader);
@@ -949,6 +951,126 @@ HLE_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
  */
 HLE_IMPORT_VAR(D3D_g_pDevice);
 HLE_IMPORT_VAR(D3D_BlockOnTime);
+/* For the swap throttle's counter pair, read out of its own code below. */
+HLE_IMPORT_VAR(D3DDevice_Present);
+
+/* `mov eax, [reg + disp]` at code[0], with an 8- or 32-bit displacement.
+ * Returns the instruction's length and writes the displacement, or 0 when it
+ * is not that instruction. Both widths, because the offset a build uses
+ * decides the width for it: 0x3F0 on XDK 3925 does not fit in a byte. */
+static int mov_reg_from_reg(const uint8_t *code, int dest, int reg,
+                            uint32_t *disp)
+{
+    uint8_t modrm;
+
+    if (code[0] != 0x8B)
+        return 0;
+    modrm = code[1];
+    if (((modrm >> 3) & 7) != (uint8_t)dest)
+        return 0;
+    if ((modrm & 7) != (uint8_t)reg || (modrm & 7) == 4)  /* no SIB form */
+        return 0;
+    if ((modrm >> 6) == 1) {
+        *disp = code[2];
+        return 3;
+    }
+    if ((modrm >> 6) == 2) {
+        uint32_t d;
+        memcpy(&d, code + 2, 4);
+        *disp = d;
+        return 6;
+    }
+    return 0;
+}
+
+static int mov_eax_from_reg(const uint8_t *code, int reg, uint32_t *disp)
+{
+    return mov_reg_from_reg(code, 0, reg, disp);
+}
+
+/*
+ * The swap throttle's counter pair, read out of D3DDevice_Present.
+ *
+ * XDK 3925 throttles frames in Present itself rather than waiting on the GPU
+ * time fence:
+ *
+ *      mov  esi, [D3D_g_pDevice]
+ *      ...
+ *   L: mov  eax, [esi + 0x2518]      ; frames completed -- the GPU moves this
+ *      mov  ecx, [esi + 0x2B60]      ; frames submitted -- the title moves it
+ *      sub  ecx, eax
+ *      cmp  ecx, 2
+ *      jae  L
+ *
+ * Nothing here is a GPU, so "completed" never moved and Max Payne spun in
+ * Present forever -- 88% of its main thread, in a four-instruction delay loop
+ * the XDK calls between polls. Mirroring submitted onto completed is the
+ * truthful answer for the same reason the DMA_PUT/GET acknowledgement is: the
+ * frames really have been drawn, by the host, by the time Present returns.
+ *
+ * The offsets are read from the title's own code rather than tabulated,
+ * because they are a per-build detail and reading them is what makes this
+ * work on the next XDK without a new table entry. xbox_Nv2aMirrorCounter
+ * copies rather than increments, so it cannot run ahead of the title and the
+ * unsigned subtraction above cannot underflow.
+ */
+static void mirror_swap_throttle(void)
+{
+    static int done;
+    const uint8_t *code;
+
+    if (done)
+        return;
+    done = 1;
+    if (!hle_var_D3D_g_pDevice || !hle_var_D3DDevice_Present)
+        return;             /* a build that throttles through the fence */
+
+    code = (const uint8_t *)HLE_PTR(hle_var_D3DDevice_Present);
+    {
+        enum { SCAN = 160 };
+        int at = -1, reg = -1, i;
+        uint32_t completed = 0, submitted = 0;
+
+        for (i = 0; i + 6 <= SCAN; i++) {
+            uint32_t addr;
+            if (code[i] != 0x8B || (code[i + 1] & 0xC7) != 0x05)
+                continue;
+            memcpy(&addr, code + i + 2, 4);
+            if (addr != hle_var_D3D_g_pDevice)
+                continue;
+            reg = (code[i + 1] >> 3) & 7;
+            at = i + 6;
+            break;
+        }
+        if (at < 0)
+            return;         /* Present does not hold the device in a register */
+
+        /* `mov eax,[reg+A]; mov ecx,[reg+B]; sub ecx,eax` -- the pair, in the
+         * order the throttle reads them. 2B C8 is `sub ecx, eax`. */
+        for (i = at; i < at + SCAN; i++) {
+            int n1 = mov_eax_from_reg(code + i, reg, &completed);
+            int n2;
+            if (!n1)
+                continue;
+            /* the second load is into ecx: same encoding, reg field 1 */
+            n2 = mov_reg_from_reg(code + i + n1, 1, reg, &submitted);
+            if (!n2)
+                continue;
+            if (code[i + n1 + n2] != 0x2B || code[i + n1 + n2 + 1] != 0xC8)
+                continue;
+            if (xbox_Nv2aMirrorCounter(hle_var_D3D_g_pDevice,
+                                       submitted, completed) == 0)
+                fprintf(stderr, "[HLE-D3D8] swap throttle mirrored: device "
+                        "+0x%X (submitted) -> +0x%X (completed), offsets read "
+                        "from D3DDevice_Present\n", submitted, completed);
+            return;
+        }
+        fprintf(stderr, "[HLE-D3D8] swap throttle not mirrored: D3DDevice_Present "
+                "at 0x%08X loads the device into r%d but no counter pair "
+                "follows; if it spins there, this is why\n",
+                hle_var_D3DDevice_Present, reg);
+    }
+}
 
 static void mirror_gpu_time_fence(void)
 {
@@ -997,22 +1119,46 @@ static void mirror_gpu_time_fence(void)
             return;
         }
         /* Then, against that register:
-         *     8B <40|reg> A   mov eax, [reg + A]   ; -> completed word
-         *     8B 08           mov ecx, [eax]
-         *     8B <40|reg> B   mov eax, [reg + B]   ; last submitted value */
-        if (code[at] != 0x8B || code[at + 1] != (uint8_t)(0x40 | reg) ||
-            code[at + 3] != 0x8B || code[at + 4] != 0x08 ||
-            code[at + 5] != 0x8B || code[at + 6] != (uint8_t)(0x40 | reg)) {
-            fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
-                            "D3D_BlockOnTime at 0x%08X loads the device into r%d "
-                            "but does not then read the fence as expected "
-                            "(%02X %02X .. %02X %02X)\n",
-                    hle_var_D3D_BlockOnTime, reg,
-                    code[at], code[at + 1], code[at + 5], code[at + 6]);
-            return;
+         *     mov eax, [reg + A]   ; -> completed word
+         *     mov ecx, [eax]       ; 8B 08
+         *     mov eax, [reg + B]   ; last submitted value
+         *
+         * Neither the displacement width nor the position is fixed. XDK 3925
+         * reads the device at +0x3F0, which needs a 32-bit displacement where
+         * later builds use an 8-bit one, and it puts a conditional jump
+         * between the device load and these three instructions. Matching only
+         * an 8-bit displacement immediately after the load found neither, and
+         * Max Payne's main thread then blocked on a fence nothing advanced. */
+        {
+            enum { FENCE_SCAN = 64 };
+            uint32_t a = 0, b = 0;
+            int p, n1, n2, found = 0;
+
+            for (p = at; p < at + FENCE_SCAN; p++) {
+                n1 = mov_eax_from_reg(code + p, reg, &a);
+                if (!n1)
+                    continue;
+                if (code[p + n1] != 0x8B || code[p + n1 + 1] != 0x08)
+                    continue;
+                n2 = mov_eax_from_reg(code + p + n1 + 2, reg, &b);
+                if (!n2)
+                    continue;
+                found = 1;
+                break;
+            }
+            if (!found) {
+                fprintf(stderr, "[HLE-D3D8] GPU time fence not mirrored: "
+                                "D3D_BlockOnTime at 0x%08X loads the device into "
+                                "r%d but no `mov eax,[r%d+A]; mov ecx,[eax]; "
+                                "mov eax,[r%d+B]` follows within %d bytes "
+                                "(starts %02X %02X %02X %02X)\n",
+                        hle_var_D3D_BlockOnTime, reg, reg, reg, (int)FENCE_SCAN,
+                        code[at], code[at + 1], code[at + 2], code[at + 3]);
+                return;
+            }
+            get_ptr_off = a;
+            put_off = b;
         }
-        get_ptr_off = code[at + 2];
-        put_off = code[at + 7];
     }
     if (xbox_Nv2aMirrorFence(hle_var_D3D_g_pDevice, put_off, get_ptr_off) == 0)
         fprintf(stderr, "[HLE-D3D8] GPU time fence mirrored: device +0x%02X -> "
@@ -1051,6 +1197,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
     /* Only beside a guest device that exists: the original's HRESULT. */
     if ((int32_t)g_eax >= 0)
         mirror_gpu_time_fence();
+        mirror_swap_throttle();
 #ifdef _WIN32
     g_in_create_device = 0;
     if (!g_backbuffer_va)
@@ -1194,39 +1341,13 @@ static void overlay_frame(void)
 }
 
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */
-HLE_EXPORT(D3DDevice_Swap)
+#ifdef _WIN32
+/* Everything a completed frame needs after the title's own flip has run:
+ * the capture boundary, the frame dump, the overlay, the host present and
+ * the five-second report. Shared because a title reaches this point
+ * through either entry point -- see the Present replacement below. */
+static void frame_end_shadow(void)
 {
-    static int seen;
-
-    /* Counted before anything else here runs, so RECOMP_FPS means the same
-     * thing whatever is switched on below. */
-    xbox_FpsCountSwap();
-#ifdef _WIN32
-    if (g_backbuffer_va)
-        note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
-#endif
-    first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
-    if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
-        HLE_RETURN(0x80004005u);
-    /* Console pacing: the flip gate sleeps here until the next vblank
-     * (xbox_memory_layout.h), before the title's own Swap runs. The three
-     * times are kept for the five-second report below: how long the gate
-     * held, how long the title's own Swap took, and the rest of the frame. */
-    {
-        LARGE_INTEGER t0, t1, t2;
-        QueryPerformanceCounter(&t0);
-        if (g_swap_last.QuadPart)
-            g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
-        xbox_Nv2aFlipGateArm();
-        QueryPerformanceCounter(&t1);
-        HLE_CALL_ORIGINAL(D3DDevice_Swap);
-        QueryPerformanceCounter(&t2);
-        g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
-        g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
-        g_swap_last = t2;
-        g_swap_timed++;
-    }
-#ifdef _WIN32
     if (g_shadow) {
         DWORD now = GetTickCount();
         DWORD thread = GetCurrentThreadId();
@@ -1291,6 +1412,94 @@ HLE_EXPORT(D3DDevice_Swap)
             g_shadow_last_report = now;
         }
     }
+}
+#endif
+
+HLE_EXPORT(D3DDevice_Swap)
+{
+    static int seen;
+
+    /* Counted before anything else here runs, so RECOMP_FPS means the same
+     * thing whatever is switched on below. */
+    xbox_FpsCountSwap();
+#ifdef _WIN32
+    if (g_backbuffer_va)
+        note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+#endif
+    first_call(&seen, "D3DDevice_Swap", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
+        HLE_RETURN(0x80004005u);
+    /* Console pacing: the flip gate sleeps here until the next vblank
+     * (xbox_memory_layout.h), before the title's own Swap runs. The three
+     * times are kept for the five-second report below: how long the gate
+     * held, how long the title's own Swap took, and the rest of the frame. */
+    {
+        LARGE_INTEGER t0, t1, t2;
+        QueryPerformanceCounter(&t0);
+        if (g_swap_last.QuadPart)
+            g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
+        xbox_Nv2aFlipGateArm();
+        QueryPerformanceCounter(&t1);
+        HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        QueryPerformanceCounter(&t2);
+        g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
+        g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
+        g_swap_last = t2;
+        g_swap_timed++;
+    }
+#ifdef _WIN32
+    frame_end_shadow();
+#endif
+}
+
+/* HRESULT D3DDevice_Present(const RECT *src, const RECT *dst,
+ *                           void *dstSurface, void *dirtyRegion)
+ *
+ * The flip, on an XDK that predates Swap. Max Payne is XDK 3925 and its
+ * D3D8 exports Present and no Swap at all, so a shadow renderer that only
+ * replaces Swap never sees a frame boundary: it draws, and never presents.
+ *
+ * Later XDKs export both, and there Present is a wrapper that ends up in
+ * Swap. Doing the frame-end work in both would present twice and count
+ * every frame twice, so this defers to Swap whenever the title has one and
+ * only takes over when it does not.
+ */
+HLE_EXPORT(D3DDevice_Present)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_Present", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_Present, "D3DDevice_Present"))
+        HLE_RETURN(0x80004005u);
+
+    /* The title has a Swap of its own, which this call will reach and which
+     * does the frame-end work. Nothing to do here but let it through. */
+    if (hle_original_D3DDevice_Swap) {
+        HLE_CALL_ORIGINAL(D3DDevice_Present);
+        return;
+    }
+
+    xbox_FpsCountSwap();
+#ifdef _WIN32
+    if (g_backbuffer_va)
+        note_framebuffer_phys(HLE_MEM32(g_backbuffer_va + 4));
+#endif
+    {
+        LARGE_INTEGER t0, t1, t2;
+        QueryPerformanceCounter(&t0);
+        if (g_swap_last.QuadPart)
+            g_swap_frame_ticks += t0.QuadPart - g_swap_last.QuadPart;
+        xbox_Nv2aFlipGateArm();
+        QueryPerformanceCounter(&t1);
+        HLE_CALL_ORIGINAL(D3DDevice_Present);
+        QueryPerformanceCounter(&t2);
+        g_swap_gate_ticks += t1.QuadPart - t0.QuadPart;
+        g_swap_body_ticks += t2.QuadPart - t1.QuadPart;
+        g_swap_last = t2;
+        g_swap_timed++;
+    }
+#ifdef _WIN32
+    frame_end_shadow();
 #endif
 }
 
