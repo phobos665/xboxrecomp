@@ -1688,11 +1688,21 @@ BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
      * pixels. Coverage rather than "touches both edges": this title
      * builds its backdrop from overlapping strips, and the ones that run
      * off the left edge stop a little short of the right. Measured on a
-     * menu, the gap is wide -- every backdrop piece covers 92% or more,
-     * and the widest HUD element covers 78% -- so the threshold sits
-     * between them with room either side. */
+     * menu the pieces fall into two groups with a gap between them:
+     * backdrop from 77% of the width upwards, and everything smaller at
+     * 70% and below. The threshold sits in that gap.
+     *
+     * It was 85% first, which split the backdrop rather than separating
+     * it from the HUD: the widest strips passed and the rest did not, so
+     * the tiling came apart and left an edge partway across where one
+     * stopped and the squeezed next one began. A backdrop only looks
+     * right if all of it is treated the same way.
+     *
+     * 75% is a measurement of one title's menu, not a principle, and the
+     * gap it sits in is about six points wide. Another title may not
+     * leave one. */
     {
-        return ((hi - lo) >= (float)guest_w * 0.85f) ? TRUE : FALSE;
+        return ((hi - lo) >= (float)guest_w * 0.75f) ? TRUE : FALSE;
     }
 }
 
