@@ -522,6 +522,44 @@ def _has_xmm_operand(ops):
                for op in (ops or ()))
 
 
+def zf_expression(flag_state):
+    """A C expression for the zero flag this state leaves, or None.
+
+    For a join whose predecessors set the flags with *different*
+    instructions, no single expression serves the consumer: `cmp a, b`
+    leaves ZF as (a == b) and `test a, b` as ((a & b) == 0), and
+    _merge_flag_states rightly refuses to call them the same state. The
+    consumer then falls back to `_flags` -- which nothing ever assigned, so
+    the branch read an uninitialised local and went whichever way the stack
+    happened to be.
+
+    This is the other half of that fallback. Each predecessor can compute its
+    own zero flag, in its own block where its snapshot is still valid, and
+    write it to `_flags`; the consumer's existing fallback then reads a real
+    value. Max Payne has 49 je/jne branches in this position.
+
+    Only ZF, and only for setters whose zero flag is recoverable. Everything
+    else returns None and keeps the fallback exactly as it was -- a wrong
+    branch is much worse than an unmodelled one, because it looks like it
+    worked.
+    """
+    if not flag_state:
+        return None
+    setter, ops = flag_state
+    if setter == "__zf_from_dest" and ops:
+        return f"({_fmt_operand_read(ops[0])} == 0)"
+    if setter == "cmp" and len(ops) >= 2:
+        return "(_fa == _fb)"
+    if setter == "test" and len(ops) >= 2:
+        return "((_fa & _fb) == 0)"
+    if setter in _RESULT_SNAPSHOT_SETTERS:
+        # These snapshot the result itself into _fa (see _make_condition).
+        return "(_fa == 0)"
+    if setter in ("inc", "dec") and ops:
+        return f"({_fmt_operand_read(ops[0])} == 0)"
+    return None
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.

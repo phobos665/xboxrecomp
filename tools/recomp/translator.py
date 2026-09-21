@@ -82,6 +82,25 @@ def _merge_zero_flag(states):
     return ("__zf_from_dest", [states[0][1][0]])
 
 
+def _before_terminator(stmts):
+    """Index of the first trailing statement that leaves the block.
+
+    A basic block transfers control only at its end, so anything that has to
+    happen on the way out goes before that run of statements -- the `goto`,
+    the conditional `goto`, the `return`, or a conditional that returns.
+    """
+    k = len(stmts)
+    while k > 0:
+        s = stmts[k - 1].lstrip()
+        leaves = (s.startswith("goto ") or s.startswith("return")
+                  or "return;" in s
+                  or (s.startswith("if (") and "goto" in s))
+        if not leaves:
+            break
+        k -= 1
+    return k
+
+
 def _incoming_flag_state(sources, known, is_entry):
     """The flag state a block inherits, or None when it cannot be known.
 
@@ -1204,7 +1223,15 @@ class FunctionTranslator:
         # itself, which is what this function did before the probe existed.
         out_state = {}
         settled_state = out_state
-        if any(p >= bb.start for bb in blocks for p in preds[bb.start]):
+        # The pre-pass runs whenever any block has more than one predecessor,
+        # not only when there is a back edge. Without a back edge address
+        # order settles the state as it goes, which is enough to *consume* a
+        # state -- but not to know, while emitting a block, whether a later
+        # join will fail to merge and need this block to leave a zero flag
+        # behind. That question is answered below, and it needs every state
+        # up front.
+        if (any(p >= bb.start for bb in blocks for p in preds[bb.start])
+                or any(len(preds[bb.start]) > 1 for bb in blocks)):
             saved_unimplemented = {
                 k: list(v) for k, v in self.lifter.unimplemented.items()
             }
@@ -1224,6 +1251,29 @@ class FunctionTranslator:
             self.lifter.unimplemented.update(saved_unimplemented)
             settled_state = out_state
             out_state = {}
+
+        # Joins whose predecessors cannot agree on a flag state. The consumer
+        # there falls back to `_flags`, so every predecessor that can work out
+        # its own zero flag writes one, and the fallback reads a real value
+        # instead of an uninitialised local. See lifter.zf_expression.
+        needs_zf = set()
+        zf_probe = [bb for bb in blocks
+                    if len(preds[bb.start]) > 1 and bb.start != start
+                    and not _incoming_flag_state(preds[bb.start],
+                                                 settled_state, False)]
+        if zf_probe:
+            # Only where the join really reads the fallback. Marking every
+            # predecessor of every failed merge emitted 69,416 assignments
+            # into Max Payne, almost none of them read: a join that starts by
+            # setting the flags itself needs nothing from its predecessors.
+            # Lifting the block once with no incoming state says which it is.
+            saved = {k: list(v) for k, v in self.lifter.unimplemented.items()}
+            for bb in zf_probe:
+                probe, _ = lift_basic_block(self.lifter, bb, flag_state=None)
+                if any("_flags /*" in stmt for stmt in probe):
+                    needs_zf.update(preds[bb.start])
+            self.lifter.unimplemented.clear()
+            self.lifter.unimplemented.update(saved)
 
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -1245,6 +1295,18 @@ class FunctionTranslator:
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+            if bb.start in needs_zf:
+                from .lifter import zf_expression
+                zf = zf_expression(out_state[bb.start])
+                if zf:
+                    # Before the block leaves, not after. Appending put it
+                    # below the `goto`, where it never ran -- so the join read
+                    # a value the *other* predecessor had left, which is worse
+                    # than the uninitialised read it replaced: it is wrong and
+                    # it looks deliberate.
+                    stmts.insert(_before_terminator(stmts),
+                                 f"_flags = {zf}; /* zero flag for a join "
+                                 f"that cannot inherit a state */")
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
