@@ -132,7 +132,16 @@ def build(t):
 
 
 MARKERS = {
+    # Two sources for the swap count, and the second is the reliable one.
+    #
+    # The shadow summary prints five seconds after the *first* swap, so a
+    # title whose first frame arrives near the end of the window renders and
+    # still counts zero -- Outrun 2 was reported as not rendering while the
+    # SEGA screen was on the monitor. RECOMP_FPS counts from process start and
+    # says so every window, whether or not anything has been drawn yet.
     "swaps":      (r"shadow: (\d+) swaps", max),
+    # summed, not maxed: each line counts that window alone.
+    "fps_swaps":  (r"\[FPS\] t=[^(]*\((\d+) swaps\)", sum),
     "clears":     (r"shadow: \d+ swaps, (\d+) clears", max),
     "kernel":     (r"\[KERNEL\] summary: (\d+) total calls", max),
     "tex_binds":  (r"shadow textures: (\d+) binds", max),
@@ -155,6 +164,8 @@ def summarise(err_text, exit_code, seconds):
         g = [int(x) for x in m.groups()]
         drawn = max(drawn, sum(g[:4]))
         skipped = max(skipped, sum(g[4:]))
+    if s.get("fps_swaps", 0) > s.get("swaps", 0):
+        s["swaps"] = s["fps_swaps"]
     s["draws"] = drawn
     s["draws_skipped"] = skipped
     s["boot"] = "Loaded" in err_text and "sections" in err_text
@@ -204,6 +215,8 @@ def run_title(t, seconds, out_dir, extra_env=None):
     env = dict(os.environ)
     env.setdefault("RECOMP_VBLANK", "1")
     env.setdefault("RECOMP_AC97_READY", "1")
+    # Count frames from process start rather than from the first swap.
+    env.setdefault("RECOMP_FPS", "5")
     env.update(extra_env or {})
     err_path = out_dir / f"{t['name']}.err"
     with open(err_path, "wb") as errf:
@@ -230,12 +243,45 @@ COLUMNS = [("verdict", 18, None), ("swaps", 8, "higher"), ("draws", 9, "higher")
            ("exit", 9, None), ("kernel", 11, None)]
 
 
+# How far a title got, worst to best. A verdict change is only a regression
+# when the rank falls: "not built -> boots" is the opposite of one, and
+# reporting it as a regression is how a report stops being read.
+VERDICT_RANK = [
+    ("build failed", 0), ("not built", 0), ("no start", 1), ("boots", 2),
+    ("no frames", 3), ("first frame late", 4), ("renders", 5),
+]
+
+
+def verdict_rank(v):
+    for prefix, rank in VERDICT_RANK:
+        if (v or "").startswith(prefix):
+            return rank
+    return -1
+
+
+def counter_regressed(col, cur, was):
+    """A drop worth reporting, rather than run-to-run noise.
+
+    Frame counts vary by a frame or two between identical runs -- flagging
+    TimeSplitters 2 for 2368 -> 2367 trains the reader to ignore the list,
+    which costs more than the one real regression it was built to catch. Ten
+    per cent, and at least two, before it counts.
+    """
+    if not isinstance(cur, int) or not isinstance(was, int):
+        return False
+    delta = was - cur
+    if delta <= 0:
+        return False
+    return delta >= 2 and delta * 10 >= was
+
+
 def print_table(rows, baseline=None):
     widths = {c: max(w, len(c) + 1) for c, w, _ in COLUMNS}
     head = f"{'title':<16}" + "".join(f"{c:>{widths[c]}}" for c, _w, _ in COLUMNS)
     print(head)
     print("-" * len(head))
     regressions = []
+    improvements = []
     for name, s in rows.items():
         line = f"{name:<16}"
         for col, _w, better in COLUMNS:
@@ -244,8 +290,10 @@ def print_table(rows, baseline=None):
             if baseline and name in baseline and better:
                 was = baseline[name].get(col, 0)
                 if isinstance(cur, int) and isinstance(was, int) and cur != was:
-                    worse = (cur < was) if better == "higher" else (cur > was)
-                    line += "!" if worse else "+"
+                    worse = (counter_regressed(col, cur, was)
+                             if better == "higher"
+                             else counter_regressed(col, was, cur))
+                    line += "!" if worse else ("+" if cur > was else "-")
                     if worse:
                         regressions.append(f"{name}.{col}: {was} -> {cur}")
                 else:
@@ -253,10 +301,16 @@ def print_table(rows, baseline=None):
             elif baseline:
                 line += " "
         if baseline and name in baseline:
-            if s.get("verdict") != baseline[name].get("verdict"):
-                line += f"   [was {baseline[name].get('verdict')}]"
-                regressions.append(
-                    f"{name}: {baseline[name].get('verdict')} -> {s.get('verdict')}")
+            before = baseline[name].get("verdict")
+            if s.get("verdict") != before:
+                fell = verdict_rank(s.get("verdict")) < verdict_rank(before)
+                line += f"   [{'was' if fell else 'up from'} {before}]"
+                if fell:
+                    regressions.append(
+                        f"{name}: {before} -> {s.get('verdict')}")
+                else:
+                    improvements.append(
+                        f"{name}: {before} -> {s.get('verdict')}")
         print(line)
     if baseline:
         print()
@@ -267,6 +321,11 @@ def print_table(rows, baseline=None):
                   f"{sorted(windows)}s, the baseline {sorted(was)}s. A title "
                   f"that starts slowly reports fewer frames for that reason "
                   f"alone -- the columns below are not comparable.")
+            print()
+        if improvements:
+            print("improved:")
+            for r in improvements:
+                print(f"  {r}")
             print()
         if regressions:
             print("REGRESSED:")
