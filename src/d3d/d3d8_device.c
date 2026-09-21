@@ -277,7 +277,12 @@ static void present_resolve(void)
         }
     }
 
-    fit = d3d8_display_fit(s->width, s->height, s->swap_width, s->swap_height);
+    {
+        UINT shape_w, shape_h;
+
+        d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
+        fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
+    }
     d3d8_display_resolve(s->scene_srv, s->width, s->height, s->present_rtv, fit);
 }
 

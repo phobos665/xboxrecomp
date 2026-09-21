@@ -67,6 +67,14 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
         if (g_policy.scale > 1)
             fprintf(stderr, "D3D8 display: supersampling %ux, box filtered at present\n",
                     g_policy.scale);
+        v = getenv("RECOMP_WIDESCREEN");
+        g_policy.widescreen = v && !(strcmp(v, "0") == 0 || _stricmp(v, "off") == 0 ||
+                                     _stricmp(v, "no") == 0 || _stricmp(v, "false") == 0);
+
+        if (g_policy.widescreen)
+            fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "
+                    "at 16:9. A title with no 16:9 mode of its own draws 4:3 and will "
+                    "look stretched; leave this off for those.\n");
         if (g_policy.anisotropy > 1)
             fprintf(stderr, "D3D8 display: anisotropic filtering forced to %ux where the "
                     "title filters linearly\n", g_policy.anisotropy);
@@ -83,25 +91,43 @@ void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
     if (scene_h) *scene_h = guest_h * p->scale;
 }
 
-D3D8DisplayFit d3d8_display_fit(UINT scene_w, UINT scene_h, UINT bb_w, UINT bb_h)
+void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
+                               UINT *shape_w, UINT *shape_h)
+{
+    const D3D8DisplayPolicy *p = d3d8_display_policy();
+
+    if (p->widescreen) {
+        /* The frame is anamorphic: the title squeezed a 16:9 view into
+         * whatever buffer it renders to, and the display is meant to
+         * stretch it back. Presenting it at its own shape would be the
+         * squeeze left in. */
+        if (shape_w) *shape_w = 16;
+        if (shape_h) *shape_h = 9;
+    } else {
+        if (shape_w) *shape_w = scene_w;
+        if (shape_h) *shape_h = scene_h;
+    }
+}
+
+D3D8DisplayFit d3d8_display_fit(UINT shape_w, UINT shape_h, UINT bb_w, UINT bb_h)
 {
     D3D8DisplayFit f;
 
     f.x = f.y = 0;
     f.w = bb_w;
     f.h = bb_h;
-    if (!scene_w || !scene_h || !bb_w || !bb_h)
+    if (!shape_w || !shape_h || !bb_w || !bb_h)
         return f;
 
-    /* Compare shapes in integers: scene_w/scene_h against bb_w/bb_h. */
-    if ((uint64_t)scene_w * bb_h > (uint64_t)bb_w * scene_h) {
-        /* The window is taller than the scene: bars above and below. */
-        f.h = (UINT)(((uint64_t)bb_w * scene_h) / scene_w);
+    /* Compare shapes in integers: shape_w/shape_h against bb_w/bb_h. */
+    if ((uint64_t)shape_w * bb_h > (uint64_t)bb_w * shape_h) {
+        /* The window is taller than the picture: bars above and below. */
+        f.h = (UINT)(((uint64_t)bb_w * shape_h) / shape_w);
         if (!f.h) f.h = 1;
         f.y = (bb_h - f.h) / 2;
-    } else if ((uint64_t)scene_w * bb_h < (uint64_t)bb_w * scene_h) {
+    } else if ((uint64_t)shape_w * bb_h < (uint64_t)bb_w * shape_h) {
         /* The window is wider: bars to the left and right. */
-        f.w = (UINT)(((uint64_t)bb_h * scene_w) / scene_h);
+        f.w = (UINT)(((uint64_t)bb_h * shape_w) / shape_h);
         if (!f.w) f.w = 1;
         f.x = (bb_w - f.w) / 2;
     }
