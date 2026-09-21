@@ -123,8 +123,11 @@ if(MSVC)
         # recompile of the large generated files.
         /DEBUG
     )
-    # The generated code files can be very large. Increase object file section limit.
-    target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+    # The generated code files can be very large. Increase object file section
+    # limit, and compile them in parallel: MSBuild only parallelises across
+    # projects, so without /MP the 36 generated files of a 36,000-function
+    # title compile one after another on a single core.
+    target_compile_options(${PROJECT_NAME} PRIVATE /bigobj /MP)
 
     # Drop MSVC's Debug runtime checks. /RTC1 traps a local read before its
     # first write, and lifted code does that deliberately: an fpo_leaf function

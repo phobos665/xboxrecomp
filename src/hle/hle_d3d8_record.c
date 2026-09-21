@@ -62,6 +62,7 @@ static D3D8CapWriter *g_cap;
 static int            g_configured;
 static const char    *g_path;
 static unsigned long  g_target_swap;
+static int            g_capture_asap;   /* the next swap, whichever it is */
 static unsigned long  g_frame;
 static unsigned long  g_every;       /* RECOMP_D3D8_CAPTURE_EVERY, 0 = once */
 static unsigned long  g_min_draws;   /* RECOMP_D3D8_CAPTURE_MINDRAWS, 0 = any */
@@ -237,6 +238,19 @@ static void rec_transform(DWORD state, const D3DMATRIX *m)
     c.state = state;
     memcpy(c.m, m, sizeof c.m);
     chunk(D3D8CAP_TRANSFORM, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+static void rec_scissors(UINT count, BOOL exclusive, const D3DRECT *rect)
+{
+    D3D8CapScissors c;
+
+    c.count = count;
+    c.exclusive = exclusive ? 1 : 0;
+    c.rect.x1 = rect ? rect->x1 : 0;
+    c.rect.y1 = rect ? rect->y1 : 0;
+    c.rect.x2 = rect ? rect->x2 : 0;
+    c.rect.y2 = rect ? rect->y2 : 0;
+    chunk(D3D8CAP_SCISSORS, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
 static void rec_viewport(const D3DVIEWPORT8 *vp)
@@ -448,6 +462,11 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
     }
     dev->lpVtbl->GetViewport(dev, &vp);
     rec_viewport(&vp);
+    {
+        UINT count; BOOL exclusive; D3DRECT rect;
+        xbox_D3D8GetScissors(&count, &exclusive, &rect);
+        rec_scissors(count, exclusive, &rect);
+    }
 
     for (s = 0; rs && s < CAPTURE_RENDER_STATES; s++)
         rec_render_state(s, rs[s]);
@@ -484,6 +503,27 @@ static void capture_configure(void)
                 g_min_draws ? " or the first frame after it with enough draws" : "",
                 g_every ? ", then every RECOMP_D3D8_CAPTURE_EVERY swaps" : "",
                 g_path, D3D8CAP_VERSION);
+}
+
+void hle_d3d8_capture_next_frame(void)
+{
+    static char fallback[512];
+    static int asked;
+
+    if (!g_configured)
+        capture_configure();
+    if (!g_path || !*g_path) {
+        /* Nowhere was asked for, so put it where the player can find it --
+         * numbered, like the dumps, because somebody pressing the key at
+         * several places wants all of them, not the last one. */
+        snprintf(fallback, sizeof fallback, "frame%03d%s", asked++, D3D8CAP_EXTENSION);
+        g_path = fallback;
+        g_every = 0;
+        g_min_draws = 0;
+    }
+    g_capture_asap = 1;                  /* whichever swap comes next */
+    fprintf(stderr, "[HLE-D3D8] capturing the next frame to %s\n", g_path);
+    fflush(stderr);
 }
 
 void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
@@ -531,6 +571,12 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
         return;
     }
 start:
+    /* Asked for by hand: this swap is the target, since the number it would
+     * otherwise have to match cannot be known before the run. */
+    if (g_capture_asap) {
+        g_capture_asap = 0;
+        g_target_swap = swaps;
+    }
     if (swaps != g_target_swap)
         return;
     dev = hle_d3d8_shadow_device();
@@ -618,6 +664,13 @@ HRESULT host_SetTransform(IDirect3DDevice8 *dev, D3DTRANSFORMSTATETYPE state,
     if (g_cap && matrix)
         rec_transform((DWORD)state, matrix);
     return dev->lpVtbl->SetTransform(dev, state, matrix);
+}
+
+void host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
+{
+    if (g_cap)
+        rec_scissors(count, exclusive, count && rects ? &rects[0] : NULL);
+    xbox_D3D8SetScissors(count, exclusive, rects);
 }
 
 HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport)
@@ -830,6 +883,19 @@ HRESULT host_vsh_create_shader(const DWORD *microcode, int insn_count, DWORD *ha
         rec_vs_create(*handle, microcode, insn_count);
     }
     return hr;
+}
+
+BOOL host_vsh_same_microcode(DWORD handle, const DWORD *microcode, int insn_count)
+{
+    const DWORD *have;
+    int length;
+
+    if (insn_count > NV2A_VS_MAX_INSTRUCTIONS)
+        insn_count = NV2A_VS_MAX_INSTRUCTIONS;
+    if (!d3d8_vsh_get_slot((int)(handle - 0x10000), NULL, &have, &length, NULL, NULL))
+        return FALSE;
+    return length == insn_count &&
+           memcmp(have, microcode, (size_t)insn_count * 4 * sizeof(DWORD)) == 0;
 }
 
 HRESULT host_vsh_delete_shader(DWORD handle)

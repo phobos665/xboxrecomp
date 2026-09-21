@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
 #include <string.h>
 /* getenv: without <stdlib.h> its pointer is truncated to int. */
 #include <stdlib.h>
@@ -201,9 +202,25 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* A 4:3 NTSC console by default, which is what every title has
+         * actually been told so far: the flags used to be written into the
+         * low half-word, where XAPI's shift never finds them, so the
+         * widescreen and HDTV this claimed to advertise both read as
+         * absent. Keeping the default at none preserves that behaviour
+         * now the encoding is right, instead of switching titles into
+         * 16:9 and HDTV code paths that have never run here.
+         *
+         * RECOMP_WIDESCREEN turns the widescreen bit on, and a title with
+         * a 16:9 mode of its own then uses it. The host's output shape
+         * reads the same variable (src/d3d/d3d8_display.c): a title told
+         * it is widescreen while the host presents 4:3 looks worse than
+         * one told the truth, so the two must not disagree. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            ULONG flags = 0;
+
+            if (xbox_EnvSwitch("RECOMP_WIDESCREEN", 0))
+                flags |= XC_VIDEO_FLAGS_WIDESCREEN;
+            *(PULONG)Value = XC_VIDEO_RAW(flags);
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

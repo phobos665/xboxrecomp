@@ -117,6 +117,12 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
                 (unsigned long)rs[D3DRS_CULLMODE],
                 (g_max_draws >= 0 && n >= g_max_draws) ? "  (not drawn: --draws)" : "",
                 n == g_skip_draw ? "  (not drawn: --skip-draw)" : "");
+        /* The states that discard fragments without leaving a mark. */
+        fprintf(stderr, "[draw %4ld] zfunc %lu afunc %lu colorwrite 0x%lX stencil %lu "
+                "fill %lu shade %lu\n", n,
+                (unsigned long)rs[D3DRS_ZFUNC], (unsigned long)rs[D3DRS_ALPHAFUNC],
+                (unsigned long)rs[D3DRS_COLORWRITEENABLE], (unsigned long)rs[D3DRS_STENCILENABLE],
+                (unsigned long)rs[D3DRS_FILLMODE], (unsigned long)rs[D3DRS_SHADEMODE]);
     }
     if (g_max_draws >= 0 && n >= g_max_draws)
         return 0;
@@ -356,6 +362,12 @@ static void do_texture(Replay *r, const D3D8CapChunk *c)
         r->malformed++;
         return;
     }
+    if (g_list_draws && t->width * t->height <= 4u && total >= 4u) {
+        /* A tiny texture is usually a constant in disguise -- a fade colour,
+         * a tint -- so its bytes are the value that matters. */
+        fprintf(stderr, "[texture %u] %ux%u format 0x%02X: %02X %02X %02X %02X\n",
+                t->id, t->width, t->height, t->format, bytes[0], bytes[1], bytes[2], bytes[3]);
+    }
 
     /* An id seen again is the same texture written again (a later loop, or a
      * writer that re-emits): replace it. */
@@ -540,6 +552,15 @@ static void do_vs_create(Replay *r, const D3D8CapChunk *c)
         r->malformed++;
         return;
     }
+    if (g_list_draws && p->insn_count <= 4) {
+        /* A short program's microcode, to check the decoder by hand. */
+        uint32_t k;
+        fprintf(stderr, "[program 0x%05lX] %u instructions:", (unsigned long)p->handle,
+                p->insn_count);
+        for (k = 0; k < p->insn_count * 4u; k++)
+            fprintf(stderr, "%s%08lX", (k % 4) ? " " : "  ", (unsigned long)code[k]);
+        fprintf(stderr, "\n");
+    }
     /* A recorded handle is only reused after its delete; a stale mapping
      * would mean a delete was lost, and the old program must not leak. */
     i = program_find(r, p->handle);
@@ -602,6 +623,12 @@ static void do_vs_declaration(Replay *r, const D3D8CapChunk *c)
         decl[k].format = (DXGI_FORMAT)in[k].dxgi_format;
         decl[k].offset = in[k].offset;
     }
+    if (g_list_draws) {
+        fprintf(stderr, "[declaration] vs 0x%05lX:", (unsigned long)p->handle);
+        for (k = 0; k < p->count; k++)
+            fprintf(stderr, " v%u@%u:dxgi%u", in[k].reg, in[k].offset, in[k].dxgi_format);
+        fprintf(stderr, "\n");
+    }
     if (FAILED(d3d8_vsh_set_declaration(r->programs[i].ours, decl, (int)p->count)))
         r->failed++;
 }
@@ -649,6 +676,15 @@ static void do_draw_up(Replay *r, const D3D8CapChunk *c)
     }
     if (!draw_gate("up", d->prim_type, d->prim_count, d->stride))
         return;
+    if (g_list_draws) {
+        const float *f = (const float *)verts;
+        const uint32_t *w = (const uint32_t *)verts;
+        uint32_t n = d->stride / 4u;
+        fprintf(stderr, "[draw %4ld] v0 = %g %g %g  raw", g_draw_index - 1, f[0], f[1], f[2]);
+        for (uint32_t k = 3; k < n && k < 8; k++)
+            fprintf(stderr, " %08X", w[k]);
+        fprintf(stderr, "\n");
+    }
     if (FAILED(r->dev->lpVtbl->DrawPrimitiveUP(r->dev, (D3DPRIMITIVETYPE)d->prim_type,
                                                d->prim_count, verts, d->stride)))
         r->failed++;
@@ -675,6 +711,20 @@ static void do_draw_indexed_up(Replay *r, const D3D8CapChunk *c)
     }
     if (!draw_gate("indexed", d->prim_type, d->prim_count, d->stride))
         return;
+    if (g_list_draws) {
+        /* The vertices as the host reads them: a draw whose geometry never
+         * lands on screen looks like every other draw in the line above. */
+        const uint16_t *ix = (const uint16_t *)idx;
+        const float *f = (const float *)((const uint8_t *)verts +
+                                         (size_t)ix[0] * d->stride);
+        const float *g = (const float *)((const uint8_t *)verts +
+                                         (size_t)ix[1] * d->stride);
+        fprintf(stderr, "[draw %4ld] verts %u from %u (%u bytes); idx %u %u %u %u; "
+                "v[%u] = %g %g %g %g | v[%u] = %g %g %g %g\n", g_draw_index - 1,
+                d->num_vertices, d->min_index, d->vertex_bytes,
+                ix[0], ix[1], ix[2], ix[3],
+                ix[0], f[0], f[1], f[2], f[3], ix[1], g[0], g[1], g[2], g[3]);
+    }
     if (FAILED(r->dev->lpVtbl->DrawIndexedPrimitiveUP(
             r->dev, (D3DPRIMITIVETYPE)d->prim_type, d->min_index, d->num_vertices,
             d->prim_count, idx, (D3DFORMAT)d->index_format, verts, d->stride)))
@@ -770,7 +820,28 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         vp.Height = p->height;
         vp.MinZ = p->min_z;
         vp.MaxZ = p->max_z;
+        if (g_list_draws)
+            fprintf(stderr, "[viewport] %lu,%lu %lux%lu z %g..%g\n",
+                    (unsigned long)vp.X, (unsigned long)vp.Y, (unsigned long)vp.Width,
+                    (unsigned long)vp.Height, vp.MinZ, vp.MaxZ);
         r->dev->lpVtbl->SetViewport(r->dev, &vp);
+        break;
+    }
+    case D3D8CAP_SCISSORS: {
+        const D3D8CapScissors *p = c->data;
+        D3DRECT rect;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        rect.x1 = p->rect.x1; rect.y1 = p->rect.y1;
+        rect.x2 = p->rect.x2; rect.y2 = p->rect.y2;
+        if (g_list_draws)
+            fprintf(stderr, "[scissors] %lu rect(s)%s: %ld,%ld-%ld,%ld\n",
+                    (unsigned long)p->count, p->exclusive ? " exclusive" : "",
+                    (long)rect.x1, (long)rect.y1, (long)rect.x2, (long)rect.y2);
+        xbox_D3D8SetScissors(p->count, p->exclusive ? TRUE : FALSE, &rect);
         break;
     }
     case D3D8CAP_SET_TEXTURE: {
@@ -824,6 +895,22 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             !(data = d3d8cap_tail(c, sizeof *p, (size_t)p->count * 4u * sizeof(float)))) {
             r->malformed++;
             break;
+        }
+        if (g_list_draws) {
+            /* Which registers hold anything, and the first four rows: a
+             * frame whose camera matrix never arrived draws nothing and
+             * says nothing, and this is where that shows. */
+            uint32_t i, nonzero = 0;
+            for (i = 0; i < p->count * 4u; i++)
+                if (data[i] != 0.0f)
+                    nonzero++;
+            fprintf(stderr, "[constants] c%u..c%u: %u of %u floats non-zero;"
+                    " c%u = %g %g %g %g | c%u = %g %g %g %g\n",
+                    p->first_reg, p->first_reg + p->count - 1, nonzero, p->count * 4u,
+                    p->first_reg, data[0], data[1], data[2], data[3],
+                    p->first_reg + 1, p->count > 1 ? data[4] : 0.f,
+                    p->count > 1 ? data[5] : 0.f, p->count > 1 ? data[6] : 0.f,
+                    p->count > 1 ? data[7] : 0.f);
         }
         d3d8_vsh_set_constant((int)p->first_reg, data, (int)p->count);
         break;

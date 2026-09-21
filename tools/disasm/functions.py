@@ -1282,6 +1282,18 @@ class FunctionDetector:
         Determines function boundaries by finding the extent of each
         function (up to the next function start or unreachable point).
         """
+        # Switch tables the sweep only exposed after it ran. The first
+        # resync_jump_tables() pass sees the dispatches the linear sweep
+        # decoded in phase; every decode_at() since -- call targets, seeds,
+        # tail-jump targets -- can put a `jmp [reg*4 + tbl]` on the map that
+        # was junk before, and its table has never been measured. Without
+        # this the function ends on that dispatch and its cases are lost
+        # (TimeSplitters 2, sub_000DDD70). Idempotent: tables already done
+        # are skipped, so calling it on every rebuild is cheap.
+        n_tables = self.engine.resync_jump_tables()
+        if n_tables:
+            print(f"  Resynced past {n_tables:,d} jump table(s) exposed by realignment")
+
         # Sort candidates by address.
         #
         # A candidate with no instruction decoded at its own address is not a

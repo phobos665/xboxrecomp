@@ -20,8 +20,15 @@
 
 namespace {
 
-constexpr uint32_t kVoiceCount = 256;
-constexpr uint32_t kQueueSize = 4;
+/* 0..255 are DirectSound buffers (hle_dsound.c), 256..271 streams
+ * (hle_dsound_stream.c). */
+constexpr uint32_t kVoiceCount = 256 + 16;
+/* Submissions in flight per voice. A stream keeps LEAD_MS of sound ahead of
+   its clock in CHUNK_MS pieces (hle_dsound_stream.c), so four was one short
+   of what the music path asks for and every frame past the first dropped a
+   whole chunk: the sound fell behind the picture by 100 ms at a time, and a
+   two-minute run lost 42 seconds of music. */
+constexpr uint32_t kQueueSize = 12;
 constexpr uint32_t kMaxBufferBytes = 160000;
 
 struct PcmBuffer {
@@ -177,25 +184,41 @@ extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
     if (slot < kVoiceCount) destroyVoice(voices[slot]);
 }
 
-extern "C" void recomp_audio_output_submit(
+extern "C" int recomp_audio_output_position(uint32_t slot, uint64_t *played_bytes,
+                                            uint32_t *queued_buffers)
+{
+    if (!engine || slot >= kVoiceCount) return 0;
+    OutputVoice &voice = voices[slot];
+    if (!voice.source) return 0;
+
+    XAUDIO2_VOICE_STATE state{};
+    voice.source->GetState(&state, 0);     /* SamplesPlayed wanted here */
+    const uint32_t block_align = voice.channels * (voice.bits_per_sample / 8);
+    if (played_bytes)
+        *played_bytes = static_cast<uint64_t>(state.SamplesPlayed) * block_align;
+    if (queued_buffers) *queued_buffers = state.BuffersQueued;
+    return 1;
+}
+
+extern "C" int recomp_audio_output_submit(
     uint32_t slot, const uint8_t *pcm, uint32_t bytes,
     uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample,
     int32_t volume_hundredth_db)
 {
     recomp_audio_output_initialize();
-    if (!engine || bytes == 0) return;
+    if (!engine || bytes == 0) return 0;
     if (slot >= kVoiceCount || !pcm || bytes > kMaxBufferBytes ||
         sample_rate < XAUDIO2_MIN_SAMPLE_RATE ||
         sample_rate > XAUDIO2_MAX_SAMPLE_RATE ||
         (channels != 1 && channels != 2) ||
         (bits_per_sample != 8 && bits_per_sample != 16)) {
         dropBuffer(slot, "invalid-pcm");
-        return;
+        return 0;
     }
     const uint32_t block_align = channels * (bits_per_sample / 8);
     if (bytes % block_align != 0) {
         dropBuffer(slot, "partial-frame");
-        return;
+        return 0;
     }
 
     OutputVoice &voice = voices[slot];
@@ -216,7 +239,7 @@ extern "C" void recomp_audio_output_submit(
         if (FAILED(error)) {
             dropBuffer(slot, "create-voice");
             disableOutput("CreateSourceVoice", error);
-            return;
+            return 0;
         }
         voice.sample_rate = sample_rate;
         voice.channels = channels;
@@ -225,7 +248,7 @@ extern "C" void recomp_audio_output_submit(
         if (FAILED(error)) {
             dropBuffer(slot, "start-voice");
             disableOutput("Start", error);
-            return;
+            return 0;
         }
     }
 
@@ -237,7 +260,7 @@ extern "C" void recomp_audio_output_submit(
     if (FAILED(error)) {
         dropBuffer(slot, "volume");
         disableOutput("SetVolume", error);
-        return;
+        return 0;
     }
     XAUDIO2_VOICE_STATE state{};
     voice.source->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
@@ -248,14 +271,14 @@ extern "C" void recomp_audio_output_submit(
     }
     if (voice.queued == kQueueSize) {
         dropBuffer(slot, "queue-full");
-        return;
+        return 0;
     }
     PcmBuffer &owned = voice.buffers[(voice.front + voice.queued) % kQueueSize];
     if (owned.capacity < bytes) {
         auto *data = static_cast<uint8_t *>(std::realloc(owned.data, bytes));
         if (!data) {
             dropBuffer(slot, "allocation");
-            return;
+            return 0;
         }
         owned.data = data;
         owned.capacity = bytes;
@@ -268,7 +291,7 @@ extern "C" void recomp_audio_output_submit(
     if (FAILED(error)) {
         dropBuffer(slot, "submit");
         disableOutput("SubmitSourceBuffer", error);
-        return;
+        return 0;
     }
     ++voice.queued;
     ++submitted_buffers;
@@ -286,4 +309,5 @@ extern "C" void recomp_audio_output_submit(
             nonzero ? 1u : 0u, static_cast<double>(gain));
     }
     if (nonzero) reported_nonzero[slot] = true;
+    return 1;
 }

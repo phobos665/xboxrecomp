@@ -85,6 +85,8 @@ typedef struct {
     uint32_t            decl_keys[16];     /* NV2AVshSlot.decl_hash */
     int                 decl_layout_count;
     uint16_t            inputs_read;  /* Which v registers are read */
+    int                 uses_proj;    /* reads the projection's first column */
+    int                 pos_input;    /* v# oPos is copied from, or -1 */
 } VshCacheEntry;
 
 static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
@@ -92,6 +94,41 @@ static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
 /* ================================================================
  * Hash Function (FNV-1a)
  * ================================================================ */
+
+/* Set while a program's HLSL is generated; see the constant emitter. */
+static int g_emit_uses_proj;
+
+/* The same fact about the program currently bound, for the draw path. */
+static int g_bound_uses_proj;
+
+int d3d8_vsh_bound_uses_projection(void) { return g_bound_uses_proj; }
+
+/* For a program that writes oPos straight from an input register -- the
+ * shape every screen-space program has -- the register that input came
+ * from, so the draw path can read the positions and measure how wide the
+ * draw actually is. -1 when the position was computed rather than
+ * copied, which is every program that went through a projection and so
+ * is never asked about. */
+static int g_emit_pos_input = -1;
+static int g_bound_pos_input = -1;
+static const D3D8VshInput *g_bound_decl;
+static int                 g_bound_decl_count;
+
+/* Where register `reg` sits in the vertex, for the bound program's own
+ * declaration. FALSE when it did not declare one, or not that register. */
+int d3d8_vsh_bound_input_offset(int reg, UINT *offset)
+{
+    int i;
+
+    for (i = 0; i < g_bound_decl_count; i++)
+        if (g_bound_decl[i].reg == reg) {
+            if (offset) *offset = g_bound_decl[i].offset;
+            return 1;
+        }
+    return 0;
+}
+
+int d3d8_vsh_bound_pos_input(void) { return g_bound_pos_input; }
 
 static uint32_t fnv1a_hash(const void *data, size_t len)
 {
@@ -195,8 +232,18 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
     case NV2A_VSH_REG_CONST:
         if (src->rel_addr)
             sb_append(sb, "c[a0 + %d]", src->reg_index);
-        else
+        else {
             sb_append(sb, "c[%d]", src->reg_index);
+            /* A program that reads the register holding the first column of
+             * the title's projection is transforming geometry through it,
+             * which is what makes it 3D. One that never does is drawing in
+             * screen coordinates it worked out itself -- the HUD, menus,
+             * a full-screen quad -- and is not widened by Hor+, so it needs
+             * the compensating squeeze instead. Relative addressing is not
+             * counted: an indexed read is a bone or a light, never this. */
+            if (src->reg_index == d3d8_vsh_hor_plus_reg())
+                g_emit_uses_proj = 1;
+        }
         break;
     default:
         sb_append(sb, "float4(0,0,0,0)");
@@ -676,6 +723,13 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         if (ilu_runs)
             emit_ilu_op(&sb, inst);
 
+        /* oPos written straight from an input: note where position came
+         * from. See g_emit_pos_input. */
+        if (mac_runs && inst->mac_op == NV2A_VSH_MAC_MOV &&
+            inst->mac_dst.output_reg == NV2A_VSH_OUT_POS &&
+            inst->mac_src[0].reg_type == NV2A_VSH_REG_INPUT)
+            g_emit_pos_input = inst->mac_src[0].reg_index;
+
         if (mac_runs && inst->mac_op == NV2A_VSH_MAC_ARL)
             sb_append(&sb, "        a0 = _a0;\n");
         else if (mac_runs)
@@ -940,6 +994,8 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     /* Generate HLSL. A source that fills the buffer was cut off. */
     if (!hlsl_buf)
         return NULL;
+    g_emit_uses_proj = 0;
+    g_emit_pos_input = -1;
     hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, HLSL_BUF);
     if (hlsl_len <= 0 || hlsl_len >= HLSL_BUF - 1) {
         fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d bytes)\n", hlsl_len);
@@ -999,6 +1055,8 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
     entry->vs_blob     = code;
     entry->inputs_read = program.inputs_read;
+    entry->uses_proj   = g_emit_uses_proj;
+    entry->pos_input   = g_emit_pos_input;
     entry->layout_count = 0;
 
     fprintf(stderr, "D3D8 VSH: Compiled shader (hash 0x%08X, %d insns, inputs 0x%04X)\n",
@@ -1235,10 +1293,12 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
         return E_OUTOFMEMORY;
     }
 
-    /* Store microcode (deferred compilation) */
+    /* Store microcode (deferred compilation); its hash is the cache key
+     * every draw with this program looks up, so it is taken once here. */
     memcpy(g_vsh_slots[slot].microcode, microcode,
            (size_t)num_insns * 4 * sizeof(DWORD));
     g_vsh_slots[slot].length = num_insns;
+    g_vsh_slots[slot].hash = fnv1a_hash(microcode, (size_t)num_insns * 4 * sizeof(DWORD));
     g_vsh_slots[slot].in_use = 1;
     g_vsh_slots[slot].decl_count = 0;
     g_vsh_slots[slot].decl_hash = 0;
@@ -1248,8 +1308,16 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
      * Xbox D3D8 uses handles with the high bit set (> 0xFFFF). */
     *out_handle = (DWORD)(slot + 0x10000);
 
-    fprintf(stderr, "D3D8 VSH: Created shader handle 0x%lX (%d instructions)\n",
-            *out_handle, num_insns);
+    /* Titles that stream programs create thousands of these; stderr is
+     * unbuffered and this line was a tenth of a frame. */
+    {
+        static int logged;
+        if (logged < 64) {
+            fprintf(stderr, "D3D8 VSH: Created shader handle 0x%lX (%d instructions)%s\n",
+                    *out_handle, num_insns,
+                    ++logged == 64 ? " (further creates not logged)" : "");
+        }
+    }
 
     return S_OK;
 }
@@ -1279,9 +1347,58 @@ const float *d3d8_vsh_constants(void)
     return &g_vsh_constants.c[0][0];
 }
 
+/* Hor+ widescreen, experimental: RECOMP_HOR_PLUS=<factor> scales one
+ * constant register as it is uploaded, and RECOMP_HOR_PLUS_REG=<n> says
+ * which (60 by default, which is what TimeSplitters 2 uses).
+ *
+ * A title whose vertex program transforms by a matrix in constant
+ * registers keeps that matrix transposed for dp4, so the register that
+ * produces oPos.x holds column 0 of the matrix. Scaling that column is
+ * exactly equivalent to scaling the projection's [0][0], because the
+ * projection is the rightmost factor of whatever composite the title
+ * built: M * diag(k,1,1,1) scales the product's first column whether M
+ * is a bare projection or a world-view-projection. 0.75, which is
+ * (4/3)/(16/9), widens the horizontal field of view and leaves the
+ * vertical alone -- more of the scene rather than the same scene
+ * stretched.
+ *
+ * This is the 3D half only. A title's pre-transformed 2D layer never
+ * goes through this register and is not widened by it. */
+static float hor_plus_factor(void)
+{
+    static float factor = -1.0f;
+
+    if (factor < 0.0f) {
+        const char *v = getenv("RECOMP_HOR_PLUS");
+
+        factor = (v && *v) ? (float)atof(v) : 1.0f;
+        if (factor <= 0.0f || factor > 4.0f)
+            factor = 1.0f;
+        if (factor != 1.0f)
+            fprintf(stderr, "D3D8 VSH: Hor+ scaling c[%d] by %.4f (experimental)\n",
+                    d3d8_vsh_hor_plus_reg(), (double)factor);
+    }
+    return factor;
+}
+
+int d3d8_vsh_hor_plus_reg(void)
+{
+    static int reg = -1;
+
+    if (reg < 0) {
+        const char *v = getenv("RECOMP_HOR_PLUS_REG");
+
+        reg = (v && *v) ? atoi(v) : 60;
+        if (reg < 0 || reg >= NV2A_VS_MAX_CONSTANTS)
+            reg = 60;
+    }
+    return reg;
+}
+
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
 {
     int end_reg;
+    float hp;
 
     if (!data || start_reg < 0)
         return;
@@ -1296,6 +1413,18 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
         g_vsh_constants.c[i][1] = data[src_offset + 1];
         g_vsh_constants.c[i][2] = data[src_offset + 2];
         g_vsh_constants.c[i][3] = data[src_offset + 3];
+    }
+
+    hp = hor_plus_factor();
+    if (hp != 1.0f) {
+        int reg = d3d8_vsh_hor_plus_reg();
+
+        if (reg >= start_reg && reg < end_reg) {
+            g_vsh_constants.c[reg][0] *= hp;
+            g_vsh_constants.c[reg][1] *= hp;
+            g_vsh_constants.c[reg][2] *= hp;
+            g_vsh_constants.c[reg][3] *= hp;
+        }
     }
 
     g_vsh_constants_dirty = TRUE;
@@ -1414,8 +1543,8 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     if (!vsh->in_use)
         return FALSE;
 
-    /* Hash the microcode to look up in cache */
-    hash = fnv1a_hash(vsh->microcode, (size_t)vsh->length * 4 * sizeof(DWORD));
+    /* The microcode's hash, taken when the program was loaded */
+    hash = vsh->hash;
 
     /* Look up in cache */
     entry = cache_lookup(hash);
@@ -1428,6 +1557,10 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
 
     /* Bind the vertex shader */
     ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
+    g_bound_uses_proj = entry->uses_proj;
+    g_bound_pos_input = entry->pos_input;
+    g_bound_decl = vsh->decl_count ? vsh->decl : NULL;
+    g_bound_decl_count = vsh->decl_count;
 
     /* Bind the input layout: the program's declaration when it has one,
      * otherwise sized from the bound stream FVF */

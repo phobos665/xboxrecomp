@@ -938,8 +938,11 @@ static void ff_vs_prepare_draw(DWORD fvf)
             memcpy(cb->world_inv_transpose, identity, sizeof(identity));
             memcpy(cb->world_view, identity, sizeof(identity));
             memcpy(cb->world_view_inv_transpose, identity, sizeof(identity));
-            cb->screen_w = (float)d3d8_GetBackbufferWidth();
-            cb->screen_h = (float)d3d8_GetBackbufferHeight();
+            /* Pre-transformed vertices are in the guest's screen pixels,
+             * not the host back buffer's: the two differ once the host
+             * renders larger than the guest asked (d3d8_GetGuestWidth). */
+            cb->screen_w = (float)d3d8_GetGuestWidth();
+            cb->screen_h = (float)d3d8_GetGuestHeight();
             cb->flags = 0x01; /* pre-transformed */
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];
@@ -970,8 +973,8 @@ static void ff_vs_prepare_draw(DWORD fvf)
             mat4_transpose(wv_inv_t, wv_inv);
             memcpy(cb->world_view_inv_transpose, wv_inv_t, sizeof(wv_inv_t));
 
-            cb->screen_w = (float)d3d8_GetBackbufferWidth();
-            cb->screen_h = (float)d3d8_GetBackbufferHeight();
+            cb->screen_w = (float)d3d8_GetGuestWidth();
+            cb->screen_h = (float)d3d8_GetGuestHeight();
             cb->flags = 0;
 
             /* Compute eye position from inverse view matrix */
@@ -1105,10 +1108,23 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     HRESULT hr;
 
     if (!ctx) return;
-    if (!d3d8_vsh_prepare_draw(handle))
+    if (d3d8_vsh_prepare_draw(handle)) {
+        /* A program that never reads the projection's first column is
+         * placing vertices in screen coordinates it worked out itself. */
+        d3d8_SetTwoDSqueeze(!d3d8_vsh_bound_uses_projection());
+    } else {
         ff_vs_prepare_draw(handle);
+        /* The fixed-function equivalent: pre-transformed vertices arrive
+         * already in screen pixels. */
+        d3d8_SetTwoDSqueeze(d3d8_fvf_transformed(d3d8_GetCurrentFVF()));
+    }
 
-    /* Pixel state is independent of whether the vertex shader is programmable. */
+    /* Pixel state is independent of whether the vertex shader is programmable.
+     * A combiner shader, when one is active, binds its own pixel shader and
+     * constants and the fixed-function ones below would only be replaced;
+     * they are still the fallback when the combiner shader cannot be built. */
+    if (d3d8_combiners_prepare_draw())
+        return;
     if (!g_ps_cb) return;
     ps = ff_ps_get_shader(ff_ps_compute_signature());
     if (!ps) return;

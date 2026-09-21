@@ -192,6 +192,38 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* The flip gate: console pacing for a title that waits on the mirrored fence.
+ *
+ * On hardware a flip completes at the next vblank, so a title's Swap blocks
+ * until then. Here the fence mirror completed everything the instant it was
+ * submitted and titles presented as fast as the host allowed. The HLE Swap
+ * calls Arm before it runs the title's own Swap, and Arm sleeps until the
+ * kernel's vblank tick calls Release. Adaptive by default: a frame that
+ * finished inside the period waits for the next vblank, a late one presents
+ * at once. RECOMP_FPS_CAP=<fps> releases every (vblank rate / fps)th vblank
+ * strictly, RECOMP_FPS_CAP=0 switches the gate off. See the comment above
+ * the implementation for why the gate sleeps in Swap rather than holding
+ * the fence, and the measurements behind the default. */
+/* A host switch read from the environment: on unless turned off when
+ * default_on, off unless turned on otherwise. "0", "off", "no" and "false"
+ * turn one off; an empty value turns it on. The switches a title needs to
+ * run at all default on, so the executable runs the game when it is simply
+ * double-clicked. */
+int xbox_EnvSwitch(const char *name, int default_on);
+
+void xbox_Nv2aFlipGateArm(void);
+void xbox_Nv2aFlipGateRelease(void);
+
+/* The setting by name ("adaptive", "60", "30", "off", or "custom" for one
+ * RECOMP_FPS_CAP asked for that is not a stop on the cycle), and the next
+ * one along. For a key the player presses while the title runs. */
+const char *xbox_Nv2aFlipGateModeName(void);
+void        xbox_Nv2aFlipGateCycle(void);
+
+/* The running title's own name, from its XBE certificate, as UTF-8; NULL
+ * when the headers carried none. Valid once the layout has been set up. */
+const char *xbox_XbeTitleName(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**
@@ -220,6 +252,19 @@ void xbox_ProtectMirrorsForDebug(void);
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
  * does nothing unless that variable is set. */
 void xbox_WatchdogStart(void);
+
+/* Frame rate at the HLE boundary (recomp_fps.c). RECOMP_FPS=<seconds> prints
+ * swaps and delivered vblanks per window; the counts cost an interlocked
+ * increment each and nothing when it is off. */
+void xbox_FpsCountSwap(void);
+void xbox_FpsCountVblank(void);
+
+/* Sampling profiler (recomp_sample.c). RECOMP_SAMPLE=<hz> samples every
+ * thread's instruction pointer and reports by symbol and category. Call from
+ * the guest's main thread, which is then named as such. */
+void xbox_SamplerStart(void);
+/* Name the calling runtime thread in the sampler's report. */
+void xbox_NameCurrentThread(const wchar_t *name);
 
 /* ================================================================
  * Xbox stack for recompiled code
@@ -253,7 +298,7 @@ void xbox_WatchdogStart(void);
 #define KDATA_FILE_OBJ_TYPE     0x0C0  /* IoFileObjectType (4 bytes) */
 #define KDATA_TIME_INCREMENT    0x0D0  /* KeTimeIncrement (4 bytes) */
 #define KDATA_BOOT_SMC_VIDEO    0x0E0  /* HalBootSMCVideoMode (4 bytes) */
-#define KDATA_IDEX_CHANNEL      0x0F0  /* IdexChannelObject (opaque) */
+#define KDATA_IDEX_CHANNEL      0x500  /* IDE_CHANNEL_OBJECT (512-byte reserved region) */
 #define KDATA_HD_KEY            0x100  /* XboxHDKey (16 bytes) */
 #define KDATA_SIGNATURE_KEY     0x110  /* XboxSignatureKey (16 bytes) */
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */

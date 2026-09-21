@@ -28,6 +28,9 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#ifdef _WIN32
+#include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
+#endif
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -233,9 +236,16 @@ static void kernel_data_init(void)
      * "no video mode reported", which titles treat as auto-detect. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
 
-    /* IdexChannelObject (ordinal 357) - IDE channel object. Opaque; only ever
-     * passed back to Io* routines we stub, so a recognisable non-null is enough. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL) = XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+    /* IdexChannelObject is a structure, not an opaque pointer. Guest file-close
+     * code walks DeviceQueue.DeviceListHead at +0x28. Host-backed synchronous
+     * I/O does not enqueue guest IRPs, so this must be an empty circular list.
+     * Reserve separate storage: the old 16-byte slot overlapped the key exports. */
+    {
+        uint32_t channel=XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
+        memset(XBOX_TO_NATIVE(channel),0,0x200);
+        BRIDGE_MEM32(channel+0x28)=channel+0x28;
+        BRIDGE_MEM32(channel+0x2C)=channel+0x28;
+    }
 
     /* HalDiskCachePartitionCount (ordinal 40) - number of cache partitions.
      * Retail consoles report 3 (X, Y, Z). Titles size a partition array from
@@ -421,6 +431,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    xbox_NameCurrentThread(L"guest worker");
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -966,14 +977,67 @@ static void bridge_NtQueryVirtualMemory(void)
     g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
+/*
+ * The allocating side of this pair hands out guest VAs from xbox_HeapAlloc.
+ * This used to free them through the host path in kernel_memory.c, which
+ * calls VirtualFree on the address -- and guest RAM is a file mapping, so
+ * VirtualFree always fails there. The allocation was therefore never
+ * reclaimed and the call reported STATUS_UNSUCCESSFUL.
+ *
+ * That is not a slow leak, it is a hard stop. The XDK's RtlFreeHeap frees a
+ * large block by calling NtFreeVirtualMemory and returns FALSE when it fails,
+ * so the CRT's free() silently does nothing. Mortal Kombat: Deadly Alliance
+ * sizes its heaps by allocating 29 MB, freeing it, and allocating it again:
+ * the second allocation returned NULL, every heap it then built was empty,
+ * and the title spun forever waiting on a load that could never be queued.
+ *
+ * MmFreeContiguousMemory next door always did the right thing. Match it.
+ */
 static void bridge_NtFreeVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+    uint32_t base_va = base_ptr ? BRIDGE_MEM32(base_ptr) : 0;
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    if (KERNEL_LOG_ON()) {
+        fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X type=0x%X\n",
+                base_va, free_type);
+        fflush(stderr);
+    }
+
+    if (!base_va) {
+        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
+    /* MEM_RELEASE (0x8000) returns the block. MEM_DECOMMIT (0x4000) asks for
+     * the pages to stay reserved but unbacked, which a bump allocator that
+     * commits everything cannot express -- so it succeeds and keeps the
+     * block, which is the conservative answer. */
+    /* RECOMP_NTFREE_LEGACY=1 keeps the block instead of returning it, which is
+     * what this did before it called xbox_HeapFree at all. Reclaiming memory
+     * is correct, but it makes the guest heap reuse addresses it never reused
+     * before, so a title that was quietly surviving a use-after-free stops
+     * surviving it. When a title regresses right after this landed, this
+     * switch says whether this is why in one run. */
+    {
+        static int legacy = -1;
+        if (legacy < 0) {
+            const char *v = getenv("RECOMP_NTFREE_LEGACY");
+            legacy = v && *v && *v != '0';
+            if (legacy)
+                fprintf(stderr, "  [KERNEL] RECOMP_NTFREE_LEGACY: "
+                                "NtFreeVirtualMemory keeps the block\n");
+        }
+        if (!legacy && (free_type & 0x8000u)) {
+            xbox_HeapFree(base_va);
+            if (base_ptr) BRIDGE_MEM32(base_ptr) = 0;
+            if (size_ptr) BRIDGE_MEM32(size_ptr) = 0;
+        }
+    }
+
+    g_eax = 0; /* STATUS_SUCCESS */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
@@ -1193,6 +1257,21 @@ static void bridge_HalReturnToFirmware(void)
     xbox_HalReturnToFirmware(routine);
 }
 
+/* The host asking to quit -- the user closed the window. The same flushes as
+ * a title's own exit above, then ExitProcess, which runs no atexit handler.
+ * Called from whichever thread owns the window. */
+void xbox_HostExit(const char *why)
+{
+    fprintf(stderr, "  [KERNEL] exiting: %s\n", why);
+    fflush(stderr);
+    RECOMP_ICALL_FEEDBACK_DUMP();
+    {
+        extern void recomp_profile_dump(void);
+        recomp_profile_dump();
+    }
+    ExitProcess(0);
+}
+
 static void bridge_ExAllocatePool(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -1379,6 +1458,43 @@ static volatile LONG *bridge_guest_event(uint32_t va, int *sync)
 /* Wait for a guest event by watching its SignalState. The Xbox timeout is a
  * LARGE_INTEGER in 100 ns units: absent means forever, zero means poll,
  * negative is relative and positive is an absolute system time. */
+/* RECOMP_WAIT_LOG=1 -- every distinct object waited on and set, once each.
+ *
+ * A title that hangs is nearly always waiting for something nothing signals,
+ * and the two facts needed to see that are which objects it waits on and
+ * which it sets. Printing every call drowns the log; printing each object
+ * once fits on a screen and answers the question. */
+static int wait_log_wanted(void)
+{
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *v = getenv("RECOMP_WAIT_LOG");
+        wanted = v && *v && strcmp(v, "0") != 0;
+    }
+    return wanted;
+}
+
+uint32_t g_kernel_caller;
+
+static void wait_log_note(const char *what, uint32_t object, uint32_t extra)
+{
+    static uint32_t seen[64];
+    static int nseen;
+    int i;
+
+    if (!wait_log_wanted())
+        return;
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == (object ^ (uint32_t)what[0] << 24))
+            return;
+    if (nseen < 64) {
+        seen[nseen++] = object ^ (uint32_t)what[0] << 24;
+        fprintf(stderr, "  [WAIT] %s object 0x%08X (caller 0x%08X)\n",
+                what, object, extra);
+        fflush(stderr);
+    }
+}
+
 static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
                                         uint32_t timeout_va)
 {
@@ -1425,6 +1541,8 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
 static void bridge_KeSetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);
+    wait_log_note("sets    ", guest_va, g_kernel_caller);
+
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
     volatile LONG *state = bridge_guest_event(guest_va, NULL);
@@ -1468,6 +1586,21 @@ static void bridge_KeWaitForSingleObject(void)
     volatile LONG *state = bridge_guest_event(object, &sync);
     HANDLE h;
 
+    wait_log_note("waits on", object, g_kernel_caller);
+    if (wait_log_wanted()) {
+        /* The dispatcher header decides the semantics: Type 0 is a
+         * notification event a waiter does not consume, Type 1 a
+         * synchronisation event it does. Reading it wrong turns a
+         * handshake into a spin, so print it once. */
+        static int dumped;
+        if (!dumped++) {
+            const uint8_t *h = (const uint8_t *)(uintptr_t)(object + g_xbox_mem_offset);
+            fprintf(stderr, "  [WAIT] header at 0x%08X: type %u absolute %u size %u "
+                    "inserted %u signalstate %d\n", object, h[0], h[1], h[2], h[3],
+                    (int)BRIDGE_MEM32(object + 4));
+        }
+    }
+
     /* Same split as KeSetEvent: wait on the guest's own SignalState when the
      * object lives in guest memory, and fall through to the shadow handle
      * otherwise. */
@@ -1480,6 +1613,14 @@ static void bridge_KeWaitForSingleObject(void)
                     sync ? "synchronisation" : "notification", object);
         }
         g_eax = bridge_wait_guest_event(state, sync, timeout_ptr);
+        if (wait_log_wanted()) {
+            /* Success or timeout, and with what timeout asked for: the two
+             * say different things about why a loop goes round again. */
+            static int shown;
+            if (shown++ < 10)
+                fprintf(stderr, "  [WAIT] 0x%08X -> %s (timeout arg 0x%08X)\n",
+                        object, g_eax ? "TIMEOUT" : "signalled", timeout_ptr);
+        }
         return;
     }
 
@@ -2145,21 +2286,106 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* The frame clock.
+ *
+ * This used to schedule the next vblank as GetTickCount64() + 16. That counter
+ * advances once per scheduler tick -- 15.6 ms unless something in the process
+ * has asked for better -- so a deadline 16 ms out could not be met until two
+ * ticks had passed, and the clock delivered 32 to 40 Hz however fast the title
+ * ran. A title that waits whole vblanks off a 40 Hz clock presents at 40, 20
+ * or 13.3, never 60. Paced from QueryPerformanceCounter instead, with the
+ * timer thread sleeping to the deadline on a 1 ms timer.
+ *
+ *   RECOMP_VBLANK_HZ=<rate>    the rate to deliver (60, the console's)
+ *   RECOMP_VBLANK_CLOCK=tick   the old GetTickCount pacing, so the two can be
+ *                              compared in one binary; for measurement only
+ */
+static struct {
+    int      configured;
+    int      enabled;        /* RECOMP_VBLANK */
+    int      legacy;         /* RECOMP_VBLANK_CLOCK=tick */
+    double   hz;
+    LONGLONG period;         /* in QPC ticks */
+    LONGLONG next;           /* QPC deadline of the next vblank */
+    LONGLONG qpf;
+    long long next_ms;       /* legacy pacing */
+} s_vblank_clock;
+
+static void vblank_clock_configure(void)
+{
+    const char *hz = getenv("RECOMP_VBLANK_HZ");
+    const char *clock = getenv("RECOMP_VBLANK_CLOCK");
+    LARGE_INTEGER li;
+
+    s_vblank_clock.configured = 1;
+    s_vblank_clock.enabled = xbox_EnvSwitch("RECOMP_VBLANK", 1);
+    if (!s_vblank_clock.enabled)
+        return;
+    s_vblank_clock.legacy = clock && strcmp(clock, "tick") == 0;
+    s_vblank_clock.hz = hz ? atof(hz) : 60.0;
+    if (s_vblank_clock.hz < 1.0 || s_vblank_clock.hz > 1000.0)
+        s_vblank_clock.hz = 60.0;
+    QueryPerformanceFrequency(&li);
+    s_vblank_clock.qpf = li.QuadPart;
+    s_vblank_clock.period = (LONGLONG)((double)li.QuadPart / s_vblank_clock.hz);
+    QueryPerformanceCounter(&li);
+    s_vblank_clock.next = li.QuadPart + s_vblank_clock.period;
+    fprintf(stderr, "  [NV2A] vblank clock: %s\n",
+            s_vblank_clock.legacy
+                ? "GetTickCount64() + 16 (legacy; RECOMP_VBLANK_CLOCK=tick)"
+                : "QueryPerformanceCounter, sleep to deadline");
+    if (!s_vblank_clock.legacy)
+        fprintf(stderr, "  [NV2A] vblank rate: %.2f Hz (RECOMP_VBLANK_HZ)\n",
+                s_vblank_clock.hz);
+    fflush(stderr);
+}
+
+/* How long the timer thread may sleep before the next vblank is due, in
+ * microseconds; 0 when it is due now, and "forever" when the clock is off or
+ * running on the legacy pacing, whose loop sleeps a fixed 10 ms. */
+static LONGLONG vblank_clock_wait_us(void)
+{
+    LARGE_INTEGER now;
+
+    if (!s_vblank_clock.configured)
+        vblank_clock_configure();
+    if (!s_vblank_clock.enabled || s_vblank_clock.legacy)
+        return -1;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart >= s_vblank_clock.next)
+        return 0;
+    return (s_vblank_clock.next - now.QuadPart) * 1000000 / s_vblank_clock.qpf;
+}
+
 static void kernel_vblank_tick(void)
 {
-    static int enabled = -1;
-    static long long next_ms;
-    long long now;
-
-    if (enabled < 0)
-        enabled = getenv("RECOMP_VBLANK") != NULL;
-    if (!enabled)
+    if (!s_vblank_clock.configured)
+        vblank_clock_configure();
+    if (!s_vblank_clock.enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    if (s_vblank_clock.legacy) {
+        long long now = (long long)GetTickCount64();
+        if (now < s_vblank_clock.next_ms)
+            return;
+        s_vblank_clock.next_ms = now + 16;                       /* ~60 Hz */
+    } else {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart < s_vblank_clock.next)
+            return;
+        /* Advance from the deadline, not from now, so late wake-ups do not
+         * accumulate into a slower clock. A thread that fell more than a
+         * whole period behind -- a long ISR, a debugger -- resynchronises
+         * rather than delivering a burst. */
+        s_vblank_clock.next += s_vblank_clock.period;
+        if (s_vblank_clock.next <= now.QuadPart)
+            s_vblank_clock.next = now.QuadPart + s_vblank_clock.period;
+    }
+
+    /* A vblank: the flip a Swap submitted completes now. Before the ISR
+     * check, so a title that never connects one is still paced. */
+    xbox_Nv2aFlipGateRelease();
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -2192,11 +2418,13 @@ static void kernel_vblank_tick(void)
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-        if (n++ < 3)
+        xbox_FpsCountVblank();
+        if (n++ < 3) {
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
-        fflush(stderr);
+            fflush(stderr);
+        }
     }
 
 }
@@ -2471,7 +2699,7 @@ typedef struct {
 } XboxTimer;
 static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
-static int g_timer_started;
+static volatile LONG g_timer_started;   /* 0 none, 1 starting, 2 running */
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
@@ -2499,12 +2727,41 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
         g_fs_base = tib;
     }
+    xbox_NameCurrentThread(L"xbox timer/vblank");
 
-    for (;;) {
-        long long now;
-        int i;
+    /* Sleeping to the vblank deadline needs a timer that fires when asked.
+     * The scheduler tick is 15.6 ms by default, and a Sleep(10) on it wakes
+     * in 15.6 or 31.2; the high-resolution waitable timer (Windows 10 1803+)
+     * fires within about 0.5 ms. Where it is unavailable, timeBeginPeriod(1)
+     * gets Sleep close to 1 ms at the cost of a system-wide 1 kHz tick. */
+    {
+        HANDLE hires = CreateWaitableTimerExW(NULL, NULL,
+                                              0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                              TIMER_ALL_ACCESS);
+        if (!hires && vblank_clock_wait_us() >= 0)
+            timeBeginPeriod(1);
 
-        Sleep(10);
+        for (;;) {
+            long long now;
+            int i;
+            LONGLONG wait_us = vblank_clock_wait_us();
+
+            if (wait_us < 0) {
+                Sleep(10);                        /* legacy pacing, or no vblank */
+            } else if (wait_us > 0) {
+                /* Deferred work and KeSetTimer timers keep their 10 ms
+                 * granularity: never sleep longer than that. */
+                if (wait_us > 10000)
+                    wait_us = 10000;
+                if (hires) {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(wait_us * 10);
+                    SetWaitableTimer(hires, &due, 0, NULL, NULL, FALSE);
+                    WaitForSingleObject(hires, INFINITE);
+                } else {
+                    Sleep((DWORD)((wait_us + 999) / 1000));
+                }
+            }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
         kernel_drain_dpcs();   /* deferred work, before due timers */
@@ -2540,6 +2797,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        }
     }
 }
 
@@ -2551,10 +2809,19 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
+    /* Exactly one timer thread. Two guest threads setting their first timer
+     * at the same moment both saw "not started" here and each started one,
+     * and the two then delivered the vblank in turn -- 80-odd Hz through a
+     * 16 ms deadline -- and ran the title's ISR and DPC chain concurrently on
+     * state that is single-threaded by design. 1 marks "being started", so a
+     * second caller waits for the lock to exist rather than creating its own. */
+    if (InterlockedCompareExchange(&g_timer_started, 1, 0) == 0) {
         InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+        InterlockedExchange(&g_timer_started, 2);
+    } else {
+        while (InterlockedCompareExchange(&g_timer_started, 0, 0) != 2)
+            Sleep(0);
     }
 
     EnterCriticalSection(&g_timer_lock);
@@ -2599,7 +2866,7 @@ int xbox_kernel_cancel_timer(uint32_t timer_va)
 {
     int i, was_set = 0;
 
-    if (!g_timer_started)
+    if (InterlockedCompareExchange(&g_timer_started, 0, 0) != 2)
         return 0;
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++)
@@ -2678,7 +2945,14 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     if (!ansi_str_va) return NULL;
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
-    return (const char*)XBOX_TO_NATIVE(buf_va);
+    /* XDK directory searches pass a counted prefix of "directory\\*".
+     * The byte after Length need not be NUL or part of the object name. */
+    static RECOMP_TLS char path[65536];
+    uint16_t length=BRIDGE_MEM16(ansi_str_va);
+    if(length>BRIDGE_MEM16(ansi_str_va+2)) return NULL;
+    memcpy(path,XBOX_TO_NATIVE(buf_va),length);
+    path[length]='\0';
+    return path;
 }
 
 /* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
@@ -2786,9 +3060,53 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     name->Buffer        = (PCHAR)path;
     name->Length        = path ? (USHORT)strlen(path) : 0;
     name->MaximumLength = (USHORT)(name->Length + 1);
-    oa->RootDirectory = NULL;
+    uint32_t root = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va) : 0;
+    /* -3 is the XDK DOS-device namespace, not a file handle. */
+    oa->RootDirectory = root && root != 0xFFFFFFFDu ? bridge_resolve_handle(root) : NULL;
     oa->ObjectName    = name;
     oa->Attributes    = 0;
+}
+
+/* RECOMP_SKIP_VIDEO: refuse to open full-motion video files.
+ *
+ * A title that opens with a logo movie decodes it with its own XMV or WMA
+ * code, which is lifted like everything else and is some of the least
+ * forgiving code in the image. Black crashes inside its XMV library in the
+ * first seconds, having got no further than the intro, and nothing past that
+ * point can be looked at until it is out of the way.
+ *
+ * Failing the open is what a title already has to cope with -- a missing
+ * video file is an ordinary condition on a scratched disc -- so a title that
+ * handles it at all handles it by skipping to the menu. That is a bring-up
+ * switch and nothing more: it is off by default, and it is not a fix for the
+ * decoder.
+ *
+ * RECOMP_FMV_HOST, just below, is the opposite choice: keep the title's
+ * decode and additionally show the video with the host's own player. Use that
+ * when the video matters; use this when it is in the way.
+ */
+static int recomp_skip_video(const char *xbox_path)
+{
+    static int on = -1;
+    static const char *const exts[] = { ".xmv", ".wmv", ".xbv", ".bik" };
+    size_t len, i, n;
+
+    if (on < 0)
+        on = getenv("RECOMP_SKIP_VIDEO") ? 1 : 0;
+    if (!on || !xbox_path)
+        return 0;
+
+    len = strlen(xbox_path);
+    for (i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        n = strlen(exts[i]);
+        if (len >= n && _stricmp(xbox_path + len - n, exts[i]) == 0) {
+            fprintf(stderr, "  [FILE] RECOMP_SKIP_VIDEO: refusing %s\n",
+                    xbox_path);
+            fflush(stderr);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
@@ -2804,6 +3122,10 @@ static NTSTATUS bridge_create_file_impl(
     NTSTATUS st;
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
+    if (recomp_skip_video(name.Buffer)) {
+        bridge_write_iostatus(iostatus_va, STATUS_OBJECT_NAME_NOT_FOUND, 0);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
     if (!name.Buffer) {
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -2987,12 +3309,18 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
+        /* What was asked, as well as what came back: a failure on an existing
+         * file is a bug only if the disposition should have opened it. */
         if (g_eax)
-            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
+            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s; access 0x%08X "
+                            "share %u disposition %u options 0x%X)\n",
                     g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
-                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
+                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND"
+                  : _e == 80u ? " ERROR_FILE_EXISTS"
+                  : _e == 183u ? " ERROR_ALREADY_EXISTS" : "",
+                    access, share, disposition, options);
         else
             fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
     }
@@ -3071,7 +3399,18 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
 {
     if (event_token) {
         HANDLE ev = bridge_resolve_handle(event_token);
-        if (ev) SetEvent(ev);
+        if (ev) {
+            SetEvent(ev);
+        } else {
+            /* The title is waiting on this event for the read to finish,
+             * and nothing will ever signal it. Silence here is a title
+             * that hangs with no fault and no clue, so say it once. */
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [FILE] completion event 0x%08X does not "
+                        "resolve to a host handle; whoever waits on it waits "
+                        "forever\n", event_token);
+        }
     }
     if (apc_routine) {
         deliver_one_apc(apc_routine, apc_context, iostatus);
@@ -3316,7 +3655,11 @@ static void bridge_NtReadFile(void)
         fprintf(stderr, "  [READ]   async: event=0x%08X apc=0x%08X -> %s\n",
                 STACK_ARG(1), STACK_ARG(2),
                 STACK_ARG(2) ? "completed now" : "pending");
-        if (!STACK_ARG(2))
+        /* RECOMP_FILE_SYNC=1 reports the read finished, for a title whose
+         * loader does not come back for the result. Burnout 2 needs the
+         * opposite -- its stream reader only accepts a short count on the
+         * pending path -- so this is a switch, not a change. */
+        if (!STACK_ARG(2) && !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
             g_eax = 0x00000103u;           /* STATUS_PENDING */
     }
 }
@@ -3594,15 +3937,16 @@ static void bridge_NtDeleteFile(void)
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
-/* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
+/* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─ */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
-    uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
-    uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
+    uint32_t info_class  = STACK_ARG(7);
+    uint32_t filename_va = STACK_ARG(8);  /* PXBOX_ANSI_STRING */
+    uint32_t restart     = STACK_ARG(9);  /* BOOLEAN */
     XBOX_IO_STATUS_BLOCK ios;
     XBOX_ANSI_STRING     fn;
     PXBOX_ANSI_STRING    pfn = NULL;
@@ -3617,7 +3961,8 @@ static void bridge_NtQueryDirectoryFile(void)
         if (fn.Buffer) pfn = &fn;
     }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(info_va), length, pfn, (BOOLEAN)restart);
+                XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
+                pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -3711,6 +4056,61 @@ static void bridge_IoCreateFile(void)
  */
 #define IOCTL_DISK_GET_DRIVE_GEOMETRY 0x00070000u
 #define IOCTL_DISK_GET_PARTITION_INFO 0x00074004u
+#define IOCTL_SCSI_PASS_THROUGH_DIRECT 0x0004D014u
+
+/* The DVD drive's security page, as XAPI's start-up disc check reads it.
+ *
+ * A title whose certificate allows only DVD-X2 media (TimeSplitters 2) has
+ * XAPI open \Device\CdRom0 before main and send MODE SENSE(10) for page 0x3E
+ * through IOCTL_SCSI_PASS_THROUGH_DIRECT, up to five times. It accepts the
+ * disc when the page says partition selected, CDF valid and authenticated;
+ * anything else, including the IOCTL failing, is XLaunchNewImage(NULL) --
+ * the title returns to the dashboard with nothing in its own log to say why.
+ * On a console the kernel has already run the challenge/response with the
+ * drive by the time a title boots, so "already authenticated" is the state
+ * hardware presents, and the one Cxbx-Reloaded and xemu present too.
+ *
+ * Layout after the 8-byte mode parameter header, from xboxdevwiki's DVD
+ * Drive page: page code, length (18), partition (1 = game), CDF valid (must
+ * be 1), authenticated (1), book type (0xD for an Xbox disc), then challenge
+ * fields this never runs. The SCSI_PASS_THROUGH_DIRECT block is the 32-bit
+ * Windows one: DataTransferLength at +0x0C, DataBuffer at +0x14, Cdb at
+ * +0x1C. */
+#define SPTD_SCSI_STATUS      0x02u
+#define SPTD_DATA_LENGTH      0x0Cu
+#define SPTD_DATA_BUFFER      0x14u
+#define SPTD_CDB              0x1Cu
+#define SCSI_MODE_SENSE10     0x5Au
+#define MODE_PAGE_XBOX_DVD    0x3Eu
+
+static int bridge_scsi_mode_sense_security(uint32_t sptd_va)
+{
+    uint32_t buf_va = BRIDGE_MEM32(sptd_va + SPTD_DATA_BUFFER);
+    uint32_t len    = BRIDGE_MEM32(sptd_va + SPTD_DATA_LENGTH);
+    uint8_t page[8 + 20];
+    uint32_t i;
+
+    if (!buf_va || len == 0)
+        return 0;
+
+    memset(page, 0, sizeof(page));
+    /* Mode parameter header (10): data length that follows, big-endian. */
+    page[0] = 0;
+    page[1] = (uint8_t)(sizeof(page) - 2);
+    page[8]  = MODE_PAGE_XBOX_DVD;
+    page[9]  = 18;                 /* page length */
+    page[10] = 1;                  /* partition: Xbox game partition */
+    page[11] = 1;                  /* CDF valid */
+    page[12] = 1;                  /* authenticated */
+    page[13] = 0x0D;               /* book type: Xbox game disc */
+
+    if (len > sizeof(page))
+        len = sizeof(page);
+    for (i = 0; i < len; i++)
+        BRIDGE_MEM8(buf_va + i) = page[i];
+    BRIDGE_MEM8(sptd_va + SPTD_SCSI_STATUS) = 0;   /* SCSISTAT_GOOD */
+    return 1;
+}
 
 /* The retail hard disk, in the units DISK_GEOMETRY reports. Deliberately the
  * same geometry kernel_path.c writes into the partition table it synthesises,
@@ -3726,6 +4126,36 @@ static void bridge_NtDeviceIoControlFile(void)
     uint32_t ioctl   = STACK_ARG(5);
     uint32_t out_va  = STACK_ARG(8);
     uint32_t out_len = STACK_ARG(9);
+
+    if (ioctl == IOCTL_SCSI_PASS_THROUGH_DIRECT) {
+        uint32_t in_va  = STACK_ARG(6);
+        uint32_t in_len = STACK_ARG(7);
+        uint8_t opcode, pagecode;
+
+        if (!in_va || in_len < SPTD_CDB + 16) {
+            bridge_write_iostatus(ios_va, 0xC000000Du, 0); /* INVALID_PARAMETER */
+            g_eax = 0xC000000Du;
+            return;
+        }
+        opcode   = BRIDGE_MEM8(in_va + SPTD_CDB);
+        pagecode = BRIDGE_MEM8(in_va + SPTD_CDB + 2) & 0x3Fu;
+        if (opcode == SCSI_MODE_SENSE10 && pagecode == MODE_PAGE_XBOX_DVD &&
+            bridge_scsi_mode_sense_security(in_va)) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [FILE] DVD security page read: "
+                                "reporting an authenticated Xbox disc\n");
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+        fprintf(stderr, "  [FILE] NtDeviceIoControlFile: SCSI pass-through "
+                        "opcode 0x%02X (page 0x%02X) - unhandled\n",
+                opcode, pagecode);
+        bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
+        g_eax = 0xC00000BBu;
+        return;
+    }
 
     if (ioctl == IOCTL_DISK_GET_DRIVE_GEOMETRY) {
         /* DISK_GEOMETRY: Cylinders (LARGE_INTEGER), MediaType,
@@ -7185,7 +7615,11 @@ static void bridge_KeGetCurrentIrql(void)
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
 static void bridge_KeGetCurrentThread(void)
 {
-    g_eax = 0;
+    /* The running thread's object, which fs:[0x28] points at and which is
+     * now per-thread. Returning 0 here made every caller that compared thread
+     * identities decide it was always the same thread. */
+    extern uint32_t xbox_CurrentThreadObject(void);
+    g_eax = xbox_CurrentThreadObject();
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */
@@ -8247,7 +8681,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 204: return 16;  /* NtProtectVirtualMemory (4) */
     case 205: return  8;  /* NtPulseEvent (2) */
     case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 36;  /* NtQueryDirectoryFile (9) */
+    case 207: return 40;  /* NtQueryDirectoryFile (10) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
@@ -9130,8 +9564,70 @@ static void kernel_watch_arm_once(void)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
 
+/* ── RECOMP_KERNEL_CALLERS=<ordinal> ──────────────────────────────────────
+ * "Which ordinal" is answered by the periodic summary; "from where" was not.
+ * A title that sits still is usually spinning on one kernel call from one or
+ * two call sites, and the call sites are what turn a hot ordinal into a
+ * function to read. Tally the guest return address for one chosen ordinal
+ * and rank the sites alongside the summary. */
+#define KCALLER_SLOTS 16
+static uint32_t g_kcaller_ordinal = 0xFFFFFFFFu;
+static uint32_t g_kcaller_va[KCALLER_SLOTS];
+static unsigned long long g_kcaller_hits[KCALLER_SLOTS];
+static unsigned long long g_kcaller_other;
+
+static void kcaller_arm_once(void)
+{
+    static int done;
+    const char *env;
+    if (done)
+        return;
+    done = 1;
+    env = getenv("RECOMP_KERNEL_CALLERS");
+    if (env && *env)
+        g_kcaller_ordinal = (uint32_t)strtoul(env, NULL, 0);
+}
+
+static void kcaller_record(uint32_t va)
+{
+    int i;
+    for (i = 0; i < KCALLER_SLOTS; i++) {
+        if (g_kcaller_va[i] == va) { g_kcaller_hits[i]++; return; }
+        if (g_kcaller_hits[i] == 0) {
+            g_kcaller_va[i] = va; g_kcaller_hits[i] = 1; return;
+        }
+    }
+    g_kcaller_other++;
+}
+
+static void kcaller_report(void)
+{
+    static unsigned char shown[KCALLER_SLOTS];
+    int r, n;
+
+    if (g_kcaller_ordinal == 0xFFFFFFFFu)
+        return;
+    memset(shown, 0, sizeof shown);
+    for (n = 0; n < 6; n++) {
+        int best = -1;
+        for (r = 0; r < KCALLER_SLOTS; r++)
+            if (g_kcaller_hits[r] && !shown[r]
+                && (best < 0 || g_kcaller_hits[r] > g_kcaller_hits[best]))
+                best = r;
+        if (best < 0)
+            break;
+        shown[best] = 1;
+        fprintf(stderr, "  [KERNEL]   ordinal %u called from 0x%08X x%llu\n",
+                g_kcaller_ordinal, g_kcaller_va[best],
+                (unsigned long long)g_kcaller_hits[best]);
+    }
+    if (g_kcaller_other)
+        fprintf(stderr, "  [KERNEL]   ordinal %u from %llu more sites (table full)\n",
+                g_kcaller_ordinal, (unsigned long long)g_kcaller_other);
+}
+
 /* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {
@@ -9152,6 +9648,18 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+
+    /* The guest return address, captured here and kept for the bridge body.
+     * At this point the caller's pushed return address is still on top of the
+     * guest stack; by the time a bridge reads its arguments esp has moved, so
+     * reading [esp] there gives the first argument instead. The [WAIT] log
+     * used to do exactly that and reported every wait as being called from
+     * the object it was waiting on. */
+    g_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+
+    kcaller_arm_once();
+    if (ordinal == g_kcaller_ordinal)
+        kcaller_record(g_kernel_caller);
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -9194,6 +9702,7 @@ static void kernel_thunk_dispatch(void)
                             (unsigned long long)g_ordinal_calls[best]);
                 }
             }
+            kcaller_report();
             fflush(stderr);
             last_summary_tick = now;
         }
@@ -9402,6 +9911,10 @@ void xbox_kernel_bridge_init(void)
     int bridged = 0;
     int unbridged = 0;
     DWORD old_protect;
+
+    /* Runs on the thread that will run the guest's main thread, which is the
+     * one the sampling profiler (RECOMP_SAMPLE) needs to be told about. */
+    xbox_SamplerStart();
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);

@@ -79,6 +79,9 @@ typedef LONG KPRIORITY;
 #ifndef STATUS_INVALID_HANDLE
 #define STATUS_INVALID_HANDLE           ((NTSTATUS)0xC0000008L)
 #endif
+#ifndef STATUS_INVALID_INFO_CLASS
+#define STATUS_INVALID_INFO_CLASS       ((NTSTATUS)0xC0000003L)
+#endif
 #ifndef STATUS_INVALID_PARAMETER
 #define STATUS_INVALID_PARAMETER        ((NTSTATUS)0xC000000DL)
 #endif
@@ -692,6 +695,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan);
 
 NTSTATUS __stdcall xbox_NtFsControlFile(
@@ -1079,11 +1083,21 @@ void     xbox_kernel_set_xbe_game_region(uint32_t region);
 #define XC_AUDIO_FLAGS_ENABLE_AC3   0x00010000
 #define XC_AUDIO_FLAGS_ENABLE_DTS   0x00020000
 
-/* Video standard flags in XC_VIDEO */
+/* Video standard flags in XC_VIDEO.
+ *
+ * These are the values a title sees, which is not how they are stored.
+ * XAPI's XGetVideoFlags reads the raw setting and returns
+ * (value >> 16) & 0x5F -- the flags live in the HIGH half-word. Writing
+ * them unshifted, as this did, meant XGetVideoFlags() returned 0 for
+ * every title however this was set. Store with XC_VIDEO_RAW. */
 #define XC_VIDEO_FLAGS_WIDESCREEN   0x01
 #define XC_VIDEO_FLAGS_HDTV         0x02
 #define XC_VIDEO_FLAGS_PAL_I        0x04
 #define XC_VIDEO_FLAGS_LETTERBOX    0x10
+#define XC_VIDEO_FLAGS_60Hz         0x40
+
+/* A set of the flags above, placed where the setting actually keeps them. */
+#define XC_VIDEO_RAW(flags)         ((ULONG)(flags) << 16)
 
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);

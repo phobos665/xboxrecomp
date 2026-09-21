@@ -17,12 +17,16 @@ if(WIN32)
     endif()
 
     # Exercise bound state objects on D3D11's software device (no window/GPU).
+    # d3d8_display.c comes along because the sampler path asks it whether
+    # anisotropy is forced. Nothing here reaches its resolve pass, which is
+    # the only part that wants a device.
     add_executable(d3d8_states_smoke
         test_states.c
         ../../src/d3d/d3d8_states.c
+        ../../src/d3d/d3d8_display.c
     )
     target_include_directories(d3d8_states_smoke PRIVATE ../../src/d3d)
-    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11)
+    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11 d3dcompiler)
 
     add_executable(d3d8_a8
         test_a8.c
@@ -32,4 +36,20 @@ if(WIN32)
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+endif()
+
+if(WIN32)
+    # Pure parsing of a pixel shader definition: no device, so it can run
+    # under ctest. Links the same sources as d3d8_a8 because d3d8_combiners.c
+    # reaches into the device layer for state it does not use here.
+    add_executable(d3d8_final_default
+        test_final_default.c
+        ../../src/d3d/d3d8_resources.c
+        ../../src/d3d/d3d8_shaders.c
+        ../../src/d3d/d3d8_combiners.c
+    )
+    target_include_directories(d3d8_final_default PRIVATE ../../src/d3d)
+    target_link_libraries(d3d8_final_default PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    # Registered with ctest from the root CMakeLists: this directory is
+    # entered from src/d3d, before the root calls enable_testing().
 endif()

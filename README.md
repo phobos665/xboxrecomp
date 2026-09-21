@@ -170,90 +170,136 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 - **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
 - **macOS**: install the native libraries required by the OpenGL backend with `brew install sdl2 libepoxy`
 - **Python 3.10+** with `capstone` (`pip install capstone`)
-- **Visual Studio 2022** (MSVC compiler)
+- **Visual Studio 2022**, or the **2019 Build Tools** (either MSVC works; the
+  2019 Build Tools ship a CMake of their own, so you may not need to install one)
 - **CMake 3.20+**
 - **XbSymbolDatabase** (MIT), as the submodule `third_party/XbSymbolDatabase`,
   pinned to a known commit. `tools.xdk_symbols` uses its CLI to name the XDK
   functions (D3D8, DirectSound, ...) linked into a title; step 1 builds it.
 - An original Xbox game disc image (you must own the game)
 
+`py -3` below is the Windows Python Launcher — on Linux and macOS use
+`python3`, and on a Microsoft Store install that has no `py`, use `python`.
+
 ### Step-by-Step
 
-The condensed version. [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) is
-the long one, and the one to read if a step here does not go as written — it
-explains *why* each flag is there, which is what you need when your title
-behaves differently from the example.
+Four stages turn a disc into C, and one script runs all four. The long version
+is [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md), which explains *why*
+each flag is there — read that when your title behaves differently from the
+example, not before.
 
 ```bash
-# 1. Clone this repo, with its submodule, and build the XDK symbol tool once.
+# 1. Clone with the submodule, and build the XDK symbol tool once.
 #    tools.xdk_symbols finds the CLI in third_party/XbSymbolDatabase/build by
-#    itself (or pass --cli, or set XBSDB_CLI). The build folder is ignored.
+#    itself (or pass --cli, or set XBSDB_CLI).
 git clone --recurse-submodules https://github.com/sp00nznet/xboxrecomp.git
 cd xboxrecomp
 #    Already cloned without it:  git submodule update --init
 cmake -S third_party/XbSymbolDatabase -B third_party/XbSymbolDatabase/build
 cmake --build third_party/XbSymbolDatabase/build --config Release
 
-# 2. Extract default.xbe from your Xbox disc image
-#    (Use xdvdfs, extract-xiso, or similar tool)
-mkdir game_files
-# copy default.xbe and game data into game_files/
+# 2. Put the game's own files where the toolkit will look for them.
+#    Extract your disc image (xdvdfs, extract-xiso, tools/xiso) into
+#    games/<title>/, so that games/<title>/default.xbe exists alongside the
+#    rest of the disc. The game is never distributed with this toolkit: you
+#    supply it, from a copy you own.
 
-# 3. Parse the XBE — learn what you're working with
-#    --json is NOT optional: step 4 reads the section layout back out of it.
-#    The name matters too. Step 4 looks for <xbe stem>_analysis.json beside the
-#    XBE, so keep it there and keep the suffix.
-py -3 -m tools.xbe_parser game_files/default.xbe --json game_files/default_analysis.json
-#    Output: section map, kernel imports, entry point, XDK version
+# 3. Make the project the executable is built from. It starts as a copy of
+#    the template, and the recompiler writes its generated C into it.
+cp -r templates/new-game titles/<name>       # Windows: xcopy /E /I templates\new-game titles\<name>
+#    Then set project(<name>_recomp C) in titles/<name>/CMakeLists.txt, and
+#    point XBOXRECOMP_DIR in the same file at this repository.
 
-# 4. Disassemble — find all functions
-py -3 -m tools.disasm game_files/default.xbe --text-only
-#    Output: tools/disasm/output/ (functions.json, xrefs.json, strings.json)
-#    --text-only does what it says: only .text. A title with code in its XDK
-#    library sections (D3D, DSOUND, XPP...) needs them named explicitly, e.g.
-#    --extra-sections XIPS,DOLBY. Drop --text-only to take every code section.
+# 4. Recompile. This runs all four stages -- parse, disassemble, identify,
+#    lift -- and writes the generated C into the project.
+py -3 scripts/recompile.py "games/<title>/default.xbe" \
+    --work-dir games/_pipeline/<name>/out --project titles/<name>
 
-# 5. Identify library functions
-py -3 -m tools.func_id game_files/default.xbe -v
-#    Output: tools/func_id/output/ (CRT, RenderWare, vtables classified)
+# 5. Tell the entry point where to start. The parse in step 4 reports it, and
+#    leaves it in games/<title>/default_analysis.json as "entry_point".
+py -3 scripts/regen_title_main.py <name> "Nice Name" 0x001CF3C9 "<title>"
 
-# 6. Recover calling conventions and parameter counts
-py -3 -m tools.abi_analysis game_files/default.xbe -v
-#    Output: tools/abi_analysis/output/abi_functions.json
-#    Skipping this still "works", but every function falls back to
-#    cdecl / 0 params / int-or-void, so the generated signatures are guesses.
+# 6. Build it.
+cmake -S titles/<name> -B titles/<name>/build -G "Visual Studio 16 2019" -A x64
+cmake --build titles/<name>/build --config Release
 
-# 6b. Optional: real names instead of sub_XXXXXXXX, if you have Ghidra.
-#     FidDb recognises the statically linked CRT/XDK helpers and names a few
-#     hundred of them. Do it BEFORE step 8: the recompiler emits whatever name
-#     is on the functions.json entry, so the names reach the generated C,
-#     crash traces and ABI reports. See docs/GETTING_STARTED.md step 4.5.
-XBE=game_files/default.xbe tools/ghidra_naming/run_ghidra.sh
-py -3 tools/ghidra_naming/merge_names.py --apply
-
-# 7. Create your game project — this is what becomes the .exe
-#    The toolkit is a library; the executable lives in your own project.
-cp -r templates/new-game ../mygame        # Windows cmd: xcopy /E /I templates\new-game ..\mygame
-#    Then edit:
-#      ../mygame/CMakeLists.txt  -> project name, XBOXRECOMP_DIR path
-#      ../mygame/src/main.c      -> YOUR_GAME_ENTRY_POINT / XBE path from step 3
-
-# 8. Lift to C — the big one
-#    --gen-dir writes the generated code into your game project, where the
-#    template's CMakeLists globs src/recomp/gen/*.c. Without it the output
-#    lands in this repo (src/game/recomp/gen/) and nothing compiles it.
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000 --gen-dir ../mygame/src/recomp/gen
-#    Output: recomp_0000.c ... recomp_dispatch.c, recomp_funcs.h (millions of
-#    lines of C), plus recomp_types.h — the runtime register model the
-#    generated code includes. You do not supply that one; if the build says
-#    "Cannot open include file: 'recomp_types.h'", this step did not finish.
-
-# 9. Build and run — from the game project, not from xboxrecomp
-cd ../mygame
-cmake -S . -B build
-cmake --build build --config Release
-build\Release\your_game_recomp.exe          # named after project() in your CMakeLists
+# 7. Run it.
+titles\<name>\build\Release\<name>_recomp.exe
 ```
+
+`<name>` is whatever you want to call the project; `<title>` is the folder your
+disc was extracted into. They can differ — `games/Time Splitters 2/` builds
+`titles/timesplitters2/`.
+
+**What to keep.** `titles/<name>/` is a normal CMake project, and the part
+worth committing is small: `CMakeLists.txt`, `src/main.c` and
+`src/recomp_manual.c`, which is where hand-written replacements for functions
+the lifter could not translate go. The generated C lands in `src/recomp/gen/`
+and the intermediate stage output in the `--work-dir`; neither belongs in
+version control. Give every title its own `--work-dir` and `--project`, or a
+second one silently overwrites the first.
+
+`scripts/regen_title_main.py` in step 5 rewrites `src/main.c` from the
+template rather than patching it, so run it again after changing the template
+and your edits are not lost — which is why anything title-specific belongs in
+`recomp_manual.c` instead.
+
+**It lifts only the game's own code by default** (`--game-only`). CRT and XDK
+library code is replaced at the boundary rather than translated, which is both
+faster to build and easier to debug. `--all` takes everything, when you need it.
+
+### Running it
+
+The executable runs the game by itself — double-click it, or make a shortcut
+anywhere. It looks for the game in this order:
+
+1. a folder called `game` next to the executable, which is what a build you
+   hand to somebody else should look like;
+2. `games/<title>/` in this repository, relative to the executable, which is
+   where step 2 put it;
+3. whatever `RECOMP_GAME_DIR` points at, which overrides both.
+
+It is a windowed program, so there is no console. Diagnostics go to whatever
+redirected them, else to the terminal you started it from, else to
+`<executable>.log` beside it. If it cannot find the game it says so in a
+message box, naming every path it tried.
+
+While it runs: **F9** shows the frame rate, **F10** steps the frame cap
+(adaptive, 60, 30, off), **F11** saves the frame on screen as a picture and as
+a replayable capture — which is how to report a rendering bug. A keyboard works
+out of the box and an XInput controller works as itself;
+`py -3 -m tools.input_ui` rebinds either, for up to four players.
+
+### Stage by stage
+
+`scripts/recompile.py` is a driver over four tools you can also run yourself,
+which is what you want when a stage needs an argument the driver does not pass
+or you want to inspect its output:
+
+```bash
+# Parse. --json is not optional: the disassembler reads the section layout
+# back out of it, and looks for <xbe stem>_analysis.json beside the XBE.
+py -3 -m tools.xbe_parser "games/<title>/default.xbe" --json "games/<title>/default_analysis.json"
+
+# Disassemble. --text-only means only .text; a title with code in its XDK
+# library sections needs them named, e.g. --extra-sections XIPS,DOLBY.
+py -3 -m tools.disasm "games/<title>/default.xbe" --text-only -v
+
+# Identify CRT, RenderWare and library functions, and recover vtables.
+py -3 -m tools.func_id "games/<title>/default.xbe" -v
+
+# Lift to C.
+py -3 -m tools.recomp "games/<title>/default.xbe" --game-only --split 1000
+```
+
+Two optional stages the driver does not run. `tools.abi_analysis` recovers
+calling conventions and parameter counts; without it every signature falls back
+to cdecl with no parameters, which still builds but makes the generated C
+harder to read. And if you have Ghidra, `tools/ghidra_naming/` recognises a few
+hundred statically linked CRT and XDK helpers by signature and names them —
+worth doing *before* lifting, since the names reach the generated C, the crash
+traces and the ABI reports. Both are covered in
+[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
 ### What To Expect
 
