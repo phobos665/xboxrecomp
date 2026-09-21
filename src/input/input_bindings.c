@@ -721,16 +721,47 @@ static const WORD PAD_BITS[PB_COUNT] = {
 };
 
 /* One answer per key per sample: 24 controls can name the same key twice and
- * GetAsyncKeyState is a call into the window manager. */
+ * GetAsyncKeyState is a call into the window manager.
+ *
+ * Per sample is not enough on its own. A title is free to read the pad far
+ * more often than it draws, and each read was costing a window-manager
+ * transition per distinct key: Tony Hawk's Pro Skater 2X polls about 372,000
+ * times a second and spent 47% of its main thread inside
+ * NtUserGetAsyncKeyState -- four times what it spent in its own lifted code.
+ *
+ * So the answers also persist between samples for a short while. A keyboard
+ * cannot change faster than a person can move, the console's own pad read is
+ * a USB transfer that returns state captured up to a frame earlier, and one
+ * millisecond is below anything a player can perceive. It is deliberately
+ * not tied to the frame: a title that polls without drawing still has to get
+ * fresh input eventually, or a menu that spins waiting for a key would never
+ * see one.
+ */
+#define KEY_CACHE_TTL_MS 1u
+
 typedef struct { unsigned char state[256]; } KeyCache;
+
+static unsigned char g_key_state[256];
+static DWORD g_key_state_at;
 
 static int key_down(KeyCache *kc, int vk)
 {
+    (void)kc;
     if (vk <= 0 || vk > 255)
         return 0;
-    if (!kc->state[vk])
-        kc->state[vk] = (GetAsyncKeyState(vk) & 0x8000) ? 2 : 1;
-    return kc->state[vk] == 2;
+    if (!g_key_state[vk])
+        g_key_state[vk] = (GetAsyncKeyState(vk) & 0x8000) ? 2 : 1;
+    return g_key_state[vk] == 2;
+}
+
+/* Start of a sample: drop answers older than the window above. */
+static void key_cache_tick(void)
+{
+    DWORD now = GetTickCount();
+    if (now - g_key_state_at >= KEY_CACHE_TTL_MS) {
+        memset(g_key_state, 0, sizeof g_key_state);
+        g_key_state_at = now;
+    }
 }
 
 static int axis_value(const XINPUT_GAMEPAD *g, int axis)
@@ -818,6 +849,7 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     if (c->device == DEV_NONE)
         return 0;
     memset(&kc, 0, sizeof kc);
+    key_cache_tick();
     memset(&pad, 0, sizeof pad);
     if (c->device == DEV_XINPUT)
         have_pad = pad_state(c->pad, &pad);

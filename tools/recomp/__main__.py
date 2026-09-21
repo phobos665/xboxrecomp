@@ -241,6 +241,15 @@ def main():
     parser.add_argument("--hle-impl", metavar="PATH", action="append",
                         help="C file or directory to scan for HLE_EXPORT(Name) "
                              "markers (repeatable; default: src/hle)")
+    parser.add_argument("--only-hle-thunks", action="store_true",
+                        help="Rewrite gen/recomp_hle.c against the current "
+                             "src/hle and exit, without lifting anything. "
+                             "Adding an HLE_EXPORT or HLE_ORIGINAL to src/hle "
+                             "leaves every already-lifted title unable to link "
+                             "until its recomp_hle.c mentions the new name; "
+                             "this refreshes it in seconds instead of hours. "
+                             "Original bodies this lift did not emit are left "
+                             "0, which the replacements report at run time.")
     parser.add_argument("--exclude-manual", metavar="FILE",
                         nargs="?", const="src/game/recomp/recomp_manual.c",
                         help="Scan a C file (default recomp_manual.c) for the "
@@ -537,6 +546,124 @@ def main():
         from .hle import keep_originals, wanted_originals
         wanted = wanted_originals([p for p in hle_impl_paths if os.path.exists(p)])
         hle_keep = keep_originals(hle_replace, wanted)
+
+        if args.only_hle_thunks:
+            # Refresh recomp_hle.c alone. Which original bodies exist is read
+            # from the generated sources rather than from this run's function
+            # list, because nothing is being translated: the bodies that are
+            # there are the ones the last real lift emitted, and claiming any
+            # other would fail the link this is here to fix.
+            import glob as _glob
+            import re as _re
+            have = set()          # bodies kept for HLE_ORIGINAL
+            emitted = set()       # ordinary bodies this lift already wrote
+            body_re = _re.compile(r"^void sub_([0-9A-F]{8})_hle_original\(void\)",
+                                  _re.M)
+            plain_re = _re.compile(r"^void sub_([0-9A-F]{8})\(void\)", _re.M)
+            for path in _glob.glob(os.path.join(gen_dir, "*.c")):
+                if os.path.basename(path) == "recomp_hle.c":
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+                have.update(int(m, 16) for m in body_re.findall(text))
+                emitted.update(int(m, 16) for m in plain_re.findall(text))
+
+            # A name src/hle has gained since this title was lifted refers to a
+            # function the old lift wrote out normally. Emitting a thunk for it
+            # too defines sub_XXXXXXXX twice and fails the link -- which is the
+            # failure this mode exists to prevent. Leave those to the caller's
+            # next real lift: the title links and behaves exactly as it did,
+            # and the count below says what it is missing out on.
+            deferred = sorted(set(hle_replace) & emitted)
+            for addr in deferred:
+                del hle_replace[addr]
+
+            # The dispatch table is the authority on what must exist: it was
+            # written by the lift and names every address the title can call.
+            # Anything it names that neither an ordinary body nor this plan's
+            # thunks define would fail the link.
+            #
+            # That happens when src/hle has *lost* a name since the lift --
+            # the body was kept only as sub_X_hle_original and the thunk was
+            # the sole definition of sub_X. Mortal Kombat hit exactly this:
+            # it was lifted while D3DDevice_SetPalette was an HLE_EXPORT on a
+            # branch that is not merged, so on main nothing replaces that
+            # address and nothing defines it either.
+            #
+            # Checking the dispatch table rather than the previous
+            # recomp_hle.c matters, because this mode rewrites that file: run
+            # twice, and comparing against it compares against your own last
+            # answer. The first version did, and reported nothing wrong.
+            #
+            # Refuse rather than write. This exists to get a title building
+            # again, and a refresh that breaks one differently is worse than
+            # no refresh, so the current recomp_hle.c is left alone.
+            out_path = os.path.join(gen_dir, "recomp_hle.c")
+            dispatch = os.path.join(gen_dir, "recomp_dispatch.c")
+            if os.path.exists(dispatch):
+                with open(dispatch, encoding="utf-8", errors="replace") as fh:
+                    needed = {int(m, 16) for m in
+                              _re.findall(r"\(recomp_func_t\)sub_([0-9A-F]{8})",
+                                          fh.read())}
+                lost = sorted(needed - emitted - set(hle_replace) - set(manual))
+                if lost:
+                    print(f"Not rewriting {out_path}: the dispatch table names "
+                          f"{len(lost)} function(s) that nothing would define "
+                          f"(e.g. 0x{lost[0]:08X}). src/hle has changed which "
+                          f"addresses it replaces since this title was lifted "
+                          f"-- lift it again.", file=sys.stderr)
+                    sys.exit(1)
+            hle_originals = {name: None for name in wanted}
+            for addr, (name, _p, _r) in hle_replace.items():
+                if name in wanted and addr in have:
+                    hle_originals[name] = addr
+            from .hle import render_thunks
+            out = out_path
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(render_thunks(hle_replace, hle_variables, hle_originals))
+            # The runtime header travels with the generated code, and a real
+            # lift refreshes it every run for the reason translator.py spells
+            # out at length: the lifter and this header are two halves of one
+            # contract, and a stale copy gives a link error against generated
+            # code that is perfectly correct. Refreshing thunks without it
+            # reproduces exactly that -- Max Payne and Mortal Kombat both
+            # failed on an unresolved g_icall_saved_esp from a header left
+            # behind by a branch that is not checked out.
+            types_dst = os.path.join(gen_dir, "recomp_types.h")
+            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                     "templates", "runtime", "recomp_types.h")
+            try:
+                with open(types_src, encoding="utf-8") as fh:
+                    want = fh.read()
+                have = None
+                if os.path.exists(types_dst):
+                    with open(types_dst, encoding="utf-8") as fh:
+                        have = fh.read()
+                if have != want:
+                    with open(types_dst, "w", encoding="utf-8") as fh:
+                        fh.write(want)
+                    print("  refreshed recomp_types.h (runtime register model)",
+                          file=sys.stderr)
+            except OSError as exc:
+                print(f"  warning: could not refresh recomp_types.h: {exc}",
+                      file=sys.stderr)
+
+            kept = sum(1 for v in hle_originals.values() if v is not None)
+            print(f"Rewrote {out}: {len(hle_replace)} replacements, "
+                  f"{kept} of {len(wanted)} original bodies already lifted",
+                  file=sys.stderr)
+            if deferred:
+                print(f"  {len(deferred)} replacement(s) new since this title "
+                      f"was lifted are not active until it is lifted again; "
+                      f"the old body still runs", file=sys.stderr)
+            missing = sorted(n for n, v in hle_originals.items() if v is None
+                             and n in {nm for _a, (nm, _p, _r)
+                                       in hle_replace.items()})
+            for name in missing:
+                print(f"  {name} is replaced here but its body was not lifted; "
+                      f"re-lift to run the title's own code for it",
+                      file=sys.stderr)
+            return 0
         # A body can only be kept if this lift emits it: translate_batch_split
         # drops owned function starts, and --game-only never passes some
         # categories in. Pointing recomp_hle.c at a body that is not there
