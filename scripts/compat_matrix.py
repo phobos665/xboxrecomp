@@ -106,6 +106,12 @@ def refresh_thunks(t, verbose=False):
         cmd += ["--exclude-manual", str(manual)]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
+        # The refresh declines when it cannot produce a working thunk file --
+        # say which, rather than a bare failure. That message is the whole
+        # answer ("lift it again"), so losing it costs a debugging round.
+        for line in reversed(r.stderr.splitlines()):
+            if line.startswith("Not rewriting"):
+                return "needs a re-lift: " + line.split(": ", 1)[-1][:70]
         return "refresh failed"
     m = re.search(r"(\d+) of (\d+) original bodies", r.stderr)
     return f"{m.group(1)}/{m.group(2)} bodies" if m else "refreshed"

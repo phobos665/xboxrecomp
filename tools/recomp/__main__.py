@@ -577,14 +577,77 @@ def main():
             deferred = sorted(set(hle_replace) & emitted)
             for addr in deferred:
                 del hle_replace[addr]
+
+            # The dispatch table is the authority on what must exist: it was
+            # written by the lift and names every address the title can call.
+            # Anything it names that neither an ordinary body nor this plan's
+            # thunks define would fail the link.
+            #
+            # That happens when src/hle has *lost* a name since the lift --
+            # the body was kept only as sub_X_hle_original and the thunk was
+            # the sole definition of sub_X. Mortal Kombat hit exactly this:
+            # it was lifted while D3DDevice_SetPalette was an HLE_EXPORT on a
+            # branch that is not merged, so on main nothing replaces that
+            # address and nothing defines it either.
+            #
+            # Checking the dispatch table rather than the previous
+            # recomp_hle.c matters, because this mode rewrites that file: run
+            # twice, and comparing against it compares against your own last
+            # answer. The first version did, and reported nothing wrong.
+            #
+            # Refuse rather than write. This exists to get a title building
+            # again, and a refresh that breaks one differently is worse than
+            # no refresh, so the current recomp_hle.c is left alone.
+            out_path = os.path.join(gen_dir, "recomp_hle.c")
+            dispatch = os.path.join(gen_dir, "recomp_dispatch.c")
+            if os.path.exists(dispatch):
+                with open(dispatch, encoding="utf-8", errors="replace") as fh:
+                    needed = {int(m, 16) for m in
+                              _re.findall(r"\(recomp_func_t\)sub_([0-9A-F]{8})",
+                                          fh.read())}
+                lost = sorted(needed - emitted - set(hle_replace) - set(manual))
+                if lost:
+                    print(f"Not rewriting {out_path}: the dispatch table names "
+                          f"{len(lost)} function(s) that nothing would define "
+                          f"(e.g. 0x{lost[0]:08X}). src/hle has changed which "
+                          f"addresses it replaces since this title was lifted "
+                          f"-- lift it again.", file=sys.stderr)
+                    sys.exit(1)
             hle_originals = {name: None for name in wanted}
             for addr, (name, _p, _r) in hle_replace.items():
                 if name in wanted and addr in have:
                     hle_originals[name] = addr
             from .hle import render_thunks
-            out = os.path.join(gen_dir, "recomp_hle.c")
+            out = out_path
             with open(out, "w", encoding="utf-8") as fh:
                 fh.write(render_thunks(hle_replace, hle_variables, hle_originals))
+            # The runtime header travels with the generated code, and a real
+            # lift refreshes it every run for the reason translator.py spells
+            # out at length: the lifter and this header are two halves of one
+            # contract, and a stale copy gives a link error against generated
+            # code that is perfectly correct. Refreshing thunks without it
+            # reproduces exactly that -- Max Payne and Mortal Kombat both
+            # failed on an unresolved g_icall_saved_esp from a header left
+            # behind by a branch that is not checked out.
+            types_dst = os.path.join(gen_dir, "recomp_types.h")
+            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                     "templates", "runtime", "recomp_types.h")
+            try:
+                with open(types_src, encoding="utf-8") as fh:
+                    want = fh.read()
+                have = None
+                if os.path.exists(types_dst):
+                    with open(types_dst, encoding="utf-8") as fh:
+                        have = fh.read()
+                if have != want:
+                    with open(types_dst, "w", encoding="utf-8") as fh:
+                        fh.write(want)
+                    print("  refreshed recomp_types.h (runtime register model)",
+                          file=sys.stderr)
+            except OSError as exc:
+                print(f"  warning: could not refresh recomp_types.h: {exc}",
+                      file=sys.stderr)
+
             kept = sum(1 for v in hle_originals.values() if v is not None)
             print(f"Rewrote {out}: {len(hle_replace)} replacements, "
                   f"{kept} of {len(wanted)} original bodies already lifted",
