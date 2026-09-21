@@ -39,6 +39,10 @@ HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 /* The guest's presentation size (d3d8_device.c); the back buffer's when unset. */
 UINT                 d3d8_GetGuestWidth(void);
+/* The finished frame as a shader input: the offscreen scene target when
+ * the host renders larger than the guest, the swap chain's back buffer
+ * when it does not. NULL before the device exists. */
+ID3D11ShaderResourceView *d3d8_GetSceneSRV(void);
 /* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
 BOOL                 d3d8_GetScissor(D3D11_RECT *out);
 UINT                 d3d8_GetGuestHeight(void);

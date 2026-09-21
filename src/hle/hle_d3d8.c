@@ -788,9 +788,22 @@ static void shadow_dump_frame(void)
         surf->lpVtbl->Release(surf);
         return;
     }
-    /* The swap chain is R8G8B8A8 (d3d8_device.c) at the size it was created. */
-    w = g_shadow_width;
-    h = g_shadow_height;
+    /* R8G8B8A8 (d3d8_device.c), but not necessarily the guest's size: the
+     * host renders the scene larger than the guest asked whenever
+     * supersampling is on, and GetBackBuffer hands back that scene. Taking
+     * the size from the surface keeps the dump whole at any scale --
+     * g_shadow_width here wrote the top-left corner and called it a frame. */
+    {
+        D3DSURFACE_DESC sd;
+
+        if (SUCCEEDED(surf->lpVtbl->GetDesc(surf, &sd)) && sd.Width && sd.Height) {
+            w = sd.Width;
+            h = sd.Height;
+        } else {
+            w = g_shadow_width;
+            h = g_shadow_height;
+        }
+    }
     pad = (4 - ((w * 3) & 3)) & 3;
     filesz = 54 + (w * 3 + pad) * h;
 
