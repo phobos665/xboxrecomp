@@ -1666,10 +1666,15 @@ BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
     if (!guest_w)
         return FALSE;
 
-    /* A quad is four vertices, a bar a few more. Anything long is
-     * geometry, and geometry is not what this asks about. */
-    if (count > 64)
-        count = 64;
+    /* Every vertex, not a sample of them. A backdrop is not always a
+     * quad -- this title builds several out of long strips -- and
+     * measuring only the first few of those reported an extent that
+     * stopped short of the edge, so the draw was squeezed and the seam
+     * it was supposed to remove stayed. The bound is a sanity limit, not
+     * a sample: screen-space draws are small, and this runs only for
+     * them. */
+    if (count > 8192)
+        count = 8192;
 
     for (i = 0; i < count; i++) {
         float x;
@@ -1679,11 +1684,15 @@ BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
         if (x > hi) hi = x;
     }
 
-    /* Within a little of both edges, in the title's own screen pixels. */
+    /* How much of the width the draw covers, in the title's own screen
+     * pixels. Coverage rather than "touches both edges": this title
+     * builds its backdrop from overlapping strips, and the ones that run
+     * off the left edge stop a little short of the right. Measured on a
+     * menu, the gap is wide -- every backdrop piece covers 92% or more,
+     * and the widest HUD element covers 78% -- so the threshold sits
+     * between them with room either side. */
     {
-        float slack = (float)guest_w * 0.04f;
-
-        return (lo <= slack && hi >= (float)guest_w - slack) ? TRUE : FALSE;
+        return ((hi - lo) >= (float)guest_w * 0.85f) ? TRUE : FALSE;
     }
 }
 
