@@ -48,6 +48,10 @@ ID3D11ShaderResourceView *d3d8_GetSceneSRV(void);
  * projection. Only matters in widescreen, where the two need different
  * horizontal treatment. */
 void d3d8_SetTwoDSqueeze(BOOL on);
+BOOL d3d8_GetTwoDSqueeze(void);
+/* Whether a draw's own vertices span the guest's full width, which is
+ * what separates a backdrop or a fade from a HUD element. */
+BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count);
 /* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
 BOOL                 d3d8_GetScissor(D3D11_RECT *out);
 UINT                 d3d8_GetGuestHeight(void);

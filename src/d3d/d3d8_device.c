@@ -1220,6 +1220,14 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
+
+    /* A screen-space draw covering the whole width is a backdrop or a
+     * fade, and must span the widescreen picture rather than be squeezed
+     * into the middle of it with the HUD. After prepare_draw, which is
+     * what decides whether this is a screen-space draw at all. */
+    if (d3d8_GetTwoDSqueeze() &&
+        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, vertex_count))
+        d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -1250,6 +1258,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
     if (index_count == 0) return E_INVALIDARG;
 
+
     idx_bytes = (IndexDataFormat == D3DFMT_INDEX32) ? 4 : 2;
     ib_fmt = (IndexDataFormat == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     vb_size = NumVertices * VertexStreamZeroStride;
@@ -1270,6 +1279,14 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
+
+    /* A screen-space draw covering the whole width is a backdrop or a
+     * fade, and must span the widescreen picture rather than be squeezed
+     * into the middle of it with the HUD. After prepare_draw, which is
+     * what decides whether this is a screen-space draw at all. */
+    if (d3d8_GetTwoDSqueeze() &&
+        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, NumVertices))
+        d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -1609,6 +1626,65 @@ void d3d8_SetTwoDSqueeze(BOOL on)
         return;
     g_2d_squeeze = on ? TRUE : FALSE;
     apply_host_viewport();
+}
+
+BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
+
+/* Does this draw cover the guest's full width?
+ *
+ * A screen-space draw that spans the screen is a backdrop, a fade, a
+ * letterbox bar or a video frame, and squeezing it leaves the sides of a
+ * widescreen picture showing whatever was behind. One that does not is a
+ * HUD element, which belongs in the centred box. The difference is the
+ * draw's own extent, so measure it rather than keep a list of elements.
+ *
+ * The vertices are the ones handed to the draw: everything reaches this
+ * device as DrawPrimitiveUP, including the draws the title sourced from
+ * a vertex buffer -- the HLE reads those itself and passes the bytes.
+ * Position sits at the offset the program's own declaration gives for
+ * the register it copies oPos from.
+ *
+ * When any of that is unavailable the answer is FALSE, which keeps the
+ * squeeze. That is the safe way to be wrong: a squeezed backdrop is
+ * visibly odd in one place, a stretched HUD is subtly wrong everywhere.
+ */
+BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
+{
+    const unsigned char *p = (const unsigned char *)vertices;
+    UINT offset = 0, i, guest_w;
+    int reg = d3d8_vsh_bound_pos_input();
+    float lo = 3.4e38f, hi = -3.4e38f;
+
+    if (reg < 0 || !p || !stride || !count)
+        return FALSE;
+    if (!d3d8_vsh_bound_input_offset(reg, &offset))
+        return FALSE;
+    if (offset + sizeof(float) > stride)
+        return FALSE;
+
+    guest_w = d3d8_GetGuestWidth();
+    if (!guest_w)
+        return FALSE;
+
+    /* A quad is four vertices, a bar a few more. Anything long is
+     * geometry, and geometry is not what this asks about. */
+    if (count > 64)
+        count = 64;
+
+    for (i = 0; i < count; i++) {
+        float x;
+
+        memcpy(&x, p + (size_t)i * stride + offset, sizeof x);
+        if (x < lo) lo = x;
+        if (x > hi) hi = x;
+    }
+
+    /* Within a little of both edges, in the title's own screen pixels. */
+    {
+        float slack = (float)guest_w * 0.04f;
+
+        return (lo <= slack && hi >= (float)guest_w - slack) ? TRUE : FALSE;
+    }
 }
 
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPORT8 *pViewport)
