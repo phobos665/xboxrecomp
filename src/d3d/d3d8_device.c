@@ -456,24 +456,20 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
                                    (void **)&back_buffer);
     if (FAILED(hr)) return hr;
 
-    if (state->width == state->present_width &&
-        state->height == state->present_height) {
-        /* Unscaled: the scene target IS the back buffer, exactly as it was
-         * before any of this existed, and present does no extra work. */
-        hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
-                                                  (ID3D11Resource *)back_buffer,
-                                                  NULL, &state->default_rtv);
-        if (SUCCEEDED(hr))
-            hr = ID3D11Device_CreateShaderResourceView(state->d3d11_device,
-                                                        (ID3D11Resource *)back_buffer,
-                                                        NULL, &state->scene_srv);
-    } else {
+    {
         D3D11_TEXTURE2D_DESC sd;
 
-        /* Scaled: an offscreen colour target the size of the scene. The
-         * swap chain stays the size of the window, and present resolves
-         * one onto the other. SHADER_RESOURCE because both the resolve and
-         * a title reading back its own screen sample it. */
+        /* An offscreen colour target the size of the scene, always, even
+         * when that is the size the guest asked for. The swap chain
+         * belongs to the window and the window can be any shape, so the
+         * step that puts one on the other is where the picture is kept
+         * from stretching -- and a path that only exists above scale 1 is
+         * a path that is only right above scale 1. The cost when nothing
+         * is scaled is one full-screen copy of a frame that was about to
+         * be presented anyway.
+         *
+         * SHADER_RESOURCE because both the resolve and a title reading
+         * back its own screen sample it. */
         memset(&sd, 0, sizeof sd);
         sd.Width = state->width;
         sd.Height = state->height;
