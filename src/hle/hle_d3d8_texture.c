@@ -25,9 +25,14 @@
  * inline), so a cached texture is checksummed again the first time it is
  * bound in each frame and uploaded again if it changed.
  *
- * Not handled, counted instead: cube and volume textures, P8 (no palette is
- * forwarded), surfaces bound as textures, textures outside the contiguous
- * window.
+ * P8 is forwarded: the host expands palettised texels to BGRA at upload
+ * through the palette of the stage the texture is bound to, and
+ * D3DDevice_SetPalette at the end of this file supplies that palette from the
+ * guest's own resource.
+ *
+ * Not handled, counted instead: cube and volume textures, surfaces bound as
+ * textures, textures outside the contiguous window, and any format
+ * d3d8_format_bpp does not know (named in the log when one is refused).
  */
 #include "platform/xbox_winnt.h"
 #include <stdio.h>
@@ -39,6 +44,10 @@
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
 #include "hle_d3d8_record.h"
+
+/* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather than
+ * including the kernel header, which this file otherwise has no need of. */
+int xbox_EnvSwitch(const char *name, int default_on);
 
 /* From hle_d3d8.c: the shadow device, or NULL, and its swap count. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
@@ -121,20 +130,32 @@ static int read_layout(uint32_t va, texture_layout *t)
     }
     memset(t, 0, sizeof *t);
     t->fmt = (format >> 8) & 0xFF;
-    if (t->fmt == XFMT_P8 || d3d8_format_bpp((D3DFORMAT)t->fmt) == 0) {
+    /* RECOMP_HLE_D3D8_P8=1: accept palettised textures.
+     *
+     * The host side is ready for them -- d3d8_resources.c expands P8 to BGRA
+     * through d3d8_convert_linear_pixels, the device keeps four palettes, and
+     * D3DDevice_SetPalette at the end of this file forwards the guest's. Marvel
+     * vs Capcom 2 is a sprite fighter with 656 of 1106 binds refused here, so
+     * this is the difference between its art arriving and not.
+     *
+     * Off by default because turning it on has not yet been shown to help:
+     * with it on, MvC2 went from reaching gameplay in two runs out of three to
+     * none out of three, and from a flat colour to a black screen. That is
+     * either this doing more work during a start-up that is already flaky, or
+     * something wrong in the upload itself. Until that is understood the
+     * default stays where the title at least renders. */
+    if (t->fmt == XFMT_P8 && !xbox_EnvSwitch("RECOMP_HLE_D3D8_P8", 0)) {
+        g_skip_format++;
+        return 0;
+    }
+    if (d3d8_format_bpp((D3DFORMAT)t->fmt) == 0) {
         /* Say which format, once each. The count alone says a title's textures
-         * are being refused without saying what to implement, and "P8" and
-         * "a format d3d8_format_bpp does not know" are different jobs: the
-         * first needs the stage palette forwarded, the second needs the format
-         * added. Marvel vs Capcom 2 has 3172 of 4914 binds refused here and
-         * draws essentially untextured because of it. */
+         * are being refused without saying what to implement. */
         static uint8_t said[256];
         if (!said[t->fmt]) {
             said[t->fmt] = 1;
-            fprintf(stderr, "[HLE-D3D8] texture format 0x%02X refused (%s); "
-                    "draws using it are untextured\n", t->fmt,
-                    t->fmt == XFMT_P8 ? "P8, no palette is forwarded"
-                                      : "no bpp known for it");
+            fprintf(stderr, "[HLE-D3D8] texture format 0x%02X refused (no bpp "
+                    "known for it); draws using it are untextured\n", t->fmt);
             fflush(stderr);
         }
         g_skip_format++;
@@ -791,4 +812,77 @@ HLE_EXPORT(D3DDevice_SetTexture)
 int hle_d3d8_stage0_is_framebuffer(void)
 {
     return g_stage0_framebuffer;
+}
+
+HLE_ORIGINAL(D3DDevice_SetPalette);
+
+/* void D3DDevice_SetPalette(DWORD Stage, X_D3DPalette *pPalette)
+ *
+ * The other half of P8. read_layout() now lets palettised textures through,
+ * and the host expands them to BGRA at upload through the palette belonging
+ * to the stage they are bound to (d3d8_convert_linear_pixels). That palette
+ * has to come from somewhere, and this is it.
+ *
+ * X_D3DPalette is an X_D3DResource -- Common, Data, Lock -- so the entries are
+ * at the physical address in Data, the same way a texture's texels are
+ * (Cxbx-Reloaded's CxbxImpl_SetPalette takes GetDataFromXboxResource(pPalette)
+ * and nothing else). 256 entries of ARGB8888, which is what the device keeps.
+ *
+ * A null palette resets the stage to the device's grey ramp rather than
+ * leaving whatever the last title state was, so a stage that has been cleared
+ * does not silently keep stale colours.
+ *
+ * Not recorded into captures: there is no host_SetPalette wrapper, so a
+ * replayed frame expands P8 through whatever palette the replay device has
+ * rather than the one the title set. Live output is right; a capture of P8
+ * content is not, and that wants a recorded wrapper before anyone bisects a
+ * palettised frame.
+ */
+HLE_EXPORT(D3DDevice_SetPalette)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t stage = HLE_ARG(0), palette_va = HLE_ARG(1);
+#endif
+
+    if (!seen) {
+        seen = 1;
+        fprintf(stderr, "[HLE] D3DDevice_SetPalette(stage %u) replaced by name\n",
+                (unsigned)HLE_ARG(0));
+        fflush(stderr);
+    }
+    if (!hle_original_D3DDevice_SetPalette) {
+        fprintf(stderr, "[HLE] D3DDevice_SetPalette: original body missing -- "
+                        "regenerate the lift\n");
+        return;
+    }
+    HLE_CALL_ORIGINAL(D3DDevice_SetPalette);
+#ifdef _WIN32
+    {
+        IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
+        uint32_t data;
+
+        if (!dev || stage >= 4u)
+            return;
+        if (!palette_va) {
+            dev->lpVtbl->SetPalette(dev, stage, NULL);
+            return;
+        }
+        data = HLE_MEM32(palette_va + 4) & 0x0FFFFFFFu;
+        /* 256 entries of 4 bytes, and it has to be inside the window the
+         * texels live in or the pointer is not a palette. */
+        if (!data || (uint64_t)data + 1024u > CONTIG_SIZE) {
+            static int said;
+            if (!said++) {
+                fprintf(stderr, "[HLE-D3D8] SetPalette: stage %u palette data "
+                        "0x%08X is outside the contiguous window; ignored\n",
+                        (unsigned)stage, data);
+                fflush(stderr);
+            }
+            return;
+        }
+        dev->lpVtbl->SetPalette(dev, stage,
+                                (const void *)HLE_PTR(CONTIG_BASE + data));
+    }
+#endif
 }
