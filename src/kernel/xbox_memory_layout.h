@@ -211,6 +211,34 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * double-clicked. */
 int xbox_EnvSwitch(const char *name, int default_on);
 
+/* The guest lock: one guest thread runs lifted code at a time.
+ *
+ * The Xbox is uniprocessor. Guest code raises IRQL as mutual exclusion and
+ * spins without barriers, which is sound on one core and is not sound here,
+ * because PsCreateSystemThreadEx spawns real host threads that run lifted
+ * code in parallel. The planned design was always a cooperative single-
+ * threaded model; this is the cheap way to find out whether that is what the
+ * remaining corruption is, before building it.
+ *
+ * Held across lifted code and dropped around every kernel bridge call, so no
+ * thread can block while holding it. Drop returns the recursion depth it
+ * released and Restore takes it back, because a bridge that runs guest code
+ * can re-enter.
+ *
+ * RECOMP_GUEST_LOCK=1 turns it on. Off by default: this is an experiment,
+ * and a title that works today must not change because of one.
+ */
+void xbox_GuestLockInit(void);
+void xbox_GuestLockEnter(void);
+void xbox_GuestLockLeave(void);
+int  xbox_GuestLockDrop(void);
+void xbox_GuestLockRestore(int held);
+int  xbox_GuestLockOn(void);
+int  xbox_GuestConcurrencyOn(void);
+void xbox_GuestLiftedEnter(void);
+void xbox_GuestLiftedLeave(void);
+void xbox_GuestConcurrencyReport(void);
+
 void xbox_Nv2aFlipGateArm(void);
 void xbox_Nv2aFlipGateRelease(void);
 

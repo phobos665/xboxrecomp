@@ -490,6 +490,7 @@ static int      g_ps_def_seen, g_ps_dirty;
  * out differently would otherwise have every draw quietly demoted. */
 static int      g_ps_def_ok;
 static int      g_state_dumped;
+static int g_state_dump_wanted = -1;
 
 /* A guest heap pointer, roughly: inside the console's RAM, aligned, not a
  * small integer. HLE_MEM32 has no mapped-page check, so a handle that is a
@@ -773,7 +774,17 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
      * way to tell a state that was never set from one that was set to zero
      * without looking. Black issues ten thousand draws a run, all of them
      * accepted by the renderer, and produces nothing. */
-    if (!g_state_dumped && getenv("RECOMP_HLE_D3D8_STATE_DUMP")) {
+    /* The lookup is cached, not just the dump.
+     *
+     * g_state_dumped is only set when the dump runs, so with the variable
+     * unset -- which is every ordinary run -- the short circuit fell
+     * through to getenv on every call, and this is called once per draw.
+     * Dino Crisis 3 issues around 300,000 draws in a minute at its menus.
+     * Caching only the success of a diagnostic makes the failure path the
+     * expensive one, which is backwards. */
+    if (g_state_dump_wanted < 0)
+        g_state_dump_wanted = getenv("RECOMP_HLE_D3D8_STATE_DUMP") != NULL;
+    if (!g_state_dumped && g_state_dump_wanted) {
         g_state_dumped = 1;
         fprintf(stderr, "[HLE-D3D8] state dump, guest values as forwarded:\n");
         for (i = 0; i < sizeof g_rs_map / sizeof g_rs_map[0]; i++)

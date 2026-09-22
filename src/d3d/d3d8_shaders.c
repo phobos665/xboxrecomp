@@ -279,6 +279,8 @@ static const char g_ps_body[] =
     "    // Per-stage: x=alphaarg1, y=alphaarg2, z=0, w=0\n"
     "    uint4  StageAlpha[4];\n"
     "    uint4  AlphaOnly;\n"
+    "    // Per-stage texel -> normalised scale; 1 unless the texture is linear\n"
+    "    float4 TexScale[4];\n"
     "};\n"
     "\n"
     "struct PS_IN {\n"
@@ -458,8 +460,9 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
     for (i = 0; i < 4; i++) {
         UINT dim = (sig >> (i * 2)) & 3u;
         off += snprintf(buf + off, bufsize - off,
-                        "    texels[%d] = tex%d.Sample(samp%d, input.tex%d.%s);\n",
-                        i, i, i, i, dim ? "xyz" : "xy");
+                        dim ? "    texels[%d] = tex%d.Sample(samp%d, input.tex%d.xyz);\n"
+                            : "    texels[%d] = tex%d.Sample(samp%d, input.tex%d.xy * TexScale[%d].xy);\n",
+                        i, i, i, i, i);
         /* Xbox A8 samples white RGB; DXGI A8 supplies zero RGB. */
         off += snprintf(buf + off, bufsize - off,
                         "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
@@ -612,6 +615,7 @@ typedef struct {
     UINT  stage_color[4][4];     /* [stage][x=colorop, y=arg1, z=arg2, w=alphaop] */
     UINT  stage_alpha[4][4];     /* [stage][x=alphaarg1, y=alphaarg2, z=0, w=0] */
     UINT  alpha_only[4];
+    float tex_scale[4][4];       /* [stage][1/w, 1/h, 0, 0] for a linear texture, else 1 */
 } PSConstants;
 
 /* ================================================================
@@ -1185,9 +1189,19 @@ void d3d8_shaders_prepare_draw(DWORD handle)
 
         /* Per-stage texture state */
         for (stage = 0; stage < 4; stage++) {
-            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(stage));
+            IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(stage);
+            D3DFORMAT format = d3d8_base_format(tex);
             const DWORD *tss = d3d8_GetTSS(stage);
+            UINT w = 0, h = 0;
             pc->alpha_only[stage] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+            /* Linear textures are addressed in texels on the NV2A; see
+             * NV2APSConstants.tex_scale in d3d8_combiners.h. */
+            pc->tex_scale[stage][0] = pc->tex_scale[stage][1] = 1.0f;
+            pc->tex_scale[stage][2] = pc->tex_scale[stage][3] = 0.0f;
+            if (tex && d3d8_format_is_linear(format) && d3d8_base_size(tex, &w, &h) && w && h) {
+                pc->tex_scale[stage][0] = 1.0f / (float)w;
+                pc->tex_scale[stage][1] = 1.0f / (float)h;
+            }
             if (!tss) {
                 pc->stage_color[stage][0] = D3DTOP_DISABLE;
                 continue;

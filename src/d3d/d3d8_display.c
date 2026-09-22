@@ -11,6 +11,7 @@
  * the life of the process, so there is nothing to recompile for.
  */
 #include "d3d8_display.h"
+#include "recomp_config.h"
 
 #if defined(_WIN32)
 
@@ -32,7 +33,7 @@ static int               g_policy_read;
 const D3D8DisplayPolicy *d3d8_display_policy(void)
 {
     if (!g_policy_read) {
-        const char *v = getenv("RECOMP_RES_SCALE");
+        const char *v = recomp_config_lookup("RECOMP_RES_SCALE", "resolution_scale");
         long n = 1;
 
 
@@ -52,7 +53,7 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
         }
 
         g_policy.anisotropy = 1;
-        v = getenv("RECOMP_ANISO");
+        v = recomp_config_lookup("RECOMP_ANISO", "anisotropy");
         if (v && *v) {
             long a = strtol(v, NULL, 10);
 
@@ -67,9 +68,7 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
         if (g_policy.scale > 1)
             fprintf(stderr, "D3D8 display: supersampling %ux, box filtered at present\n",
                     g_policy.scale);
-        v = getenv("RECOMP_WIDESCREEN");
-        g_policy.widescreen = v && !(strcmp(v, "0") == 0 || _stricmp(v, "off") == 0 ||
-                                     _stricmp(v, "no") == 0 || _stricmp(v, "false") == 0);
+        g_policy.widescreen = recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
 
         if (g_policy.widescreen)
             fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "

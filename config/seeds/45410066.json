@@ -1,0 +1,26 @@
+[
+ {
+  "start": "0x00156CB0",
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x003801D9",
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0046C904",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0046D30B",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00030160",
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime (thread #5, spawned after the intro movie); reached through an unresolved indirect call once."
+ },
+ {
+  "start": "0x00191B10",
+  "note": "Indirect-call target observed at runtime, called once from 0x00078F74 after the intro movie."
+ }
+]

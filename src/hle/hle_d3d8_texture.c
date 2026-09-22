@@ -54,11 +54,13 @@ IDirect3DDevice8 *hle_d3d8_shadow_device(void);
 unsigned long hle_d3d8_shadow_swaps(void);
 /* Whether these texels are the frame buffer's -- see hle_d3d8.c. */
 int hle_d3d8_is_framebuffer(uint32_t phys);
+int hle_d3d8_trace_on(void);
 
 #define CONTIG_BASE          0x80000000u
 #define CONTIG_SIZE          (64u * 1024u * 1024u)   /* kernel.h XBOX_CONTIG_SIZE */
 #define COMMON_TYPE_MASK     0x00070000u
 #define COMMON_TYPE_TEXTURE  0x00040000u
+#define COMMON_TYPE_SURFACE  0x00050000u
 #define FORMAT_CUBEMAP       0x00000004u
 #define XFMT_P8              0x0B
 #define TEXTURE_CACHE        512
@@ -120,7 +122,17 @@ static int read_layout(uint32_t va, texture_layout *t)
     uint32_t l;
     uint64_t bytes = 0;
 
-    if ((common & COMMON_TYPE_MASK) != COMMON_TYPE_TEXTURE) {
+    /* A D3DSurface is accepted as well as a D3DTexture. On the Xbox both are
+     * D3DPixelContainers with the same Format, Size and Data fields, and the
+     * hardware reads a texture from those three, so a title can hand
+     * SetTexture a surface and it works. TimeSplitters: Future Perfect does:
+     * its colour-grading quad binds the back buffer's surface object
+     * (0x003E5984, common type 5) and samples the scene through it. Refused
+     * here as "not a texture", that bind got the 1x1 white placeholder, and
+     * the whole graded frame came out white -- once per frame, for 3,296 of
+     * the run's skipped binds. */
+    if ((common & COMMON_TYPE_MASK) != COMMON_TYPE_TEXTURE &&
+        (common & COMMON_TYPE_MASK) != COMMON_TYPE_SURFACE) {
         g_skip_type++;
         return 0;
     }
@@ -799,6 +811,18 @@ HLE_EXPORT(D3DDevice_SetTexture)
         host_SetTexture(dev, stage,
                         (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
         g_bound_count++;
+        if (hle_d3d8_trace_on()) {
+            int fb = 0, i;
+            for (i = 0; host && i < g_texture_count; i++)
+                if (g_textures[i].host == host && g_textures[i].framebuffer)
+                    fb = 1;
+            fprintf(stderr, "[TRACE swap %lu] SetTexture stage %u <- 0x%08X common 0x%08X "
+                    "data 0x%08X format 0x%08X size 0x%08X -> %s\n",
+                    hle_d3d8_shadow_swaps(), stage, texture,
+                    texture ? HLE_MEM32(texture) : 0, texture ? HLE_MEM32(texture + 4) : 0,
+                    texture ? HLE_MEM32(texture + 12) : 0, texture ? HLE_MEM32(texture + 16) : 0,
+                    !texture ? "none" : fb ? "frame buffer copy" : host ? "host texture" : "white");
+        }
         report();
     }
 #endif

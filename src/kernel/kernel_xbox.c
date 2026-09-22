@@ -11,6 +11,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
+#include "recomp_config.h"
 #include <string.h>
 /* getenv: without <stdlib.h> its pointer is truncated to int. */
 #include <stdlib.h>
@@ -218,7 +219,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         if (ValueLength >= sizeof(ULONG)) {
             ULONG flags = 0;
 
-            if (xbox_EnvSwitch("RECOMP_WIDESCREEN", 0))
+            if (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0))
                 flags |= XC_VIDEO_FLAGS_WIDESCREEN;
             *(PULONG)Value = XC_VIDEO_RAW(flags);
             if (Type) *Type = 4; /* REG_DWORD */

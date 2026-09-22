@@ -785,6 +785,34 @@ class DisasmEngine:
         # ...through the register the load just filled.
         return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
 
+    def follows_padding(self, addr: int) -> bool:
+        """
+        Read-only: is the byte before `addr` the linker's inter-function
+        padding -- `int3` (0xCC) or `nop` (0x90)?
+
+        The other evidence that a seed inside an already-decoded instruction
+        is right and the sweep is wrong. A function does not have to open
+        with a prologue: TimeSplitters: Future Perfect's callback at
+        0x00191B10 opens with `mov ecx, [mem]`, and the sweep had walked the
+        byte-index table of the switch before it (00 06 06 01 06 02 ...) as
+        instructions, swallowing the function's first two bytes inside
+        `add al, [eax+0xd8bcccc]`. MSVC pads to the next function with 0xCC,
+        so a claimed start that sits right after padding is one the sweep
+        drifted over, whatever its first instruction is. That callback was
+        the title's menu handler; skipped as an unresolved target it left the
+        stack four bytes high, and the corruption ran from there.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+        offset = addr - section.virtual_addr
+        if offset < 1 or offset >= len(data):
+            return False
+        return data[offset - 1] in (0xCC, 0x90)
+
     def probes_as_prologue(self, addr: int) -> bool:
         """
         Read-only: do the bytes at `addr` start with a recognisable MSVC

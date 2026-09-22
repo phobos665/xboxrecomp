@@ -289,16 +289,28 @@ HLE_EXPORT(XInputGetState)
          * splits here into a binding that produces nothing, a title that
          * never reads this port, and a title that reads it and does
          * nothing with it -- and only the last one is the title's fault. */
-        if (input_log_wanted() && (pad.buttons || pad.thumb_lx || pad.thumb_ly ||
-                                   pad.thumb_rx || pad.thumb_ry)) {
-            static ULONGLONG next;
-            ULONGLONG now = GetTickCount64();
-            if (now >= next) {
-                next = now + 500;
-                fprintf(stderr, "[INPUT] port %u reads buttons 0x%04X lx %6d ly %6d "
-                        "rx %6d ry %6d\n", port + 1u, pad.buttons, pad.thumb_lx,
-                        pad.thumb_ly, pad.thumb_rx, pad.thumb_ry);
-                fflush(stderr);
+        if (input_log_wanted()) {
+            /* The analog buttons too (A B X Y black white L R): on this
+             * console those are bytes, not bits in wButtons, and a scripted
+             * `a` press that never appears here is what "the menu ignores
+             * A" looks like from the title's side. */
+            int any = pad.buttons || pad.thumb_lx || pad.thumb_ly ||
+                      pad.thumb_rx || pad.thumb_ry;
+            for (i = 0; i < RECOMP_INPUT_ANALOG_BUTTON_COUNT; i++)
+                any |= pad.analog_buttons[i] != 0;
+            if (any) {
+                static ULONGLONG next;
+                ULONGLONG now = GetTickCount64();
+                if (now >= next) {
+                    next = now + 500;
+                    fprintf(stderr, "[INPUT] port %u reads buttons 0x%04X analog", port + 1u,
+                            pad.buttons);
+                    for (i = 0; i < RECOMP_INPUT_ANALOG_BUTTON_COUNT; i++)
+                        fprintf(stderr, " %02X", pad.analog_buttons[i]);
+                    fprintf(stderr, " lx %6d ly %6d rx %6d ry %6d\n", pad.thumb_lx,
+                            pad.thumb_ly, pad.thumb_rx, pad.thumb_ry);
+                    fflush(stderr);
+                }
             }
         }
     }

@@ -210,7 +210,11 @@ class Disassembler:
                     # A prologue is the evidence that separates the two cases:
                     # the bad HL2 seed at 0x00202C2E is six bytes into a mov
                     # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
+                    # ...or sits right after the linker's 0xCC / 0x90 padding,
+                    # which is where a function starts whether or not it has
+                    # a prologue (engine.follows_padding has the case).
+                    if (self.engine.probes_as_prologue(addr)
+                            or self.engine.follows_padding(addr)):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(

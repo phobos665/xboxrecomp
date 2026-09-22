@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "recomp_config.h"
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
  *
@@ -636,6 +637,140 @@ static const struct { int divisor, strict; const char *name; } g_gate_modes[] = 
  * window, so they default on and the variable turns them off. "0", "off",
  * "no" and "false" mean off; anything else, including an empty value, means
  * on. */
+/* ── The guest lock ─────────────────────────────────────────────────────
+ * See xbox_memory_layout.h for what it is for. A CRITICAL_SECTION because it
+ * is recursive and uncontended acquisition is cheap, which matters: this is
+ * taken and dropped once per kernel call, and Dino Crisis 3 makes over a
+ * million of those a minute. */
+static CRITICAL_SECTION g_guest_cs;
+static int g_guest_cs_ready;
+static int g_guest_lock_on = -1;
+static RECOMP_TLS int g_guest_depth;
+
+/* How often two guest threads are inside lifted code at the same time.
+ *
+ * The threading hypothesis rests on that happening at all, and waiting for
+ * the resulting corruption to show is a poor way to find out: Dino Crisis 3
+ * faults on roughly one run in twenty, so an A/B of the guest lock over eight
+ * runs a side produced zero events on both sides and settled nothing.
+ *
+ * This measures the hazard instead of the damage, and it is deterministic.
+ * A guest thread is "in lifted code" whenever it is not inside a kernel
+ * bridge, which the existing drop/restore around bridge() already brackets.
+ * If the peak is 1, guest threads never overlap and threading cannot be the
+ * cause whatever else is wrong; if it is above 1, the uniprocessor
+ * assumption is being violated continuously and that is worth fixing on its
+ * own terms, crash or no crash.
+ *
+ * RECOMP_GUEST_CONCURRENCY=1. Independent of the lock, so the hazard can be
+ * measured with the lock off, which is the configuration that ships.
+ */
+static volatile LONG g_lifted_now;
+static volatile LONG g_lifted_peak;
+static volatile LONG g_lifted_overlaps;
+static int g_concurrency_on = -1;
+
+int xbox_GuestConcurrencyOn(void)
+{
+    if (g_concurrency_on < 0)
+        g_concurrency_on = xbox_EnvSwitch("RECOMP_GUEST_CONCURRENCY", 0);
+    return g_concurrency_on;
+}
+
+void xbox_GuestLiftedEnter(void)
+{
+    LONG n;
+    if (!xbox_GuestConcurrencyOn())
+        return;
+    n = InterlockedIncrement(&g_lifted_now);
+    if (n > 1)
+        InterlockedIncrement(&g_lifted_overlaps);
+    for (;;) {
+        LONG peak = g_lifted_peak;
+        if (n <= peak ||
+            InterlockedCompareExchange(&g_lifted_peak, n, peak) == peak)
+            break;
+    }
+}
+
+void xbox_GuestLiftedLeave(void)
+{
+    if (!xbox_GuestConcurrencyOn())
+        return;
+    InterlockedDecrement(&g_lifted_now);
+}
+
+void xbox_GuestConcurrencyReport(void)
+{
+    if (!xbox_GuestConcurrencyOn())
+        return;
+    fprintf(stderr, "  [CONCURRENCY] peak guest threads in lifted code: %ld; "
+                    "entries that found another already there: %ld\n",
+            (long)g_lifted_peak, (long)g_lifted_overlaps);
+    fflush(stderr);
+}
+
+int xbox_GuestLockOn(void)
+{
+    if (g_guest_lock_on < 0)
+        g_guest_lock_on = xbox_EnvSwitch("RECOMP_GUEST_LOCK", 0);
+    return g_guest_lock_on;
+}
+
+void xbox_GuestLockInit(void)
+{
+    if (g_guest_cs_ready)
+        return;
+    InitializeCriticalSection(&g_guest_cs);
+    g_guest_cs_ready = 1;
+    if (xbox_GuestLockOn()) {
+        fprintf(stderr, "  Guest lock: on -- one guest thread runs lifted "
+                        "code at a time (RECOMP_GUEST_LOCK=0 to switch off)\n");
+        fflush(stderr);
+    }
+}
+
+void xbox_GuestLockEnter(void)
+{
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready)
+        return;
+    EnterCriticalSection(&g_guest_cs);
+    g_guest_depth++;
+}
+
+void xbox_GuestLockLeave(void)
+{
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready || g_guest_depth <= 0)
+        return;
+    g_guest_depth--;
+    LeaveCriticalSection(&g_guest_cs);
+}
+
+/* Release every level this thread holds, so it cannot block while holding
+ * the lock, and report how many to take back afterwards. */
+int xbox_GuestLockDrop(void)
+{
+    int held = 0;
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready)
+        return 0;
+    while (g_guest_depth > 0) {
+        g_guest_depth--;
+        LeaveCriticalSection(&g_guest_cs);
+        held++;
+    }
+    return held;
+}
+
+void xbox_GuestLockRestore(int held)
+{
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready)
+        return;
+    while (held-- > 0) {
+        EnterCriticalSection(&g_guest_cs);
+        g_guest_depth++;
+    }
+}
+
 int xbox_EnvSwitch(const char *name, int default_on)
 {
     const char *v = name ? getenv(name) : NULL;
@@ -651,7 +786,7 @@ int xbox_EnvSwitch(const char *name, int default_on)
 static int flip_gate_divisor(void)
 {
     if (g_flip_gate_divisor < 0) {
-        const char *cap = getenv("RECOMP_FPS_CAP");
+        const char *cap = recomp_config_lookup("RECOMP_FPS_CAP", "frame_cap");
         const char *hz = getenv("RECOMP_VBLANK_HZ");
         int vblank = hz && atoi(hz) > 0 ? atoi(hz) : 60;
         int d = 1;                                      /* adaptive unless asked */
@@ -1708,6 +1843,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
             /* The bound above reaches past the region word, so the title
              * name at +0x0C is already known to be inside the file. */
+            /* The settings file is named for the title, so the id goes
+             * over as soon as it is known -- before anything reads a
+             * setting, since nothing has drawn yet. */
+            recomp_config_set_title(*(const uint32_t *)(xbe + cert_off + 0x08));
+
             xbe_title_name_store((const unsigned char *)xbe + cert_off + CERT_TITLE_NAME);
             if (g_xbe_title_name[0])
                 fprintf(stderr, "  XBE certificate: title \"%s\"\n", g_xbe_title_name);
@@ -2779,9 +2919,41 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         if (g_heap_blocks[i].addr & (alignment - 1)) {
             continue;   /* wrong alignment for this request */
         }
+        /* Hand back only what was asked for, and keep the rest available.
+         *
+         * Taking the whole block is what first-fit does if you let it, and
+         * the waste is not marginal: free a 29 MB heap, ask for 16 bytes,
+         * and the 29 MB goes with it until that 16-byte pointer is freed.
+         * Mortal Kombat: Deadly Alliance allocates and frees exactly that
+         * sized block while sizing its heaps.
+         *
+         * The remainder becomes its own free block immediately after this
+         * one. Index order is address order -- xbox_HeapFree's coalescing
+         * depends on that -- so it is inserted at i + 1 rather than appended,
+         * and the two merge back together when this block is freed.
+         *
+         * doaxbv-re (GPL-3.0) fixed the same exhaustion the same way; this is
+         * the same idea written against our block table.
+         */
+        {
+            uint32_t spare = g_heap_blocks[i].size - size;
+            /* Not worth a table entry, and a split that leaves a few bytes
+             * fragments the heap faster than it saves it. */
+            if (spare >= 64u && g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+                memmove(&g_heap_blocks[i + 2], &g_heap_blocks[i + 1],
+                        (size_t)(g_heap_block_count - i - 1)
+                            * sizeof g_heap_blocks[0]);
+                g_heap_block_count++;
+                g_heap_blocks[i + 1].addr = g_heap_blocks[i].addr + size;
+                g_heap_blocks[i + 1].size = spare;
+                g_heap_blocks[i + 1].free = 1;
+                g_heap_blocks[i].size = size;
+            }
+        }
         g_heap_blocks[i].free = 0;
         result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        memset((void *)((uintptr_t)result + g_memory_offset), 0,
+               g_heap_blocks[i].size);
         return result;
     }
 

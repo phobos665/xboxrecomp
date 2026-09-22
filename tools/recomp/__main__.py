@@ -128,8 +128,28 @@ def game_categories(classification_db):
     conversion in the game produce garbage, which surfaces much later as a
     corrupt pointer in an unrelated function. Excluding library code is only
     sound once something actually implements it.
+
+    "data_init" is included for exactly the same reason, and it took Black to
+    notice. func_id's stub_pattern classifier gives that category to any short
+    function that is a chain of SSE float moves ending in ret, on the theory
+    that a static initialiser has already done its work by the time the image
+    is on disc. They are ordinary functions, and Black calls sixteen of them
+    through function pointers: every one came back "unresolved call target",
+    every one returned 0, and the title presented 3,774 entirely black frames.
+    Seeding them did not help and could not have -- they were found, they were
+    classified, they became function starts, and then this set dropped them
+    before anything was translated. That loop is worth naming, because from
+    the outside it looks exactly like a seed file that is not being read:
+    tools.seed_from_log reports them as "already seeded" on every subsequent
+    run while the runtime goes on reporting them as unresolved.
+
+    The paragraph above said the sharper the classifier gets, the more
+    --game-only leaves out, and then this happened one category later. So the
+    rule to apply to a new category is the one that was already right for crt:
+    a category may only be excluded once something actually implements it, and
+    a classifier deciding code is uninteresting is not an implementation.
     """
-    categories = {"unknown", "crt"}
+    categories = {"unknown", "crt", "data_init"}
     for entry in classification_db.values():
         category = entry.get("category")
         if category and category.startswith("game_"):

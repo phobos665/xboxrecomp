@@ -398,6 +398,16 @@ void xbox_kernel_init(void)
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
 
+    /* The guest lock, and the main thread takes it: everything after this
+     * on this thread is the title running, and it is dropped at each
+     * kernel call like any other guest thread. */
+    xbox_GuestLockInit();
+    xbox_GuestLockEnter();
+    xbox_GuestLiftedEnter();
+
+    /* Timer base, before anything can ask for a timestamp. */
+    xbox_hal_init_timers();
+
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
     g_log_cs_init = TRUE;

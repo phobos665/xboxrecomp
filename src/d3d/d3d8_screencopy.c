@@ -185,6 +185,63 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 
     ID3D11DeviceContext_OMGetRenderTargets(ctx, 1, &saved_rtv, &saved_dsv);
     ID3D11DeviceContext_RSGetViewports(ctx, &saved_vps, saved_vp);
+    /* RECOMP_D3D8_SCREENCOPY_PROBE=1: what the source holds at the moment of
+     * the copy, read back through a staging texture, and whether drawing was
+     * going to the scene target at all. The texture layer's own probe reads
+     * the destination; when that says "not arriving" this says which side
+     * is empty. */
+    {
+        static int probe = -1;
+        static unsigned long said;
+        if (probe < 0) {
+            const char *v = getenv("RECOMP_D3D8_SCREENCOPY_PROBE");
+            probe = (v && atoi(v) > 0) ? atoi(v) : 0;   /* how many copies to report */
+        }
+        if (probe && said++ < (unsigned long)probe) {
+            ID3D11Texture2D *scene = d3d8_GetSceneTexture();
+            ID3D11Texture2D *staging = NULL;
+            D3D11_TEXTURE2D_DESC sd;
+            D3D11_MAPPED_SUBRESOURCE m;
+            unsigned long long sum = 0;
+            unsigned nonzero = 0, samples = 0;
+
+            if (scene) {
+                ID3D11Texture2D_GetDesc(scene, &sd);
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.BindFlags = 0;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                sd.MiscFlags = 0;
+                if (SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &staging))) {
+                    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging,
+                                                     (ID3D11Resource *)scene);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0,
+                                                          D3D11_MAP_READ, 0, &m))) {
+                        UINT x, y;
+                        for (y = 0; y < sd.Height; y += 16) {
+                            const uint8_t *row = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+                            for (x = 0; x < sd.Width; x += 16) {
+                                const uint8_t *p = row + (size_t)x * 4u;
+                                sum += (unsigned)p[0] + p[1] + p[2];
+                                samples += 3;
+                                if (p[0] || p[1] || p[2]) nonzero++;
+                            }
+                        }
+                        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+                    }
+                    ID3D11Texture2D_Release(staging);
+                }
+            }
+            fprintf(stderr, "D3D8 screen copy probe: scene %ux%u holds mean %.1f/255, %u of %u "
+                    "non-zero; current target %s the scene; dst %ux%u scale %g x %g\n",
+                    scene ? sd.Width : 0, scene ? sd.Height : 0,
+                    samples ? (double)sum / samples : 0.0, nonzero, samples / 3u,
+                    saved_rtv == d3d8_GetDefaultRTV() ? "is" : "is NOT",
+                    tex->width, tex->height,
+                    tex->width ? (double)back_w / tex->width : 0.0,
+                    tex->height ? (double)back_h / tex->height : 0.0);
+            fflush(stderr);
+        }
+    }
 
     if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g.cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
