@@ -789,6 +789,7 @@ VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);
+void xbox_hal_init_timers(void);
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void);
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void);
 VOID    __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime);

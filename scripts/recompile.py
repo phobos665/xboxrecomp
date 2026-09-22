@@ -183,10 +183,12 @@ def main() -> int:
     ap.add_argument("xbe", help="Path to the title's default.xbe")
     ap.add_argument("--seeds", action="append", default=None, metavar="FILE",
                     help="Seed file of extra entry points. Repeatable. "
-                         "Defaults to config/seed_functions.json when it "
-                         "exists; pass --no-seeds to disable.")
+                         "Defaults to config/seeds/<TITLEID>.json for "
+                         "the XBE given -- the file tools.seed_from_log "
+                         "writes -- when one exists; --no-seeds "
+                         "disables it.")
     ap.add_argument("--no-seeds", action="store_true",
-                    help="Ignore the default seed file")
+                    help="Ignore this title's seed file")
     ap.add_argument("--trace-all-entries", action="store_true",
                     help="Hook every function's entry so a profiled run can "
                          "report how many distinct functions it reached. That "

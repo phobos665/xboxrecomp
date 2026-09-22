@@ -93,6 +93,7 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* Defined in recomp_trace.c. Declared here rather than pulled from
  * the generated headers, which this file does not include. */
 void recomp_profile_dump(void);
+void recomp_exit_trace_init(void);      /* src/kernel/exit_trace.c */
 
 /* Defined in kernel_bridge.c: the APU is a separate library the kernel must
  * not need to link, so the kernel takes its interrupt line as a callback. */
@@ -243,7 +244,7 @@ static void print_guest_context(void *rip)
          * loaded out of is usually sitting in the frame -- invisible in
          * the filtered list above, which keeps only code addresses. */
         fprintf(stderr, "  guest stack (raw):\n");
-        for (i = 0; i < 16; i += 4)
+        for (i = 0; i < 48; i += 4)
             fprintf(stderr, "    [esp+%-3d] %08X %08X %08X %08X\n",
                     i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
     }
@@ -521,6 +522,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    /* And the other way a run ends: an exit nobody logged. Prints [EXIT]
+     * with the code and both stacks before the process goes (exit_trace.c). */
+    recomp_exit_trace_init();
 
     /* Step 1: Find and load the XBE */
     {

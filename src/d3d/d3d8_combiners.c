@@ -606,6 +606,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    uint   alpha_test_enable;\n");
     EMIT("    uint   fog_enable;\n");
     EMIT("    uint4  alpha_only;\n");
+    EMIT("    float4 tex_scale[4];\n");   /* texel -> normalised, linear textures */
     EMIT("};\n\n");
 
     /* ---- Input structure ---- */
@@ -661,8 +662,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d);\n",
                  i, i, i, i);
         } else {
-            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d.xy);\n",
-                 i, i, i, i);
+            EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d.xy * tex_scale[%d].xy);\n",
+                 i, i, i, i, i);
         }
         /* Preserve disabled stages and sampled alpha. */
         if (state->tex_mode[i] != NV2A_TEXMODE_NONE)
@@ -1267,8 +1268,19 @@ BOOL d3d8_combiners_prepare_draw(void)
         cb->alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
         cb->fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
         for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
-            D3DFORMAT format = d3d8_base_format(d3d8_GetStageTexture(i));
+            IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(i);
+            D3DFORMAT format = d3d8_base_format(tex);
+            UINT w = 0, h = 0;
+
             cb->alpha_only[i] = format == D3DFMT_A8 || format == D3DFMT_LIN_A8;
+            /* Linear textures are addressed in texels on the NV2A; see
+             * NV2APSConstants.tex_scale. */
+            cb->tex_scale[i][0] = cb->tex_scale[i][1] = 1.0f;
+            cb->tex_scale[i][2] = cb->tex_scale[i][3] = 0.0f;
+            if (tex && d3d8_format_is_linear(format) && d3d8_base_size(tex, &w, &h) && w && h) {
+                cb->tex_scale[i][0] = 1.0f / (float)w;
+                cb->tex_scale[i][1] = 1.0f / (float)h;
+            }
         }
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);

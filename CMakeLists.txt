@@ -49,6 +49,14 @@ endif()
 # the kernel HLE and the graphics/audio/input layers build on.
 add_subdirectory(src/platform)
 
+# Player settings, read by the d3d backend, the kernel and the HLE, so it
+# comes before all three and depends on none of them.
+add_subdirectory(src/config)
+
+# The launcher a title ships beside its game. Defines recomp_add_launcher
+# for a title's CMakeLists to call; builds nothing on its own.
+add_subdirectory(src/launcher)
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 

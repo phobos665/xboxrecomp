@@ -137,6 +137,32 @@ back to exactly the old behaviour when there is none. `py -3 -m tools.input_ui` 
 that writes it. See `docs/technical/input-binding.md`. `RECOMP_FAKE_INPUT` and
 `RECOMP_INPUT_SEQ` still apply to controller 1 and ignore the bindings.
 
+**Update, 22 Sep 2026 -- TimeSplitters: Future Perfect (XDK 5849) reaches its front end.**
+Five faults sat on top of each other and each needed its own measurement; the
+list, with the tool that found each, is in `docs/technical/shadow-mode.md` ("A frame
+that never reaches the back buffer"). The short form: the XMV entry that builds the
+movie's DirectSound stream is now replaced (`XMVPlaybackCreateAudioStream`), XMV status
+1 means *new frame* and 2 *end of file* (the HLE had 1 as finished, and FP waited
+forever), a surface over frame-buffer memory is the screen whatever its parent
+(`g_swap_data`), a title may bind a D3DSurface as a texture (common type 5), and linear
+textures are addressed in **texels**, so both pixel paths scale by 1/size for LIN_
+formats. Three new switches for this class of problem: `RECOMP_HLE_D3D8_TRACE_SWAPS=a-b`
+(the order of a frame, including what the XDK does inside Swap's own body -- FP's swap
+callback draws its colour grading there), `RECOMP_HLE_D3D8_FB_PROBE=1` and
+`RECOMP_D3D8_SCREENCOPY_PROBE=n`. Still blocking FP's menu: ~25 s in, the title's arena
+fill runs with a NULL base and zeroes guest 0..0x80000 (found with
+`RECOMP_WATCH_WRITE=0x0001EDCC`); on hardware that faults, so a runtime divergence
+precedes it. **Seeds are applied by the disassembly stage:** `--only lift` and
+`--from identify` leave a new seed undetected; use `--from disasm`.
+
+**Process exits are traced (22 Sep 2026):** `src/kernel/exit_trace.c` hooks
+ExitProcess/TerminateProcess/ExitThread and the ntdll funnel under them in every loaded
+module's import table and prints `[EXIT] <call>(code)` with host and guest stacks.
+Built for TimeSplitters 2's unexplained `0xFFFFFFFF` exit (one driven run in two to
+three, once 4.7 s in, no fault, no kernel call). `RECOMP_EXIT_TRACE=0` turns it off. A
+`timeout`-killed run shows as `ExitProcess(0x8F)` from a remote thread -- that is the
+killer, not the title.
+
 Two things that cost days and are worth knowing before touching this code. The title's
 **deferred render state arrays do not follow its pixel shader** — `SetPixelShader` selects
 an object carrying a `D3DPIXELSHADERDEF`, and the arrays hold whichever shader last went

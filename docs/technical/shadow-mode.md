@@ -92,6 +92,53 @@ on Windows and Linux.
 | `RECOMP_D3D8_CAPTURE_SWAP`, `_EVERY`, `_MINDRAWS` | which frames to record |
 | `RECOMP_D3D8_PS_SHOW=<reg>` | draw one combiner register instead of the result: `v0`, `t0`, `r0`, `fog`, or `<reg>a` for its alpha |
 | `RECOMP_D3D8_PS_DUMP=1`, `RECOMP_D3D8_VS_DUMP=1` | print the generated HLSL |
+| `RECOMP_HLE_D3D8_TRACE_SWAPS=<from>-<to>` | one line per SetRenderTarget, SetTexture, Clear, GetBackBuffer2, CopyRects and Swap while the swap count is in the range: the order of a frame, including what the XDK does inside Swap's own body |
+| `RECOMP_HLE_D3D8_FB_PROBE=1` | after each copy of the host frame into a title's frame-buffer texture, what the texture now holds |
+| `RECOMP_D3D8_SCREENCOPY_PROBE=<n>` | for the first n copies, what the *source* held and whether drawing was going to the scene target |
+
+## A frame that never reaches the back buffer (Future Perfect, 22 Sep 2026)
+
+TimeSplitters: Future Perfect drew 69,000 times a minute and the screen stayed
+pure white. Five things were wrong at once, and each needed a measurement:
+
+1. **Its scene goes into a texture over the frame buffer.** The title wraps
+   frame buffer A (data 0x00204000) in a texture of its own with
+   `XGSetTextureHeader`, takes a surface of that texture each frame and sets
+   it as the render target. Judged by its parent, that surface was "a render
+   target texture" and every draw went into a host texture nothing presented.
+   Now a surface whose data pointer is one of the swap surfaces' (the target
+   CreateDevice set, plus whatever `GetBackBuffer2` has returned) is the
+   screen, whatever it hangs off. Read the log's `data` fields, not the
+   parent.
+2. **Its device is `D3DSWAPEFFECT_COPY` with one back buffer**, and it calls
+   `Swap(D3DSWAP_BYPASSCOPY)` then `Swap(D3DSWAP_FINISH)` every frame. The
+   trace shows the XDK's Swap body itself setting the front buffer as the
+   target and drawing a full-screen quad -- the title's swap callback, doing
+   the back-to-front copy through a five-stage colour-grading combiner. The
+   `[TRACE]` lines that appear *between* "Swap flags 0x2" and the next
+   frame boundary are that callback. Both swaps present here; the second
+   shows the same frame again.
+3. **The callback binds the back buffer's *surface* object as its texture**
+   (common type 5, not 4). The texture layer refused it as "not a texture"
+   -- 3,296 skipped binds, one per frame -- and the quad sampled the 1x1
+   white placeholder. A D3DSurface is a pixel container with the same
+   Format, Size and Data fields, and the hardware reads it as a texture, so
+   it is accepted now.
+4. **The copy of the host frame into that texture must happen at bind time,
+   inside Swap's body**, when the scene is still in the scene target. A
+   snapshot taken at the frame boundary was tried and pinned a stale black
+   copy: by then the target held the graded output, not the scene.
+5. **Linear textures are addressed in texels on the NV2A.** The quad handed
+   the sampler coordinates in 0..640 x 0..480 for a `LIN_A8R8G8B8` frame
+   buffer; a normalised sampler clamped every one to an edge texel and the
+   whole frame came out one flat grey. Both pixel paths now scale a stage's
+   coordinates by 1/size when its texture's Xbox format is linear
+   (`d3d8_format_is_linear`, `tex_scale` / `TexScale`).
+
+The white screen that preceded all of this was not any of them: with nothing
+drawn to the host back buffer, a frame dump shows whatever the buffer last
+held, and it had last held a white fade frame. A dump is only evidence about
+the frame if something drew that frame.
 
 `MINDRAWS` matters more than it sounds: a title's 3D frames can be rare among
 its 2D ones. Burnout 2 draws 2-6 times on a loading frame and 690-910 in a

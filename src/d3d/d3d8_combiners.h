@@ -271,6 +271,13 @@ typedef struct NV2APSConstants {
     UINT  alpha_test_enable;                /* 0 or 1 */
     UINT  fog_enable;                       /* 0 or 1 */
     UINT  alpha_only[NV2A_MAX_TEXTURES];     /* A8 sampling uses white RGB */
+    /* Per-stage texture coordinate scale. 1 for a swizzled texture; 1/width,
+     * 1/height for a linear one, because the NV2A addresses linear textures
+     * in texels and titles hand it texel coordinates (0..640, 0..480 for a
+     * frame buffer), which a normalised sampler would clamp to one edge
+     * texel. TimeSplitters: Future Perfect's colour-grading pass samples its
+     * frame buffer this way and came out a single flat colour without it. */
+    float tex_scale[NV2A_MAX_TEXTURES][4];
 } NV2APSConstants;
 
 /* ================================================================

@@ -49,6 +49,21 @@ from tools.disasm.loader import DATA_SECTION_NAMES, load_image
 # Each pattern must have exactly one group: the hex address.
 LOG_PATTERNS = [
     # Unresolved indirect call, from the RECOMP_ICALL dispatch failure path.
+    #
+    # Two wordings, because the runtime's changed and old logs are still worth
+    # reading. The current one says which form was refused, and only a *call*
+    # belongs here: a refused jump is usually the guest entering the middle of
+    # a function -- a coroutine, a longjmp, a switch arm it kept -- and seeding
+    # that address declares a function start where there is none.
+    # tools.seed_from_log's own gates would mostly reject it, but the ones that
+    # slip through are worse than the ones that do not, so it is not offered.
+    #
+    # This regressed silently: renaming the line to distinguish call from jump
+    # left this pattern matching nothing, and every log written afterwards
+    # yielded no indirect-call seeds at all. Nobody noticed because the log
+    # being tested with was older than the rename.
+    (re.compile(r"unresolved call target 0x([0-9A-Fa-f]+)"),
+     "Indirect-call target observed at runtime"),
     (re.compile(r"Failed to resolve VA (0x[0-9A-Fa-f]+)"),
      "Indirect-call target observed at runtime"),
     # PsCreateSystemThreadEx handed a routine with no dispatch entry. Nothing
