@@ -1165,6 +1165,9 @@ uint32_t g_xbox_code_hi = 0;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
 RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
 
+/* How far the runtime's low memory moved to clear the image; see XBOX_LOW_VA. */
+uint32_t g_xbox_low_shift = 0;
+
 /* The current-thread object, reached through fs:[0x28].
  *
  * On the console fs points at the KPCR and the processor control block is
@@ -1182,7 +1185,7 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
  * itself on purpose after loading. Each thread now gets its own copy with a
  * distinct id, and everything else in the block is inherited exactly as
  * before so that nothing which already worked changes. */
-#define XBOX_THREAD_OBJ_MAIN 0x00760000u   /* the main thread's, in BSS */
+#define XBOX_THREAD_OBJ_MAIN XBOX_LOW_VA(0x00760000u) /* the main thread's */
 #define XBOX_THREAD_OBJ_SIZE 0x200u
 #define XBOX_THREAD_ID_OFF   0x12Cu
 
@@ -1685,6 +1688,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * Move the runtime's low memory clear of the image (see XBOX_LOW_VA).
+     *
+     * SizeOfImage (header offset 0x010C) covers every section including BSS,
+     * which the section table's raw sizes do not. Rounded to 64 KB so the
+     * stack and heap keep the alignment they had at their old addresses.
+     */
+    if (xbe_size >= 0x0110) {
+        DWORD base_addr  = *(const DWORD *)(xbe + XBE_BASE_ADDR_OFFSET);
+        DWORD image_size = *(const DWORD *)(xbe + 0x010C);
+        uint32_t image_end = (uint32_t)base_addr + (uint32_t)image_size;
+
+        if (image_end > XBOX_LOW_REGION_START) {
+            g_xbox_low_shift = (image_end - XBOX_LOW_REGION_START + 0xFFFFu)
+                               & ~0xFFFFu;
+            fprintf(stderr, "  Image ends at 0x%08X, past 0x%08X: runtime low "
+                    "memory moved up 0x%08X (stack 0x%08X, heap 0x%08X)\n",
+                    image_end, XBOX_LOW_REGION_START, g_xbox_low_shift,
+                    XBOX_STACK_BASE, XBOX_HEAP_BASE);
+        }
+    }
+
+    /*
      * Dynamically load ALL XBE sections by parsing the section headers.
      *
      * This replaces the old approach of hardcoding section addresses for
@@ -1917,7 +1942,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * only worked while page zero was mapped. Pointing at real zeroed
          * memory says the same thing to the title and survives that page being
          * unmapped, which is what makes a genuine null dereference visible. */
-        #define FAKE_PRCB_VA 0x00761000  /* zeroed KPCR Prcb stand-in */
+        #define FAKE_PRCB_VA XBOX_LOW_VA(0x00761000)  /* zeroed KPCR Prcb stand-in */
         memset(XBOX_VA(FAKE_PRCB_VA), 0, 0x400);
         MEM32_INIT(XBOX_FS_BASE + 0x20, FAKE_PRCB_VA);
         #undef FAKE_PRCB_VA
@@ -1928,8 +1953,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * to its data area. We allocate a fake structure at 0x00760000
          * (in the BSS area) and a data buffer at 0x00700000.
          */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
+        #define FAKE_TLS_VA     XBOX_LOW_VA(0x00760000)  /* Fake TLS structure (in BSS) */
+        #define FAKE_RWDATA_VA  XBOX_LOW_VA(0x00700000)  /* RW engine data area (in BSS) */
 
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
@@ -1967,8 +1992,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Every guest thread therefore shares LastError. Give this a per-thread
          * allocation when a title is observed to care.
          */
-        #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
-        #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
+        #define FAKE_TLS_BLOCK_VA  XBOX_LOW_VA(0x00770000)  /* image TLS data          */
+        #define FAKE_TLS_THREAD_VA XBOX_LOW_VA(0x00770200)  /* what slot 0 points at   */
         {
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
 
@@ -2651,7 +2676,9 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
+/* Set by xbox_MemoryLayoutInit: XBOX_HEAP_BASE moves with the image
+ * (see XBOX_LOW_VA), so it is not a constant any more. */
+static uint32_t g_heap_next;
 
 static int g_heap_alloc_count = 0;
 
@@ -2898,6 +2925,8 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     uint32_t result;
 
     if (alignment < 4) alignment = 4;
+    if (!g_heap_next)
+        g_heap_next = XBOX_HEAP_BASE;
 
     /* Enforce minimum allocation size.
      * The Xbox D3D8 code sometimes computes resource sizes from GPU

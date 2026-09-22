@@ -270,6 +270,59 @@ a replayable capture — which is how to report a rendering bug. A keyboard work
 out of the box and an XInput controller works as itself;
 `py -3 -m tools.input_ui` rebinds either, for up to four players.
 
+### The launcher
+
+A title can ship a second, small program beside its executable: a launcher
+that shows the settings worth choosing, saves them, and starts the game. It
+has a Video tab (resolution scale, widescreen, wide camera, texture sharpness,
+frame cap, frame-rate counter), an Input tab that rebinds the keyboard and pad
+for all four ports, and an About tab. It can be driven entirely with a
+controller — D-pad or stick to move, **A** to play, **B** to quit, the
+shoulder buttons to change tab — because the front ends a recompiled game ends
+up inside may never see a keyboard.
+
+**A title does not get one unless its project asks for it.** The code is in
+[src/launcher/](src/launcher/), and the top-level `CMakeLists.txt` defines a
+function for it, but no project calls that function by default, the template
+included. To build one, add this to `titles/<name>/CMakeLists.txt`, *after* the
+`add_subdirectory(${XBOXRECOMP_DIR} ...)` line (the function does not exist
+before it):
+
+```cmake
+if(COMMAND recomp_add_launcher)    # Windows only; the guard keeps other hosts building
+    recomp_add_launcher(${PROJECT_NAME}_launcher ${PROJECT_NAME}.exe)
+endif()
+```
+
+The next build then produces `<name>_recomp_launcher.exe` beside
+`<name>_recomp.exe` in `build/Release`. The second argument is the file name the
+launcher starts from its own folder, so it has to match the game's executable
+exactly; `${PROJECT_NAME}.exe` always does.
+
+**The launcher is optional.** It writes a settings file and starts the
+game; the game reads that file whether or not a launcher wrote it, and runs
+without either. The file is per title, named after the title id in the XBE
+certificate:
+
+| Host | Settings file |
+|---|---|
+| Windows | `%APPDATA%\xboxrecomp\titles\<title id>.conf` |
+| Linux | `$XDG_CONFIG_HOME/xboxrecomp/titles/<title id>.conf` (else `~/.config/...`) |
+
+`RECOMP_DISPLAY_CONFIG=<path>` names a different file for both. **Environment
+variables override the file**, so a `.bat` that sets `RECOMP_RES_SCALE`, or
+any of the other switches, still behaves exactly as it did. Input bindings are
+not in this file: they belong to the player, not the title, and live in
+`input_bindings.json` ([docs/technical/input-binding.md](docs/technical/input-binding.md)).
+
+The launcher needs the game's XBE to know the title id, and so which file
+to write. It looks exactly where the game does, in the same order:
+`RECOMP_GAME_DIR`, then `game/` beside the executable, then the title's
+`YOUR_GAME_DIR`, which `recomp_add_launcher` reads out of `src/main.c`. Its
+About tab shows the XBE it found, or says that none was found, and in that case
+settings go to `titles\default.conf`, which no game reads. On the game's side,
+the first line starting `[CONFIG]` in its log names the file it read.
+
 ### Stage by stage
 
 `scripts/recompile.py` is a driver over four tools you can also run yourself,
@@ -338,7 +391,9 @@ xboxrecomp/
 │   ├── apu/                     # xbox_apu    - MCPX APU emulation (xemu)
 │   ├── nv2a/                    # xbox_nv2a   - NV2A GPU emulation (xemu)
 │   ├── input/                   # xbox_input  - Gamepad → XInput
-│   └── video/                   # xbox_video  - FMV playback + framebuffer window
+│   ├── video/                   # xbox_video  - FMV playback + framebuffer window
+│   ├── config/                  # xbox_config - per-title settings file
+│   └── launcher/                # Settings launcher a title can build beside its .exe
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
 ├── templates/                   # Starter templates for new projects
 │   ├── new-game/                # ** Copy this to start a game project **

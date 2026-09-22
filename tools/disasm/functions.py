@@ -204,6 +204,23 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return not (i >= 0 and addr < bounds[i][1])
 
+        # A switch's tables sit after the function's ret, outside its range,
+        # so they are "in a gap" -- and MSVC aligns the dword table with the
+        # two-byte nop 8B FF, which is also the hot-patch prologue. So the
+        # padding before every inline jump table read as a function start. The
+        # "function" then ran on through the dword table and the byte index
+        # table into the real function after them, which became an entry in
+        # the middle of a bogus one. TimeSplitters: Future Perfect's per-level
+        # callbacks at 0x001C4DC0 and 0x001C51E0 were each hidden that way,
+        # were never lifted, and the call to each was skipped at level load.
+        tables = sorted(self.engine.jump_tables.items())
+        table_starts = [t[0] for t in tables]
+
+        def table_or_its_padding(addr: int) -> bool:
+            """Inside a jump table, or up to 3 bytes of alignment before one."""
+            i = bisect.bisect_right(table_starts, addr + 3) - 1
+            return i >= 0 and addr < tables[i][1]
+
         added = False
         for insn in list(self.engine.instructions.values()):
             if not insn.is_ret:
@@ -216,6 +233,8 @@ class FunctionDetector:
                 continue
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
+            if table_or_its_padding(nxt):
+                continue                    # a switch table's 8B FF alignment
             # A prologue, or a whole small function.
             #
             # MSVC packs runs of constant-returning accessors -- "mov eax,
@@ -236,8 +255,53 @@ class FunctionDetector:
                                 "gap_prologue")
             added = True
 
+        # And the function that follows a switch's tables. Nothing marks it:
+        # it is not after a ret, it need not have a prologue (Future Perfect's
+        # level callbacks begin "mov eax, [esp+4]"), and if it is reached only
+        # through a pointer built at run time, no pass sees it. What does mark
+        # it is the shape of the data in front of it. MSVC emits a two-level
+        # switch as the dword table followed immediately by a byte table of
+        # indices into it, and every index is below the dword table's entry
+        # count; the first byte of real code (8B, 55, 83, 56, ...) is not. So
+        # skip the index bytes, then int3/nop padding, and what is left is the
+        # next function -- or another switch's 8B FF, which is not.
+        after = 0
+        for tbl, end in tables:
+            entries = (end - tbl) // 4
+            section = self.image.get_section_at_va(end)
+            if section is None or not section.executable or entries < 2:
+                continue
+            addr = end
+            for _ in range(256):
+                b = self.image.read_bytes_at_va(addr, 1)
+                if not b or b[0] >= entries:
+                    break
+                addr += 1
+            while True:
+                b = self.image.read_bytes_at_va(addr, 1)
+                if not b or b[0] not in (0xCC, 0x90):
+                    break
+                addr += 1
+            if (addr in self._candidates or addr in self.functions
+                    or table_or_its_padding(addr) or not in_a_gap(addr)):
+                continue
+            if not self.engine.probes_as_function_body(addr):
+                continue
+            # The sweep resumed at the dword table's end and decoded the index
+            # bytes as code, so it can be out of phase here: Future Perfect's
+            # 0x002257D0 follows "... 0d 0d 0c" directly, 0D is a five-byte
+            # "or eax, imm32", and no instruction started at the function.
+            # A candidate with no instruction under it is dropped when bodies
+            # are built, so put the stream back in step first.
+            self.engine.decode_at(addr)
+            self._add_candidate(addr, config.CONFIDENCE_CC_BOUNDARY,
+                                "after_switch_table")
+            after += 1
+            added = True
+
         if added:
-            print("  functions recovered that follow a ret with no padding")
+            print("  functions recovered that follow a ret with no padding"
+                  + (f" ({after} after a switch table)" if after else ""))
         return added
 
     def _pass_seed_aliases(self) -> None:

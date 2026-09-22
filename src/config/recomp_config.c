@@ -397,6 +397,18 @@ static void load(void)
     }
 }
 
+/* Said once, because "which file did it read" is the first question when a
+ * setting chosen in the launcher does not seem to apply. */
+static void load_and_report(void)
+{
+    load();
+    if (g_have_path)
+        fprintf(stderr, "[CONFIG] settings from %s (title %08X)\n", g_path, g_title_id);
+    else
+        fprintf(stderr, "[CONFIG] no settings file (title %08X); using the defaults\n",
+                g_title_id);
+}
+
 /* ---------------------------------------------------------------- lookup */
 
 /* The table as it stands, without loading anything. */
@@ -417,7 +429,7 @@ static const char *from_file(const char *key)
     if (!key)
         return NULL;
     if (!g_loaded)
-        load();
+        load_and_report();
     return from_table(key);
 }
 
@@ -433,7 +445,7 @@ const char *recomp_config_lookup(const char *env_name, const char *key)
 const char *recomp_config_path(void)
 {
     if (!g_loaded)
-        load();
+        load_and_report();
     return g_have_path ? g_path : NULL;
 }
 

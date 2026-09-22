@@ -200,48 +200,79 @@ static int row_can(const Row *r, int delta)
 
 static char g_title_name[128] = "Xbox game";
 static uint32_t g_title_id;
+static char g_xbe_found[MAX_PATH];      /* empty: the game's files were not found */
 
 /* The name and id out of the game's own XBE, so the launcher says what it
- * launches without being told at build time. Looked for where the runtime
- * looks: a "game" folder beside the executable, then one beside the
- * working directory. */
+ * launches without being told at build time -- and, more to the point, so
+ * it writes the settings file the game will read, which is named after the
+ * title id. A launcher that cannot find the XBE writes default.conf, which
+ * the game never reads, so every setting chosen here would quietly do
+ * nothing.
+ *
+ * Looked for exactly where the game's find_game() looks, in its order:
+ * RECOMP_GAME_DIR alone if it is set, else a "game" folder beside the
+ * executable, else the title's YOUR_GAME_DIR (LAUNCHER_GAME_DIR, read out
+ * of its main.c by recomp_add_launcher) -- all relative to this executable,
+ * not the working directory, as the game's are. */
+static int read_cert(const char *xbe)
+{
+    FILE *f = fopen(xbe, "rb");
+    unsigned char head[0x200], cert[0xA4];
+    uint32_t cert_va, base_va, off;
+
+    if (!f)
+        return 0;
+    if (fread(head, 1, sizeof head, f) != sizeof head) { fclose(f); return 0; }
+    base_va = *(uint32_t *)(head + 0x0104);
+    cert_va = *(uint32_t *)(head + 0x0118);
+    if (cert_va < base_va) { fclose(f); return 0; }
+    off = cert_va - base_va;
+    if (fseek(f, (long)off, SEEK_SET) != 0 ||
+        fread(cert, 1, sizeof cert, f) != sizeof cert) { fclose(f); return 0; }
+    fclose(f);
+
+    g_title_id = *(uint32_t *)(cert + 0x08);
+    {   /* wszTitleName: 40 UTF-16 units at +0x0C, padded not terminated */
+        int j, k = 0;
+        for (j = 0; j < 40 && k < (int)sizeof g_title_name - 1; j++) {
+            unsigned c = cert[0x0C + j * 2] | (cert[0x0C + j * 2 + 1] << 8);
+            if (!c) break;
+            if (c < 0x80) g_title_name[k++] = (char)c;
+        }
+        while (k > 0 && g_title_name[k - 1] == ' ') k--;
+        g_title_name[k] = '\0';
+        if (!k) snprintf(g_title_name, sizeof g_title_name, "Xbox game");
+    }
+    if (!GetFullPathNameA(xbe, sizeof g_xbe_found, g_xbe_found, NULL))
+        snprintf(g_xbe_found, sizeof g_xbe_found, "%s", xbe);
+    return 1;
+}
+
 static void read_title(void)
 {
-    static const char *const places[] = {
-        "game\\default.xbe", "..\\game\\default.xbe", "default.xbe", NULL
-    };
-    int i;
+    const char *env = getenv("RECOMP_GAME_DIR");
+    char dir[MAX_PATH], xbe[MAX_PATH], *slash;
 
-    for (i = 0; places[i]; i++) {
-        FILE *f = fopen(places[i], "rb");
-        unsigned char head[0x200], cert[0xA4];
-        uint32_t cert_va, base_va, off;
-
-        if (!f)
-            continue;
-        if (fread(head, 1, sizeof head, f) != sizeof head) { fclose(f); continue; }
-        base_va = *(uint32_t *)(head + 0x0104);
-        cert_va = *(uint32_t *)(head + 0x0118);
-        if (cert_va < base_va) { fclose(f); continue; }
-        off = cert_va - base_va;
-        if (fseek(f, (long)off, SEEK_SET) != 0 ||
-            fread(cert, 1, sizeof cert, f) != sizeof cert) { fclose(f); continue; }
-        fclose(f);
-
-        g_title_id = *(uint32_t *)(cert + 0x08);
-        {   /* wszTitleName: 40 UTF-16 units at +0x0C, padded not terminated */
-            int j, k = 0;
-            for (j = 0; j < 40 && k < (int)sizeof g_title_name - 1; j++) {
-                unsigned c = cert[0x0C + j * 2] | (cert[0x0C + j * 2 + 1] << 8);
-                if (!c) break;
-                if (c < 0x80) g_title_name[k++] = (char)c;
-            }
-            while (k > 0 && g_title_name[k - 1] == ' ') k--;
-            g_title_name[k] = '\0';
-            if (!k) snprintf(g_title_name, sizeof g_title_name, "Xbox game");
-        }
+    /* Set means only this, as it does for the game: finding the XBE
+     * somewhere else would name a settings file for a different copy. */
+    if (env && *env) {
+        snprintf(xbe, sizeof xbe, "%s\\default.xbe", env);
+        read_cert(xbe);
         return;
     }
+
+    if (!GetModuleFileNameA(NULL, dir, sizeof dir))
+        return;
+    slash = strrchr(dir, '\\');
+    if (slash) *slash = '\0';
+
+    snprintf(xbe, sizeof xbe, "%s\\game\\default.xbe", dir);
+    if (read_cert(xbe))
+        return;
+#ifdef LAUNCHER_GAME_DIR
+    snprintf(xbe, sizeof xbe, "%s\\%s\\default.xbe", dir, LAUNCHER_GAME_DIR);
+    read_cert(xbe);
+#endif
 }
 
 /* ------------------------------------------------------------- capture */
@@ -890,6 +921,16 @@ static void draw(void)
         p.y += 24;
         snprintf(line, sizeof line, "Game      %s", LAUNCHER_GAME_EXE);
         theme_text(p, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+
+        /* Where the title id came from, or that it did not: without it the
+         * settings above go to default.conf, which the game does not read. */
+        p.y += 24;
+        if (g_xbe_found[0])
+            snprintf(line, sizeof line, "Files     %s", g_xbe_found);
+        else
+            snprintf(line, sizeof line, "Files     not found -- settings will not reach the game");
+        theme_text(p, line, 11, 400, g_xbe_found[0] ? THEME_TEXT_DIM : THEME_TEXT,
+                   THEME_LEFT);
 
         p.y += 34; p.h = 60;
         theme_text_wrapped(p,
