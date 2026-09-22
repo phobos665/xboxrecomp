@@ -152,3 +152,10 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+
+# ── Launcher ────────────────────────────────────────────────────
+# A settings window that writes the per-title settings file and starts
+# the game. Windows only; see "The launcher" in the top-level README.
+if(COMMAND recomp_add_launcher)
+    recomp_add_launcher(${PROJECT_NAME}_launcher ${PROJECT_NAME}.exe)
+endif()

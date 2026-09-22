@@ -1667,11 +1667,64 @@ static void bridge_KeWaitForSingleObject(void)
  * "return 0" default (STATUS_SUCCESS = "already signalled"), so the read handshake
  * completed before the data arrived and the UI-map precache never made progress.
  */
+/* A wait on NtCurrentThread() (-2) or NtCurrentProcess() (-1).
+ *
+ * Neither is signalled while the caller is running, so on hardware this is a
+ * sleep: it ends when the timeout runs out, with STATUS_TIMEOUT, or when an
+ * alertable wait is alerted. Titles use it as one. The pseudo-handles are
+ * never in the handle table, though, so they reached Windows zero-extended --
+ * 0x00000000FFFFFFFE, which is not the host's own (HANDLE)-2 -- and every wait
+ * failed at once with STATUS_UNSUCCESSFUL. TimeSplitters: Future Perfect waits
+ * this way in a loop while it loads an arcade level and made seven million
+ * calls in a few seconds, with the thread it was pacing itself against
+ * starved.
+ *
+ * Returns 1 with g_eax set when the token was a pseudo-handle, else 0. */
+static int bridge_wait_on_self(uint32_t token, uint32_t alertable,
+                               uint32_t timeout_ptr)
+{
+    NTSTATUS st;
+
+    if (token != 0xFFFFFFFEu && token != 0xFFFFFFFFu)
+        return 0;
+
+    if (timeout_ptr) {
+        st = xbox_KeDelayExecutionThread(0, (BOOLEAN)alertable,
+                                         XBOX_TO_NATIVE(timeout_ptr));
+        g_eax = st ? (uint32_t)st : 0x00000102u;   /* STATUS_TIMEOUT */
+        return 1;
+    }
+
+    /* No timeout: waiting for yourself to finish. Faithfully, that never
+     * returns unless an alertable wait is alerted. */
+    {
+        static int said;
+        LARGE_INTEGER second;
+        if (!said++) {
+            fprintf(stderr, "  [KERNEL] a guest thread waits on itself with no "
+                            "timeout (token 0x%08X); it sleeps until alerted\n",
+                    token);
+            fflush(stderr);
+        }
+        second.QuadPart = -10000000LL;
+        for (;;) {
+            st = xbox_KeDelayExecutionThread(0, (BOOLEAN)alertable, &second);
+            if (st) {
+                g_eax = (uint32_t)st;
+                return 1;
+            }
+        }
+    }
+}
+
 static void bridge_NtWaitForSingleObject(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
+
+    if (bridge_wait_on_self(STACK_ARG(0), alertable, timeout_ptr))
+        return;
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
@@ -1731,6 +1784,9 @@ static void bridge_NtWaitForSingleObjectEx(void)
     static uint64_t calls  = 0;
     static uint64_t spin_at = 1000000;
     int             say = logged < 20;
+
+    if (bridge_wait_on_self(STACK_ARG(0), alertable, timeout_ptr))
+        return;
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,

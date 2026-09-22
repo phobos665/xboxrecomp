@@ -305,7 +305,7 @@ void xbox_NameCurrentThread(const wchar_t *name);
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
+#define XBOX_KERNEL_DATA_BASE   XBOX_LOW_VA(0x00740000)   /* see XBOX_LOW_VA */
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */
@@ -392,6 +392,24 @@ typedef union RecompXmm {
 
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
+/* The runtime's own low memory -- kernel data exports, the main thread's
+ * object and TLS block, the main stack, and the heap above it -- was laid out
+ * at fixed addresses from 0x00700000 up, on the assumption that every image
+ * ends below that. Three do not: TimeSplitters: Future Perfect runs to
+ * 0x0089CD60, Bloody Roar Extreme to 0x009D3360 and Otogi to 0x0148F9C0. Their
+ * own data sat on top of the runtime's, and Future Perfect's writes of -1 to
+ * a table at 0x00760028 replaced the main thread's TlsData, so every thread
+ * started afterwards faulted on its first TLS store.
+ *
+ * So the whole block keeps its internal layout but moves up past the image:
+ * XBOX_LOW_VA(va) is the address a structure designed for va actually has.
+ * The shift is 0 for an image that ends below 0x00700000, which is every
+ * title that worked before, so nothing about them changes. Set once by
+ * xbox_MemoryLayoutInit from the XBE header, before anything below is used. */
+#define XBOX_LOW_REGION_START  0x00700000u
+extern uint32_t g_xbox_low_shift;
+#define XBOX_LOW_VA(va)     ((uint32_t)(va) + g_xbox_low_shift)
+
 /** Base VA of the stack area (above last XBE section). */
 /* Where the fake TIB lives -- the linear address fs: is based at.
  *
@@ -419,7 +437,7 @@ typedef union RecompXmm {
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
-#define XBOX_STACK_BASE     0x00780000
+#define XBOX_STACK_BASE     XBOX_LOW_VA(0x00780000)   /* see XBOX_LOW_VA */
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)

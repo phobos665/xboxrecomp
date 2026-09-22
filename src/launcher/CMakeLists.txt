@@ -25,6 +25,25 @@ if(WIN32)
         target_compile_definitions(${TARGET} PRIVATE
             LAUNCHER_GAME_EXE="${GAME_EXE}"
         )
+        # The launcher has to find the game's XBE where the game does, or it
+        # names the wrong settings file and every choice made in it is lost.
+        # The game looks beside itself in game/, then in YOUR_GAME_DIR from
+        # its main.c; read that define rather than repeat it here, so the
+        # two cannot drift. It is a C string literal, so its separators are
+        # doubled backslashes: made forward slashes, which Windows accepts.
+        set(_main_c "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c")
+        if(EXISTS "${_main_c}")
+            file(STRINGS "${_main_c}" _dir_line
+                 REGEX "^#define[ \t]+YOUR_GAME_DIR[ \t]+\"")
+            if(_dir_line MATCHES "\"([^\"]*)\"")
+                string(REPLACE "\\\\" "/" _game_dir "${CMAKE_MATCH_1}")
+                target_compile_definitions(${TARGET} PRIVATE
+                    LAUNCHER_GAME_DIR="${_game_dir}")
+            endif()
+            # Re-configure when main.c changes, e.g. after regen_title_main.py.
+            set_property(DIRECTORY APPEND PROPERTY
+                CMAKE_CONFIGURE_DEPENDS "${_main_c}")
+        endif()
         # xbox_config carries the settings file's format, so the launcher
         # and the runtime cannot disagree about what they are writing and
         # reading. xinput is the pad; the rest is in every Windows.

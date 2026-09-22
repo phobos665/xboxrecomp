@@ -41,15 +41,26 @@ class _Func:
 
 
 class _Image:
+    def __init__(self, memory=None):
+        self.memory = memory or {}     # va -> bytes, for read_bytes_at_va
+
     def get_section_at_va(self, addr):
         return _Section()
 
+    def read_bytes_at_va(self, addr, n):
+        for base, data in self.memory.items():
+            if base <= addr and addr + n <= base + len(data):
+                return data[addr - base:addr - base + n]
+        return None
+
 
 class _Engine:
-    def __init__(self, insns, prologues):
+    def __init__(self, insns, prologues, jump_tables=None, bodies=()):
         self.instructions = {i.address: i for i in insns}
         self._prologues = set(prologues)
         self._stub = False
+        self.jump_tables = dict(jump_tables or {})
+        self._bodies = set(bodies)
 
     def probes_as_prologue(self, addr):
         return addr in self._prologues
@@ -57,11 +68,19 @@ class _Engine:
     def probes_as_constant_stub(self, addr):
         return self._stub
 
+    def probes_as_function_body(self, addr):
+        return addr in self._bodies
 
-def _detector(insns, functions, prologues):
+    def decode_at(self, addr):
+        self.decoded = getattr(self, "decoded", []) + [addr]
+        return 0
+
+
+def _detector(insns, functions, prologues, jump_tables=None, memory=None,
+              bodies=()):
     det = FunctionDetector.__new__(FunctionDetector)
-    det.engine = _Engine(insns, prologues)
-    det.image = _Image()
+    det.engine = _Engine(insns, prologues, jump_tables, bodies)
+    det.image = _Image(memory)
     det.functions = {f.start: f for f in functions}
     det._candidates = {}
     det.added = []
@@ -116,6 +135,64 @@ class GapPrologueTest(unittest.TestCase):
         funcs = [_Func(0x00476EA0, 0x00476EB0), _Func(0x004771C0, 0x004771D0)]
         det = _detector(insns, funcs, prologues={0x00476EB0})
         self.assertFalse(det._pass_gap_prologues([]))
+
+
+class SwitchTableTest(unittest.TestCase):
+    """The bytes after a switch's function, from Future Perfect at 0x001C4D8A.
+
+    The function above ends with a ret at 0x001C4D89. Then: 8B FF, which
+    aligns the dword table and is also the hot-patch prologue; six case
+    pointers; a byte table of indices into them, every one below six; int3
+    padding; and the next function, a level callback reached only through a
+    pointer built at run time, at 0x001C4DC0.
+    """
+    RET = 0x001C4D89
+    TABLE = (0x001C4D8C, 0x001C4DA4)
+    NEXT = 0x001C4DC0
+    BYTES = bytes.fromhex(
+        "8bff"
+        "f74c1c00844d1c00354d1c00254d1c004a4d1c00224d1c00"
+        "0005050501050502050505050505050503"
+        "04" "cccccccccccccccccccc"
+        "8b442404")
+
+    def _det(self, prologues=(), bodies=()):
+        insns = [_Insn(self.RET, 1, is_ret=True)]
+        funcs = [_Func(0x001C4CE0, self.RET + 1), _Func(0x001C4E50, 0x001C4F35)]
+        return _detector(insns, funcs, prologues=set(prologues),
+                         jump_tables=dict([self.TABLE]),
+                         memory={self.RET + 1: self.BYTES}, bodies=bodies)
+
+    def test_the_tables_alignment_is_not_a_prologue(self):
+        # 8B FF probes as a prologue -- it is one, when it is not padding.
+        det = self._det(prologues={self.RET + 1})
+        det._pass_gap_prologues([])
+        self.assertNotIn((self.RET + 1, "gap_prologue"), det.added)
+
+    def test_the_function_after_the_tables_is_found(self):
+        det = self._det(bodies={self.NEXT})
+        self.assertTrue(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [(self.NEXT, "after_switch_table")])
+        # Decoded from its own start: the sweep came through the index bytes
+        # as code and need not be in step at the function.
+        self.assertEqual(det.engine.decoded, [self.NEXT])
+
+    def test_nothing_is_added_where_the_bytes_do_not_decode(self):
+        det = self._det(bodies=set())
+        self.assertFalse(det._pass_gap_prologues([]))
+
+    def test_a_second_switchs_table_is_not_a_function(self):
+        # Future Perfect 0x001C53FE: the index bytes run straight into the
+        # next table's 8B FF alignment.
+        tail = bytes.fromhex("0005050501050505050505050502030505" "04")             + bytes.fromhex("8bff") + bytes(24)
+        start = 0x001C5410
+        det = _detector([], [], prologues=set(),
+                        jump_tables={0x001C53F8: start,
+                                     start + len(tail) - 24: start + len(tail)},
+                        memory={start: tail}, bodies={start + len(tail) - 26})
+        det._pass_gap_prologues([])
+        self.assertEqual(det.added, [])
+
 
 class SehPrologueShapeTest(unittest.TestCase):
     """A function whose frame __SEH_prolog builds has no prologue to find.

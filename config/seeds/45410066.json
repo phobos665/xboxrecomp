@@ -22,5 +22,9 @@
  {
   "start": "0x00191B10",
   "note": "Indirect-call target observed at runtime, called once from 0x00078F74 after the intro movie."
+ },
+ {
+  "start": "0x001C4DC0",
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
  }
 ]
