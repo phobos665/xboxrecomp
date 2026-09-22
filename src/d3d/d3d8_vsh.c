@@ -21,6 +21,7 @@
 #include "d3d8_internal.h"
 #include <float.h>
 #include "d3d8_vsh.h"
+#include "recomp_config.h"
 #include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
@@ -1369,9 +1370,11 @@ static float hor_plus_factor(void)
     static float factor = -1.0f;
 
     if (factor < 0.0f) {
-        const char *v = getenv("RECOMP_HOR_PLUS");
+        const char *v = recomp_config_lookup("RECOMP_HOR_PLUS", "hor_plus");
 
         factor = (v && *v) ? (float)atof(v) : 1.0f;
+        if (factor == 0.0f)
+            factor = 1.0f;              /* the config's "leave it alone" */
         if (factor <= 0.0f || factor > 4.0f)
             factor = 1.0f;
         if (factor != 1.0f)
@@ -1386,7 +1389,7 @@ int d3d8_vsh_hor_plus_reg(void)
     static int reg = -1;
 
     if (reg < 0) {
-        const char *v = getenv("RECOMP_HOR_PLUS_REG");
+        const char *v = recomp_config_lookup("RECOMP_HOR_PLUS_REG", "hor_plus_register");
 
         reg = (v && *v) ? atoi(v) : 60;
         if (reg < 0 || reg >= NV2A_VS_MAX_CONSTANTS)

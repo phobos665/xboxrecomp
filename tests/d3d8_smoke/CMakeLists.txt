@@ -25,8 +25,8 @@ if(WIN32)
         ../../src/d3d/d3d8_states.c
         ../../src/d3d/d3d8_display.c
     )
-    target_include_directories(d3d8_states_smoke PRIVATE ../../src/d3d)
-    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11 d3dcompiler)
+    target_include_directories(d3d8_states_smoke PRIVATE ../../src/d3d ../../src/config)
+    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11 d3dcompiler xbox_config)
 
     add_executable(d3d8_a8
         test_a8.c

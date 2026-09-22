@@ -13,6 +13,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
+#include "recomp_config.h"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -94,21 +95,90 @@ static void xbox_update_tick_count(void)
 /* ============================================================================
  * Performance Counters
  *
- * Direct 1:1 mapping to Win32 QueryPerformanceCounter/Frequency.
- * Both Xbox and Windows return LARGE_INTEGER.
+ * The Xbox counter is the ACPI timer in the nForce southbridge, and it runs
+ * at a fixed 3,375,000 Hz on every console ever made. That is the number the
+ * console's KeQueryPerformanceFrequency returns, so a title is free to skip
+ * asking and write the constant into its own arithmetic -- and titles do.
+ *
+ * This used to hand back Win32's counter and Win32's frequency unchanged.
+ * That is self-consistent, so a title that asks for both computes correct
+ * durations and nothing looks wrong; Burnout 2 and TimeSplitters 2 both do
+ * that and both work. A title that assumes the console's rate instead gets
+ * every duration scaled by whatever this machine's QPC happens to run at --
+ * typically 10 MHz, so just under three times too fast. Tony Hawk's Pro
+ * Skater 2X calls ordinal 126 ninety-four million times in seventy seconds
+ * and ordinal 127 not once, which is what "it hard-codes the frequency"
+ * looks like from outside.
+ *
+ * So scale the host counter to the console's rate and report the console's
+ * rate. Both kinds of title are then right, and the two answers still agree
+ * with each other, which is the property the old code had and the only one
+ * worth keeping.
+ *
+ * The scaling is done on the difference from a base captured at start-up,
+ * not on the raw QPC value: QPC counts from boot, and 64-bit ticks times
+ * 3,375,000 overflows about twenty minutes after the host was switched on.
+ *
+ * RECOMP_HOST_QPC=1 restores the old 1:1 behaviour, for bisecting a title
+ * whose timing changes with this.
  * ============================================================================ */
+
+#define XBOX_ACPI_FREQUENCY 3375000LL
+
+static LARGE_INTEGER qpc_base;      /* host ticks at first call */
+static LONGLONG      qpc_host_freq; /* host ticks per second */
+static int           qpc_passthru;  /* RECOMP_HOST_QPC */
+static int           qpc_ready;
+
+/* Called once from xbox_kernel_init, before any guest code runs, so the
+ * base is captured on one thread and no later caller can move it. The
+ * lazy checks below stay as a backstop for a caller that somehow beats
+ * kernel init; re-entering it would otherwise shift the base under a
+ * thread already holding a timestamp, and a delta that goes backwards
+ * reads as an enormous one to a title doing unsigned arithmetic. */
+void xbox_hal_init_timers(void)
+{
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    qpc_host_freq = f.QuadPart ? f.QuadPart : XBOX_ACPI_FREQUENCY;
+    QueryPerformanceCounter(&qpc_base);
+    qpc_passthru = xbox_EnvSwitch("RECOMP_HOST_QPC", 0);
+    qpc_ready = 1;
+}
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
+
+    if (!qpc_ready)
+        xbox_hal_init_timers();
     QueryPerformanceCounter(&counter);
+    if (qpc_passthru)
+        return counter;
+    /* Ticks since start-up, at the console's rate. Divide the elapsed count
+     * by the host frequency first for the whole seconds and scale only the
+     * remainder, so this stays exact without needing 128-bit arithmetic. */
+    {
+        LONGLONG d = counter.QuadPart - qpc_base.QuadPart;
+        LONGLONG sec = d / qpc_host_freq;
+        LONGLONG rem = d % qpc_host_freq;
+        counter.QuadPart = sec * XBOX_ACPI_FREQUENCY
+                         + (rem * XBOX_ACPI_FREQUENCY) / qpc_host_freq;
+    }
     return counter;
 }
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
 {
     LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
+
+    if (!qpc_ready)
+        xbox_hal_init_timers();
+    if (qpc_passthru) {
+        QueryPerformanceFrequency(&freq);
+        return freq;
+    }
+    freq.QuadPart = XBOX_ACPI_FREQUENCY;
     return freq;
 }
 
@@ -468,7 +538,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * be told the console is widescreen here and 4:3 there. */
         *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
                 | AV_FLAGS_HDTV_720p
-                | (xbox_EnvSwitch("RECOMP_WIDESCREEN", 0) ? AV_FLAGS_WIDESCREEN : 0)
+                | (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0) ? AV_FLAGS_WIDESCREEN : 0)
                 | AV_FLAGS_60Hz;
         break;
 
@@ -481,7 +551,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         /* Same as capabilities for our purposes */
         *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
                 | AV_FLAGS_HDTV_720p
-                | (xbox_EnvSwitch("RECOMP_WIDESCREEN", 0) ? AV_FLAGS_WIDESCREEN : 0)
+                | (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0) ? AV_FLAGS_WIDESCREEN : 0)
                 | AV_FLAGS_60Hz;
         break;
 

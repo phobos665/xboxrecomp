@@ -200,6 +200,13 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.present_width; }
 
 ID3D11ShaderResourceView *d3d8_GetSceneSRV(void) { return g_device_state.scene_srv; }
+ID3D11Texture2D *d3d8_GetSceneTexture(void) { return g_device_state.scene_texture; }
+/* The render target drawing goes to right now: a title's own surface, or the
+ * scene target when none is set. For the screen copy's probe. */
+ID3D11RenderTargetView *d3d8_GetCurrentRTV(void)
+{
+    return g_cur_rt ? g_cur_rt->rtv : g_device_state.default_rtv;
+}
 
 /* Guest render-target pixels to host pixels, for the viewport and the
  * scissor rectangle -- the two pieces of state a title hands us measured

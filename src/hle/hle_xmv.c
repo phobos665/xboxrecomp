@@ -34,11 +34,16 @@
  *                                   title then calls its error callback
  *   GetStreamInfo(handle, out)      copies the playback object's +0x40, +0x44
  *                                   and +0x48 into out +0, +4 and +0xC
+ *   CreateAudioStream(handle, 0, 0, 0, &stream)
+ *                                   Future Perfect only; answered with a NULL
+ *                                   stream, which the title checks for
  *   Start(handle)                   the title sets its own playing flag after
  *   Update(handle, surface, &status, user)
- *                                   status 0 keeps playing, 1 means finished
- *                                   and makes the title set its done flag,
- *                                   2 and 3 are paused or stopped
+ *                                   status 0 is no new frame, 1 is a frame
+ *                                   ready to present (Future Perfect hands it
+ *                                   to D3DDevice_UpdateOverlay), 2 is end of
+ *                                   file and 3 failure; both titles leave
+ *                                   their loop on 2 or 3
  *   Destroy(handle)                 the title zeroes its handle field after
  *
  * What this does not do
@@ -61,15 +66,39 @@
 #include "hle.h"
 #include "../kernel/xbox_memory_layout.h"
 
-/* Playback status, as the title's switch reads it. */
-#define XMV_STATUS_PLAYING   0u
-#define XMV_STATUS_FINISHED  1u
-#define XMV_STATUS_PAUSED    2u
+/* Playback status, as the titles' switches read it. Two titles agree, and
+ * they were read separately:
+ *
+ *   Black's Update caller switches on the status through a four-entry jump
+ *   table at 0x000C4720: 0 retries the poll, 1 rotates its frame-buffer
+ *   indices and marks a frame ready, 2 and 3 both set its done flag.
+ *
+ *   Future Perfect's loop (0x00030542..0x00030604) calls
+ *   D3DDevice_UpdateOverlay when the status is 1, presents, and leaves the
+ *   loop only when the status is 2 or 3.
+ *
+ * So 1 is "a new frame is ready", not "finished". Until 22 Sep 2026 this
+ * file reported 1 to mean finished, and Future Perfect sat in its movie loop
+ * presenting black frames at 60 fps for as long as it was left running,
+ * waiting for a 2 that never came. */
+#define XMV_STATUS_NOFRAME   0u   /* nothing new this poll */
+#define XMV_STATUS_NEWFRAME  1u   /* a decoded frame is in the surface */
+#define XMV_STATUS_ENDOFFILE 2u   /* the movie is over */
+#define XMV_STATUS_FAILED    3u
 
 /* The playback object the title is handed. Only three fields are ever read by
  * it, through GetStreamInfo, and they sit where the real library puts them so
- * that a title reading them directly finds them too. The rest is ours. */
-#define XMV_OBJ_SIZE     0x100u
+ * that a title reading them directly finds them too. The rest is ours.
+ *
+ * The size is set by the library entry points that are *not* replaced and
+ * still run against this object. TimeSplitters: Future Perfect calls a
+ * two-argument setter straight after Create that stores its argument at
+ * +0x130, and the audio-stream creator (replaced below) reads +0x4C and
+ * +0x130..+0x138. At 0x100 bytes that setter wrote 0x30 bytes past the end of
+ * the allocation on every run. 0x200 covers the real object's extent with
+ * room to spare; the fields it lands on are zero, which is what an unstarted
+ * playback holds. */
+#define XMV_OBJ_SIZE     0x200u
 #define XMV_OFF_WIDTH    0x40u
 #define XMV_OFF_HEIGHT   0x44u
 #define XMV_OFF_RATE     0x48u
@@ -203,6 +232,41 @@ HLE_EXPORT(XMVPlaybackGetStreamInfo)
     HLE_MEM32(out + 0xCu) = HLE_MEM32(obj + XMV_OFF_RATE);
 }
 
+/* HRESULT XMVPlaybackCreateAudioStream(XMVPlayback *p, DWORD a, DWORD b,
+ *                                      DWORD c, IDirectSoundStream **out)
+ *
+ * The XDK's own name for this entry is not known; the name describes what it
+ * does. TimeSplitters: Future Perfect calls it straight after Create, with the
+ * handle, three zeros and an output slot, and the library body builds a
+ * DirectSound stream for the movie's audio: it reads the playback object at
+ * +0x4C and +0x130..+0x138, divides by one of those fields, and calls
+ * DirectSoundCreateStream with a format derived from them. Against this
+ * object those fields are zero, so with the body left lifted the run ended in
+ * a divide-by-zero inside DirectSound (0xC0000094 at 0x0040CA37+0x508,
+ * `div edi` with edi loaded from a byte at +0x64 of the half-built stream)
+ * the moment the movie was opened.
+ *
+ * Nothing here decodes audio, so there is no stream to hand back. The title
+ * allows for that: it tests the output slot for zero before calling
+ * IDirectSoundStream_SetVolume on it, and again before Flush and Release when
+ * the movie ends. So the answer is "no audio stream", written as NULL, and
+ * S_OK, which the title does not look at. */
+HLE_EXPORT(XMVPlaybackCreateAudioStream)
+{
+    uint32_t obj = HLE_ARG(0);
+    uint32_t out = HLE_ARG(4);
+
+    if (out)
+        HLE_MEM32(out) = 0;
+    if (xmv_is_ours(obj)) {
+        fprintf(stderr, "[XMV] audio stream requested for playback 0x%08X; "
+                        "none is made, because nothing here decodes audio\n",
+                obj);
+        fflush(stderr);
+    }
+    HLE_RETURN(0);
+}
+
 /* HRESULT XMVPlaybackUpdate(XMVPlayback *p, void *surface, DWORD *status,
  *                           void *user)
  *
@@ -234,18 +298,20 @@ HLE_EXPORT(XMVPlaybackUpdate)
     elapsed = xmv_now_ms() - started;
 
     if (status_va) {
+        /* No frame is ever decoded, so no poll reports NEWFRAME: a title
+         * given 1 would present whatever its surface holds. */
         uint32_t status = (frames > XMV_MIN_POLLS && elapsed >= xmv_ms())
-                        ? XMV_STATUS_FINISHED : XMV_STATUS_PLAYING;
+                        ? XMV_STATUS_ENDOFFILE : XMV_STATUS_NOFRAME;
         HLE_MEM32(status_va) = status;
 
-        if (frames <= 3u || (status == XMV_STATUS_FINISHED
+        if (frames <= 3u || (status == XMV_STATUS_ENDOFFILE
                              && !HLE_MEM32(obj + XMV_OFF_DONE))) {
             fprintf(stderr, "[XMV] update #%u: status %u -> 0x%08X "
                             "(elapsed %u ms, surface 0x%08X)\n",
                     frames, status, status_va, elapsed, HLE_ARG(1));
             fflush(stderr);
         }
-        if (status == XMV_STATUS_FINISHED)
+        if (status == XMV_STATUS_ENDOFFILE)
             HLE_MEM32(obj + XMV_OFF_DONE) = 1u;
     }
     HLE_RETURN(0);

@@ -43,6 +43,8 @@ UINT                 d3d8_GetGuestWidth(void);
  * the host renders larger than the guest, the swap chain's back buffer
  * when it does not. NULL before the device exists. */
 ID3D11ShaderResourceView *d3d8_GetSceneSRV(void);
+ID3D11Texture2D *d3d8_GetSceneTexture(void);
+ID3D11RenderTargetView *d3d8_GetCurrentRTV(void);
 /* Tell the device whether the next draw is positioned in screen
  * coordinates of the title's own making rather than through its
  * projection. Only matters in widescreen, where the two need different
@@ -300,6 +302,8 @@ ID3D11Resource *d3d8_base_resource(IDirect3DBaseTexture8 *texture);
 
 /* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);
+BOOL d3d8_format_is_linear(D3DFORMAT fmt);
+BOOL d3d8_base_size(IDirect3DBaseTexture8 *texture, UINT *width, UINT *height);
 void      d3d8_base_set_palette(IDirect3DBaseTexture8 *texture, UINT palette);
 
 /* Re-upload every level of a P8 (palettized) texture through its

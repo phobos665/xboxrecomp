@@ -672,6 +672,23 @@ HLE_EXPORT(CDirectSoundStream_Pause)
 {
     g_calls_pause++;
     note_caller("Pause");
+    /* Which mode, because the three are not interchangeable and this file
+     * treats two of them the same. RESUME is 0, PAUSE is 1, SYNCHPLAYBACK
+     * is 2 -- and SYNCHPLAYBACK starts playback rather than stopping it, so
+     * a title using it to begin a stream and a title pausing one look
+     * identical in the counts. Powers of ten, so this costs a few lines. */
+    {
+        static unsigned long seen[4], next = 1, total;
+        uint32_t m = HLE_ARG(1);
+        seen[m < 3 ? m : 3]++;
+        if (++total >= next) {
+            next *= 10;
+            fprintf(stderr, "[DSOUND] Pause modes so far: resume=%lu "
+                    "pause=%lu synchplayback=%lu other=%lu\n",
+                    seen[0], seen[1], seen[2], seen[3]);
+            fflush(stderr);
+        }
+    }
     uint32_t mode = HLE_ARG(1);
     uint64_t now = now_ms();
     Stream *s;
@@ -688,7 +705,11 @@ HLE_EXPORT(CDirectSoundStream_Pause)
                 refeed(s, now);
             }
         } else {                      /* PAUSE, and SYNCHPLAYBACK treated the same */
-            if (!s->paused) {
+            /* RECOMP_DSOUND_IGNORE_PAUSE=1: refuse to pause, as an
+             * experiment. A decoder that stops feeding because its
+             * output never drains looks exactly like one that has
+             * failed, and this tells the two apart in one run. */
+            if (!s->paused && !xbox_EnvSwitch("RECOMP_DSOUND_IGNORE_PAUSE", 0)) {
                 s->consumed_base = consumed(s, now);
                 s->paused = 1;
                 s->resumed_ms = 0u;
