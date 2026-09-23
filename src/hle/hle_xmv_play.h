@@ -20,8 +20,9 @@ int  xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height);
 void xmv_play_start(int handle);
 
 /* One poll: 0 no new picture, 1 a new picture (on the movie layer, and in
- * `surface_va` when that is a surface this can write), 2 the movie is over. */
-uint32_t xmv_play_update(int handle, uint32_t surface_va);
+ * `surface_va` when that is a surface this can write), 2 the movie is over.
+ * With a new picture, *pts_ms is its time in the movie. */
+uint32_t xmv_play_update(int handle, uint32_t surface_va, uint32_t *pts_ms);
 
 void xmv_play_close(int handle);
 

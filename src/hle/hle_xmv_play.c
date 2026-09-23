@@ -31,6 +31,10 @@
 #include "xmv_decode.h"
 #include "d3d8_movie.h"
 
+/* hle_d3d8.c: where the playing movie's surface keeps its texels, so a frame
+ * that never samples them can have the picture drawn over it. 0 when none. */
+void hle_d3d8_movie_surface(uint32_t data);
+
 /* kernel_path.c: an Xbox path to the host file it names. */
 BOOL xbox_translate_path(const char *xbox_path, WCHAR *host_path_buf, DWORD buf_size);
 
@@ -334,6 +338,7 @@ static void write_surface(movie *m, uint32_t surface)
     }
     if (!size || !data || (uint64_t)(data & 0x03FFFFFFu) + (uint64_t)pitch * sh > 0x04000000u)
         return;
+    hle_d3d8_movie_surface(data);
     dst = (uint8_t *)HLE_PTR(0x80000000u | data);
     for (y = 0; y < sh; y++) {
         const uint8_t *row = m->bgra + (size_t)(y * m->h / sh) * m->w * 4u;
@@ -361,10 +366,10 @@ static void write_surface(movie *m, uint32_t surface)
     }
 }
 
-uint32_t xmv_play_update(int handle, uint32_t surface_va)
+uint32_t xmv_play_update(int handle, uint32_t surface_va, uint32_t *pts_ms)
 {
     movie *m = get(handle);
-    uint32_t now, decoded = 0;
+    uint32_t now, decoded = 0, shown_pts = 0;
     int got = 0;
 
     if (!m)
@@ -390,13 +395,17 @@ uint32_t xmv_play_update(int handle, uint32_t surface_va)
         fflush(stderr);
     }
     while (read_next(m) && m->next_pts <= now && decoded < MAX_CATCH_UP) {
-        if (xmv_decoder_decode(m->dec, m->next, m->next_size, m->next_pts, m->bgra) == 1)
+        if (xmv_decoder_decode(m->dec, m->next, m->next_size, m->next_pts, m->bgra) == 1) {
             got = 1;
+            shown_pts = m->next_pts;
+        }
         m->have_next = 0;
         decoded++;
     }
     feed_audio(m);
     if (got) {
+        if (pts_ms)
+            *pts_ms = shown_pts;
         write_surface(m, surface_va);
         d3d8_movie_set_frame(m->bgra, m->w, m->h);
         m->shown++;
@@ -425,6 +434,7 @@ void xmv_play_close(int handle)
     fprintf(stderr, "[XMV] movie closed after %u pictures\n", m->shown);
     fflush(stderr);
     recomp_audio_output_reset_voice(RECOMP_AUDIO_SLOT_MOVIE);
+    hle_d3d8_movie_surface(0);
     d3d8_movie_clear();
     xmv_decoder_destroy(m->dec);
     xmv_close(&m->dm);
@@ -442,9 +452,9 @@ int xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height)
     return 0;
 }
 void xmv_play_start(int handle) { (void)handle; }
-uint32_t xmv_play_update(int handle, uint32_t surface_va)
+uint32_t xmv_play_update(int handle, uint32_t surface_va, uint32_t *pts_ms)
 {
-    (void)handle; (void)surface_va;
+    (void)handle; (void)surface_va; (void)pts_ms;
     return 2u;
 }
 void xmv_play_close(int handle) { (void)handle; }
