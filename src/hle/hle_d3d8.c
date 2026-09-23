@@ -1060,6 +1060,11 @@ HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetScissors);
 HLE_ORIGINAL(D3DDevice_CopyRects);
 HLE_ORIGINAL(D3DDevice_GetBackBuffer2);
+/* The dispatch table, for calling a title's callback. */
+typedef void (*recomp_func_t)(void);
+recomp_func_t recomp_lookup(uint32_t xbox_va);
+recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
 HLE_ORIGINAL(D3DDevice_SetPixelShader);
 HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
@@ -2640,6 +2645,52 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     shadow_viewport_constants(&g_title_viewport);
 }
 #endif /* _WIN32 */
+
+/* void D3DDevice_InsertCallback(D3DCALLBACKTYPE Type, D3DCALLBACK pCallback,
+ *     DWORD Context) -- stdcall; the callback is __cdecl void (DWORD Context).
+ *
+ * The XDK writes the callback into the push buffer for the GPU to raise when
+ * it gets there: READ (0) once the GPU has read everything before it, WRITE
+ * (1) once it has finished it. No GPU here runs push buffers, so the callback
+ * never came, and Breakdown spun forever on the flag its callback clears
+ * (sub_0018EA30, `while (flag) ;` straight after the insert). Everything
+ * before the call has already been drawn by the time it returns, so both
+ * kinds are due at once, and the callback runs here. The original body still
+ * runs first, so the push buffer is what the XDK made. */
+HLE_ORIGINAL(D3DDevice_InsertCallback);
+HLE_EXPORT(D3DDevice_InsertCallback)
+{
+    static int seen;
+    uint32_t type = HLE_ARG(0), callback = HLE_ARG(1), context = HLE_ARG(2);
+    recomp_func_t fn;
+
+    first_call(&seen, "D3DDevice_InsertCallback", callback);
+    if (original_missing(hle_original_D3DDevice_InsertCallback, "D3DDevice_InsertCallback"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_InsertCallback);
+    if (!callback)
+        return;
+    fn = recomp_lookup(callback);
+    if (!fn)
+        fn = recomp_lookup_manual(callback);
+    if (!fn) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HLE-D3D8] InsertCallback: callback 0x%08X (type %u) is not "
+                    "in the dispatch table; it does not run\n", callback, type);
+        return;
+    }
+    {
+        /* cdecl: the callee leaves its argument, so the stack is put back. */
+        uint32_t saved_esp = g_esp;
+        uint32_t saved_eax = g_eax;
+        g_esp -= 4; HLE_MEM32(g_esp) = context;
+        g_esp -= 4; HLE_MEM32(g_esp) = 0;        /* return address, popped by its ret */
+        fn();
+        g_esp = saved_esp;
+        g_eax = saved_eax;
+    }
+}
 
 /* The video overlay: the plane XMV movies are shown on by titles that use it
  * (TimeSplitters: Future Perfect calls UpdateOverlay once per decoded frame
