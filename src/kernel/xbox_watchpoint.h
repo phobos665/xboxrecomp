@@ -34,6 +34,14 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep);
 /* Print every guest address currently holding `value`. Answers "who is
  * holding this bad pointer?", which is the question that gives the
  * watchpoint above an address to watch. Safe to call from a fault handler. */
+/* RECOMP_WATCH_ARM_ON=<text>: hold the watches until the title opens a file
+ * whose path contains <text>. Called with every translated guest path. */
+#ifdef _WIN32
+void xbox_watch_note_path(const char *xbox_path);
+#else
+#define xbox_watch_note_path(p)                 ((void)0)
+#endif
+
 void xbox_watch_scan_value(uint32_t value);
 
 /* Called from the crash path: runs the scan if RECOMP_FIND_VALUE is set. */

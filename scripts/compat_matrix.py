@@ -452,6 +452,11 @@ def run_title(t, seconds, out_dir, extra_env=None):
     # window and Outrun 2 fewer, which never reached 150. The runtime caps how
     # many files it writes, so this costs a fast title nothing.
     env.setdefault("RECOMP_HLE_D3D8_DUMP_EVERY", "20")
+    # ...and at 20 a fast title fills all 24 files in its first 480 swaps.
+    # Outrun 2's were all intro logos while it spent the last minute of the
+    # run in a race. Keep 12 from the start and let the other 12 roll, so the
+    # frames show where the run ended up as well as how it began.
+    env.setdefault("RECOMP_HLE_D3D8_DUMP_KEEP_LAST", "12")
     env.update(extra_env or {})
     err_path = out_dir / f"{t['name']}.err"
     with open(err_path, "wb") as errf, fresh_save_data(t.get("game_dir"),
@@ -694,6 +699,10 @@ def main():
                          "not touching save data is the safer default and the "
                          "overwrite prompt is a smaller problem than losing "
                          "track of someone's saves")
+    ap.add_argument("--mute", action="store_true",
+                    help="run every title silently (RECOMP_MUTE=1): the audio "
+                         "device still opens and plays at its own pace, so "
+                         "timing is the same as an audible run")
     ap.add_argument("--idle", action="store_true",
                     help="do not press anything. The old behaviour, and worth "
                          "having: TimeSplitters 2 crashes 10/10 idle and 0/10 "
@@ -718,6 +727,8 @@ def main():
                     help="where per-title logs and the JSON go")
     ap.add_argument("--baseline", help="a previous run's JSON to compare against")
     args = ap.parse_args()
+    if args.mute:
+        os.environ["RECOMP_MUTE"] = "1"      # inherited by every title run
 
     only = set(args.titles.split(",")) if args.titles else None
     titles = discover(only)

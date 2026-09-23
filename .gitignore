@@ -23,12 +23,16 @@ game_files/
 *.iso
 *.xiso
 
+titles/
 # IDE
 .vs/
 .vscode/
 .idea/
 *.suo
 *.user
+
+# Per-machine notes for Claude Code (toolchain paths, what is installed where)
+CLAUDE.local.md
 
 # OS
 Thumbs.db
@@ -52,3 +56,6 @@ xbox_kernel.log
 # commit one. The round-trip test writes its synthetic capture as .tmp.
 *.d3dcap
 d3d8_capture_*.tmp
+
+# FFmpeg shared build for XMV movie playback (fetched, not committed; see docs/technical/video-playback.md)
+third_party/ffmpeg/

@@ -22,8 +22,11 @@
  * `this` on the stack -- never updates it; the first indexed buffer draw
  * without it says so once, and draws with base 0.
  *
- * Only stream 0 is forwarded: the host binds one stream, and FVF draws use
- * only that one.
+ * The host binds one stream, stream 0. A vertex program that reads another
+ * one -- Outrun 2's road takes v13 from stream 1 -- has those registers copied
+ * in beside each stream 0 vertex (shadow_expand_vertices in hle_d3d8.c),
+ * which finds them through hle_d3d8_stream_vertices below at the first
+ * vertex each buffer draw passes along. FVF draws use only stream 0.
  *
  * Vertex shader constants arrive through fastcall setters: register in ecx,
  * data in edx, and for the NotInline pair a count of floats on the stack.
@@ -51,6 +54,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
                           uint32_t stride, int from_buffer);
 void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *idx,
                                   const void *verts, uint32_t stride, int from_buffer);
+void hle_d3d8_shadow_set_first_vertex(uint32_t first);
 
 #define CONTIG_BASE 0x80000000u
 #define CONTIG_SIZE (64u * 1024u * 1024u)    /* kernel.h XBOX_CONTIG_SIZE */
@@ -58,6 +62,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
 
 static uint32_t g_stream0_vb;        /* guest X_D3DVertexBuffer */
 static uint32_t g_stream0_stride;
+static uint32_t g_stream_vb[16], g_stream_stride[16];   /* every stream, 0 included */
 static uint32_t g_base_vertex;
 static int      g_base_vertex_seen;  /* CDevice_SetStateVB has run */
 static int      g_in_notinline;      /* inside SetVertexShaderConstantNotInline */
@@ -92,6 +97,30 @@ static const void *stream0_vertices(uint32_t first, uint32_t vertices)
         g_skip_range++;
         return NULL;
     }
+    return HLE_PTR(CONTIG_BASE + (uint32_t)start);
+}
+
+/* Host pointer to vertex `first` of any stream's buffer, for `vertices`
+ * vertices, with its stride; NULL if there is none or it would read outside
+ * the contiguous window. For the registers a program reads from streams other
+ * than 0, found at the same index as the stream 0 vertex they go with. */
+const void *hle_d3d8_stream_vertices(uint32_t stream, uint32_t first, uint32_t vertices,
+                                     uint32_t *stride)
+{
+    uint32_t vb, data;
+    uint64_t start, bytes;
+
+    if (stream >= 16u)
+        return NULL;
+    vb = g_stream_vb[stream];
+    *stride = g_stream_stride[stream];
+    if (!vb || !*stride || !guest_readable(vb, 12u))
+        return NULL;
+    data = HLE_MEM32(vb + 4u);
+    start = (uint64_t)((data | CONTIG_BASE) - CONTIG_BASE) + (uint64_t)first * *stride;
+    bytes = (uint64_t)vertices * *stride;
+    if (!data || start + bytes > CONTIG_SIZE)
+        return NULL;
     return HLE_PTR(CONTIG_BASE + (uint32_t)start);
 }
 
@@ -157,6 +186,10 @@ HLE_EXPORT(D3DDevice_SetStreamSource)
         g_stream0_vb = vb;
         g_stream0_stride = stride;
     }
+    if (stream < 16u) {
+        g_stream_vb[stream] = vb;
+        g_stream_stride[stream] = stride;
+    }
 #endif
 }
 
@@ -194,8 +227,10 @@ HLE_EXPORT(D3DDevice_DrawVertices)
 #ifdef _WIN32
     if (hle_d3d8_shadow_device() && count) {
         const void *verts = stream0_vertices(start, count);
-        if (verts)
+        if (verts) {
+            hle_d3d8_shadow_set_first_vertex(start);
             hle_d3d8_shadow_draw(xpt, count, verts, g_stream0_stride, 1);
+        }
         report();
     }
 #endif
@@ -233,8 +268,10 @@ HLE_EXPORT(D3DDevice_DrawIndexedVertices)
                         "ran; indexed buffer draws use base vertex 0\n");
         }
         verts = stream0_vertices(g_base_vertex, vertices);
-        if (verts)
+        if (verts) {
+            hle_d3d8_shadow_set_first_vertex(g_base_vertex);
             hle_d3d8_shadow_draw_indexed(xpt, count, idx, verts, g_stream0_stride, 1);
+        }
         report();
     }
 #endif
@@ -268,6 +305,33 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant1)
                          "D3DDevice_SetVertexShaderConstant1"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant1);
+#ifdef _WIN32
+    forward_constants(reg, data, 1u);
+#endif
+}
+
+/* void __fastcall D3DDevice_SetVertexShaderConstant1Fast(int Register,
+ *     const void *pConstantData) -- one register, without the checks.
+ *
+ * Some builds have only this form of the single-register setter, beside
+ * NotInlineFast: XGRA, Doom 3 and Breakdown name no other, and Outrun 2 has
+ * both. Unreplaced, every constant a title set this way stayed zero on the
+ * host, and a program that transforms its position by one drew nothing --
+ * XGRA's movie quad reached the host every frame and came out black. */
+HLE_ORIGINAL(D3DDevice_SetVertexShaderConstant1Fast);
+HLE_EXPORT(D3DDevice_SetVertexShaderConstant1Fast)
+{
+    static int seen;
+    uint32_t reg = g_ecx;
+#ifdef _WIN32
+    uint32_t data = g_edx;
+#endif
+
+    first_call(&seen, "D3DDevice_SetVertexShaderConstant1Fast", reg);
+    if (original_missing(hle_original_D3DDevice_SetVertexShaderConstant1Fast,
+                         "D3DDevice_SetVertexShaderConstant1Fast"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant1Fast);
 #ifdef _WIN32
     forward_constants(reg, data, 1u);
 #endif

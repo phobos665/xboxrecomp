@@ -54,6 +54,9 @@ IDirect3DDevice8 *hle_d3d8_shadow_device(void);
 unsigned long hle_d3d8_shadow_swaps(void);
 /* Whether these texels are the frame buffer's -- see hle_d3d8.c. */
 int hle_d3d8_is_framebuffer(uint32_t phys);
+/* From hle_d3d8.c: where the texels of the texture bound to a stage live, so
+ * a draw can tell whether it samples the playing movie. */
+void hle_d3d8_note_stage_texels(uint32_t stage, uint32_t phys);
 int hle_d3d8_trace_on(void);
 
 #define CONTIG_BASE          0x80000000u
@@ -406,8 +409,8 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
         e->rendered = 1;
         e->framebuffer = 1;
         fprintf(stderr, "[HLE-D3D8] the title binds its own frame as a texture "
-                "0x%08X (%ux%u, format 0x%02X); filling it from the host's frame\n",
-                va, t->width, t->height, t->fmt);
+                "0x%08X (%ux%u, format 0x%02X, data 0x%08X); filling it from the "
+                "host's frame\n", va, t->width, t->height, t->fmt, data);
         fflush(stderr);
     }
     e->data = data;
@@ -789,6 +792,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
             }
             host = host_texture(dev, texture);
         }
+        hle_d3d8_note_stage_texels(stage, texture ? HLE_MEM32(texture + 4) & 0x0FFFFFFFu : 0u);
         g_bound[stage] = host;
         if (stage == 0) {
             /* Whether this draw is one of the title's full-screen passes over

@@ -189,6 +189,12 @@ CONFIDENCE_DATA_PTR = 0.84   # Code pointer stored in a data section
 # Chunk size for linear sweep (64 KB)
 SWEEP_CHUNK_SIZE = 0x10000
 
+# How far past a `call [reg*4 + disp]` displacement a function-pointer table
+# in a code section is looked for. The displacement is index 0, and the used
+# entries can start well after it (D3D8 SetRenderState: 0x88 slots, 0x220
+# bytes); 4 KB covers 1024 slots.
+CALL_TABLE_WINDOW = 0x1000
+
 # x86-32 mode
 CS_MODE = 32
 

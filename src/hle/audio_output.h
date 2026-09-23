@@ -18,12 +18,15 @@ extern "C" {
 /* Initialization is attempted once per process; an unavailable device or
    shutdown leaves guest audio timing unchanged. RECOMP_AUDIO_GAIN is the host
    master gain (0..1); absent means 1, zero mutes without opening a device. */
+#define RECOMP_AUDIO_SLOT_MOVIE 272u
+
 void recomp_audio_output_initialize(void);
 void recomp_audio_output_shutdown(void);
 void recomp_audio_output_reset_voice(uint32_t slot);
 
 /* Copies PCM before returning; never retains a guest-memory pointer.
-   Slots: 0..255 for buffers, 256..271 for streams. PCM: 1000..200000 Hz,
+   Slots: 0..255 for buffers, 256..271 for streams, 272
+   (RECOMP_AUDIO_SLOT_MOVIE) for a movie's sound. PCM: 1000..200000 Hz,
    mono/stereo, unsigned 8 or signed 16 bit.
    Each submission is frame-aligned and at most 160000 bytes.
 

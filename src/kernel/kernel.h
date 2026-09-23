@@ -1059,6 +1059,10 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_AV_STANDARD_NTSC_J     0x00400200
 #define XC_AV_STANDARD_PAL_I      0x00800300
 
+/* The console's video standard and refresh (XC_AV_STANDARD_*), from the
+ * disc's region; kernel_xbox.c. */
+uint32_t xbox_kernel_console_av_standard(void);
+
 /* Game region the XBE certificate allows, as parsed during layout init, or 0
  * if there was no mapped XBE to read it from. */
 uint32_t xbox_kernel_get_xbe_game_region(void);

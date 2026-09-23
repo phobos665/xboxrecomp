@@ -48,6 +48,8 @@
  * RECOMP_HLE_D3D8_DUMP=<prefix> writes the host frame to <prefix>NNN.bmp
  * every RECOMP_HLE_D3D8_DUMP_EVERY swaps (default 300), at most 24 files --
  * the same format as the executor's RECOMP_FB_DUMP, to put them side by side.
+ * RECOMP_HLE_D3D8_DUMP_KEEP_LAST=<k> makes the last k of those roll, so the
+ * files show where a long run ended up and not only how it began.
  *
  * Two host facts shape it:
  *   - Guest threads are real host threads. DXGI's Present sends messages to
@@ -70,6 +72,7 @@
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
 #include "d3d8_overlay.h"
+#include "d3d8_movie.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
 #endif
@@ -121,6 +124,53 @@ static DWORD              g_shadow_swap_thread;
 static int                g_shadow_thread_notes;
 static unsigned long      g_shadow_clears;
 static unsigned long      g_shadow_swaps;
+/* The video overlay's state, from EnableOverlay and UpdateOverlay. */
+static int                g_overlay_enabled, g_overlay_updated;
+/* Where the playing movie's surface keeps its texels (hle_xmv_play.c), and
+ * whether a draw that reached the host this frame sampled them. Bound is not
+ * enough: XGRA binds its movie texture through SetTexture and then draws
+ * through a push buffer of its own, so the bind happens and no draw does. */
+static uint32_t           g_movie_phys;
+static int                g_movie_sampled;
+static int                g_movie_yuy2;       /* the movie surface is YUY2 */
+static uint32_t           g_stage_texels[4];
+
+void hle_d3d8_movie_surface(uint32_t data, uint32_t xbox_format)
+{
+    g_movie_phys = data & 0x0FFFFFFFu;
+    g_movie_yuy2 = data && xbox_format == 0x24u;
+}
+
+void hle_d3d8_note_stage_texels(uint32_t stage, uint32_t phys)
+{
+    if (stage < 4u)
+        g_stage_texels[stage] = phys;
+}
+
+/* RECOMP_XMV_LAYER=1: draw a playing movie over the frame on the host's
+ * movie layer even when the title draws it itself -- for a title whose own
+ * movie draw comes out wrong, and to tell a decoding fault from a drawing one. */
+static int movie_layer_forced(void)
+{
+    static int forced = -1;
+    if (forced < 0) {
+        const char *e = getenv("RECOMP_XMV_LAYER");
+        forced = e && *e && strcmp(e, "0") != 0;
+    }
+    return forced;
+}
+
+/* After a draw reached the host. */
+static void note_draw_sampled_movie(void)
+{
+    int s;
+
+    if (!g_movie_phys)
+        return;
+    for (s = 0; s < 4; s++)
+        if (g_stage_texels[s] == g_movie_phys)
+            g_movie_sampled = 1;
+}
 static uint32_t           g_shadow_last_color;
 
 /* RECOMP_HLE_D3D8_TRACE_SWAPS=<from>-<to>: one line per render-target set,
@@ -557,8 +607,26 @@ struct shadow_program {
     UINT     packed_offset[SHADOW_MAX_PACKED];   /* in the guest vertex */
     UINT     packed_out[SHADOW_MAX_PACKED];      /* in the prefix */
     uint32_t packed_format[SHADOW_MAX_PACKED];   /* X_D3DVSDT */
+    /* Registers read from a stream other than 0 go through the same prefix:
+     * the host binds one stream, so each draw copies them in beside the
+     * stream 0 vertex, as they are when the host can read the format
+     * (packed_raw, packed_size bytes) and unpacked when it cannot. */
+    uint8_t  packed_stream[SHADOW_MAX_PACKED];
+    uint8_t  packed_raw[SHADOW_MAX_PACKED];
+    UINT     packed_size[SHADOW_MAX_PACKED];
+    int      other_streams;              /* any register from stream 1..15 */
     UINT     expanded_bytes;
 };
+
+/* The first vertex of the buffer draw about to be made, so other streams can
+ * be read at the same index; NO_FIRST_VERTEX for a UP draw, which has only
+ * the vertices it was handed. Set by hle_d3d8_vertex.c. */
+#define NO_FIRST_VERTEX 0xFFFFFFFFu
+static uint32_t g_draw_first = NO_FIRST_VERTEX;
+void hle_d3d8_shadow_set_first_vertex(uint32_t first) { g_draw_first = first; }
+/* From hle_d3d8_vertex.c: vertex `first` of stream `stream`, or NULL. */
+const void *hle_d3d8_stream_vertices(uint32_t stream, uint32_t first, uint32_t vertices,
+                                     uint32_t *stride);
 
 static struct shadow_program g_programs[SHADOW_MAX_PROGRAMS];
 static int      g_program_count;
@@ -737,6 +805,7 @@ static unsigned long g_skipped_fullscreen;
 /* The inline immediate-mode vertex path, counted but not implemented; see the
  * replacements for D3DDevice_Begin further down. */
 static unsigned long g_inline_begin, g_inline_end, g_inline_vdata;
+static unsigned long g_inline_drawn, g_inline_program;   /* drawn at End; under a program */
 static unsigned long g_inline_begin_frame, g_inline_vdata_frame;
 static unsigned long g_inline_begin_max, g_inline_vdata_max;
 /* From hle_d3d8_texture.c: stage 0 holds the title's own frame. */
@@ -894,8 +963,9 @@ static void shadow_frame_brightness(void)
 static void shadow_dump_frame(void)
 {
     static const char *prefix;
-    static int configured, every = 300, written;
+    static int configured, every = 300, written, keep_last;
     static unsigned long min_draws, last_dump, from_swap;
+    static char ring[24][512];
     static char asked_prefix[8];
     int asked;
     IDirect3DSurface8 *surf = NULL;
@@ -923,6 +993,14 @@ static void shadow_dump_frame(void)
         e = getenv("RECOMP_HLE_D3D8_DUMP_FROM");
         if (e && atol(e) > 0)
             from_swap = (unsigned long)atol(e);
+        /* RECOMP_HLE_D3D8_DUMP_KEEP_LAST=<k>: the first 24-k dumps are kept
+         * as usual and the last k slots roll, always holding the latest
+         * frames, as <prefix>_s<swap>.bmp. Without it a fast title fills the
+         * 24 files in its first few hundred swaps: Outrun 2's matrix frames
+         * all showed the intro logos while it was 90 seconds into a race. */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_KEEP_LAST");
+        if (e && atoi(e) > 0)
+            keep_last = atoi(e) > 24 ? 24 : atoi(e);
     }
     /* Asked for by hand: this frame, wherever the run has got to, whatever
      * the interval and the 24-file cap say, and beside the executable when
@@ -934,7 +1012,9 @@ static void shadow_dump_frame(void)
         prefix = asked_prefix;
     }
     if (!asked) {
-        if (!prefix || !*prefix || written >= 24 || g_shadow_swaps < from_swap)
+        if (!prefix || !*prefix || g_shadow_swaps < from_swap)
+            return;
+        if (written >= 24 && !keep_last)
             return;
         if (min_draws) {
             if (g_frame_draws < min_draws ||
@@ -971,7 +1051,17 @@ static void shadow_dump_frame(void)
     pad = (4 - ((w * 3) & 3)) & 3;
     filesz = 54 + (w * 3 + pad) * h;
 
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, written++);
+    if (!asked && keep_last && written >= 24 - keep_last) {
+        char *slot = ring[(written - (24 - keep_last)) % keep_last];
+
+        if (slot[0])
+            remove(slot);
+        snprintf(path, sizeof path, "%s_s%08lu.bmp", prefix, g_shadow_swaps);
+        snprintf(slot, sizeof ring[0], "%s", path);
+        written++;
+    } else {
+        snprintf(path, sizeof path, "%s%03d.bmp", prefix, written++);
+    }
     f = fopen(path, "wb");
     if (f) {
         memset(hdr, 0, sizeof hdr);
@@ -1016,6 +1106,11 @@ HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetScissors);
 HLE_ORIGINAL(D3DDevice_CopyRects);
 HLE_ORIGINAL(D3DDevice_GetBackBuffer2);
+/* The dispatch table, for calling a title's callback. */
+typedef void (*recomp_func_t)(void);
+recomp_func_t recomp_lookup(uint32_t xbox_va);
+recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+
 HLE_ORIGINAL(D3DDevice_SetRenderTarget);
 HLE_ORIGINAL(D3DDevice_SetPixelShader);
 HLE_ORIGINAL(D3DDevice_SetVertexDataColor);
@@ -1301,11 +1396,15 @@ HLE_EXPORT(Direct3D_CreateDevice)
 #ifdef _WIN32
     g_in_create_device = 1;
 #endif
+    /* Before the original, not after: some XDKs wait on the fence inside
+     * CreateDevice itself. XGRA's (5558) calls D3D_KickOffAndWaitForIdle
+     * there and spun in D3D_BlockOnTime before the device was ever returned.
+     * The kernel follows the device pointer afresh on every poll and skips
+     * it while it is still zero, so the mirror can go in before the device
+     * exists. */
+    mirror_gpu_time_fence();
     HLE_CALL_ORIGINAL(Direct3D_CreateDevice);
-    /* Only beside a guest device that exists: the original's HRESULT. */
-    if ((int32_t)g_eax >= 0)
-        mirror_gpu_time_fence();
-        mirror_swap_throttle();
+    mirror_swap_throttle();
 #ifdef _WIN32
     g_in_create_device = 0;
     if (pp_va) {
@@ -1313,10 +1412,12 @@ HLE_EXPORT(Direct3D_CreateDevice)
          * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
          * decides what a Swap means (frame_end_shadow). */
         g_swap_effect = HLE_MEM32(pp_va + 0x14);
-        fprintf(stderr, "[HLE-D3D8] CreateDevice: %u back buffer(s), swap effect %u "
-                "(1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
-                "presentation interval 0x%08X\n", HLE_MEM32(pp_va + 0xC),
-                g_swap_effect, HLE_MEM32(pp_va + 0x28), HLE_MEM32(pp_va + 0x30));
+        fprintf(stderr, "[HLE-D3D8] CreateDevice: %ux%u format 0x%02X, %u back buffer(s), "
+                "swap effect %u (1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
+                "refresh %u Hz, presentation interval 0x%08X -> 0x%08X\n",
+                HLE_MEM32(pp_va + 0x0), HLE_MEM32(pp_va + 0x4), HLE_MEM32(pp_va + 0x8),
+                HLE_MEM32(pp_va + 0xC), g_swap_effect, HLE_MEM32(pp_va + 0x28),
+                HLE_MEM32(pp_va + 0x2C), HLE_MEM32(pp_va + 0x30), g_eax);
     }
     if (!g_backbuffer_va)
         fprintf(stderr, "[HLE-D3D8] CreateDevice set no render target; the back "
@@ -1487,6 +1588,29 @@ static void frame_end_shadow(void)
         /* The frame boundary for capture: closes the frame being recorded, or
          * starts recording if this is the requested swap. */
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
+        /* A movie on the video overlay (UpdateOverlay, below) is a plane the
+         * scan-out puts over the frame buffer; here it is drawn over the
+         * finished frame, before the dump so captures show it. */
+        if (g_overlay_enabled && g_overlay_updated) {
+            d3d8_movie_draw();
+        } else if (g_movie_phys &&
+                   (!g_movie_sampled || g_movie_yuy2 || movie_layer_forced())) {
+            /* A movie is playing and no draw this frame sampled its picture.
+             * The title shows it by a way the host cannot see -- XGRA and
+             * Breakdown draw through push buffers they fill themselves -- so
+             * the picture goes over the frame the way the overlay's does.
+             * A title that draws the movie surface itself (Black) samples it
+             * and is left alone.
+             *
+             * A YUY2 movie surface goes on the layer whatever the title
+             * draws. YUY2 is the video overlay's format: Future Perfect and
+             * Breakdown use it that way, and Otogi, which textures from it,
+             * does so through a two-pass draw that comes out black here while
+             * the layer shows its promo exactly (RECOMP_XMV_LAYER=1). The
+             * cost is that anything drawn over such a movie is covered. */
+            d3d8_movie_draw();
+        }
+        g_movie_sampled = 0;
         shadow_dump_frame();             /* before Present discards the buffer */
         shadow_frame_brightness();       /* likewise: Present discards it */
         if (g_inline_begin_frame > g_inline_begin_max)
@@ -1512,11 +1636,11 @@ static void frame_end_shadow(void)
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
             if (g_inline_begin || g_inline_vdata)
-                fprintf(stderr, "[HLE-D3D8] inline vertex path (not implemented, "
-                        "goes to the push buffer): %lu Begin, %lu End, %lu "
-                        "SetVertexData4f; peak per frame %lu Begin, %lu vertex "
-                        "data\n", g_inline_begin, g_inline_end, g_inline_vdata,
-                        g_inline_begin_max, g_inline_vdata_max);
+                fprintf(stderr, "[HLE-D3D8] inline vertex path: %lu Begin, %lu End, "
+                        "%lu SetVertexData4f; %lu drawn, %lu under a vertex program "
+                        "(not drawn); peak per frame %lu Begin, %lu vertex data\n",
+                        g_inline_begin, g_inline_end, g_inline_vdata, g_inline_drawn,
+                        g_inline_program, g_inline_begin_max, g_inline_vdata_max);
             if (g_skipped_fullscreen)
                 fprintf(stderr, "[HLE-D3D8] shadow: %lu full-screen passes over the "
                         "title's own frame dropped (RECOMP_HLE_D3D8_SKIP_FULLSCREEN)\n",
@@ -1727,15 +1851,25 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     p->has_declaration = 0;
     p->extent = 0;
     p->packed_count = 0;
+    p->other_streams = 0;
     p->expanded_bytes = 0;
     if (!object)
         return;
     for (i = 0; i < 16u; i++) {
+        uint32_t attr = object + 20u + i * 16u;
+        uint32_t format = HLE_MEM32(attr + 8u);
+        DXGI_FORMAT dxgi;
         UINT size;
-        int floats = xbox_vsdt_expanded(HLE_MEM32(object + 20u + i * 16u + 8u), &size);
-        if (floats) {
+        int floats;
+
+        if (format <= 0x02u)
+            continue;
+        if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             packed++;
             shift += (UINT)floats * 4u;
+        } else if (HLE_MEM32(attr) != 0u && xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+            packed++;
+            shift += (size + 3u) & ~3u;
         }
     }
     if (packed > SHADOW_MAX_PACKED)
@@ -1752,21 +1886,35 @@ static void shadow_read_declaration(int slot, uint32_t handle)
 
         if (format <= 0x02u)
             continue;
-        if (stream != 0u || offset > 0xFFFFu) {
+        if (stream > 15u || offset > 0xFFFFu) {
             refused = 1;
         } else if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             p->packed_offset[packed] = offset;
             p->packed_out[packed] = out;
             p->packed_format[packed] = format;
+            p->packed_stream[packed] = (uint8_t)stream;
+            p->packed_raw[packed] = 0;
+            p->packed_size[packed] = size;
             packed++;
             in[n].format = FLOATN_FORMAT[floats];
             in[n].offset = out;
             out += (UINT)floats * 4u;
-        } else if (xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+        } else if (!xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+            refused = 1;
+        } else if (stream != 0u) {
+            p->packed_offset[packed] = offset;
+            p->packed_out[packed] = out;
+            p->packed_format[packed] = format;
+            p->packed_stream[packed] = (uint8_t)stream;
+            p->packed_raw[packed] = 1;
+            p->packed_size[packed] = size;
+            packed++;
+            in[n].format = dxgi;
+            in[n].offset = out;
+            out += (size + 3u) & ~3u;
+        } else {
             in[n].format = dxgi;
             in[n].offset = offset + shift;
-        } else {
-            refused = 1;
         }
         if (refused) {
             bad_reg = i;
@@ -1775,7 +1923,9 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             break;
         }
         in[n].reg = (int)i;
-        if (offset + size > p->extent)
+        if (stream != 0u)
+            p->other_streams = 1;
+        else if (offset + size > p->extent)
             p->extent = offset + size;
         n++;
     }
@@ -2065,6 +2215,168 @@ HLE_EXPORT(D3DDevice_SetPixelShader)
 #endif
 }
 
+#ifdef _WIN32
+/* Immediate mode, drawn (D3DDevice_Begin ... SetVertexData* ... End).
+ *
+ * Each SetVertexData* between Begin and End sets one input register's current
+ * value; writing the position register (0, or D3DVSDE_VERTEX, -1) ends a
+ * vertex with every register's current value, as the NV2A does. At End the
+ * vertices are laid out for the fixed-function shader's FVF and drawn through
+ * the same path as DrawVerticesUP, pre-transformed positions included.
+ *
+ * XGRA draws its movies this way, one quad a frame, and was black while these
+ * were only counted. A vertex program is still only counted: its layout comes
+ * from a declaration there is no stream for. */
+#define INLINE_MAX_VERTICES 4096u
+static int      g_inline_on;
+static uint32_t g_inline_xpt;
+static float    g_inline_cur[16][4] = {
+    { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0, 0, 1 },
+    { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 },
+    { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, { 0, 0, 0, 1 },
+    { 0, 0, 0, 1 } };
+static float  (*g_inline_verts)[16][4];
+static uint32_t g_inline_nverts;
+
+void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
+                          uint32_t stride, int from_buffer);
+
+/* 1 if this call was part of an immediate-mode vertex and has been taken. */
+static int inline_vertex_data(uint32_t reg, const float v[4])
+{
+    if (!g_inline_on)
+        return 0;
+    if (reg == 0xFFFFFFFFu)
+        reg = 0;                         /* D3DVSDE_VERTEX: the position */
+    if (reg >= 16u)
+        return 1;
+    memcpy(g_inline_cur[reg], v, sizeof g_inline_cur[reg]);
+    if (reg == 0u) {
+        if (!g_inline_verts)
+            g_inline_verts = malloc(INLINE_MAX_VERTICES * sizeof *g_inline_verts);
+        if (g_inline_verts && g_inline_nverts < INLINE_MAX_VERTICES)
+            memcpy(g_inline_verts[g_inline_nverts++], g_inline_cur, sizeof g_inline_cur);
+    }
+    return 1;
+}
+
+static uint32_t inline_color(const float *c)   /* r, g, b, a -> D3DCOLOR */
+{
+    uint32_t r = (uint32_t)(c[0] * 255.0f + 0.5f), g = (uint32_t)(c[1] * 255.0f + 0.5f);
+    uint32_t b = (uint32_t)(c[2] * 255.0f + 0.5f), a = (uint32_t)(c[3] * 255.0f + 0.5f);
+    return ((a > 255 ? 255 : a) << 24) | ((r > 255 ? 255 : r) << 16) |
+           ((g > 255 ? 255 : g) << 8) | (b > 255 ? 255 : b);
+}
+
+/* The recorded vertices under a vertex program. Immediate mode feeds a
+ * program its sixteen input registers directly, with no stream declaration,
+ * and the recording already holds exactly that: sixteen float4s a vertex. So
+ * the program gets that layout for this one draw, and its own declaration
+ * back afterwards for the stream draws that follow. */
+static void inline_draw_program(uint32_t n)
+{
+    struct shadow_program *p, saved;
+    D3D8VshInput in[16];
+    int i;
+    static int notes;
+
+    if (notes++ < 2) {
+        uint32_t k;
+        fprintf(stderr, "[HLE-D3D8] inline draw under program 0x%08X: %u vertices, "
+                "primitive %u\n", g_shadow_vs, n, g_inline_xpt);
+        for (k = 0; k < n && k < 4; k++) {
+            float (*v)[4] = g_inline_verts[k];
+            fprintf(stderr, "[HLE-D3D8]   vertex %u: v0 (%.1f %.1f %.1f %.1f) v3 (%.2f %.2f "
+                    "%.2f %.2f) v9 (%.3f %.3f %.3f %.3f)\n", k,
+                    v[0][0], v[0][1], v[0][2], v[0][3], v[3][0], v[3][1], v[3][2], v[3][3],
+                    v[9][0], v[9][1], v[9][2], v[9][3]);
+        }
+    }
+
+    if (g_shadow_vs_kind != SHADER_HOST_PROGRAM || g_shadow_vs_slot < 0) {
+        g_inline_program++;
+        return;
+    }
+    p = &g_programs[g_shadow_vs_slot];
+    for (i = 0; i < 16; i++) {
+        in[i].reg = i;
+        in[i].format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        in[i].offset = (UINT)i * 16u;
+    }
+    if (FAILED(host_vsh_set_declaration(p->host, in, 16))) {
+        g_inline_program++;
+        return;
+    }
+    saved = *p;
+    p->has_declaration = 1;
+    p->extent = sizeof g_inline_verts[0];
+    p->packed_count = 0;
+    p->other_streams = 0;
+    p->expanded_bytes = 0;
+    hle_d3d8_shadow_draw(g_inline_xpt, n, g_inline_verts, sizeof g_inline_verts[0], 0);
+    *p = saved;
+    if (saved.has_declaration)
+        shadow_read_declaration(g_shadow_vs_slot, g_shadow_vs);
+    g_inline_drawn++;
+}
+
+/* The recorded vertices in the current FVF's layout, drawn. */
+static void inline_draw(void)
+{
+    uint32_t fvf = g_shadow_vs, n = g_inline_nverts, pos, weights, ntex, i, t;
+    uint32_t stride, tsize[8];
+    uint8_t *buf;
+
+    if (!g_shadow || !n)
+        return;
+    if (g_shadow_vs_is_program) {
+        inline_draw_program(n);
+        return;
+    }
+    pos = fvf & 0x00Eu;
+    weights = pos >= 0x006u ? (pos - 0x004u) / 2u : 0u;   /* XYZB1..XYZB5 */
+    stride = pos == 0x004u ? 16u : 12u + weights * 4u;
+    if (fvf & 0x010u) stride += 12u;                       /* normal */
+    if (fvf & 0x020u) stride += 4u;                        /* point size */
+    if (fvf & 0x040u) stride += 4u;                        /* diffuse */
+    if (fvf & 0x080u) stride += 4u;                        /* specular */
+    ntex = (fvf >> 8) & 0xFu;
+    if (ntex > 4u)
+        ntex = 4u;
+    for (t = 0; t < ntex; t++) {
+        static const uint32_t sizes[4] = { 2, 3, 4, 1 };
+        tsize[t] = sizes[(fvf >> (16u + 2u * t)) & 3u];
+        stride += tsize[t] * 4u;
+    }
+    buf = malloc((size_t)n * stride);
+    if (!buf)
+        return;
+    for (i = 0; i < n; i++) {
+        float (*v)[4] = g_inline_verts[i];
+        uint8_t *o = buf + (size_t)i * stride;
+        uint32_t c;
+
+        memcpy(o, v[0], pos == 0x004u ? 16u : 12u);
+        o += pos == 0x004u ? 16u : 12u;
+        if (weights) {
+            memcpy(o, v[1], weights * 4u);
+            o += weights * 4u;
+        }
+        if (fvf & 0x010u) { memcpy(o, v[2], 12u); o += 12u; }
+        if (fvf & 0x020u) { memcpy(o, &v[6][0], 4u); o += 4u; }
+        if (fvf & 0x040u) { c = inline_color(v[3]); memcpy(o, &c, 4u); o += 4u; }
+        if (fvf & 0x080u) { c = inline_color(v[4]); memcpy(o, &c, 4u); o += 4u; }
+        for (t = 0; t < ntex; t++) {
+            memcpy(o, v[9 + t], tsize[t] * 4u);
+            o += tsize[t] * 4u;
+        }
+    }
+    hle_d3d8_shadow_draw(g_inline_xpt, n, buf, stride, 0);
+    free(buf);
+    g_inline_drawn++;
+}
+#endif
+
 /* void D3DDevice_SetVertexDataColor(INT Register, D3DCOLOR Color)
  * The current value of an input register: what a vertex program reads from a
  * register the vertex does not carry. Burnout 2 sets v3, the diffuse colour,
@@ -2090,7 +2402,8 @@ HLE_EXPORT(D3DDevice_SetVertexDataColor)
         v[1] = (float)((color >>  8) & 0xFF) / 255.0f;
         v[2] = (float)( color        & 0xFF) / 255.0f;
         v[3] = (float)((color >> 24) & 0xFF) / 255.0f;
-        host_vsh_set_vertex_data((int)reg, v);
+        if (!inline_vertex_data(reg, v))
+            host_vsh_set_vertex_data((int)reg, v);
     }
 #endif
 }
@@ -2115,7 +2428,8 @@ HLE_EXPORT(D3DDevice_SetVertexData2f)
 
         memcpy(&v[0], &a, 4);
         memcpy(&v[1], &b, 4);
-        host_vsh_set_vertex_data((int)reg, v);
+        if (!inline_vertex_data(reg, v))
+            host_vsh_set_vertex_data((int)reg, v);
     }
 #endif
 }
@@ -2123,10 +2437,9 @@ HLE_EXPORT(D3DDevice_SetVertexData2f)
 /* The inline immediate-mode vertex path: Begin, then one SetVertexData* per
  * attribute per vertex, then End.
  *
- * These are counted, not replaced. The bodies run, so the title's own D3D8
- * writes its NV097_SET_BEGIN_END and vertex data into the push buffer exactly
- * as before -- and nothing here reads the push buffer, so that geometry never
- * reaches the host. The question these counters answer is how much of a
+ * The bodies run, so the title's own D3D8 writes its NV097_SET_BEGIN_END and
+ * vertex data into the push buffer exactly as before; the vertices are also
+ * recorded and drawn on the host at End (see "Immediate mode, drawn" above). The question these counters answer is how much of a
  * title's scene goes this way, which decides whether implementing the path is
  * worth it. Marvel vs Capcom 2 calls Begin from six sites and
  * SetVertexData4f from sixteen, but a static call site says nothing about how
@@ -2153,6 +2466,11 @@ HLE_EXPORT(D3DDevice_Begin)
     g_inline_begin++;
     g_inline_begin_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_Begin);
+#ifdef _WIN32
+    g_inline_on = 1;
+    g_inline_xpt = HLE_ARG(0);
+    g_inline_nverts = 0;
+#endif
 }
 
 /* void D3DDevice_End(void) */
@@ -2165,6 +2483,13 @@ HLE_EXPORT(D3DDevice_End)
         return;
     g_inline_end++;
     HLE_CALL_ORIGINAL(D3DDevice_End);
+#ifdef _WIN32
+    if (g_inline_on) {
+        inline_draw();
+        g_inline_on = 0;
+        g_inline_nverts = 0;
+    }
+#endif
 }
 
 /* void D3DDevice_SetVertexData4f(INT Register, float a, float b, float c,
@@ -2180,6 +2505,16 @@ HLE_EXPORT(D3DDevice_SetVertexData4f)
     g_inline_vdata++;
     g_inline_vdata_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexData4f);
+#ifdef _WIN32
+    if (g_shadow) {
+        uint32_t w[4] = { HLE_ARG(1), HLE_ARG(2), HLE_ARG(3), HLE_ARG(4) };
+        float v[4];
+
+        memcpy(v, w, sizeof v);
+        if (!inline_vertex_data(HLE_ARG(0), v))
+            host_vsh_set_vertex_data((int)HLE_ARG(0), v);
+    }
+#endif
 }
 
 /* HRESULT D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE State,
@@ -2529,14 +2864,26 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
 
     if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : target, level, face,
                                     depth))) {
-        /* The host keeps its old targets; go to the back buffer instead, so
-         * the sizes below describe what is drawn into. */
+        IDirect3DTexture8 *scratch = kind != 0 ? scratch_target(w, h) : NULL;
+
+        /* The host keeps its old targets. An offscreen pass goes to a
+         * scratch target of its own size, not the screen: Outrun 2 renders
+         * colour into a surface whose parent texture is LIN_D24S8, the host
+         * cannot make that a colour target, and its 512x512 shadow pass
+         * landed on the back buffer every frame and blacked out the race. */
         g_target_failed++;
-        kind = 0;
-        w = g_shadow_width;
-        h = g_shadow_height;
-        depth = zs ? g_device_depth : NULL;
-        host_SetRenderTarget(g_shadow, NULL, 0, 0, depth);
+        if (scratch && SUCCEEDED(host_SetRenderTarget(g_shadow,
+                                     (IDirect3DBaseTexture8 *)scratch, 0, 0, depth))) {
+            kind = 2;
+        } else {
+            /* Go to the back buffer instead, so the sizes below describe
+             * what is drawn into. */
+            kind = 0;
+            w = g_shadow_width;
+            h = g_shadow_height;
+            depth = zs ? g_device_depth : NULL;
+            host_SetRenderTarget(g_shadow, NULL, 0, 0, depth);
+        }
     }
     g_target_width = w;
     g_target_height = h;
@@ -2553,6 +2900,127 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     shadow_viewport_constants(&g_title_viewport);
 }
 #endif /* _WIN32 */
+
+/* void D3DDevice_InsertCallback(D3DCALLBACKTYPE Type, D3DCALLBACK pCallback,
+ *     DWORD Context) -- stdcall; the callback is __cdecl void (DWORD Context).
+ *
+ * The XDK writes the callback into the push buffer for the GPU to raise when
+ * it gets there: READ (0) once the GPU has read everything before it, WRITE
+ * (1) once it has finished it. No GPU here runs push buffers, so the callback
+ * never came, and Breakdown spun forever on the flag its callback clears
+ * (sub_0018EA30, `while (flag) ;` straight after the insert). Everything
+ * before the call has already been drawn by the time it returns, so both
+ * kinds are due at once, and the callback runs here. The original body still
+ * runs first, so the push buffer is what the XDK made. */
+HLE_ORIGINAL(D3DDevice_InsertCallback);
+HLE_EXPORT(D3DDevice_InsertCallback)
+{
+    static int seen;
+    uint32_t type = HLE_ARG(0), callback = HLE_ARG(1), context = HLE_ARG(2);
+    recomp_func_t fn;
+
+    first_call(&seen, "D3DDevice_InsertCallback", callback);
+    if (original_missing(hle_original_D3DDevice_InsertCallback, "D3DDevice_InsertCallback"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_InsertCallback);
+    if (!callback)
+        return;
+    fn = recomp_lookup(callback);
+    if (!fn)
+        fn = recomp_lookup_manual(callback);
+    if (!fn) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HLE-D3D8] InsertCallback: callback 0x%08X (type %u) is not "
+                    "in the dispatch table; it does not run\n", callback, type);
+        return;
+    }
+    {
+        /* cdecl: the callee leaves its argument, so the stack is put back. */
+        uint32_t saved_esp = g_esp;
+        uint32_t saved_eax = g_eax;
+        g_esp -= 4; HLE_MEM32(g_esp) = context;
+        g_esp -= 4; HLE_MEM32(g_esp) = 0;        /* return address, popped by its ret */
+        fn();
+        g_esp = saved_esp;
+        g_eax = saved_eax;
+    }
+}
+
+/* The video overlay: the plane XMV movies are shown on by titles that use it
+ * (TimeSplitters: Future Perfect calls UpdateOverlay once per decoded frame
+ * and then Swap). The picture itself comes from hle_xmv.c, which decodes the
+ * movie and hands each frame to d3d8_movie; these only say whether the plane
+ * is showing, which is all the host needs from them. */
+HLE_ORIGINAL(D3DDevice_EnableOverlay);
+HLE_ORIGINAL(D3DDevice_UpdateOverlay);
+
+/* void D3DDevice_EnableOverlay(BOOL Enable)
+ *
+ * The XDK's own body is NOT run. Turning the overlay off waits for the video
+ * scaler to let go of it, polling hardware nothing here emulates: Future
+ * Perfect hung there, 82% of its main thread in this function's lifted body,
+ * the moment its first movie ended. The plane only exists on the host, so the
+ * two flags below are the whole of its state. */
+HLE_EXPORT(D3DDevice_EnableOverlay)
+{
+    static int seen;
+    uint32_t enable = HLE_ARG(0);
+
+    first_call(&seen, "D3DDevice_EnableOverlay", enable);
+#ifdef _WIN32
+    g_overlay_enabled = enable != 0;
+    if (!enable) {
+        g_overlay_updated = 0;
+        d3d8_movie_clear();
+    }
+#endif
+}
+
+/* void D3DDevice_UpdateOverlay(D3DSurface *pSurface, const RECT *SrcRect,
+ *     const RECT *DstRect, BOOL EnableColorKey, D3DCOLOR ColorKey)          */
+HLE_EXPORT(D3DDevice_UpdateOverlay)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_UpdateOverlay", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_UpdateOverlay, "D3DDevice_UpdateOverlay"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_UpdateOverlay);
+#ifdef _WIN32
+    /* A title that never calls EnableOverlay still means the plane to show
+     * when it updates it; the XDK turns it on at the first update. */
+    g_overlay_enabled = 1;
+    g_overlay_updated = HLE_ARG(0) != 0;
+#endif
+}
+
+/* void D3DDevice_SetRenderTargetFast(D3DSurface *pRenderTarget,
+ *     D3DSurface *pNewZStencil, DWORD Flags) -- stdcall, later XDKs.
+ *
+ * The same switch without SetRenderTarget's checks, and a title can use both:
+ * Outrun 2 (5849) renders its environment cube through SetRenderTarget and
+ * goes back to the screen for the world through this one, so without it the
+ * whole race was drawn into a 128x128 cube face (Cxbx-Reloaded patches it the
+ * same way, onto its SetRenderTarget). */
+HLE_ORIGINAL(D3DDevice_SetRenderTargetFast);
+HLE_EXPORT(D3DDevice_SetRenderTargetFast)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t rt = HLE_ARG(0), zs = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_SetRenderTargetFast", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetRenderTargetFast,
+                         "D3DDevice_SetRenderTargetFast"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetRenderTargetFast);
+#ifdef _WIN32
+    if (g_shadow)
+        shadow_set_render_target(rt, zs);
+#endif
+}
 
 /* void D3DDevice_SetRenderTarget(D3DSurface *pRenderTarget,
  *     D3DSurface *pNewZStencil)                                             */
@@ -2687,9 +3155,11 @@ HLE_EXPORT(D3DDevice_CopyRects)
  * when the current program packs nothing, and NULL with *failed set when the
  * copy cannot be made; otherwise the copy, and *stride grows to match. */
 static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *stride,
-                                       int *failed)
+                                       uint32_t first, int *failed)
 {
     const struct shadow_program *p;
+    const uint8_t *base[SHADOW_MAX_PACKED];
+    uint32_t sstride[SHADOW_MAX_PACKED];
     UINT in_stride = *stride, out_stride, shift, v;
     uint8_t *out;
     int k;
@@ -2700,6 +3170,23 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     p = &g_programs[g_shadow_vs_slot];
     if (!p->packed_count)
         return NULL;
+    /* Where each register's vertices are: stream 0 is what the draw was
+     * handed, any other stream is looked up at the same first vertex. A UP
+     * draw has no other streams to read, so it cannot feed this program. */
+    for (k = 0; k < p->packed_count; k++) {
+        if (!p->packed_stream[k]) {
+            base[k] = (const uint8_t *)verts;
+            sstride[k] = in_stride;
+            continue;
+        }
+        base[k] = first == NO_FIRST_VERTEX ? NULL
+                : (const uint8_t *)hle_d3d8_stream_vertices(p->packed_stream[k], first,
+                                                            vertices, &sstride[k]);
+        if (!base[k] || sstride[k] < p->packed_offset[k] + p->packed_size[k]) {
+            *failed = 1;
+            return NULL;
+        }
+    }
     shift = p->expanded_bytes;
     out_stride = in_stride + shift;
     out = malloc((size_t)vertices * out_stride);
@@ -2712,10 +3199,14 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         uint8_t *dst = out + (size_t)v * out_stride;
 
         for (k = 0; k < p->packed_count; k++) {
-            const uint8_t *at = src + p->packed_offset[k];
+            const uint8_t *at = base[k] + (size_t)v * sstride[k] + p->packed_offset[k];
             float n[4];
             int c, count;
 
+            if (p->packed_raw[k]) {
+                memcpy(dst + p->packed_out[k], at, p->packed_size[k]);
+                continue;
+            }
             if (p->packed_format[k] == 0x16u) {      /* NORMPACKED3 */
                 uint32_t bits;
                 memcpy(&bits, at, sizeof bits);
@@ -2759,7 +3250,10 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
         g_draws_primitive++;
         return;
     }
-    expanded = shadow_expand_vertices(verts, count, &host_stride, &failed);
+    expanded = shadow_expand_vertices(verts, count, &host_stride,
+                                      from_buffer ? g_draw_first : NO_FIRST_VERTEX,
+                                      &failed);
+    g_draw_first = NO_FIRST_VERTEX;
     if (failed) {
         g_draws_failed++;
         return;
@@ -2786,6 +3280,8 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
         g_draws_vb++;
     else
         g_draws_up++;
+    if (SUCCEEDED(hr))
+        note_draw_sampled_movie();
 }
 
 /* The host half of every indexed draw. `count` counts indices, always 16-bit
@@ -2872,7 +3368,11 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         g_draws_failed++;
         return;
     }
-    expanded = shadow_expand_vertices(verts, vertices, &host_stride, &failed);
+    expanded = shadow_expand_vertices(verts, vertices, &host_stride,
+                                      from_buffer && g_draw_first != NO_FIRST_VERTEX
+                                          ? g_draw_first + min_index : NO_FIRST_VERTEX,
+                                      &failed);
+    g_draw_first = NO_FIRST_VERTEX;
     if (failed) {
         free(list);
         g_draws_failed++;
@@ -2889,6 +3389,8 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         g_draws_indexed_vb++;
     else
         g_draws_indexed_up++;
+    if (SUCCEEDED(hr))
+        note_draw_sampled_movie();
 }
 #endif /* _WIN32 */
 
