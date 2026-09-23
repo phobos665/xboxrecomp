@@ -1604,9 +1604,19 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
     td.Format = tex->dxgi_format;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (Usage & D3DUSAGE_RENDERTARGET)     td.BindFlags |= D3D11_BIND_RENDER_TARGET;
-    if (Usage & D3DUSAGE_DEPTHSTENCIL)     td.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+    /* Depth textures are not sampled directly in D3D11, and a
+     * D24_UNORM_S8_UINT texture that asks for SHADER_RESOURCE is refused
+     * outright with E_INVALIDARG -- Outrun 2's 512x512 LIN_D24S8 shadow
+     * maps failed 345 times a run. Bind them as depth instead, whatever
+     * the title's usage says: that is the only way D3D11 can hold one. */
+    want_srv = !d3d8_format_is_depth(Format);
+    if (want_srv) {
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (Usage & D3DUSAGE_RENDERTARGET) td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+        if (Usage & D3DUSAGE_DEPTHSTENCIL) td.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+    } else {
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    }
 
     hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex->d3d11_texture);
     if (FAILED(hr)) {
@@ -1615,9 +1625,6 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
         free(tex);
         return hr;
     }
-
-    /* Depth textures are not sampled directly in D3D11. */
-    want_srv = !d3d8_format_is_depth(Format);
 
     /* Create shader resource view */
     if (want_srv) {

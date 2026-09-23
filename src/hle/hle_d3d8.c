@@ -559,8 +559,26 @@ struct shadow_program {
     UINT     packed_offset[SHADOW_MAX_PACKED];   /* in the guest vertex */
     UINT     packed_out[SHADOW_MAX_PACKED];      /* in the prefix */
     uint32_t packed_format[SHADOW_MAX_PACKED];   /* X_D3DVSDT */
+    /* Registers read from a stream other than 0 go through the same prefix:
+     * the host binds one stream, so each draw copies them in beside the
+     * stream 0 vertex, as they are when the host can read the format
+     * (packed_raw, packed_size bytes) and unpacked when it cannot. */
+    uint8_t  packed_stream[SHADOW_MAX_PACKED];
+    uint8_t  packed_raw[SHADOW_MAX_PACKED];
+    UINT     packed_size[SHADOW_MAX_PACKED];
+    int      other_streams;              /* any register from stream 1..15 */
     UINT     expanded_bytes;
 };
+
+/* The first vertex of the buffer draw about to be made, so other streams can
+ * be read at the same index; NO_FIRST_VERTEX for a UP draw, which has only
+ * the vertices it was handed. Set by hle_d3d8_vertex.c. */
+#define NO_FIRST_VERTEX 0xFFFFFFFFu
+static uint32_t g_draw_first = NO_FIRST_VERTEX;
+void hle_d3d8_shadow_set_first_vertex(uint32_t first) { g_draw_first = first; }
+/* From hle_d3d8_vertex.c: vertex `first` of stream `stream`, or NULL. */
+const void *hle_d3d8_stream_vertices(uint32_t stream, uint32_t first, uint32_t vertices,
+                                     uint32_t *stride);
 
 static struct shadow_program g_programs[SHADOW_MAX_PROGRAMS];
 static int      g_program_count;
@@ -1750,15 +1768,25 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     p->has_declaration = 0;
     p->extent = 0;
     p->packed_count = 0;
+    p->other_streams = 0;
     p->expanded_bytes = 0;
     if (!object)
         return;
     for (i = 0; i < 16u; i++) {
+        uint32_t attr = object + 20u + i * 16u;
+        uint32_t format = HLE_MEM32(attr + 8u);
+        DXGI_FORMAT dxgi;
         UINT size;
-        int floats = xbox_vsdt_expanded(HLE_MEM32(object + 20u + i * 16u + 8u), &size);
-        if (floats) {
+        int floats;
+
+        if (format <= 0x02u)
+            continue;
+        if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             packed++;
             shift += (UINT)floats * 4u;
+        } else if (HLE_MEM32(attr) != 0u && xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+            packed++;
+            shift += (size + 3u) & ~3u;
         }
     }
     if (packed > SHADOW_MAX_PACKED)
@@ -1775,21 +1803,35 @@ static void shadow_read_declaration(int slot, uint32_t handle)
 
         if (format <= 0x02u)
             continue;
-        if (stream != 0u || offset > 0xFFFFu) {
+        if (stream > 15u || offset > 0xFFFFu) {
             refused = 1;
         } else if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             p->packed_offset[packed] = offset;
             p->packed_out[packed] = out;
             p->packed_format[packed] = format;
+            p->packed_stream[packed] = (uint8_t)stream;
+            p->packed_raw[packed] = 0;
+            p->packed_size[packed] = size;
             packed++;
             in[n].format = FLOATN_FORMAT[floats];
             in[n].offset = out;
             out += (UINT)floats * 4u;
-        } else if (xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+        } else if (!xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+            refused = 1;
+        } else if (stream != 0u) {
+            p->packed_offset[packed] = offset;
+            p->packed_out[packed] = out;
+            p->packed_format[packed] = format;
+            p->packed_stream[packed] = (uint8_t)stream;
+            p->packed_raw[packed] = 1;
+            p->packed_size[packed] = size;
+            packed++;
+            in[n].format = dxgi;
+            in[n].offset = out;
+            out += (size + 3u) & ~3u;
+        } else {
             in[n].format = dxgi;
             in[n].offset = offset + shift;
-        } else {
-            refused = 1;
         }
         if (refused) {
             bad_reg = i;
@@ -1798,7 +1840,9 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             break;
         }
         in[n].reg = (int)i;
-        if (offset + size > p->extent)
+        if (stream != 0u)
+            p->other_streams = 1;
+        else if (offset + size > p->extent)
             p->extent = offset + size;
         n++;
     }
@@ -2552,14 +2596,26 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
 
     if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : target, level, face,
                                     depth))) {
-        /* The host keeps its old targets; go to the back buffer instead, so
-         * the sizes below describe what is drawn into. */
+        IDirect3DTexture8 *scratch = kind != 0 ? scratch_target(w, h) : NULL;
+
+        /* The host keeps its old targets. An offscreen pass goes to a
+         * scratch target of its own size, not the screen: Outrun 2 renders
+         * colour into a surface whose parent texture is LIN_D24S8, the host
+         * cannot make that a colour target, and its 512x512 shadow pass
+         * landed on the back buffer every frame and blacked out the race. */
         g_target_failed++;
-        kind = 0;
-        w = g_shadow_width;
-        h = g_shadow_height;
-        depth = zs ? g_device_depth : NULL;
-        host_SetRenderTarget(g_shadow, NULL, 0, 0, depth);
+        if (scratch && SUCCEEDED(host_SetRenderTarget(g_shadow,
+                                     (IDirect3DBaseTexture8 *)scratch, 0, 0, depth))) {
+            kind = 2;
+        } else {
+            /* Go to the back buffer instead, so the sizes below describe
+             * what is drawn into. */
+            kind = 0;
+            w = g_shadow_width;
+            h = g_shadow_height;
+            depth = zs ? g_device_depth : NULL;
+            host_SetRenderTarget(g_shadow, NULL, 0, 0, depth);
+        }
     }
     g_target_width = w;
     g_target_height = h;
@@ -2576,6 +2632,33 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     shadow_viewport_constants(&g_title_viewport);
 }
 #endif /* _WIN32 */
+
+/* void D3DDevice_SetRenderTargetFast(D3DSurface *pRenderTarget,
+ *     D3DSurface *pNewZStencil, DWORD Flags) -- stdcall, later XDKs.
+ *
+ * The same switch without SetRenderTarget's checks, and a title can use both:
+ * Outrun 2 (5849) renders its environment cube through SetRenderTarget and
+ * goes back to the screen for the world through this one, so without it the
+ * whole race was drawn into a 128x128 cube face (Cxbx-Reloaded patches it the
+ * same way, onto its SetRenderTarget). */
+HLE_ORIGINAL(D3DDevice_SetRenderTargetFast);
+HLE_EXPORT(D3DDevice_SetRenderTargetFast)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t rt = HLE_ARG(0), zs = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_SetRenderTargetFast", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_SetRenderTargetFast,
+                         "D3DDevice_SetRenderTargetFast"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetRenderTargetFast);
+#ifdef _WIN32
+    if (g_shadow)
+        shadow_set_render_target(rt, zs);
+#endif
+}
 
 /* void D3DDevice_SetRenderTarget(D3DSurface *pRenderTarget,
  *     D3DSurface *pNewZStencil)                                             */
@@ -2710,9 +2793,11 @@ HLE_EXPORT(D3DDevice_CopyRects)
  * when the current program packs nothing, and NULL with *failed set when the
  * copy cannot be made; otherwise the copy, and *stride grows to match. */
 static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *stride,
-                                       int *failed)
+                                       uint32_t first, int *failed)
 {
     const struct shadow_program *p;
+    const uint8_t *base[SHADOW_MAX_PACKED];
+    uint32_t sstride[SHADOW_MAX_PACKED];
     UINT in_stride = *stride, out_stride, shift, v;
     uint8_t *out;
     int k;
@@ -2723,6 +2808,23 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     p = &g_programs[g_shadow_vs_slot];
     if (!p->packed_count)
         return NULL;
+    /* Where each register's vertices are: stream 0 is what the draw was
+     * handed, any other stream is looked up at the same first vertex. A UP
+     * draw has no other streams to read, so it cannot feed this program. */
+    for (k = 0; k < p->packed_count; k++) {
+        if (!p->packed_stream[k]) {
+            base[k] = (const uint8_t *)verts;
+            sstride[k] = in_stride;
+            continue;
+        }
+        base[k] = first == NO_FIRST_VERTEX ? NULL
+                : (const uint8_t *)hle_d3d8_stream_vertices(p->packed_stream[k], first,
+                                                            vertices, &sstride[k]);
+        if (!base[k] || sstride[k] < p->packed_offset[k] + p->packed_size[k]) {
+            *failed = 1;
+            return NULL;
+        }
+    }
     shift = p->expanded_bytes;
     out_stride = in_stride + shift;
     out = malloc((size_t)vertices * out_stride);
@@ -2735,10 +2837,14 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         uint8_t *dst = out + (size_t)v * out_stride;
 
         for (k = 0; k < p->packed_count; k++) {
-            const uint8_t *at = src + p->packed_offset[k];
+            const uint8_t *at = base[k] + (size_t)v * sstride[k] + p->packed_offset[k];
             float n[4];
             int c, count;
 
+            if (p->packed_raw[k]) {
+                memcpy(dst + p->packed_out[k], at, p->packed_size[k]);
+                continue;
+            }
             if (p->packed_format[k] == 0x16u) {      /* NORMPACKED3 */
                 uint32_t bits;
                 memcpy(&bits, at, sizeof bits);
@@ -2782,7 +2888,10 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
         g_draws_primitive++;
         return;
     }
-    expanded = shadow_expand_vertices(verts, count, &host_stride, &failed);
+    expanded = shadow_expand_vertices(verts, count, &host_stride,
+                                      from_buffer ? g_draw_first : NO_FIRST_VERTEX,
+                                      &failed);
+    g_draw_first = NO_FIRST_VERTEX;
     if (failed) {
         g_draws_failed++;
         return;
@@ -2895,7 +3004,11 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
         g_draws_failed++;
         return;
     }
-    expanded = shadow_expand_vertices(verts, vertices, &host_stride, &failed);
+    expanded = shadow_expand_vertices(verts, vertices, &host_stride,
+                                      from_buffer && g_draw_first != NO_FIRST_VERTEX
+                                          ? g_draw_first + min_index : NO_FIRST_VERTEX,
+                                      &failed);
+    g_draw_first = NO_FIRST_VERTEX;
     if (failed) {
         free(list);
         g_draws_failed++;
