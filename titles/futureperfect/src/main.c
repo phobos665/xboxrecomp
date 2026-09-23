@@ -85,8 +85,8 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* Relative to the executable's own directory, titles/<title>/build/<Config>/,
  * which is where scripts/run_and_report.py starts it. Run it from there by
  * hand too, or the XBE is not found. */
-#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\Timesplitters - Future Perfect\\default.xbe"
-#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\Timesplitters - Future Perfect"
+#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\Timesplitters - Future Perfect (USA)\\default.xbe"
+#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\Timesplitters - Future Perfect (USA)"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
