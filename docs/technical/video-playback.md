@@ -318,3 +318,27 @@ end play (254 and 391 pictures); the frames it captures went from 0.4% lit to
 Still to do: the four XMV titles whose library entry points are not named yet
 (Nightfire, Breakdown, XGRA, Otogi) -- `config/extra_symbols/<title id>.json`
 through `scripts/section_calls.py`, as for Black and Future Perfect.
+
+### Breakdown (23 September 2026)
+
+Breakdown never reached its movie: it stopped after one frame, spinning on a
+flag its `D3DDevice_InsertCallback` callback clears. The XDK writes that
+callback into the push buffer for the GPU to raise, and no GPU here runs
+push buffers, so `InsertCallback` is now replaced and runs the callback at
+once (everything before it has been drawn by then). Breakdown now runs at
+about 50 fps and opens `romdata\movie\namcologo.xmv`.
+
+Its XMV entry points are named in `config/extra_symbols/4E4D0009.json`: the
+six above plus `XMVPlaybackGetAudioStreamInfo` and
+`XMVPlaybackGetCurrentTime`. Naming them showed that `GetStreamInfo`'s `+0xC`
+is the **audio stream count** (`XMVVIDEODESC`: width, height, frames per
+second, audio streams), not a frame rate: Breakdown read the old float 30.0
+as 0x41F00000 tracks. It is 0 now, since the host plays the sound itself.
+
+The movie opens, its Xbox ADPCM sound decodes, and each picture is written
+into its YUY2 surface. **It is not visible yet**, for a reason that is not
+the movie's: all of Breakdown's drawing goes through recorded push buffers
+(`BeginPushBuffer`/`RunPushBuffer`, `BeginPush`/`EndPush`), which the shadow
+renderer does not see, so it reports no draws on any screen. Its player also
+calls `Update` only once: after `Start` it sits in state 3 and nothing seen so
+far moves it on, which may be how this XDK's asynchronous playback works.

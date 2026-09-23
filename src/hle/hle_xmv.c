@@ -102,7 +102,13 @@
 #define XMV_OBJ_SIZE     0x200u
 #define XMV_OFF_WIDTH    0x40u
 #define XMV_OFF_HEIGHT   0x44u
-#define XMV_OFF_RATE     0x48u
+/* +0x48 is the audio stream count: the XDK's GetStreamInfo copies it to the
+ * caller's +0xC (XMVVIDEODESC: Width, Height, FramesPerSecond,
+ * AudioStreamCount), and Breakdown loops over it creating one DirectSound
+ * stream per track. It was a float 30.0 here, which Breakdown read as
+ * 0x41F00000 tracks and capped at 6. Zero: the movie's sound plays on a host
+ * voice (hle_xmv_play.c), so the title needs no stream of its own. */
+#define XMV_OFF_AUDIO_COUNT 0x48u
 /* Our own bookkeeping, past anything the library exposes. */
 #define XMV_OFF_MAGIC    0xE0u
 #define XMV_OFF_START_MS 0xE4u
@@ -178,17 +184,11 @@ HLE_EXPORT(XMVPlaybackCreate)
     }
     memset(HLE_PTR(obj), 0, XMV_OBJ_SIZE);
 
-    /* What the title will read back through GetStreamInfo. The dimensions are
-     * the console's standard frame; the third field is a float, and a frame
-     * rate is what a caller storing it next to a timer wants. */
+    /* What the title will read back through GetStreamInfo: the console's
+     * standard frame until the file says otherwise, and no audio streams. */
     HLE_MEM32(obj + XMV_OFF_WIDTH)  = 640u;
     HLE_MEM32(obj + XMV_OFF_HEIGHT) = 480u;
-    {
-        float rate = 30.0f;
-        uint32_t bits;
-        memcpy(&bits, &rate, sizeof(bits));
-        HLE_MEM32(obj + XMV_OFF_RATE) = bits;
-    }
+    HLE_MEM32(obj + XMV_OFF_AUDIO_COUNT) = 0u;
 
     HLE_MEM32(obj + XMV_OFF_MAGIC)    = XMV_MAGIC;
     HLE_MEM32(obj + XMV_OFF_START_MS) = 0;    /* not started yet */
@@ -245,7 +245,7 @@ HLE_EXPORT(XMVPlaybackGetStreamInfo)
         return;
     HLE_MEM32(out + 0x0u) = HLE_MEM32(obj + XMV_OFF_WIDTH);
     HLE_MEM32(out + 0x4u) = HLE_MEM32(obj + XMV_OFF_HEIGHT);
-    HLE_MEM32(out + 0xCu) = HLE_MEM32(obj + XMV_OFF_RATE);
+    HLE_MEM32(out + 0xCu) = HLE_MEM32(obj + XMV_OFF_AUDIO_COUNT);
 }
 
 /* HRESULT XMVPlaybackCreateAudioStream(XMVPlayback *p, DWORD a, DWORD b,
@@ -282,6 +282,40 @@ HLE_EXPORT(XMVPlaybackCreateAudioStream)
         fflush(stderr);
     }
     HLE_RETURN(0);
+}
+
+/* HRESULT XMVPlaybackGetAudioStreamInfo(XMVPlayback *p, DWORD index, void *out)
+ *
+ * Breakdown asks this once per audio stream GetStreamInfo reported. That count
+ * is 0 now, so it should not be asked; if a title asks anyway, there is no
+ * such stream. */
+HLE_EXPORT(XMVPlaybackGetAudioStreamInfo)
+{
+    if (xmv_is_ours(HLE_ARG(0))) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[XMV] audio stream %u info requested: there are none "
+                            "(the movie's sound plays on a host voice)\n", HLE_ARG(1));
+    }
+    HLE_RETURN(0x80004005u);
+}
+
+/* DWORD XMVPlaybackGetCurrentTime(XMVPlayback *p)
+ *
+ * Breakdown calls this after every Update. The XDK's body subtracts a start
+ * time kept in the real playback object from QueryPerformanceCounter, and in
+ * this object that field is zero, so it would report the time since boot.
+ * Milliseconds since Start instead. */
+HLE_EXPORT(XMVPlaybackGetCurrentTime)
+{
+    uint32_t obj = HLE_ARG(0), started;
+
+    if (!xmv_is_ours(obj)) {
+        HLE_RETURN(0);
+        return;
+    }
+    started = HLE_MEM32(obj + XMV_OFF_START_MS);
+    HLE_RETURN(started ? xmv_now_ms() - started : 0u);
 }
 
 /* HRESULT XMVPlaybackUpdate(XMVPlayback *p, void *surface, DWORD *status,
