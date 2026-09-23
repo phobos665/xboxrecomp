@@ -156,6 +156,17 @@ extern "C" void recomp_audio_output_initialize(void)
         disableOutput("CreateMasteringVoice", error);
         return;
     }
+    /* RECOMP_MUTE: silent, but everything else as usual. RECOMP_AUDIO_GAIN=0
+     * opens no device at all, and then nothing reports a play position: the
+     * DirectSound streams and the movie's sound fall back to other clocks, so
+     * a muted run would not be the run being tested. */
+    {
+        const char *mute = std::getenv("RECOMP_MUTE");
+        if (mute && *mute && std::strcmp(mute, "0") != 0) {
+            gain = 0.0;
+            std::fprintf(stderr, "[audio-output] RECOMP_MUTE: playing silently\n");
+        }
+    }
     error = master->SetVolume(static_cast<float>(gain));
     if (FAILED(error)) {
         disableOutput("MasterSetVolume", error);
