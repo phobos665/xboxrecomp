@@ -48,6 +48,8 @@
  * RECOMP_HLE_D3D8_DUMP=<prefix> writes the host frame to <prefix>NNN.bmp
  * every RECOMP_HLE_D3D8_DUMP_EVERY swaps (default 300), at most 24 files --
  * the same format as the executor's RECOMP_FB_DUMP, to put them side by side.
+ * RECOMP_HLE_D3D8_DUMP_KEEP_LAST=<k> makes the last k of those roll, so the
+ * files show where a long run ended up and not only how it began.
  *
  * Two host facts shape it:
  *   - Guest threads are real host threads. DXGI's Present sends messages to
@@ -894,8 +896,9 @@ static void shadow_frame_brightness(void)
 static void shadow_dump_frame(void)
 {
     static const char *prefix;
-    static int configured, every = 300, written;
+    static int configured, every = 300, written, keep_last;
     static unsigned long min_draws, last_dump, from_swap;
+    static char ring[24][512];
     static char asked_prefix[8];
     int asked;
     IDirect3DSurface8 *surf = NULL;
@@ -923,6 +926,14 @@ static void shadow_dump_frame(void)
         e = getenv("RECOMP_HLE_D3D8_DUMP_FROM");
         if (e && atol(e) > 0)
             from_swap = (unsigned long)atol(e);
+        /* RECOMP_HLE_D3D8_DUMP_KEEP_LAST=<k>: the first 24-k dumps are kept
+         * as usual and the last k slots roll, always holding the latest
+         * frames, as <prefix>_s<swap>.bmp. Without it a fast title fills the
+         * 24 files in its first few hundred swaps: Outrun 2's matrix frames
+         * all showed the intro logos while it was 90 seconds into a race. */
+        e = getenv("RECOMP_HLE_D3D8_DUMP_KEEP_LAST");
+        if (e && atoi(e) > 0)
+            keep_last = atoi(e) > 24 ? 24 : atoi(e);
     }
     /* Asked for by hand: this frame, wherever the run has got to, whatever
      * the interval and the 24-file cap say, and beside the executable when
@@ -934,7 +945,9 @@ static void shadow_dump_frame(void)
         prefix = asked_prefix;
     }
     if (!asked) {
-        if (!prefix || !*prefix || written >= 24 || g_shadow_swaps < from_swap)
+        if (!prefix || !*prefix || g_shadow_swaps < from_swap)
+            return;
+        if (written >= 24 && !keep_last)
             return;
         if (min_draws) {
             if (g_frame_draws < min_draws ||
@@ -971,7 +984,17 @@ static void shadow_dump_frame(void)
     pad = (4 - ((w * 3) & 3)) & 3;
     filesz = 54 + (w * 3 + pad) * h;
 
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, written++);
+    if (!asked && keep_last && written >= 24 - keep_last) {
+        char *slot = ring[(written - (24 - keep_last)) % keep_last];
+
+        if (slot[0])
+            remove(slot);
+        snprintf(path, sizeof path, "%s_s%08lu.bmp", prefix, g_shadow_swaps);
+        snprintf(slot, sizeof ring[0], "%s", path);
+        written++;
+    } else {
+        snprintf(path, sizeof path, "%s%03d.bmp", prefix, written++);
+    }
     f = fopen(path, "wb");
     if (f) {
         memset(hdr, 0, sizeof hdr);
