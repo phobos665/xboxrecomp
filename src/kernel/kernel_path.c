@@ -13,6 +13,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_watchpoint.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -424,6 +425,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 translate:
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
     fflush(stderr);
+    xbox_watch_note_path(xbox_path);   /* RECOMP_WATCH_ARM_ON */
     {
         WCHAR remainder_wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);

@@ -21,8 +21,8 @@
 namespace {
 
 /* 0..255 are DirectSound buffers (hle_dsound.c), 256..271 streams
- * (hle_dsound_stream.c). */
-constexpr uint32_t kVoiceCount = 256 + 16;
+ * (hle_dsound_stream.c), 272 a movie's sound (hle_xmv.c). */
+constexpr uint32_t kVoiceCount = 256 + 16 + 1;
 /* Submissions in flight per voice. A stream keeps LEAD_MS of sound ahead of
    its clock in CHUNK_MS pieces (hle_dsound_stream.c), so four was one short
    of what the music path asks for and every frame past the first dropped a
@@ -155,6 +155,17 @@ extern "C" void recomp_audio_output_initialize(void)
     if (FAILED(error)) {
         disableOutput("CreateMasteringVoice", error);
         return;
+    }
+    /* RECOMP_MUTE: silent, but everything else as usual. RECOMP_AUDIO_GAIN=0
+     * opens no device at all, and then nothing reports a play position: the
+     * DirectSound streams and the movie's sound fall back to other clocks, so
+     * a muted run would not be the run being tested. */
+    {
+        const char *mute = std::getenv("RECOMP_MUTE");
+        if (mute && *mute && std::strcmp(mute, "0") != 0) {
+            gain = 0.0;
+            std::fprintf(stderr, "[audio-output] RECOMP_MUTE: playing silently\n");
+        }
     }
     error = master->SetVolume(static_cast<float>(gain));
     if (FAILED(error)) {

@@ -38,6 +38,7 @@ class Instruction:
     jump_target: Optional[int] = None     # For direct jumps
     memory_ref: Optional[int] = None      # For [addr] references
     jump_table: Optional[int] = None      # For `jmp [reg*4 + table]`
+    call_table: Optional[int] = None      # For `call [reg*4 + table]`
     imm_ref: Optional[int] = None         # For `push offset x` / `mov reg, offset x`
 
     @property
@@ -95,6 +96,8 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
+        # Displacements of `call [reg*4 + disp]`: function-pointer tables.
+        self.call_tables: Set[int] = set()
         # Displacement the dispatch names -> where the table actually starts.
         # They differ when the index can be negative (memcpy's tail table) or
         # never takes the low values, and jump_table_entries() is asked by the
@@ -137,6 +140,20 @@ class DisasmEngine:
                     insn.call_target = op.imm & 0xFFFFFFFF
                 elif op.type == CS_OP_MEM and op.mem.base == 0 and op.mem.index == 0:
                     insn.memory_ref = op.mem.disp & 0xFFFFFFFF
+                elif (op.type == CS_OP_MEM and op.mem.base == 0
+                      and op.mem.index != 0 and op.mem.scale == 4):
+                    # `call dword ptr [reg*4 + disp]` -- a dispatch through a
+                    # table of function pointers. disp is where index 0 would
+                    # be, which need not be where the entries start: D3D8's
+                    # SetRenderState calls [state*4 + disp] only for states
+                    # >= 0x88, so its first real entry is 0x220 bytes in and
+                    # disp itself lands in the middle of another function.
+                    # See FunctionDetector._pass_data_ptr_targets.
+                    disp = op.mem.disp & 0xFFFFFFFF
+                    if self.image.base_address <= disp < (
+                            self.image.base_address + self.image.image_size):
+                        insn.call_table = disp
+                        self.call_tables.add(disp)
 
             elif insn.is_jump or insn.is_cond_jump:
                 if op.type == CS_OP_IMM:

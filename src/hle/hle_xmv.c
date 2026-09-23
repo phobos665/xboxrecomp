@@ -64,6 +64,7 @@
 #include <time.h>
 
 #include "hle.h"
+#include "hle_xmv_play.h"
 #include "../kernel/xbox_memory_layout.h"
 
 /* Playback status, as the titles' switches read it. Two titles agree, and
@@ -101,12 +102,19 @@
 #define XMV_OBJ_SIZE     0x200u
 #define XMV_OFF_WIDTH    0x40u
 #define XMV_OFF_HEIGHT   0x44u
-#define XMV_OFF_RATE     0x48u
+/* +0x48 is the audio stream count: the XDK's GetStreamInfo copies it to the
+ * caller's +0xC (XMVVIDEODESC: Width, Height, FramesPerSecond,
+ * AudioStreamCount), and Breakdown loops over it creating one DirectSound
+ * stream per track. It was a float 30.0 here, which Breakdown read as
+ * 0x41F00000 tracks and capped at 6. Zero: the movie's sound plays on a host
+ * voice (hle_xmv_play.c), so the title needs no stream of its own. */
+#define XMV_OFF_AUDIO_COUNT 0x48u
 /* Our own bookkeeping, past anything the library exposes. */
 #define XMV_OFF_MAGIC    0xE0u
 #define XMV_OFF_START_MS 0xE4u
 #define XMV_OFF_FRAMES   0xE8u
 #define XMV_OFF_DONE     0xECu
+#define XMV_OFF_PLAY     0xF0u   /* hle_xmv_play handle, 0 when not playing */
 
 #define XMV_MAGIC 0x584D5648u   /* 'XMVH' */
 
@@ -157,6 +165,35 @@ static int xmv_is_ours(uint32_t handle)
     return handle && HLE_MEM32(handle + XMV_OFF_MAGIC) == XMV_MAGIC;
 }
 
+/* A playback this file did not make goes to the XDK's own body. XGRA creates
+ * some through an entry point that is not replaced (0x000D975A, fed packets
+ * by the title through two callbacks) and then polls and destroys them through
+ * the same Update and Destroy as its file movies; answering those "not ours,
+ * E_FAIL" would stop them dead. A title whose symbols do not name the original
+ * gets E_FAIL as before. */
+HLE_ORIGINAL(XMVPlaybackStart);
+HLE_ORIGINAL(XMVPlaybackGetStreamInfo);
+HLE_ORIGINAL(XMVPlaybackCreateAudioStream);
+HLE_ORIGINAL(XMVPlaybackGetAudioStreamInfo);
+HLE_ORIGINAL(XMVPlaybackGetCurrentTime);
+HLE_ORIGINAL(XMVPlaybackUpdate);
+HLE_ORIGINAL(XMVPlaybackDestroy);
+HLE_ORIGINAL(XMVPlaybackReleaseAudioStream);
+HLE_ORIGINAL(XMVPlaybackStopAudioStreams);
+HLE_ORIGINAL(XMVPlaybackGetAudioStream);
+
+#define XMV_OTHERS_TO_XDK(name)                                               \
+    do {                                                                       \
+        if (!xmv_is_ours(HLE_ARG(0))) {                                        \
+            if (hle_original_##name) {                                         \
+                HLE_CALL_ORIGINAL(name);                                       \
+                return;                                                        \
+            }                                                                  \
+            HLE_RETURN(0x80004005u);                                           \
+            return;                                                            \
+        }                                                                      \
+    } while (0)
+
 /* HRESULT XMVPlaybackCreate(DWORD flags, void *source, XMVPlayback **out) */
 HLE_EXPORT(XMVPlaybackCreate)
 {
@@ -176,28 +213,35 @@ HLE_EXPORT(XMVPlaybackCreate)
     }
     memset(HLE_PTR(obj), 0, XMV_OBJ_SIZE);
 
-    /* What the title will read back through GetStreamInfo. The dimensions are
-     * the console's standard frame; the third field is a float, and a frame
-     * rate is what a caller storing it next to a timer wants. */
+    /* What the title will read back through GetStreamInfo: the console's
+     * standard frame until the file says otherwise, and no audio streams. */
     HLE_MEM32(obj + XMV_OFF_WIDTH)  = 640u;
     HLE_MEM32(obj + XMV_OFF_HEIGHT) = 480u;
-    {
-        float rate = 30.0f;
-        uint32_t bits;
-        memcpy(&bits, &rate, sizeof(bits));
-        HLE_MEM32(obj + XMV_OFF_RATE) = bits;
-    }
+    HLE_MEM32(obj + XMV_OFF_AUDIO_COUNT) = 0u;
 
     HLE_MEM32(obj + XMV_OFF_MAGIC)    = XMV_MAGIC;
     HLE_MEM32(obj + XMV_OFF_START_MS) = 0;    /* not started yet */
     HLE_MEM32(obj + XMV_OFF_FRAMES)   = 0;
     HLE_MEM32(obj + XMV_OFF_DONE)     = 0;
 
+    /* Play the file when it can be (hle_xmv_play.c: FFmpeg present, the file
+     * found); otherwise the movie is reported over, as before. */
+    {
+        uint32_t w = 0, h = 0;
+        int play = xmv_play_open(HLE_ARG(1), &w, &h);
+        HLE_MEM32(obj + XMV_OFF_PLAY) = (uint32_t)play;
+        if (play) {
+            HLE_MEM32(obj + XMV_OFF_WIDTH)  = w;
+            HLE_MEM32(obj + XMV_OFF_HEIGHT) = h;
+        }
+    }
+
     HLE_MEM32(out_va) = obj;
 
-    fprintf(stderr, "[XMV] playback created at 0x%08X, reported as 640x480; "
-                    "the title's decoder will not run "
-                    "(RECOMP_HLE_XMV=0 gives it back)\n", obj);
+    fprintf(stderr, "[XMV] playback created at 0x%08X, %s; the title's decoder "
+                    "will not run (RECOMP_HLE_XMV=0 gives it back)\n", obj,
+            HLE_MEM32(obj + XMV_OFF_PLAY) ? "playing the file on the host"
+                                          : "reported over at once");
     fflush(stderr);
     HLE_RETURN(0);
 }
@@ -207,8 +251,11 @@ HLE_EXPORT(XMVPlaybackStart)
 {
     uint32_t obj = HLE_ARG(0);
 
+    XMV_OTHERS_TO_XDK(XMVPlaybackStart);
+
     if (xmv_is_ours(obj)) {
         HLE_MEM32(obj + XMV_OFF_START_MS) = xmv_now_ms();
+        xmv_play_start((int)HLE_MEM32(obj + XMV_OFF_PLAY));
         fprintf(stderr, "[XMV] playback started; the movie is reported as "
                         "%u ms long (RECOMP_XMV_SECONDS)\n", xmv_ms());
         fflush(stderr);
@@ -225,11 +272,13 @@ HLE_EXPORT(XMVPlaybackGetStreamInfo)
     uint32_t obj = HLE_ARG(0);
     uint32_t out = HLE_ARG(1);
 
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetStreamInfo);
+
     if (!obj || !out)
         return;
     HLE_MEM32(out + 0x0u) = HLE_MEM32(obj + XMV_OFF_WIDTH);
     HLE_MEM32(out + 0x4u) = HLE_MEM32(obj + XMV_OFF_HEIGHT);
-    HLE_MEM32(out + 0xCu) = HLE_MEM32(obj + XMV_OFF_RATE);
+    HLE_MEM32(out + 0xCu) = HLE_MEM32(obj + XMV_OFF_AUDIO_COUNT);
 }
 
 /* HRESULT XMVPlaybackCreateAudioStream(XMVPlayback *p, DWORD a, DWORD b,
@@ -256,15 +305,64 @@ HLE_EXPORT(XMVPlaybackCreateAudioStream)
     uint32_t obj = HLE_ARG(0);
     uint32_t out = HLE_ARG(4);
 
+    XMV_OTHERS_TO_XDK(XMVPlaybackCreateAudioStream);
+
     if (out)
         HLE_MEM32(out) = 0;
     if (xmv_is_ours(obj)) {
         fprintf(stderr, "[XMV] audio stream requested for playback 0x%08X; "
-                        "none is made, because nothing here decodes audio\n",
-                obj);
+                        "none is made: %s\n", obj,
+                HLE_MEM32(obj + XMV_OFF_PLAY) ? "the movie's sound plays on a host voice"
+                                              : "the movie is not being played");
         fflush(stderr);
     }
     HLE_RETURN(0);
+}
+
+/* HRESULT XMVPlaybackGetAudioStreamInfo(XMVPlayback *p, DWORD index, void *out)
+ *
+ * Breakdown asks this once per audio stream GetStreamInfo reported. That count
+ * is 0 now, so it should not be asked; if a title asks anyway, there is no
+ * such stream. */
+HLE_EXPORT(XMVPlaybackGetAudioStreamInfo)
+{
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetAudioStreamInfo);
+    if (xmv_is_ours(HLE_ARG(0))) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[XMV] audio stream %u info requested: there are none "
+                            "(the movie's sound plays on a host voice)\n", HLE_ARG(1));
+    }
+    HLE_RETURN(0x80004005u);
+}
+
+/* DWORD XMVPlaybackGetCurrentTime(XMVPlayback *p)
+ *
+ * Breakdown calls this after every Update. The XDK's body subtracts a start
+ * time kept in the real playback object from QueryPerformanceCounter, and in
+ * this object that field is zero, so it would report the time since boot.
+ *
+ * For a movie played here, the host player's own clock -- the one its
+ * pictures' times (Update's fourth argument) are on. Otogi waits after each
+ * picture until this reaches that picture's time, and never calls Start, so
+ * a clock kept from Start stood at zero and Otogi waited for ever. */
+HLE_EXPORT(XMVPlaybackGetCurrentTime)
+{
+    uint32_t obj = HLE_ARG(0), started;
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetCurrentTime);
+
+    if (!xmv_is_ours(obj)) {
+        HLE_RETURN(0);
+        return;
+    }
+    if (HLE_MEM32(obj + XMV_OFF_PLAY)) {
+        HLE_RETURN(xmv_play_time((int)HLE_MEM32(obj + XMV_OFF_PLAY)));
+        return;
+    }
+    started = HLE_MEM32(obj + XMV_OFF_START_MS);
+    HLE_RETURN(started ? xmv_now_ms() - started : 0u);
 }
 
 /* HRESULT XMVPlaybackUpdate(XMVPlayback *p, void *surface, DWORD *status,
@@ -278,16 +376,33 @@ HLE_EXPORT(XMVPlaybackUpdate)
     uint32_t status_va = HLE_ARG(2);
     uint32_t started, frames, elapsed;
 
-    if (!xmv_is_ours(obj)) {
-        /* Not one of ours: say nothing rather than guess, and let the title
-         * take whatever path it takes for a playback it does not own. */
-        HLE_RETURN(0x80004005u);
-        return;
-    }
+    XMV_OTHERS_TO_XDK(XMVPlaybackUpdate);
 
     started = HLE_MEM32(obj + XMV_OFF_START_MS);
     frames  = HLE_MEM32(obj + XMV_OFF_FRAMES) + 1u;
     HLE_MEM32(obj + XMV_OFF_FRAMES) = frames;
+
+    if (HLE_MEM32(obj + XMV_OFF_PLAY)) {
+        uint32_t pts = 0, time_va = HLE_ARG(3);
+        uint32_t status = xmv_play_update((int)HLE_MEM32(obj + XMV_OFF_PLAY), HLE_ARG(1), &pts);
+        if (status_va)
+            HLE_MEM32(status_va) = status;
+        /* The fourth argument, when the title passes one, receives the new
+         * picture's time: the XDK writes [playback +0xE4] + [+0xC8] through
+         * it whenever it is non-NULL and a picture is new. Future Perfect and
+         * Breakdown pass 0; XGRA passes a local and draws only when it comes
+         * back non-zero, so the first picture (at 0 ms) is reported as 1. */
+        if (status == XMV_STATUS_NEWFRAME && time_va >= 0x00010000u &&
+            (uint64_t)time_va + 4u <= g_xbox_total_ram)
+            HLE_MEM32(time_va) = pts + 1u;
+        if (status == XMV_STATUS_ENDOFFILE && !HLE_MEM32(obj + XMV_OFF_DONE)) {
+            HLE_MEM32(obj + XMV_OFF_DONE) = 1u;
+            fprintf(stderr, "[XMV] update #%u: the movie is over\n", frames);
+            fflush(stderr);
+        }
+        HLE_RETURN(0);
+        return;
+    }
 
     if (!started) {
         /* Polled before Start. Treat the first poll as the start so a title
@@ -317,15 +432,56 @@ HLE_EXPORT(XMVPlaybackUpdate)
     HLE_RETURN(0);
 }
 
+/* HRESULT XMVPlaybackGetAudioStream(XMVPlayback *p, DWORD index,
+ *                                   IDirectSoundStream **out)
+ *
+ * Nightfire's (XDK 4831) way of fetching the DirectSound stream for one audio
+ * track after creating it. A playback made here has none -- its sound is on a
+ * host voice -- so the answer is NULL, which is also what CreateAudioStream
+ * hands back. */
+HLE_EXPORT(XMVPlaybackGetAudioStream)
+{
+    uint32_t out = HLE_ARG(2);
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetAudioStream);
+    if (out)
+        HLE_MEM32(out) = 0;
+    HLE_RETURN(0);
+}
+
+/* void XMVPlaybackStopAudioStreams(XMVPlayback *p)
+ * void XMVPlaybackReleaseAudioStream(XMVPlayback *p, DWORD index)
+ *
+ * XGRA's names for two calls its movie code makes before Destroy: the first
+ * walks the playback's DirectSound streams and calls a method on each, the
+ * second clears one slot of the stream array the playback keeps at +0x138.
+ * A playback made here has no DirectSound streams -- its sound is on a host
+ * voice, closed with the movie -- and no such array, so both are done. */
+HLE_EXPORT(XMVPlaybackStopAudioStreams)
+{
+    XMV_OTHERS_TO_XDK(XMVPlaybackStopAudioStreams);
+    HLE_RETURN(0);
+}
+
+HLE_EXPORT(XMVPlaybackReleaseAudioStream)
+{
+    XMV_OTHERS_TO_XDK(XMVPlaybackReleaseAudioStream);
+    HLE_RETURN(0);
+}
+
 /* HRESULT XMVPlaybackDestroy(XMVPlayback *p) */
 HLE_EXPORT(XMVPlaybackDestroy)
 {
     uint32_t obj = HLE_ARG(0);
 
+    XMV_OTHERS_TO_XDK(XMVPlaybackDestroy);
+
     if (xmv_is_ours(obj)) {
         /* The guest heap here has no free, so the object is neutered rather
          * than returned: a title that keeps a stale handle then gets the same
          * answer as one that passes a handle we never made. */
+        xmv_play_close((int)HLE_MEM32(obj + XMV_OFF_PLAY));
+        HLE_MEM32(obj + XMV_OFF_PLAY) = 0;
         HLE_MEM32(obj + XMV_OFF_MAGIC) = 0;
         fprintf(stderr, "[XMV] playback destroyed\n");
         fflush(stderr);
