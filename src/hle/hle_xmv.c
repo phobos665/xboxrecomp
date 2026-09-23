@@ -180,6 +180,7 @@ HLE_ORIGINAL(XMVPlaybackUpdate);
 HLE_ORIGINAL(XMVPlaybackDestroy);
 HLE_ORIGINAL(XMVPlaybackReleaseAudioStream);
 HLE_ORIGINAL(XMVPlaybackStopAudioStreams);
+HLE_ORIGINAL(XMVPlaybackGetAudioStream);
 
 #define XMV_OTHERS_TO_XDK(name)                                               \
     do {                                                                       \
@@ -341,7 +342,11 @@ HLE_EXPORT(XMVPlaybackGetAudioStreamInfo)
  * Breakdown calls this after every Update. The XDK's body subtracts a start
  * time kept in the real playback object from QueryPerformanceCounter, and in
  * this object that field is zero, so it would report the time since boot.
- * Milliseconds since Start instead. */
+ *
+ * For a movie played here, the host player's own clock -- the one its
+ * pictures' times (Update's fourth argument) are on. Otogi waits after each
+ * picture until this reaches that picture's time, and never calls Start, so
+ * a clock kept from Start stood at zero and Otogi waited for ever. */
 HLE_EXPORT(XMVPlaybackGetCurrentTime)
 {
     uint32_t obj = HLE_ARG(0), started;
@@ -350,6 +355,10 @@ HLE_EXPORT(XMVPlaybackGetCurrentTime)
 
     if (!xmv_is_ours(obj)) {
         HLE_RETURN(0);
+        return;
+    }
+    if (HLE_MEM32(obj + XMV_OFF_PLAY)) {
+        HLE_RETURN(xmv_play_time((int)HLE_MEM32(obj + XMV_OFF_PLAY)));
         return;
     }
     started = HLE_MEM32(obj + XMV_OFF_START_MS);
@@ -420,6 +429,23 @@ HLE_EXPORT(XMVPlaybackUpdate)
         if (status == XMV_STATUS_ENDOFFILE)
             HLE_MEM32(obj + XMV_OFF_DONE) = 1u;
     }
+    HLE_RETURN(0);
+}
+
+/* HRESULT XMVPlaybackGetAudioStream(XMVPlayback *p, DWORD index,
+ *                                   IDirectSoundStream **out)
+ *
+ * Nightfire's (XDK 4831) way of fetching the DirectSound stream for one audio
+ * track after creating it. A playback made here has none -- its sound is on a
+ * host voice -- so the answer is NULL, which is also what CreateAudioStream
+ * hands back. */
+HLE_EXPORT(XMVPlaybackGetAudioStream)
+{
+    uint32_t out = HLE_ARG(2);
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetAudioStream);
+    if (out)
+        HLE_MEM32(out) = 0;
     HLE_RETURN(0);
 }
 

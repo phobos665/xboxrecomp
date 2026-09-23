@@ -132,17 +132,32 @@ static int                g_overlay_enabled, g_overlay_updated;
  * through a push buffer of its own, so the bind happens and no draw does. */
 static uint32_t           g_movie_phys;
 static int                g_movie_sampled;
+static int                g_movie_yuy2;       /* the movie surface is YUY2 */
 static uint32_t           g_stage_texels[4];
 
-void hle_d3d8_movie_surface(uint32_t data)
+void hle_d3d8_movie_surface(uint32_t data, uint32_t xbox_format)
 {
     g_movie_phys = data & 0x0FFFFFFFu;
+    g_movie_yuy2 = data && xbox_format == 0x24u;
 }
 
 void hle_d3d8_note_stage_texels(uint32_t stage, uint32_t phys)
 {
     if (stage < 4u)
         g_stage_texels[stage] = phys;
+}
+
+/* RECOMP_XMV_LAYER=1: draw a playing movie over the frame on the host's
+ * movie layer even when the title draws it itself -- for a title whose own
+ * movie draw comes out wrong, and to tell a decoding fault from a drawing one. */
+static int movie_layer_forced(void)
+{
+    static int forced = -1;
+    if (forced < 0) {
+        const char *e = getenv("RECOMP_XMV_LAYER");
+        forced = e && *e && strcmp(e, "0") != 0;
+    }
+    return forced;
 }
 
 /* After a draw reached the host. */
@@ -1578,13 +1593,21 @@ static void frame_end_shadow(void)
          * finished frame, before the dump so captures show it. */
         if (g_overlay_enabled && g_overlay_updated) {
             d3d8_movie_draw();
-        } else if (g_movie_phys && !g_movie_sampled) {
+        } else if (g_movie_phys &&
+                   (!g_movie_sampled || g_movie_yuy2 || movie_layer_forced())) {
             /* A movie is playing and no draw this frame sampled its picture.
              * The title shows it by a way the host cannot see -- XGRA and
              * Breakdown draw through push buffers they fill themselves -- so
              * the picture goes over the frame the way the overlay's does.
              * A title that draws the movie surface itself (Black) samples it
-             * and is left alone. */
+             * and is left alone.
+             *
+             * A YUY2 movie surface goes on the layer whatever the title
+             * draws. YUY2 is the video overlay's format: Future Perfect and
+             * Breakdown use it that way, and Otogi, which textures from it,
+             * does so through a two-pass draw that comes out black here while
+             * the layer shows its promo exactly (RECOMP_XMV_LAYER=1). The
+             * cost is that anything drawn over such a movie is covered. */
             d3d8_movie_draw();
         }
         g_movie_sampled = 0;
