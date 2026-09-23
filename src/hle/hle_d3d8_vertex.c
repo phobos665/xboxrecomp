@@ -310,6 +310,33 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant1)
 #endif
 }
 
+/* void __fastcall D3DDevice_SetVertexShaderConstant1Fast(int Register,
+ *     const void *pConstantData) -- one register, without the checks.
+ *
+ * Some builds have only this form of the single-register setter, beside
+ * NotInlineFast: XGRA, Doom 3 and Breakdown name no other, and Outrun 2 has
+ * both. Unreplaced, every constant a title set this way stayed zero on the
+ * host, and a program that transforms its position by one drew nothing --
+ * XGRA's movie quad reached the host every frame and came out black. */
+HLE_ORIGINAL(D3DDevice_SetVertexShaderConstant1Fast);
+HLE_EXPORT(D3DDevice_SetVertexShaderConstant1Fast)
+{
+    static int seen;
+    uint32_t reg = g_ecx;
+#ifdef _WIN32
+    uint32_t data = g_edx;
+#endif
+
+    first_call(&seen, "D3DDevice_SetVertexShaderConstant1Fast", reg);
+    if (original_missing(hle_original_D3DDevice_SetVertexShaderConstant1Fast,
+                         "D3DDevice_SetVertexShaderConstant1Fast"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant1Fast);
+#ifdef _WIN32
+    forward_constants(reg, data, 1u);
+#endif
+}
+
 /* void __fastcall D3DDevice_SetVertexShaderConstant4(int Register,
  *     const void *pConstantData) -- four registers.                         */
 HLE_EXPORT(D3DDevice_SetVertexShaderConstant4)

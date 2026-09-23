@@ -374,9 +374,18 @@ HLE_EXPORT(XMVPlaybackUpdate)
     HLE_MEM32(obj + XMV_OFF_FRAMES) = frames;
 
     if (HLE_MEM32(obj + XMV_OFF_PLAY)) {
-        uint32_t status = xmv_play_update((int)HLE_MEM32(obj + XMV_OFF_PLAY), HLE_ARG(1));
+        uint32_t pts = 0, time_va = HLE_ARG(3);
+        uint32_t status = xmv_play_update((int)HLE_MEM32(obj + XMV_OFF_PLAY), HLE_ARG(1), &pts);
         if (status_va)
             HLE_MEM32(status_va) = status;
+        /* The fourth argument, when the title passes one, receives the new
+         * picture's time: the XDK writes [playback +0xE4] + [+0xC8] through
+         * it whenever it is non-NULL and a picture is new. Future Perfect and
+         * Breakdown pass 0; XGRA passes a local and draws only when it comes
+         * back non-zero, so the first picture (at 0 ms) is reported as 1. */
+        if (status == XMV_STATUS_NEWFRAME && time_va >= 0x00010000u &&
+            (uint64_t)time_va + 4u <= g_xbox_total_ram)
+            HLE_MEM32(time_va) = pts + 1u;
         if (status == XMV_STATUS_ENDOFFILE && !HLE_MEM32(obj + XMV_OFF_DONE)) {
             HLE_MEM32(obj + XMV_OFF_DONE) = 1u;
             fprintf(stderr, "[XMV] update #%u: the movie is over\n", frames);
