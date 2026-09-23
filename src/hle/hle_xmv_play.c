@@ -8,11 +8,10 @@
  * refuses because its queue is full is offered again next poll, never
  * dropped (audio_output.h says why that matters).
  *
- * The picture goes to the host's movie layer (d3d8_movie), which the swap
- * draws while the title has its video overlay up. A title that draws the
- * movie surface as a texture instead would need the picture written into
- * that surface in its own format; the first poll logs the surface so that
- * can be added from evidence rather than guessed.
+ * The picture goes two places: the host's movie layer (d3d8_movie), which
+ * the swap draws while the title has its video overlay up, and the title's
+ * own surface in its own format (write_surface), for a title that draws the
+ * movie as a texture instead.
  */
 #include "hle_xmv_play.h"
 
@@ -302,15 +301,64 @@ static int read_next(movie *m)
     return 1;
 }
 
-static void log_surface(movie *m, uint32_t surface)
+/* The picture into the title's own surface, in the surface's format, for a
+ * title that draws the movie as a texture rather than on the overlay (Black
+ * draws a LIN_A8R8G8B8 surface; Future Perfect's overlay surface is YUY2).
+ * The shadow renderer checksums bound textures each frame and uploads what
+ * changed, so nothing else is needed for the picture to reach the host.
+ *
+ * A D3DSurface is Common, Data (physical), Lock, Format, Size: the format in
+ * bits 8-15 of Format, and Size holds width-1, height-1 and pitch/64-1. A
+ * swizzled surface has Size 0; none has been seen, so it is logged and left. */
+static void write_surface(movie *m, uint32_t surface)
 {
-    if (m->logged_surface++ || !surface)
+    uint32_t data, format, size, fmt, sw, sh, pitch, x, y;
+    uint8_t *dst;
+
+    if (!surface)
         return;
-    fprintf(stderr, "[XMV] the title's movie surface 0x%08X: common 0x%08X data 0x%08X "
-            "format 0x%08X size 0x%08X (not written: the picture is on the host's "
-            "movie layer)\n", surface, HLE_MEM32(surface), HLE_MEM32(surface + 4),
-            HLE_MEM32(surface + 12), HLE_MEM32(surface + 16));
-    fflush(stderr);
+    data = HLE_MEM32(surface + 4);
+    format = HLE_MEM32(surface + 12);
+    size = HLE_MEM32(surface + 16);
+    fmt = (format >> 8) & 0xFFu;
+    sw = (size & 0xFFFu) + 1u;
+    sh = ((size >> 12) & 0xFFFu) + 1u;
+    pitch = (((size >> 24) & 0xFFu) + 1u) * 64u;
+    if (!m->logged_surface++) {
+        fprintf(stderr, "[XMV] the title's movie surface 0x%08X: format 0x%02X %ux%u pitch %u, "
+                "data 0x%08X -- %s\n", surface, fmt, sw, sh, pitch, data,
+                !size ? "swizzled, not written"
+                : (fmt == 0x12u || fmt == 0x1Eu || fmt == 0x24u) ? "written each picture"
+                : "a format this does not write");
+        fflush(stderr);
+    }
+    if (!size || !data || (uint64_t)(data & 0x03FFFFFFu) + (uint64_t)pitch * sh > 0x04000000u)
+        return;
+    dst = (uint8_t *)HLE_PTR(0x80000000u | data);
+    for (y = 0; y < sh; y++) {
+        const uint8_t *row = m->bgra + (size_t)(y * m->h / sh) * m->w * 4u;
+        uint8_t *out = dst + (size_t)y * pitch;
+
+        if (fmt == 0x12u || fmt == 0x1Eu) {             /* LIN_A8R8G8B8 / X8R8G8B8 */
+            for (x = 0; x < sw; x++)
+                memcpy(out + x * 4u, row + (size_t)(x * m->w / sw) * 4u, 4);
+        } else if (fmt == 0x24u) {                      /* YUY2: Y0 U Y1 V */
+            for (x = 0; x + 1u < sw; x += 2u) {
+                const uint8_t *a = row + (size_t)(x * m->w / sw) * 4u;
+                const uint8_t *b = row + (size_t)((x + 1u) * m->w / sw) * 4u;
+                int ya = ( 66 * a[2] + 129 * a[1] +  25 * a[0] + 128) / 256 + 16;
+                int yb = ( 66 * b[2] + 129 * b[1] +  25 * b[0] + 128) / 256 + 16;
+                int u  = (-38 * a[2] -  74 * a[1] + 112 * a[0] + 128) / 256 + 128;
+                int v  = (112 * a[2] -  94 * a[1] -  18 * a[0] + 128) / 256 + 128;
+                out[x * 2u + 0u] = (uint8_t)ya;
+                out[x * 2u + 1u] = (uint8_t)u;
+                out[x * 2u + 2u] = (uint8_t)yb;
+                out[x * 2u + 3u] = (uint8_t)v;
+            }
+        } else {
+            return;
+        }
+    }
 }
 
 uint32_t xmv_play_update(int handle, uint32_t surface_va)
@@ -323,7 +371,6 @@ uint32_t xmv_play_update(int handle, uint32_t surface_va)
         return 2u;
     if (!m->started)
         xmv_play_start(handle);
-    log_surface(m, surface_va);
 
     /* Keep the sound a little ahead: reading a picture reads its packet's
      * sound too, so reading ahead to the next picture is enough. */
@@ -350,6 +397,7 @@ uint32_t xmv_play_update(int handle, uint32_t surface_va)
     }
     feed_audio(m);
     if (got) {
+        write_surface(m, surface_va);
         d3d8_movie_set_frame(m->bgra, m->w, m->h);
         m->shown++;
         return 1u;

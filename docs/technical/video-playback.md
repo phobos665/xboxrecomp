@@ -289,13 +289,15 @@ player-count menu at 60 fps.
 
 How the pieces ended up, where they differ from the plan above:
 
-- **The picture does not go through the title's surface.** Future Perfect
-  shows its movie on the video overlay (`UpdateOverlay`), a plane the Xbox
-  scan-out puts over the frame buffer, so `hle_xmv_play.c` hands each picture
-  to a host movie layer (`src/d3d/d3d8_movie.c`) and the shadow renderer draws
-  it over the finished frame while the overlay is up. A title that draws the
-  movie surface as a texture (Black) will need the picture written into that
-  surface in its own format; the first poll logs the surface for that.
+- **The picture goes two ways.** Future Perfect shows its movie on the video
+  overlay (`UpdateOverlay`), a plane the Xbox scan-out puts over the frame
+  buffer, so `hle_xmv_play.c` hands each picture to a host movie layer
+  (`src/d3d/d3d8_movie.c`) and the shadow renderer draws it over the finished
+  frame while the overlay is up. Black draws its movie surface as a texture
+  instead, so each picture is also written into the surface `Update` is given,
+  in that surface's own format (`LIN_A8R8G8B8` for Black, `YUY2` for Future
+  Perfect's overlay surface); the shadow renderer's per-frame checksum sees the
+  change and uploads it.
 - **`EnableOverlay` must not run the XDK's body.** Turning the overlay off
   waits for the video scaler, hardware nothing emulates, and Future Perfect
   hung there the moment its first movie ended.
@@ -309,7 +311,10 @@ Switches: `RECOMP_XMV_PLAY=0` goes back to reporting movies over at once;
 `RECOMP_HLE_XMV=0` still hands the title its own decoder; `RECOMP_FFMPEG_DIR`
 says where FFmpeg is when it is not beside the executable.
 
-Still to do: Black (texture surface), and the four XMV titles whose library
-entry points are not named yet (Nightfire, Breakdown, XGRA, Otogi) --
-`config/extra_symbols/<title id>.json` through `scripts/section_calls.py`, as
-for Black and Future Perfect.
+**Black**, the texture case: its EA logo and the rifle movie behind its front
+end play (254 and 391 pictures); the frames it captures went from 0.4% lit to
+82.5%. Its movies carry no sound track.
+
+Still to do: the four XMV titles whose library entry points are not named yet
+(Nightfire, Breakdown, XGRA, Otogi) -- `config/extra_symbols/<title id>.json`
+through `scripts/section_calls.py`, as for Black and Future Perfect.
