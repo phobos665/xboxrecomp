@@ -36,52 +36,102 @@ class GdbError(RuntimeError):
 class Gdb:
     """Just enough GDB Remote Serial Protocol to halt, break and read."""
 
-    def __init__(self, host, port, timeout):
+    def __init__(self, host, port, timeout, verbose=False):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
         self.breakpoints = set()
+        self.verbose = verbose
+        # Bytes received but not yet consumed. Kept across reads: a chunk can
+        # carry more than one packet, and throwing the tail away put every
+        # later read one packet out of step -- which is how a stale stop
+        # reply came to be taken for a breakpoint hit, and the probe then
+        # asked a running guest for its registers and waited forever.
+        self.rx = b""
 
     # -- wire format -----------------------------------------------------
 
     def _send(self, payload: str) -> None:
         checksum = sum(payload.encode()) & 0xFF
+        if self.verbose:
+            print(f"    -> ${payload}")
         self.sock.sendall(f"${payload}#{checksum:02x}".encode())
 
     def _read_packet(self, timeout=None) -> str:
+        """The next whole packet, acknowledged. '+'/'-' are skipped."""
         if timeout is not None:
             self.sock.settimeout(timeout)
-        buf = b""
         while True:
+            start = self.rx.find(b"$")
+            if start >= 0:
+                end = self.rx.find(b"#", start)
+                if end >= 0 and len(self.rx) >= end + 3:
+                    payload = self.rx[start + 1:end].decode(errors="replace")
+                    self.rx = self.rx[end + 3:]
+                    # Every packet from the stub is acknowledged, stop
+                    # replies included; an unacknowledged one may be sent
+                    # again and read later as something new.
+                    self.sock.sendall(b"+")
+                    if self.verbose:
+                        print(f"    <- ${payload[:120]}")
+                    return payload
             try:
                 chunk = self.sock.recv(4096)
             except socket.timeout:
                 raise GdbError("timed out waiting for the stub")
             if not chunk:
                 raise GdbError("stub closed the connection")
-            buf += chunk
-            # Skip the '+' / '-' acknowledgements the stub interleaves.
-            if b"$" in buf and b"#" in buf:
-                start = buf.index(b"$") + 1
-                end = buf.index(b"#", start)
-                if len(buf) >= end + 3:
-                    return buf[start:end].decode(errors="replace")
+            self.rx += chunk
+
+    def drain(self) -> None:
+        """Discard anything already received and not asked for."""
+        self.sock.settimeout(0.2)
+        try:
+            while True:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                self.rx += chunk
+        except (socket.timeout, BlockingIOError):
+            pass
+        while b"$" in self.rx and b"#" in self.rx[self.rx.find(b"$"):]:
+            stale = self._read_packet(timeout=0.2)
+            if self.verbose:
+                print(f"    (discarded stale packet {stale[:40]!r})")
+        self.rx = b""
 
     def command(self, payload: str, timeout=None) -> str:
         self._send(payload)
-        reply = self._read_packet(timeout)
-        self.sock.sendall(b"+")
-        return reply
+        return self._read_packet(timeout)
 
     # -- operations ------------------------------------------------------
 
     def halt(self) -> str:
         """Interrupt the guest. Required before touching breakpoints."""
         self.sock.sendall(b"\x03")
-        time.sleep(0.3)
         try:
-            return self._read_packet(timeout=3.0)
+            reply = self._read_packet(timeout=3.0)
         except GdbError:
-            return ""       # already stopped
+            reply = ""       # already stopped
+        self.drain()
+        return reply
+
+    def continue_until_stop(self, timeout: float) -> str:
+        """Resume, and return the stop reply -- only a stop reply.
+
+        Console output ('O...') and anything else the stub volunteers is
+        read past; 'W'/'X' mean the guest is gone."""
+        self.drain()
+        self._send("c")
+        deadline = time.time() + timeout
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                raise GdbError("timed out waiting for the stub")
+            reply = self._read_packet(timeout=left)
+            if reply[:1] in ("T", "S"):
+                return reply
+            if reply[:1] in ("W", "X"):
+                raise GdbError(f"the guest exited ({reply})")
 
     def set_breakpoint(self, addr: int, hardware: bool = False) -> None:
         kind = "Z1" if hardware else "Z0"
@@ -103,10 +153,6 @@ class Gdb:
                 print(f"  WARNING: could not remove the breakpoint at "
                       f"0x{addr:08X}; it may still be set in the guest",
                       file=sys.stderr)
-
-    def continue_until_stop(self, timeout: float) -> str:
-        self._send("c")
-        return self._read_packet(timeout)
 
     def registers(self) -> dict:
         raw = self.command("g")
@@ -166,8 +212,10 @@ def main() -> int:
     ap.add_argument("--deref", metavar="REG", default="ecx",
                     help="Register to treat as a pointer and sample "
                          "(default ecx, the thiscall receiver)")
-    ap.add_argument("--offset", type=lambda s: int(s, 0), default=0,
-                    help="Also read this offset from the --deref pointer")
+    ap.add_argument("--offset", type=lambda s: int(s, 0), action="append",
+                    default=[], metavar="OFF",
+                    help="Also read this offset from the --deref pointer "
+                         "(repeatable)")
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=1234)
     ap.add_argument("--wait", type=float, default=120.0,
@@ -191,17 +239,29 @@ def main() -> int:
                          "actually loaded there.")
     ap.add_argument("--hw", action="store_true",
                     help="Use a hardware breakpoint (Z1) instead of Z0")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="print every packet exchanged with the stub")
     args = ap.parse_args()
 
     print(f"connecting to {args.host}:{args.port} ...")
     try:
-        gdb = Gdb(args.host, args.port, timeout=10.0)
+        gdb = Gdb(args.host, args.port, timeout=10.0, verbose=args.verbose)
     except OSError as exc:
         print(f"error: could not connect: {exc}\n"
               f"       is xemu running with -s ?", file=sys.stderr)
         return 1
 
     try:
+        # '?' first, as every real client does. QEMU's stub (xemu) attaches
+        # to the CPU when it answers it; without that, memory reads and Z
+        # packets still work, but 'c' is answered "W00" -- the process has
+        # exited -- and 'g' is not answered at all. Three probe runs of Future
+        # Perfect's cutscene were lost to exactly that before it was found.
+        # QEMU also pauses the guest when a debugger connects, so the reply
+        # is normally a stop reply straight away.
+        print("attaching ...")
+        gdb.command("?", timeout=5.0)
+
         print("halting the guest ...")
         gdb.halt()
 
@@ -266,6 +326,13 @@ def main() -> int:
                 break
 
             regs = gdb.registers()
+            if regs.get("eip") != args.addr:
+                # A stop that is not this breakpoint: an exception in the
+                # guest, or a stray trap. Say so rather than report its
+                # registers as the answer.
+                print(f"  stopped at eip=0x{regs.get('eip', 0):08X}, not at "
+                      f"0x{args.addr:08X}; not counted, resuming")
+                continue
             print(f"--- hit {hit} at 0x{args.addr:08X} "
                   f"(eip=0x{regs.get('eip', 0):08X}) ---")
             for name in ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"):
@@ -292,16 +359,17 @@ def main() -> int:
                     words = struct.unpack("<8I", head)
                     print(f"  [{args.deref}] first 8 words: "
                           + " ".join(f"{w:08X}" for w in words))
-                if args.offset:
-                    field = gdb.read_memory(pointer + args.offset, 4)
-                    target = pointer + args.offset
+                for off in args.offset:
+                    field = gdb.read_memory(pointer + off, 4)
+                    target = pointer + off
                     if field is None:
-                        print(f"  [{args.deref}+0x{args.offset:X}] "
+                        print(f"  [{args.deref}+0x{off:X}] "
                               f"(0x{target:08X}) is NOT readable")
                     else:
-                        print(f"  [{args.deref}+0x{args.offset:X}] "
-                              f"(0x{target:08X}) = "
-                              f"0x{struct.unpack('<I', field)[0]:08X}")
+                        value = struct.unpack('<I', field)[0]
+                        print(f"  [{args.deref}+0x{off:X}] "
+                              f"(0x{target:08X}) = 0x{value:08X}   "
+                              f"{describe(value)}")
     except GdbError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -309,6 +377,13 @@ def main() -> int:
         print("\ninterrupted")
     finally:
         print("\nremoving breakpoints and resuming ...")
+        # The stub refuses breakpoint changes while the guest runs, so stop
+        # it first -- otherwise a failed run leaves the breakpoint behind.
+        if gdb.breakpoints:
+            try:
+                gdb.halt()
+            except Exception:                       # noqa: BLE001
+                pass
         gdb.clear_all()
         try:
             gdb._send("c")
