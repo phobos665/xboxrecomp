@@ -176,3 +176,140 @@ the combiners are what produce colour. So the title either never sets a pixel
 shader, or sets one the combiner layer declines to parse, and that is where
 the next session should start: instrument `D3DDevice_SetPixelShader` to say
 what it is handed and how often.
+
+## Playing the movies (planned, 23 September 2026)
+
+Answering the calls without decoding was the right first step: it stopped the
+crashes. The cost is that no title shows its intro, and six of the titles on
+hand ship XMV:
+
+| title | files | video | audio |
+| --- | --- | --- | --- |
+| XGRA | 68 | 640x480, 640x512 | PCM, 44.1 and 48 kHz |
+| Breakdown | 24 | 640x480, 640x540 | Xbox ADPCM (0x69), a few PCM |
+| Black | 17 | 640x480 | no audio track in the file |
+| 007: Nightfire | 16 | 640x480, container version 3 | Xbox ADPCM |
+| TimeSplitters: Future Perfect | 6 | 640x480, 720x480, 720x576 | PCM |
+| Otogi | 1 | 640x480 | PCM |
+
+(Bloody Roar Extreme and Gauntlet ship ASF `.wmv`, which Media Foundation reads
+as it is. Doom 3 and THPS2X ship Bink, which nothing in Windows decodes.)
+
+`RECOMP_FMV_HOST` does not cover these: it plays through Media Foundation,
+which does not know the XMV container, and it owns a D3D8 device of its own,
+which the shadow renderer excludes.
+
+### The container
+
+FFmpeg's `libavformat/xmv.c` describes it, and a parse to that description
+walks every packet and frame of all six Future Perfect files to the byte:
+
+- File header: next packet size, this packet size, max packet size, `xobX`,
+  version (4; Nightfire's is 3), width, height, duration in ms, audio track
+  count (u16) plus two bytes, then 12 bytes per track: codec tag (u16),
+  channels (u16), sample rate (u32), bits per sample (u16), flags (u16).
+- Each packet: next packet size, then a video word (low 23 bits the video data
+  size, bits 23-30 the frame count, bit 31 "extradata follows"), then one word
+  per audio track (low 23 bits its size). The video size is 4 bytes short per
+  audio track, which FFmpeg notes and corrects for.
+- Video data: optional 4-byte WMV2 extradata (`0x75000000` in every file seen),
+  then frames, each a header word (low 17 bits the size in words minus one,
+  the rest a timestamp delta in ms) and the frame. **The WMV2 bitstream is
+  stored as little-endian 32-bit words**, so each word is byte-swapped before
+  it goes to a standard decoder.
+- Audio data follows the video data, track by track.
+
+### The design
+
+1. **Demux** in portable C (`src/video/xmv_demux.c`): open the file the title
+   asked for, hand out video frames and audio blocks in order with their
+   timestamps.
+2. **Decode video** with the WMV decoder that ships with Windows (the WMV
+   decoder MFT), fed WMV2 with the extradata as its user data. No FFmpeg.
+3. **Decode into the title's own surface.** `XMVPlaybackUpdate` is handed the
+   surface the title will present; the frame is converted into that surface's
+   own format in guest memory and the update reports status 1, "new frame".
+   The title then presents it exactly as it would on hardware (Future Perfect
+   through `UpdateOverlay`, Black as a texture), and the shadow renderer picks
+   the pixels up like any other texture upload. Nothing here needs to know how
+   a given title shows its movie.
+4. **Audio** goes straight to the host's XAudio2 output, PCM as it is and
+   Xbox ADPCM through `src/hle/xbox_adpcm.c`. The title's own DirectSound
+   stream for the movie stays NULL, as now.
+5. **Timing** follows the frame timestamps against the host clock, so a movie
+   plays at its own rate whatever the title's poll rate is.
+
+What is still to be found, per title, before it can work: how `Create`'s
+`source` argument names the file, and whether `UpdateOverlay` reaches the
+shadow renderer.
+
+### Finding: Windows' WMV decoder will not take WMV2 (23 September 2026)
+
+Step 2 does not work on the machine this was tried on (Windows 11, build
+26200). The WMV decoder MFT lists WMV2 among its input types and refuses every
+WMV2 input type it is given (`MF_E_INVALIDMEDIATYPE`), with the file's codec
+data in either byte order, with none, and with the full attribute set that a
+real ASF file produces. Through its DMO interface the answer is the same
+(`DMO_E_TYPE_NOT_ACCEPTED`). The WMV **encoder** refuses a WMV2 output type in
+the same way. WMV1 works end to end through both with identical code, so the
+calls are right and WMV2 specifically is unavailable.
+
+So the decode is FFmpeg's `libavcodec`, loaded at run time (below).
+
+### Decoding through FFmpeg
+
+`src/video/xmv_decode.c` compiles against FFmpeg's headers only and loads
+`avcodec-62`, `avutil-60` and `swresample-6` when the first movie opens: beside
+the executable, then `RECOMP_FFMPEG_DIR`, then this checkout's
+`third_party/ffmpeg/bin` (the BtbN LGPL shared build of 8.1, fetched, not
+committed). Without them a movie is skipped exactly as before, so no title
+needs FFmpeg to start.
+
+Two things about the container that the prose above does not say, both found
+by comparing against FFmpeg byte for byte:
+
+- **The codec data is not WMV2's.** XMV packs the WMV2 flags into its own
+  layout (mspel bit 0, loop filter 1, abt 2, j-type 3, top-left MV 4,
+  per-MB RL 5, slice count bits 6-8), and they have to be moved to where WMV2
+  keeps them (bits 15, 14, 13, 12, 11, 10 and 7-9) before a decoder sees them.
+  `0x75` in Future Perfect's files becomes `0x0000AC80`. With the raw word
+  every frame decodes to coloured blocks.
+- **A packet whose frame count is 0 has no video**, only audio; its video bytes
+  are padding. Reading one frame from it walks into the padding.
+
+Checked on Future Perfect (`frd`, `eag_e`), Nightfire and Black: every frame
+decodes with no errors and the pictures are right. Black's `02_n.xmv` gives
+803 pictures from 1000 frames, the same count as FFmpeg's own tool.
+
+### Result on Future Perfect (23 September 2026)
+
+Both intro movies play in full with their sound, and the front end follows:
+the EA logo (88 of 88 pictures) and the Free Radical logo (81 of 81), then the
+player-count menu at 60 fps.
+
+How the pieces ended up, where they differ from the plan above:
+
+- **The picture does not go through the title's surface.** Future Perfect
+  shows its movie on the video overlay (`UpdateOverlay`), a plane the Xbox
+  scan-out puts over the frame buffer, so `hle_xmv_play.c` hands each picture
+  to a host movie layer (`src/d3d/d3d8_movie.c`) and the shadow renderer draws
+  it over the finished frame while the overlay is up. A title that draws the
+  movie surface as a texture (Black) will need the picture written into that
+  surface in its own format; the first poll logs the surface for that.
+- **`EnableOverlay` must not run the XDK's body.** Turning the overlay off
+  waits for the video scaler, hardware nothing emulates, and Future Perfect
+  hung there the moment its first movie ended.
+- **Pictures are timed by the wall clock, not the sound.** A packet's sound is
+  read with its first picture, so a clock that follows the sound stops when
+  the sound runs out and waits forever for a picture that is only read when
+  the clock moves. The EA logo stopped at exactly 1033 ms that way.
+- The sound has a voice of its own, `RECOMP_AUDIO_SLOT_MOVIE` (272).
+
+Switches: `RECOMP_XMV_PLAY=0` goes back to reporting movies over at once;
+`RECOMP_HLE_XMV=0` still hands the title its own decoder; `RECOMP_FFMPEG_DIR`
+says where FFmpeg is when it is not beside the executable.
+
+Still to do: Black (texture surface), and the four XMV titles whose library
+entry points are not named yet (Nightfire, Breakdown, XGRA, Otogi) --
+`config/extra_symbols/<title id>.json` through `scripts/section_calls.py`, as
+for Black and Future Perfect.

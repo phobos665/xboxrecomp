@@ -72,6 +72,7 @@
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
 #include "d3d8_overlay.h"
+#include "d3d8_movie.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
 #endif
@@ -123,6 +124,8 @@ static DWORD              g_shadow_swap_thread;
 static int                g_shadow_thread_notes;
 static unsigned long      g_shadow_clears;
 static unsigned long      g_shadow_swaps;
+/* The video overlay's state, from EnableOverlay and UpdateOverlay. */
+static int                g_overlay_enabled, g_overlay_updated;
 static uint32_t           g_shadow_last_color;
 
 /* RECOMP_HLE_D3D8_TRACE_SWAPS=<from>-<to>: one line per render-target set,
@@ -1528,6 +1531,11 @@ static void frame_end_shadow(void)
         /* The frame boundary for capture: closes the frame being recorded, or
          * starts recording if this is the requested swap. */
         hle_d3d8_capture_swap(g_shadow_swaps, g_shadow_width, g_shadow_height);
+        /* A movie on the video overlay (UpdateOverlay, below) is a plane the
+         * scan-out puts over the frame buffer; here it is drawn over the
+         * finished frame, before the dump so captures show it. */
+        if (g_overlay_enabled && g_overlay_updated)
+            d3d8_movie_draw();
         shadow_dump_frame();             /* before Present discards the buffer */
         shadow_frame_brightness();       /* likewise: Present discards it */
         if (g_inline_begin_frame > g_inline_begin_max)
@@ -2632,6 +2640,54 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     shadow_viewport_constants(&g_title_viewport);
 }
 #endif /* _WIN32 */
+
+/* The video overlay: the plane XMV movies are shown on by titles that use it
+ * (TimeSplitters: Future Perfect calls UpdateOverlay once per decoded frame
+ * and then Swap). The picture itself comes from hle_xmv.c, which decodes the
+ * movie and hands each frame to d3d8_movie; these only say whether the plane
+ * is showing, which is all the host needs from them. */
+HLE_ORIGINAL(D3DDevice_EnableOverlay);
+HLE_ORIGINAL(D3DDevice_UpdateOverlay);
+
+/* void D3DDevice_EnableOverlay(BOOL Enable)
+ *
+ * The XDK's own body is NOT run. Turning the overlay off waits for the video
+ * scaler to let go of it, polling hardware nothing here emulates: Future
+ * Perfect hung there, 82% of its main thread in this function's lifted body,
+ * the moment its first movie ended. The plane only exists on the host, so the
+ * two flags below are the whole of its state. */
+HLE_EXPORT(D3DDevice_EnableOverlay)
+{
+    static int seen;
+    uint32_t enable = HLE_ARG(0);
+
+    first_call(&seen, "D3DDevice_EnableOverlay", enable);
+#ifdef _WIN32
+    g_overlay_enabled = enable != 0;
+    if (!enable) {
+        g_overlay_updated = 0;
+        d3d8_movie_clear();
+    }
+#endif
+}
+
+/* void D3DDevice_UpdateOverlay(D3DSurface *pSurface, const RECT *SrcRect,
+ *     const RECT *DstRect, BOOL EnableColorKey, D3DCOLOR ColorKey)          */
+HLE_EXPORT(D3DDevice_UpdateOverlay)
+{
+    static int seen;
+
+    first_call(&seen, "D3DDevice_UpdateOverlay", HLE_ARG(0));
+    if (original_missing(hle_original_D3DDevice_UpdateOverlay, "D3DDevice_UpdateOverlay"))
+        HLE_RETURN(0u);
+    HLE_CALL_ORIGINAL(D3DDevice_UpdateOverlay);
+#ifdef _WIN32
+    /* A title that never calls EnableOverlay still means the plane to show
+     * when it updates it; the XDK turns it on at the first update. */
+    g_overlay_enabled = 1;
+    g_overlay_updated = HLE_ARG(0) != 0;
+#endif
+}
 
 /* void D3DDevice_SetRenderTargetFast(D3DSurface *pRenderTarget,
  *     D3DSurface *pNewZStencil, DWORD Flags) -- stdcall, later XDKs.

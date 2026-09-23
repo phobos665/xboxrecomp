@@ -145,6 +145,7 @@ static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 static void present_resolve(void);
 #include "d3d8_overlay.h"
+#include "d3d8_movie.h"
 
 /* ================================================================
  * Public frame pump (called from recompiled game code)
@@ -628,6 +629,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         /* Cleanup subsystems first */
         up_ring_shutdown();
         d3d8_overlay_shutdown();
+        d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
         d3d8_display_shutdown();
         d3d8_vsh_shutdown();
