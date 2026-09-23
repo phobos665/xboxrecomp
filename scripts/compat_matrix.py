@@ -699,6 +699,10 @@ def main():
                          "not touching save data is the safer default and the "
                          "overwrite prompt is a smaller problem than losing "
                          "track of someone's saves")
+    ap.add_argument("--mute", action="store_true",
+                    help="run every title silently (RECOMP_MUTE=1): the audio "
+                         "device still opens and plays at its own pace, so "
+                         "timing is the same as an audible run")
     ap.add_argument("--idle", action="store_true",
                     help="do not press anything. The old behaviour, and worth "
                          "having: TimeSplitters 2 crashes 10/10 idle and 0/10 "
@@ -723,6 +727,8 @@ def main():
                     help="where per-title logs and the JSON go")
     ap.add_argument("--baseline", help="a previous run's JSON to compare against")
     args = ap.parse_args()
+    if args.mute:
+        os.environ["RECOMP_MUTE"] = "1"      # inherited by every title run
 
     only = set(args.titles.split(",")) if args.titles else None
     titles = discover(only)

@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv: RECOMP_MUTE */
 #include "apu_xaudio2.h"
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
@@ -61,6 +62,13 @@ int xa2_init(void)
     if (FAILED(hr)) {
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
+    }
+    {
+        /* RECOMP_MUTE: silent, with the voice still running at its own pace
+         * (see src/hle/audio_output_xaudio2.cpp). */
+        const char *mute = getenv("RECOMP_MUTE");
+        if (mute && *mute && strcmp(mute, "0") != 0)
+            IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
     }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
