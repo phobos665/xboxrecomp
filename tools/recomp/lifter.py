@@ -1046,6 +1046,33 @@ def _make_setcc_value(setcc_mnemonic, flag_setter, flag_ops):
     return None
 
 
+def _make_lahf_value(flag_setter, flag_ops):
+    """The AH that lahf loads, as a C expression, or None if unknown.
+
+    The float compares are spelled out rather than taken from
+    _make_condition, which treats them as always ordered: after ucomiss an
+    unordered result sets ZF, PF and CF together, and `test ah, 44h; jnp`
+    exists precisely to tell NaN apart from equal.
+    """
+    if flag_setter in ("comiss", "comisd", "ucomiss", "ucomisd"):
+        un = "(_fca != _fca || _fcb != _fcb)"
+        return (f"(uint8_t)(0x02"
+                f" | (((_fca == _fcb) || {un}) ? 0x40 : 0)"
+                f" | ({un} ? 0x04 : 0)"
+                f" | (((_fca < _fcb) || {un}) ? 0x01 : 0))")
+    parts = []
+    for jcc, bit in (("js", 0x80), ("je", 0x40), ("jp", 0x04), ("jb", 0x01)):
+        r = _make_condition(jcc, flag_setter, flag_ops)
+        if r is None:
+            # fcomi and sahf clear SF; nothing else is safe to assume.
+            if jcc == "js" and flag_setter in ("fcompi", "fcomip", "fucomi",
+                                               "fucompi", "fucomip", "fcomi"):
+                continue
+            return None
+        parts.append(f"(({r[0]}) ? 0x{bit:02X} : 0)")
+    return "(uint8_t)(0x02 | " + " | ".join(parts) + ")"
+
+
 def _make_cmovcc_cond(cmov_mnemonic, flag_setter, flag_ops):
     """Generate the condition expression for a CMOVcc instruction."""
     cc = cmov_mnemonic[4:]
@@ -3844,6 +3871,18 @@ def lift_basic_block(lifter, bb, flag_state=None):
                     _fmt_operand_write(curr.operands[0],
                                        f"({cond}) ? 1 : 0")
                     + f" /* {curr.mnemonic} */")
+                i += 1
+                continue
+
+        # lahf copies SF:ZF:0:AF:0:PF:1:CF into AH. MSVC's float compare
+        # with no fcomi/SSE branch of its own is `ucomiss; lahf; test ah, 44h;
+        # jnp` (and the 05h/41h variants), so an AH left untouched makes every
+        # such branch read whatever eax last held. Outrun 2's draw-sort loop
+        # did exactly that and walked into unfilled entries.
+        if curr.mnemonic == "lahf" and last_flag_setter:
+            ah = _make_lahf_value(last_flag_setter, last_flag_ops)
+            if ah:
+                stmts.append(f"SET_HI8(eax, {ah}); /* lahf */")
                 i += 1
                 continue
 
