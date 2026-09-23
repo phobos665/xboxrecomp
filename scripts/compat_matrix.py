@@ -452,6 +452,11 @@ def run_title(t, seconds, out_dir, extra_env=None):
     # window and Outrun 2 fewer, which never reached 150. The runtime caps how
     # many files it writes, so this costs a fast title nothing.
     env.setdefault("RECOMP_HLE_D3D8_DUMP_EVERY", "20")
+    # ...and at 20 a fast title fills all 24 files in its first 480 swaps.
+    # Outrun 2's were all intro logos while it spent the last minute of the
+    # run in a race. Keep 12 from the start and let the other 12 roll, so the
+    # frames show where the run ended up as well as how it began.
+    env.setdefault("RECOMP_HLE_D3D8_DUMP_KEEP_LAST", "12")
     env.update(extra_env or {})
     err_path = out_dir / f"{t['name']}.err"
     with open(err_path, "wb") as errf, fresh_save_data(t.get("game_dir"),
