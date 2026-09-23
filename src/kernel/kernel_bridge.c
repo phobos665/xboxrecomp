@@ -3752,14 +3752,14 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X -> 0x%08X  %02X %02X %02X %02X\n",
                     (long long)off.QuadPart, length, got,
-                    (uint32_t)ios.Status,
+                    (uint32_t)ios.Status, buffer_va,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    length, got, (uint32_t)ios.Status,
+            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X -> 0x%08X  %02X %02X %02X %02X\n",
+                    length, got, (uint32_t)ios.Status, buffer_va,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         fflush(stderr);

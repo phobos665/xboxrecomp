@@ -66,6 +66,31 @@ eight of them. `RECOMP_WATCH_READS=1` traps reads as well, which is much
 slower. `RECOMP_WATCH_BUDGET` caps the reports and disarms afterwards, so a
 watch on a hot address cannot fill a disk; it defaults to 200.
 
+Addresses in the contiguous window (`0x80000000`, where
+`MmAllocateContiguousMemory` and most streamed data land) can be watched as
+well as low RAM. They used to be refused as "outside mapped guest RAM".
+
+### Arming late: `RECOMP_WATCH_ARM_ON`
+
+`RECOMP_WATCH_ARM_ON=<text>` holds the watches until the title opens a file
+whose guest path contains `<text>`; `<text>#N` waits for the Nth such open.
+Use it when the page is busy long before the write that matters. Every
+write to a watched page traps, and on a hot page that slows the title enough
+to change what it does. TimeSplitters: Future Perfect's cutscene record at
+`0x813A6580` shares a page with start-up work: armed from boot, the scripted
+presses landed on different screens and the run never reached the cutscene.
+`RECOMP_WATCH_ARM_ON=skelts3#2` armed it straight after the cutscene pack was
+read, and the next run named the writer.
+
+**Never arm a watch over memory the title is about to read a file into.** The
+kernel reads with the host's `ReadFile`, which cannot write into a read-only
+page, so the read fails with `STATUS_UNSUCCESSFUL` and the title reports a
+damaged disc. Future Perfect showed "There is a problem with the disc you are
+using" for exactly that reason. It also means a watch never sees data
+arriving from a file: to find where a value came from, compare the file's
+bytes against what was read (the `[READ]` line now names the destination,
+`-> 0x...`), then arm after the read and watch what the title does to it.
+
 ## How it works, and the four things that follow from it
 
 The watched page is made read-only, so a write to it raises an access

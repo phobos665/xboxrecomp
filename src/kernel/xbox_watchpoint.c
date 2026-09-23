@@ -80,6 +80,8 @@ static int     g_n_watch;
 static int     g_watch_reads;       /* trap reads as well as writes */
 static long    g_watch_budget = 200;
 static int     g_disarmed;
+static char    g_arm_on[128];       /* RECOMP_WATCH_ARM_ON, until it fires */
+static long    g_arm_on_nth = 1;    /* ...on the Nth matching open ("text#N") */
 
 /* Single-step state is per thread: two threads can be mid-step at once, and
  * each has to put back its own page. */
@@ -93,9 +95,21 @@ static uint8_t *guest_base(void)
     return (uint8_t *)xbox_GetMemoryOffset();
 }
 
+/* The contiguous window (MmAllocateContiguousMemory, 0x80000000) is separate
+ * storage from low RAM, mapped at the same guest-to-host offset, so the page
+ * arithmetic here holds for it unchanged. It used to be refused as "outside
+ * mapped guest RAM", which is where a title's pinned pools and a lot of its
+ * streamed data live: TimeSplitters: Future Perfect's cutscene animation
+ * records are at 0x813A6580. Kept in step with kernel.h's XBOX_CONTIG_*. */
+#define WATCH_CONTIG_BASE 0x80000000u
+#define WATCH_CONTIG_SIZE (64u * 1024u * 1024u)
+
 static int guest_in_ram(uint32_t va, uint32_t len)
 {
-    return (uint64_t)va + len <= (uint64_t)xbox_GetMappedSize();
+    if ((uint64_t)va + len <= (uint64_t)xbox_GetMappedSize())
+        return 1;
+    return va >= WATCH_CONTIG_BASE
+        && (uint64_t)va + len <= (uint64_t)WATCH_CONTIG_BASE + WATCH_CONTIG_SIZE;
 }
 
 static uint32_t guest_read32(uint32_t va)
@@ -259,10 +273,54 @@ void xbox_watch_init(void)
     if (!g_n_watch)
         return;
 
+    /* Armed late, on a file open, when the page is busy long before the
+     * write that matters. Every write to a watched page traps, and on a hot
+     * page that slows the title enough to change what it does: Future
+     * Perfect's cutscene record at 0x813A6580 shares its page with start-up
+     * work, and with the watch armed from boot the scripted presses landed on
+     * different screens and the run never reached the cutscene at all. */
+    {
+        const char *on = getenv("RECOMP_WATCH_ARM_ON");
+        if (on && *on) {
+            /* "text#N": the Nth open of a matching file. A pack a title
+             * opens at boot and again at the moment of interest -- Future
+             * Perfect's skelts3.pak, once at start-up and once right after a
+             * cutscene's data is read -- can only be named that way. */
+            char *hash;
+            snprintf(g_arm_on, sizeof g_arm_on, "%s", on);
+            hash = strrchr(g_arm_on, '#');
+            if (hash) {
+                *hash = 0;
+                g_arm_on_nth = strtol(hash + 1, NULL, 10);
+                if (g_arm_on_nth < 1)
+                    g_arm_on_nth = 1;
+            }
+            fprintf(stderr, "[WATCH] %d watchpoint(s) held until open #%ld "
+                    "of a file matching \"%s\"\n", g_n_watch, g_arm_on_nth,
+                    g_arm_on);
+            fflush(stderr);
+            return;
+        }
+    }
+
     arm_all();
     fprintf(stderr, "[WATCH] %d watchpoint(s) armed on %s, budget %ld reports\n",
             g_n_watch, g_watch_reads ? "reads and writes" : "writes",
             g_watch_budget);
+    fflush(stderr);
+}
+
+void xbox_watch_note_path(const char *xbox_path)
+{
+    if (!g_arm_on[0] || !xbox_path || !strstr(xbox_path, g_arm_on))
+        return;
+    if (--g_arm_on_nth > 0)
+        return;
+    g_arm_on[0] = 0;                    /* once */
+    arm_all();
+    fprintf(stderr, "[WATCH] armed on opening %s: %d watchpoint(s) on %s, "
+            "budget %ld reports\n", xbox_path, g_n_watch,
+            g_watch_reads ? "reads and writes" : "writes", g_watch_budget);
     fflush(stderr);
 }
 
