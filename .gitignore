@@ -52,3 +52,6 @@ xbox_kernel.log
 # commit one. The round-trip test writes its synthetic capture as .tmp.
 *.d3dcap
 d3d8_capture_*.tmp
+
+# FFmpeg shared build for XMV movie playback (fetched, not committed; see docs/technical/video-playback.md)
+third_party/ffmpeg/

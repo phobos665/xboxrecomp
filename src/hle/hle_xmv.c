@@ -64,6 +64,7 @@
 #include <time.h>
 
 #include "hle.h"
+#include "hle_xmv_play.h"
 #include "../kernel/xbox_memory_layout.h"
 
 /* Playback status, as the titles' switches read it. Two titles agree, and
@@ -107,6 +108,7 @@
 #define XMV_OFF_START_MS 0xE4u
 #define XMV_OFF_FRAMES   0xE8u
 #define XMV_OFF_DONE     0xECu
+#define XMV_OFF_PLAY     0xF0u   /* hle_xmv_play handle, 0 when not playing */
 
 #define XMV_MAGIC 0x584D5648u   /* 'XMVH' */
 
@@ -193,11 +195,24 @@ HLE_EXPORT(XMVPlaybackCreate)
     HLE_MEM32(obj + XMV_OFF_FRAMES)   = 0;
     HLE_MEM32(obj + XMV_OFF_DONE)     = 0;
 
+    /* Play the file when it can be (hle_xmv_play.c: FFmpeg present, the file
+     * found); otherwise the movie is reported over, as before. */
+    {
+        uint32_t w = 0, h = 0;
+        int play = xmv_play_open(HLE_ARG(1), &w, &h);
+        HLE_MEM32(obj + XMV_OFF_PLAY) = (uint32_t)play;
+        if (play) {
+            HLE_MEM32(obj + XMV_OFF_WIDTH)  = w;
+            HLE_MEM32(obj + XMV_OFF_HEIGHT) = h;
+        }
+    }
+
     HLE_MEM32(out_va) = obj;
 
-    fprintf(stderr, "[XMV] playback created at 0x%08X, reported as 640x480; "
-                    "the title's decoder will not run "
-                    "(RECOMP_HLE_XMV=0 gives it back)\n", obj);
+    fprintf(stderr, "[XMV] playback created at 0x%08X, %s; the title's decoder "
+                    "will not run (RECOMP_HLE_XMV=0 gives it back)\n", obj,
+            HLE_MEM32(obj + XMV_OFF_PLAY) ? "playing the file on the host"
+                                          : "reported over at once");
     fflush(stderr);
     HLE_RETURN(0);
 }
@@ -209,6 +224,7 @@ HLE_EXPORT(XMVPlaybackStart)
 
     if (xmv_is_ours(obj)) {
         HLE_MEM32(obj + XMV_OFF_START_MS) = xmv_now_ms();
+        xmv_play_start((int)HLE_MEM32(obj + XMV_OFF_PLAY));
         fprintf(stderr, "[XMV] playback started; the movie is reported as "
                         "%u ms long (RECOMP_XMV_SECONDS)\n", xmv_ms());
         fflush(stderr);
@@ -260,8 +276,9 @@ HLE_EXPORT(XMVPlaybackCreateAudioStream)
         HLE_MEM32(out) = 0;
     if (xmv_is_ours(obj)) {
         fprintf(stderr, "[XMV] audio stream requested for playback 0x%08X; "
-                        "none is made, because nothing here decodes audio\n",
-                obj);
+                        "none is made: %s\n", obj,
+                HLE_MEM32(obj + XMV_OFF_PLAY) ? "the movie's sound plays on a host voice"
+                                              : "the movie is not being played");
         fflush(stderr);
     }
     HLE_RETURN(0);
@@ -288,6 +305,19 @@ HLE_EXPORT(XMVPlaybackUpdate)
     started = HLE_MEM32(obj + XMV_OFF_START_MS);
     frames  = HLE_MEM32(obj + XMV_OFF_FRAMES) + 1u;
     HLE_MEM32(obj + XMV_OFF_FRAMES) = frames;
+
+    if (HLE_MEM32(obj + XMV_OFF_PLAY)) {
+        uint32_t status = xmv_play_update((int)HLE_MEM32(obj + XMV_OFF_PLAY), HLE_ARG(1));
+        if (status_va)
+            HLE_MEM32(status_va) = status;
+        if (status == XMV_STATUS_ENDOFFILE && !HLE_MEM32(obj + XMV_OFF_DONE)) {
+            HLE_MEM32(obj + XMV_OFF_DONE) = 1u;
+            fprintf(stderr, "[XMV] update #%u: the movie is over\n", frames);
+            fflush(stderr);
+        }
+        HLE_RETURN(0);
+        return;
+    }
 
     if (!started) {
         /* Polled before Start. Treat the first poll as the start so a title
@@ -326,6 +356,8 @@ HLE_EXPORT(XMVPlaybackDestroy)
         /* The guest heap here has no free, so the object is neutered rather
          * than returned: a title that keeps a stale handle then gets the same
          * answer as one that passes a handle we never made. */
+        xmv_play_close((int)HLE_MEM32(obj + XMV_OFF_PLAY));
+        HLE_MEM32(obj + XMV_OFF_PLAY) = 0;
         HLE_MEM32(obj + XMV_OFF_MAGIC) = 0;
         fprintf(stderr, "[XMV] playback destroyed\n");
         fflush(stderr);

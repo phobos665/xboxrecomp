@@ -26,6 +26,7 @@ add_library(xbox_hle STATIC
     xbox_adpcm.c
     hle_input.c
     hle_xmv.c
+    hle_xmv_play.c
     input_model.c
 )
 
@@ -50,5 +51,5 @@ if(WIN32)
     target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
     # The D3D8 replacements drive the host renderer in src/d3d, and open a
     # window of their own for it.
-    target_link_libraries(xbox_hle PRIVATE xbox_d3d8 user32)
+    target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)
 endif()
