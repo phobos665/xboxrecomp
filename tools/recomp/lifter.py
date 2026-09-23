@@ -616,6 +616,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     else:
         lhs = None
         rhs = None
+    # _fa is zero-extended, so (int32_t)_fa is never negative for an 8- or
+    # 16-bit result. Sign tests read _fas, the same snapshot sign-extended.
+    slhs = "_fas" if lhs == "_fa" else f"(int32_t){lhs}"
 
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
@@ -789,9 +792,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
@@ -800,13 +803,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -816,21 +819,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -840,9 +843,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -852,13 +855,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         if jcc in ("jb", "jnae"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb"):
@@ -916,17 +919,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         return None
 
     # ── shift: result-based ──
@@ -936,9 +939,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         # SAR LEAVES OF CLEAR, SO THE SIGNED CONDITIONS ARE THE RESULT'S SIGN
         # AND ZERO.
         #
@@ -969,9 +972,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
