@@ -885,6 +885,75 @@ class FunctionDetector:
                     targets.add(value)
                     table_mates.setdefault(value, set()).update(values - {value})
 
+        # Tables inside a code section, which the loop above skips. XDK
+        # library sections (D3D, DSOUND, XPP) are executable and carry their
+        # own data, so a handler table can sit between two functions of the
+        # same section. D3D8's SetRenderState dispatches its complex states
+        # through one -- `call [state*4 + table]` -- and on Nightfire,
+        # Gauntlet and Bloody Roar the 16 handlers nothing calls directly were
+        # the 16 unresolved ICALLs every one of them stopped on, right after
+        # CreateDevice.
+        #
+        # Scanning whole code sections for pointer runs would drag in anything
+        # that happens to decode, so only the neighbourhood of a table an
+        # indexed call actually names is read, and only the words in it that
+        # no switch table and no well-evidenced function body covers (see
+        # covered_by_code). The dispatch's
+        # displacement is where index 0 would be, not where the entries
+        # start (SetRenderState's first entry is 0x88 slots in, and slot 0
+        # lands inside another function), hence a window rather than a walk
+        # from the displacement. What the window finds goes through the same
+        # filters as a data-section table below.
+        jump_tables = sorted(self.engine.jump_tables.items())
+        jt_starts = [t[0] for t in jump_tables]
+
+        def in_jump_table(addr: int) -> bool:
+            i = bisect.bisect_right(jt_starts, addr) - 1
+            return i >= 0 and addr < jump_tables[i][1]
+
+        def covered_by_code(addr: int) -> bool:
+            # A body found only by the padding rule does not vouch for its
+            # bytes. Gauntlet's SetRenderState table starts with 11 words
+            # inside sub_000CC4C8, a "function" the cc_boundary pass found
+            # because the data before it decodes to a ret and an int3; it
+            # has no callers and no prologue. Skipping those words lost 10
+            # of the 16 handlers. A run of code pointers is the stronger
+            # evidence there.
+            i = bisect.bisect_right(starts, addr) - 1
+            if i < 0 or addr >= bounds[i][1]:
+                return False
+            fn = self.functions.get(bounds[i][0])
+            return getattr(fn, "detection_method", "") != "cc_boundary"
+
+        for disp in sorted(getattr(self.engine, "call_tables", ())):
+            sec = self.image.get_section_at_va(disp)
+            if sec is None or sec.name not in code_names:
+                continue                    # a data section: scanned above
+            data = self.image.get_section_data(sec)
+            if not data:
+                continue
+            base = disp - sec.virtual_addr
+            window = data[base:base + config.CALL_TABLE_WINDOW]
+            run: List[int] = []
+            for off in range(0, len(window) - 3, 4):
+                addr = disp + off
+                value = int.from_bytes(window[off:off + 4], "little")
+                if (in_code_section(value) and not covered_by_code(addr)
+                        and not in_jump_table(addr)):
+                    run.append(value)
+                    continue
+                if len(run) >= 2:
+                    values = set(run)
+                    for v in values:
+                        targets.add(v)
+                        table_mates.setdefault(v, set()).update(values - {v})
+                run = []
+            if len(run) >= 2:
+                values = set(run)
+                for v in values:
+                    targets.add(v)
+                    table_mates.setdefault(v, set()).update(values - {v})
+
         # Alias entries, not candidates.
         #
         # Registering these as function starts measurably hurt: Half-Life 2
