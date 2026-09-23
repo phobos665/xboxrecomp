@@ -1350,11 +1350,15 @@ HLE_EXPORT(Direct3D_CreateDevice)
 #ifdef _WIN32
     g_in_create_device = 1;
 #endif
+    /* Before the original, not after: some XDKs wait on the fence inside
+     * CreateDevice itself. XGRA's (5558) calls D3D_KickOffAndWaitForIdle
+     * there and spun in D3D_BlockOnTime before the device was ever returned.
+     * The kernel follows the device pointer afresh on every poll and skips
+     * it while it is still zero, so the mirror can go in before the device
+     * exists. */
+    mirror_gpu_time_fence();
     HLE_CALL_ORIGINAL(Direct3D_CreateDevice);
-    /* Only beside a guest device that exists: the original's HRESULT. */
-    if ((int32_t)g_eax >= 0)
-        mirror_gpu_time_fence();
-        mirror_swap_throttle();
+    mirror_swap_throttle();
 #ifdef _WIN32
     g_in_create_device = 0;
     if (pp_va) {
@@ -1362,10 +1366,12 @@ HLE_EXPORT(Direct3D_CreateDevice)
          * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
          * decides what a Swap means (frame_end_shadow). */
         g_swap_effect = HLE_MEM32(pp_va + 0x14);
-        fprintf(stderr, "[HLE-D3D8] CreateDevice: %u back buffer(s), swap effect %u "
-                "(1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
-                "presentation interval 0x%08X\n", HLE_MEM32(pp_va + 0xC),
-                g_swap_effect, HLE_MEM32(pp_va + 0x28), HLE_MEM32(pp_va + 0x30));
+        fprintf(stderr, "[HLE-D3D8] CreateDevice: %ux%u format 0x%02X, %u back buffer(s), "
+                "swap effect %u (1 discard, 2 flip, 3 copy, 4 copy vsync), flags 0x%08X, "
+                "refresh %u Hz, presentation interval 0x%08X -> 0x%08X\n",
+                HLE_MEM32(pp_va + 0x0), HLE_MEM32(pp_va + 0x4), HLE_MEM32(pp_va + 0x8),
+                HLE_MEM32(pp_va + 0xC), g_swap_effect, HLE_MEM32(pp_va + 0x28),
+                HLE_MEM32(pp_va + 0x2C), HLE_MEM32(pp_va + 0x30), g_eax);
     }
     if (!g_backbuffer_va)
         fprintf(stderr, "[HLE-D3D8] CreateDevice set no render target; the back "

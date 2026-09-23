@@ -23,12 +23,16 @@ game_files/
 *.iso
 *.xiso
 
+titles/
 # IDE
 .vs/
 .vscode/
 .idea/
 *.suo
 *.user
+
+# Per-machine notes for Claude Code (toolchain paths, what is installed where)
+CLAUDE.local.md
 
 # OS
 Thumbs.db

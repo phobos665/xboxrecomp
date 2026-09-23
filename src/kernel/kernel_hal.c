@@ -519,12 +519,15 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * row, so the mode scan ran off the end of the table and device
          * creation failed with E_FAIL.
          *
-         * HDTV pack keeps 480p/720p available to titles that offer them;
-         * NTSC-M and 60Hz are the North American retail default, and match
-         * the region reported by ExQueryNonVolatileSetting. */
-        *Result = AV_PACK_HDTV
-                | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
-                | AV_REFRESH_60Hz;
+         * HDTV pack keeps 480p/720p available to titles that offer them.
+         * The standard and refresh are the console's region, the same value
+         * ExQueryNonVolatileSetting(XC_FACTORY_AV_REGION) gives (NTSC-M 60Hz
+         * unless the disc allows only another region). They were fixed at
+         * NTSC-M here while the EEPROM said PAL for a PAL-only disc, and XGRA
+         * asked for the 640x576 PAL mode it read from one and D3D rejected it
+         * against the other: CreateDevice returned E_FAIL and the title ran
+         * with no device. */
+        *Result = AV_PACK_HDTV | xbox_kernel_console_av_standard();
         break;
 
     case AV_OPTION_QUERY_MODE:

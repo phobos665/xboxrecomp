@@ -183,6 +183,14 @@ static uint32_t console_av_region(void)
     }
 }
 
+/* The same answer for AvSendTVEncoderOption (kernel_hal.c), which reports the
+ * video standard and refresh in the same bits: a title reads its standard from
+ * one and D3D validates the mode against the other, so they must agree. */
+uint32_t xbox_kernel_console_av_standard(void)
+{
+    return console_av_region();
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
