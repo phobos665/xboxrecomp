@@ -24,6 +24,10 @@ void xmv_play_start(int handle);
  * With a new picture, *pts_ms is its time in the movie. */
 uint32_t xmv_play_update(int handle, uint32_t surface_va, uint32_t *pts_ms);
 
+/* Milliseconds into the movie, on the clock its pictures' times are on: what
+ * XMVPlaybackGetCurrentTime answers for a movie played here. */
+uint32_t xmv_play_time(int handle);
+
 void xmv_play_close(int handle);
 
 #endif
