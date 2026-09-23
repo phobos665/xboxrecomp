@@ -165,6 +165,34 @@ static int xmv_is_ours(uint32_t handle)
     return handle && HLE_MEM32(handle + XMV_OFF_MAGIC) == XMV_MAGIC;
 }
 
+/* A playback this file did not make goes to the XDK's own body. XGRA creates
+ * some through an entry point that is not replaced (0x000D975A, fed packets
+ * by the title through two callbacks) and then polls and destroys them through
+ * the same Update and Destroy as its file movies; answering those "not ours,
+ * E_FAIL" would stop them dead. A title whose symbols do not name the original
+ * gets E_FAIL as before. */
+HLE_ORIGINAL(XMVPlaybackStart);
+HLE_ORIGINAL(XMVPlaybackGetStreamInfo);
+HLE_ORIGINAL(XMVPlaybackCreateAudioStream);
+HLE_ORIGINAL(XMVPlaybackGetAudioStreamInfo);
+HLE_ORIGINAL(XMVPlaybackGetCurrentTime);
+HLE_ORIGINAL(XMVPlaybackUpdate);
+HLE_ORIGINAL(XMVPlaybackDestroy);
+HLE_ORIGINAL(XMVPlaybackReleaseAudioStream);
+HLE_ORIGINAL(XMVPlaybackStopAudioStreams);
+
+#define XMV_OTHERS_TO_XDK(name)                                               \
+    do {                                                                       \
+        if (!xmv_is_ours(HLE_ARG(0))) {                                        \
+            if (hle_original_##name) {                                         \
+                HLE_CALL_ORIGINAL(name);                                       \
+                return;                                                        \
+            }                                                                  \
+            HLE_RETURN(0x80004005u);                                           \
+            return;                                                            \
+        }                                                                      \
+    } while (0)
+
 /* HRESULT XMVPlaybackCreate(DWORD flags, void *source, XMVPlayback **out) */
 HLE_EXPORT(XMVPlaybackCreate)
 {
@@ -222,6 +250,8 @@ HLE_EXPORT(XMVPlaybackStart)
 {
     uint32_t obj = HLE_ARG(0);
 
+    XMV_OTHERS_TO_XDK(XMVPlaybackStart);
+
     if (xmv_is_ours(obj)) {
         HLE_MEM32(obj + XMV_OFF_START_MS) = xmv_now_ms();
         xmv_play_start((int)HLE_MEM32(obj + XMV_OFF_PLAY));
@@ -240,6 +270,8 @@ HLE_EXPORT(XMVPlaybackGetStreamInfo)
 {
     uint32_t obj = HLE_ARG(0);
     uint32_t out = HLE_ARG(1);
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetStreamInfo);
 
     if (!obj || !out)
         return;
@@ -272,6 +304,8 @@ HLE_EXPORT(XMVPlaybackCreateAudioStream)
     uint32_t obj = HLE_ARG(0);
     uint32_t out = HLE_ARG(4);
 
+    XMV_OTHERS_TO_XDK(XMVPlaybackCreateAudioStream);
+
     if (out)
         HLE_MEM32(out) = 0;
     if (xmv_is_ours(obj)) {
@@ -291,6 +325,8 @@ HLE_EXPORT(XMVPlaybackCreateAudioStream)
  * such stream. */
 HLE_EXPORT(XMVPlaybackGetAudioStreamInfo)
 {
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetAudioStreamInfo);
     if (xmv_is_ours(HLE_ARG(0))) {
         static int said;
         if (!said++)
@@ -309,6 +345,8 @@ HLE_EXPORT(XMVPlaybackGetAudioStreamInfo)
 HLE_EXPORT(XMVPlaybackGetCurrentTime)
 {
     uint32_t obj = HLE_ARG(0), started;
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackGetCurrentTime);
 
     if (!xmv_is_ours(obj)) {
         HLE_RETURN(0);
@@ -329,12 +367,7 @@ HLE_EXPORT(XMVPlaybackUpdate)
     uint32_t status_va = HLE_ARG(2);
     uint32_t started, frames, elapsed;
 
-    if (!xmv_is_ours(obj)) {
-        /* Not one of ours: say nothing rather than guess, and let the title
-         * take whatever path it takes for a playback it does not own. */
-        HLE_RETURN(0x80004005u);
-        return;
-    }
+    XMV_OTHERS_TO_XDK(XMVPlaybackUpdate);
 
     started = HLE_MEM32(obj + XMV_OFF_START_MS);
     frames  = HLE_MEM32(obj + XMV_OFF_FRAMES) + 1u;
@@ -381,10 +414,32 @@ HLE_EXPORT(XMVPlaybackUpdate)
     HLE_RETURN(0);
 }
 
+/* void XMVPlaybackStopAudioStreams(XMVPlayback *p)
+ * void XMVPlaybackReleaseAudioStream(XMVPlayback *p, DWORD index)
+ *
+ * XGRA's names for two calls its movie code makes before Destroy: the first
+ * walks the playback's DirectSound streams and calls a method on each, the
+ * second clears one slot of the stream array the playback keeps at +0x138.
+ * A playback made here has no DirectSound streams -- its sound is on a host
+ * voice, closed with the movie -- and no such array, so both are done. */
+HLE_EXPORT(XMVPlaybackStopAudioStreams)
+{
+    XMV_OTHERS_TO_XDK(XMVPlaybackStopAudioStreams);
+    HLE_RETURN(0);
+}
+
+HLE_EXPORT(XMVPlaybackReleaseAudioStream)
+{
+    XMV_OTHERS_TO_XDK(XMVPlaybackReleaseAudioStream);
+    HLE_RETURN(0);
+}
+
 /* HRESULT XMVPlaybackDestroy(XMVPlayback *p) */
 HLE_EXPORT(XMVPlaybackDestroy)
 {
     uint32_t obj = HLE_ARG(0);
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackDestroy);
 
     if (xmv_is_ours(obj)) {
         /* The guest heap here has no free, so the object is neutered rather
