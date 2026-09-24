@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "recomp_config.h"
+#include "xbox_watchpoint.h"
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
  *
@@ -1468,6 +1469,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
             fprintf(stderr, "\n");
         }
     }
+    /* RECOMP_FIND_VALUE: who holds this value. A hang has no crash handler
+     * to run the scan, and "which object still points at the freed block"
+     * is as much a hang question as a crash one (Max Payne's heap spin). */
+    xbox_watch_scan_on_crash();
 
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;

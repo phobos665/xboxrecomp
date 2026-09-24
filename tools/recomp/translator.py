@@ -736,10 +736,14 @@ class FunctionTranslator:
                 cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
-                         or last_setter in ("inc", "dec")
+                         or last_setter in ("inc", "dec", "rep-cmps")
                          or last_setter in BT_MODIFY)):
                 return True
-            if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
+            if m.startswith("rep") and ("cmps" in m or "scas" in m):
+                # repe cmpsb and friends set CF from the last pair compared
+                # (lifter._lift_rep_string); a jb/ja after one reads it.
+                last_setter = "rep-cmps"
+            elif m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
             elif m in _FLAGS_UNDEFINED:
                 last_setter = None
