@@ -145,21 +145,19 @@ static int read_layout(uint32_t va, texture_layout *t)
     }
     memset(t, 0, sizeof *t);
     t->fmt = (format >> 8) & 0xFF;
-    /* RECOMP_HLE_D3D8_P8=1: accept palettised textures.
+    /* Palettised textures; RECOMP_HLE_D3D8_P8=0 refuses them as before.
      *
-     * The host side is ready for them -- d3d8_resources.c expands P8 to BGRA
-     * through d3d8_convert_linear_pixels, the device keeps four palettes, and
-     * D3DDevice_SetPalette at the end of this file forwards the guest's. Marvel
-     * vs Capcom 2 is a sprite fighter with 656 of 1106 binds refused here, so
-     * this is the difference between its art arriving and not.
+     * The host side expands P8 to BGRA through d3d8_convert_linear_pixels,
+     * the device keeps four palettes, and D3DDevice_SetPalette at the end of
+     * this file forwards the guest's. Marvel vs Capcom 2 is a sprite fighter
+     * that binds almost nothing else.
      *
-     * Off by default because turning it on has not yet been shown to help:
-     * with it on, MvC2 went from reaching gameplay in two runs out of three to
-     * none out of three, and from a flat colour to a black screen. That is
-     * either this doing more work during a start-up that is already flaky, or
-     * something wrong in the upload itself. Until that is understood the
-     * default stays where the title at least renders. */
-    if (t->fmt == XFMT_P8 && !xbox_EnvSwitch("RECOMP_HLE_D3D8_P8", 0)) {
+     * This was off by default because turning it on made MvC2's start-up
+     * worse. That start-up was broken by lifter bugs fixed on 24 Sep 2026
+     * (sar branches, a memcpy jump-table arm, CF after repe cmpsb). With
+     * those fixed, MvC2 runs clean with P8 on and draws its character select
+     * fully textured, where with it off the screen stayed white. */
+    if (t->fmt == XFMT_P8 && !xbox_EnvSwitch("RECOMP_HLE_D3D8_P8", 1)) {
         g_skip_format++;
         return 0;
     }
