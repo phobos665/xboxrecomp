@@ -939,6 +939,27 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"((int32_t){lhs} < 0)", desc
         if jcc == "jns":
             return f"((int32_t){lhs} >= 0)", desc
+        # SAR LEAVES OF CLEAR, SO THE SIGNED CONDITIONS ARE THE RESULT'S SIGN
+        # AND ZERO.
+        #
+        # MSVC's memcpy counts its 32-byte blocks with `sar edx, 5; jle tail`.
+        # These four had no rule, fell back to `_flags` -- always 0 -- and the
+        # block loop ran once for every copy under 32 bytes. Max Payne copied
+        # 12 bytes of indices as 32, overran into the next heap block's header
+        # and links, and the heap's free-list walk then spun forever six
+        # seconds in. OF is defined as 0 for a 1-bit sar and undefined for a
+        # longer one, which the compiler treats as 0 all the same: the branch
+        # it emits means "result <= 0". _fas is the result sign-extended at
+        # the operand's width. shl and shr keep no rule: their OF is not 0.
+        if flag_setter == "sar":
+            if jcc in ("jl", "jnge"):
+                return "(_fas < 0)", desc
+            if jcc in ("jge", "jnl"):
+                return "(_fas >= 0)", desc
+            if jcc in ("jle", "jng"):
+                return "(_fas <= 0)", desc
+            if jcc in ("jg", "jnle"):
+                return "(_fas > 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -1031,6 +1052,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return "(_flags != 0)", desc
         if jcc in ("jne", "jnz"):
             return "(_flags == 0)", desc
+        # CF from the last pair compared; see _lift_rep_string.
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        if jcc in ("jbe", "jna"):
+            return "(_cf || _flags != 0)", desc
+        if jcc in ("ja", "jnbe"):
+            return "(!_cf && _flags == 0)", desc
         return None
 
     return None
@@ -2586,9 +2616,13 @@ class Lifter:
             # The engine has instruction bounds and uses those; here there is
             # only the image, so test for the opcode directly and keep the
             # value check as a backstop for encodings this does not name.
+            # FF 24 <SIB> with scale 4 and no base: SIB 10 iii 101, one per
+            # index register. Only eax and ecx were listed, so an edx-indexed
+            # dispatch (FF 24 95) was left to the value backstop below.
             floor = 0
-            if offset >= 7 and self.xbe_data[offset - 7:offset - 4] in (
-                    b"\xff\x24\x8d", b"\xff\x24\x85"):
+            if (offset >= 7 and self.xbe_data[offset - 7] == 0xFF
+                    and self.xbe_data[offset - 6] == 0x24
+                    and (self.xbe_data[offset - 5] & 0xC7) == 0x85):
                 floor = offset - 4       # the disp belongs to the jump
 
             back = []
@@ -2597,7 +2631,22 @@ class Lifter:
                 if o < 0 or o >= floor > 0:
                     break
                 val = struct.unpack_from('<I', self.xbe_data, o)[0]
-                if not is_code_address(val) or val == table_va:
+                if not is_code_address(val):
+                    break
+                # The value backstop is for the jump's own displacement, so it
+                # only fires when the word IS one: preceded by FF 24 <SIB>.
+                # Otherwise an entry equal to table_va is a real arm -- the
+                # code straight after a backwards table. Max Payne's memcpy
+                # dispatches through `jmp [ecx*4 + 0x2C67E8]` with ecx -4..-1
+                # over a table at 0x2C67D8 whose first entry is 0x2C67E8, the
+                # "copy 0 more bytes" arm. Stopping there dropped it: every
+                # copy that reached that arm left memcpy through an unresolved
+                # jump without its epilogue, and the title went on to ask for
+                # 512 MB and die in an allocation exception.
+                if val == table_va and o >= 3 and (
+                        self.xbe_data[o - 3] == 0xFF
+                        and self.xbe_data[o - 2] == 0x24
+                        and (self.xbe_data[o - 1] & 0xC7) == 0x85):
                     break
                 back.append(val)
             if back:
@@ -2874,6 +2923,15 @@ class Lifter:
                 " edi += ecx * _st; }",
                 "ecx = 0; /* rep stosw */"
             ]
+        # CF as well as ZF. The compare is [esi] - [edi] (scas: al - [edi]),
+        # so CF is the unsigned "less than" of the last pair, and MSVC's
+        # std::string compare turns it into -1/+1 with `sbb eax, eax;
+        # sbb eax, -1`. Without it CF kept whatever came before -- 0 from the
+        # `xor eax, eax` the idiom starts with -- so every mismatch compared
+        # as "greater". Max Payne's script loader then found every name it
+        # looked up in its std::set of included files already there, and
+        # threw MultipleInclusion on its first include.
+        cf = self.needs_cf
         if "cmpsb" in m:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
@@ -2881,6 +2939,7 @@ class Lifter:
                 "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (MEM8(esi) == MEM8(edi));",
+            ] + (["    _cf = (MEM8(esi) < MEM8(edi));"] if cf else []) + [
                 "    esi += _st; edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
@@ -2892,6 +2951,7 @@ class Lifter:
                 "{ int32_t _st = RECOMP_DF_STEP(1);",
                 "while (ecx != 0) {",
                 "    _flags = (LO8(eax) == MEM8(edi));",
+            ] + (["    _cf = (LO8(eax) < MEM8(edi));"] if cf else []) + [
                 "    edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
@@ -2911,6 +2971,7 @@ class Lifter:
                 f"{{ int32_t _st = RECOMP_DF_STEP({step});",
                 "while (ecx != 0) {",
                 f"    _flags = ({acc}(esi) == {acc}(edi));",
+            ] + ([f"    _cf = ({acc}(esi) < {acc}(edi));"] if cf else []) + [
                 "    esi += _st; edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
@@ -2925,6 +2986,7 @@ class Lifter:
                 f"{{ int32_t _st = RECOMP_DF_STEP({step});",
                 "while (ecx != 0) {",
                 f"    _flags = ({value} == {acc}(edi));",
+            ] + ([f"    _cf = ({value} < {acc}(edi));"] if cf else []) + [
                 "    edi += _st; ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} }} /* {m} */",
@@ -3969,10 +4031,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            if "cmps" in raw_m or "scas" in raw_m:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif "cmps" in rest or "scas" in rest:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:

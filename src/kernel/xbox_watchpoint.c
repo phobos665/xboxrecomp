@@ -225,6 +225,34 @@ static void print_callers(void)
     fprintf(stderr, "\n");
 }
 
+/* RECOMP_WATCH_STACK=<n>: the first n guest stack words at the write.
+ *
+ * The writer's registers are printed, but its caller's are not, and they
+ * are often the question: Max Payne's index copy overran its buffer, and
+ * the object that handed out that buffer was only in the copy's saved edi,
+ * which a routine pushes on entry and nothing else records. */
+static void print_stack(void)
+{
+    static int n = -1;
+    const uint32_t *sp;
+    int i;
+
+    if (n < 0) {
+        const char *v = getenv("RECOMP_WATCH_STACK");
+        n = v ? atoi(v) : 0;
+        if (n > 64)
+            n = 64;
+    }
+    if (n <= 0 || !g_esp || !guest_in_ram(g_esp, (uint32_t)n * 4))
+        return;
+    sp = (const uint32_t *)(guest_base() + g_esp);
+    for (i = 0; i < n; i++)
+        fprintf(stderr, "%s%08X", (i % 8) ? " " : (i ? "\n[WATCH]   stack: "
+                                                      : "[WATCH]   stack: "),
+                sp[i]);
+    fprintf(stderr, "\n");
+}
+
 void xbox_watch_init(void)
 {
     const char *spec = getenv("RECOMP_WATCH_WRITE");
@@ -373,6 +401,7 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
                         "edx=0x%08X esi=0x%08X edi=0x%08X\n",
                 g_esp, g_eax, g_ecx, g_edx, g_esi, g_edi);
         print_callers();
+        print_stack();
         g_step_before = guest_read32(g_watch[idx].va);
         g_step_va = g_watch[idx].va;
     } else {
