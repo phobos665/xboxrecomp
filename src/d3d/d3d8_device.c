@@ -259,6 +259,35 @@ static void present_resolve(void)
     d3d8_display_frame_done();
 }
 
+/* Set while drawing something positioned in screen coordinates the title
+ * worked out itself, rather than through its projection. See
+ * d3d8_SetTwoDSqueeze. */
+static BOOL g_2d_squeeze;
+
+/* The widescreen 2D squeeze (see apply_host_viewport) as a horizontal
+ * factor about a centre, both in host pixels of the scene. FALSE when no
+ * squeeze applies to the draw in hand.
+ *
+ * Everything that positions a 2D draw in pixels has to go through this
+ * together. The viewport alone is not enough: a title that clips a menu
+ * with a scissor rectangle hands it in the same 4:3 pixels, and a squeezed
+ * draw under an unsqueezed scissor comes out cut off at the old edge --
+ * TimeSplitters 2's character portraits and difficulty list both were. */
+static BOOL two_d_squeeze(float *k_out, float *cx_out)
+{
+    float k;
+
+    if (!g_2d_squeeze || !g_device_state.height || g_cur_rt)
+        return FALSE;
+    k = ((float)g_device_state.width * 9.0f) /
+        ((float)g_device_state.height * 16.0f);
+    if (!(k > 0.0f && k < 1.0f))
+        return FALSE;
+    *k_out = k;
+    *cx_out = (float)g_device_state.width * 0.5f;
+    return TRUE;
+}
+
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
@@ -347,13 +376,19 @@ BOOL d3d8_GetScissor(RhiRect *out)
 {
     if (out) {
         float sx = rt_scale_x(), sy = rt_scale_y();
+        float left = g_scissor.left * sx, right = g_scissor.right * sx;
+        float k, cx;
 
         /* Stored as the title gave them, converted here, so the stored
          * rectangle stays comparable with anything else in guest pixels
          * and GetScissors keeps answering in the title's own units. */
-        out->left   = (int32_t)(g_scissor.left   * sx);
+        if (two_d_squeeze(&k, &cx)) {
+            left  = cx + (left  - cx) * k;
+            right = cx + (right - cx) * k;
+        }
+        out->left   = (int32_t)left;
         out->top    = (int32_t)(g_scissor.top    * sy);
-        out->right  = (int32_t)(g_scissor.right  * sx);
+        out->right  = (int32_t)right;
         out->bottom = (int32_t)(g_scissor.bottom * sy);
     }
     return g_scissor_enabled;
@@ -1216,7 +1251,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
      * into the middle of it with the HUD. After prepare_draw, which is
      * what decides whether this is a screen-space draw at all. */
     if (d3d8_GetTwoDSqueeze() &&
-        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, vertex_count))
+        d3d8_draw_escapes_squeeze(pVertexData, VertexStreamZeroStride, vertex_count))
         d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
@@ -1270,7 +1305,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
      * into the middle of it with the HUD. After prepare_draw, which is
      * what decides whether this is a screen-space draw at all. */
     if (d3d8_GetTwoDSqueeze() &&
-        d3d8_draw_spans_guest_width(pVertexData, VertexStreamZeroStride, NumVertices))
+        d3d8_draw_escapes_squeeze(pVertexData, VertexStreamZeroStride, NumVertices))
         d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
@@ -1543,15 +1578,11 @@ static HRESULT __stdcall dev_GetDepthStencilSurface(IDirect3DDevice8 *self, IDir
     return S_OK;
 }
 
-/* Set while drawing something positioned in screen coordinates the title
- * worked out itself, rather than through its projection. See
- * d3d8_SetTwoDSqueeze. */
-static BOOL g_2d_squeeze;
-
 static void apply_host_viewport(void)
 {
     const D3DVIEWPORT8 *vp = &g_device_state.viewport;
     float sx = rt_scale_x(), sy = rt_scale_y();
+    float k, cx;
     RhiViewport hv;
 
     if (!rhi_device_ready())
@@ -1570,17 +1601,11 @@ static void apply_host_viewport(void)
      * factor, about the middle of the scene, means the stretch puts it
      * back: a HUD laid out for 4:3 keeps its proportions and sits in the
      * centre. Nothing is resampled twice -- the squeeze is a viewport, so
-     * the draw is simply rasterised narrower. */
-    if (g_2d_squeeze && g_device_state.height && !g_cur_rt) {
-        float k = ((float)g_device_state.width * 9.0f) /
-                  ((float)g_device_state.height * 16.0f);
-
-        if (k > 0.0f && k < 1.0f) {
-            float cx = (float)g_device_state.width * 0.5f;
-
-            hv.x = cx + (hv.x - cx) * k;
-            hv.width *= k;
-        }
+     * the draw is simply rasterised narrower. The scissor follows it, in
+     * d3d8_GetScissor. */
+    if (two_d_squeeze(&k, &cx)) {
+        hv.x = cx + (hv.x - cx) * k;
+        hv.width *= k;
     }
 
     rhi_set_viewports(1, &hv);
@@ -1601,7 +1626,8 @@ void d3d8_SetTwoDSqueeze(BOOL on)
 
 BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
 
-/* Does this draw cover the guest's full width?
+/* Does this draw cover the guest's full width, and so escape the 2D
+ * squeeze?
  *
  * A screen-space draw that spans the screen is a backdrop, a fade, a
  * letterbox bar or a video frame, and squeezing it leaves the sides of a
@@ -1619,7 +1645,33 @@ BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
  * squeeze. That is the safe way to be wrong: a squeezed backdrop is
  * visibly odd in one place, a stretched HUD is subtly wrong everywhere.
  */
-BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
+/* Whether the bound textures make a draw a pass over the whole screen
+ * rather than a picture placed on it: stage 0 is nothing or a single
+ * texel (flat colour), or some stage holds a copy of the frame.
+ *
+ * Only stage 0 is asked about pictures. A title leaves textures bound on
+ * stages its shader never reads, so a later stage holding something
+ * large says nothing; TimeSplitters 2's glow passes, for one, have the
+ * frame on stage 0 and a 1x1 white texture on stage 1. */
+static BOOL draw_is_screen_pass(void)
+{
+    IDirect3DBaseTexture8 *tex;
+    UINT w = 0, h = 0;
+    DWORD s;
+
+    for (s = 0; s < 4; s++) {
+        tex = d3d8_GetStageTexture(s);
+        if (tex && IDirect3DBaseTexture8_GetType(tex) == D3DRTYPE_TEXTURE &&
+            ((D3D8Texture *)tex)->screen_copy)
+            return TRUE;
+    }
+    tex = d3d8_GetStageTexture(0);
+    if (!tex)
+        return TRUE;
+    return d3d8_base_size(tex, &w, &h) && w <= 1 && h <= 1;
+}
+
+BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
 {
     const unsigned char *p = (const unsigned char *)vertices;
     UINT offset = 0, i, guest_w;
@@ -1655,6 +1707,17 @@ BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
         if (x > hi) hi = x;
     }
 
+    /* What the draw can reach, not what it is: a quad the size of the
+     * screen under a scissor the size of a menu box is that box's
+     * background. TimeSplitters 2 fills its difficulty list that way, and
+     * measured unclipped it passed for a backdrop, stayed unsqueezed, and
+     * showed as a dark panel beside the squeezed list. Both are in the
+     * title's own screen pixels. */
+    if (g_scissor_enabled && !g_cur_rt) {
+        if ((float)g_scissor.left > lo)  lo = (float)g_scissor.left;
+        if ((float)g_scissor.right < hi) hi = (float)g_scissor.right;
+    }
+
     /* How much of the width the draw covers, in the title's own screen
      * pixels. Coverage rather than "touches both edges": this title
      * builds its backdrop from overlapping strips, and the ones that run
@@ -1671,10 +1734,21 @@ BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count)
      *
      * 75% is a measurement of one title's menu, not a principle, and the
      * gap it sits in is about six points wide. Another title may not
-     * leave one. */
-    {
-        return ((hi - lo) >= (float)guest_w * 0.75f) ? TRUE : FALSE;
-    }
+     * leave one.
+     *
+     * With centre_2d that measurement is not trusted at all. The same
+     * title's menus still came apart at it: a glow drawn over the right
+     * third of the screen was squeezed off the hex backdrop it was painted
+     * to meet, leaving an edge, and a header that animates across the
+     * threshold flickered between the two treatments. So there only a
+     * whole-screen pass escapes: one covering the full width that is flat
+     * colour -- a fade, a tint, a letterbox bar -- or that draws the frame
+     * itself back over the frame, which squeezed would put a shrunken copy
+     * of the picture in the middle of it. */
+    if (d3d8_display_policy()->centre_2d)
+        return ((hi - lo) >= (float)guest_w * 0.98f && draw_is_screen_pass())
+               ? TRUE : FALSE;
+    return ((hi - lo) >= (float)guest_w * 0.75f) ? TRUE : FALSE;
 }
 
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPORT8 *pViewport)

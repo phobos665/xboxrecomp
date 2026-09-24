@@ -179,6 +179,7 @@ void recomp_settings_defaults(RecompSettings *s)
     s->widescreen        = 0;
     s->hor_plus          = 0.0;
     s->hor_plus_register = 60;
+    snprintf(s->widescreen_2d, sizeof s->widescreen_2d, "auto");
     s->anisotropy        = 1;
     s->fps_overlay       = 0;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
@@ -219,6 +220,8 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->hor_plus = atof(v);
         if ((v = from_table("hor_plus_register")) != NULL)
             s->hor_plus_register = clamp_int(atoi(v), 0, 191);
+        if ((v = from_table("widescreen_2d")) != NULL)
+            snprintf(s->widescreen_2d, sizeof s->widescreen_2d, "%s", v);
         if ((v = from_table("anisotropy")) != NULL)
             s->anisotropy = clamp_int(atoi(v), 1, 16);
         if ((v = from_table("frame_cap")) != NULL)
@@ -300,6 +303,14 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# above. Per game; 60 for TimeSplitters 2.       [RECOMP_HOR_PLUS_REG]\n"
         "hor_plus_register = %d\n"
         "\n"
+        "# In widescreen, where the game's 2D layer (menus, HUD, text) goes.\n"
+        "# auto keeps it at 4:3 in the middle but lets anything most of the\n"
+        "# screen wide span it. centre keeps all of it at 4:3, backdrops too,\n"
+        "# and lets only whole-screen fades and effects span: no seams where\n"
+        "# a game's menu layers meet, at the price of bars beside 2D-only\n"
+        "# screens.                                      [RECOMP_WIDESCREEN_2D]\n"
+        "widescreen_2d = %s\n"
+        "\n"
         "# Sharpen textures seen at a glancing angle, 1 to 16. The flat layer\n"
         "# is left alone, which wants no filtering.              [RECOMP_ANISO]\n"
         "anisotropy = %d\n"
@@ -314,6 +325,7 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
+        s->widescreen_2d[0] ? s->widescreen_2d : "auto",
         s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay);
 
     if (s->game_dir[0])

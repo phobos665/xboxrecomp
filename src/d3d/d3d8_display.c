@@ -69,10 +69,18 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
                     g_policy.scale);
         g_policy.widescreen = recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
 
+        v = recomp_config_lookup("RECOMP_WIDESCREEN_2D", "widescreen_2d");
+        g_policy.centre_2d = v && (strcmp(v, "centre") == 0 || strcmp(v, "center") == 0);
+        if (v && *v && !g_policy.centre_2d && strcmp(v, "auto") != 0)
+            fprintf(stderr, "D3D8 display: RECOMP_WIDESCREEN_2D=%s is neither auto nor "
+                    "centre; using auto\n", v);
+
         if (g_policy.widescreen)
             fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "
                     "at 16:9. A title with no 16:9 mode of its own draws 4:3 and will "
-                    "look stretched; leave this off for those.\n");
+                    "look stretched; leave this off for those.%s\n",
+                    g_policy.centre_2d ? " All 2D but whole-screen passes is kept at 4:3."
+                                       : "");
         if (g_policy.anisotropy > 1)
             fprintf(stderr, "D3D8 display: anisotropic filtering forced to %ux where the "
                     "title filters linearly\n", g_policy.anisotropy);

@@ -61,9 +61,11 @@ void      d3d8_compile_note(int kind, long long started);
 void      d3d8_hlsl_note(const char *src, size_t len, const char *name,
                          const RhiMacro *macros, const char *entry, const char *target);
 BOOL d3d8_GetTwoDSqueeze(void);
-/* Whether a draw's own vertices span the guest's full width, which is
- * what separates a backdrop or a fade from a HUD element. */
-BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count);
+/* Whether a screen-space draw spans the widescreen picture rather than
+ * being squeezed to 4:3 with the HUD: a backdrop or a fade, by its own
+ * extent under the scissor (and, with RECOMP_WIDESCREEN_2D=centre, only a
+ * whole-screen pass). */
+BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count);
 /* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
 BOOL                 d3d8_GetScissor(RhiRect *out);
 UINT                 d3d8_GetGuestHeight(void);
@@ -161,6 +163,7 @@ typedef struct D3D8Texture {
     BOOL                    locked;
     BOOL                    dirty;
     UINT                    palette;    /* Palette index (texture stage) this P8 texture bakes */
+    BOOL                    screen_copy; /* the frame was copied into it (d3d8_screencopy.c) */
 } D3D8Texture;
 
 typedef struct D3D8Surface {
