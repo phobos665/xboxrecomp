@@ -35,6 +35,13 @@ typedef struct D3D8DisplayPolicy {
      * renders 4:3 content that then gets stretched. The kernel reads the
      * same variable to answer XC_VIDEO. */
     int  widescreen;
+    /* RECOMP_WIDESCREEN_2D=centre: in widescreen, every 2D draw is kept at
+     * 4:3 in the middle, backdrops included, and only whole-screen passes
+     * (flat fades, effects over a copy of the frame) span the picture.
+     * The default, auto, lets any 2D draw most of the screen wide span it,
+     * which suits a title whose backdrops are separate from its HUD and
+     * leaves seams in one that composes its menus from both. */
+    int  centre_2d;
     /* RECOMP_ANISO=<1..16>, the anisotropy to force on textures the title
      * already filters linearly. 1 leaves every sampler as the title asked
      * for it. */
