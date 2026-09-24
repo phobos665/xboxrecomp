@@ -1305,6 +1305,17 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
             got > want ? " esp-too-high" : got < want ? " esp-too-low" : "",
             got, want, pop, ebx0, g_ebx, esi0, g_esi, edi0, g_edi,
             esp0, g_esp);
+    /* The callee's own epilogue is usually right; what moved esp is an
+     * indirect call it made, whose target popped too much. Name the recent
+     * ones, as the one-sided form above does. */
+    {
+        int t;
+        fprintf(stderr, "      recent icall targets:");
+        for (t = 4; t >= 1; t--)
+            fprintf(stderr, " %08X",
+                    g_icall_trace[(g_icall_trace_idx - t) & 15]);
+        fputc('\n', stderr);
+    }
     fflush(stderr);
 }
 #endif

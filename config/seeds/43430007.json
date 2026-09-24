@@ -118,5 +118,17 @@
  {
   "start": "0x002C0D2E",
   "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0001F720",
+  "note": "Indirect-call target observed at runtime (in a fight, called 100+ times before the crash). Starts straight after sub_0001F6A7's ret with no padding, and dispatches through the jump table at 0x2E3EF0."
+ },
+ {
+  "start": "0x00024DD0",
+  "note": "Indirect-call target in the attract-mode fight, via sub_001E2800's object-update list. Starts straight after a ret with no padding. Unresolved, the cdecl call's recovery over-popped 4 bytes per call and the main thread's esp climbed into the heap."
+ },
+ {
+  "start": "0x000256F0",
+  "note": "Indirect-call target in the attract-mode fight, via sub_001E2800's object-update list. Starts straight after a ret with no padding. Unresolved, the cdecl call's recovery over-popped 4 bytes per call and the main thread's esp climbed into the heap."
  }
 ]
