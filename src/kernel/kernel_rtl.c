@@ -565,6 +565,10 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
         case STATUS_NOT_SUPPORTED:              return ERROR_NOT_SUPPORTED;
         case STATUS_CANCELLED:                  return ERROR_CANCELLED;
         case STATUS_ALREADY_COMMITTED:          return ERROR_COMMITMENT_LIMIT;
+        /* The CRT heap-grow path retries at a new address only on
+         * ERROR_INVALID_ADDRESS. The ntdll fallback below already answers
+         * that on Windows; a POSIX host has no ntdll, so it is listed. */
+        case STATUS_CONFLICTING_ADDRESSES:      return ERROR_INVALID_ADDRESS;
         default: {
 #ifdef _WIN32
             /* The Xbox kernel's table is NT's, so the host's ntdll holds the
