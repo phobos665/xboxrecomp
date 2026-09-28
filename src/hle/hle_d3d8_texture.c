@@ -1025,9 +1025,9 @@ HLE_ORIGINAL(D3DDevice_SetPalette);
  * (Cxbx-Reloaded's CxbxImpl_SetPalette takes GetDataFromXboxResource(pPalette)
  * and nothing else). 256 entries of ARGB8888, which is what the device keeps.
  *
- * A null palette resets the stage to the device's grey ramp rather than
- * leaving whatever the last title state was, so a stage that has been cleared
- * does not silently keep stale colours.
+ * Only remembered here. The hardware reads the palette at each draw, so
+ * sync_palette reads it there too and picks the host texture baked with it.
+ * A null palette means the device's grey ramp, not whatever was there last.
  *
  * Not recorded into captures: there is no host_SetPalette wrapper, so a
  * replayed frame expands P8 through whatever palette the replay device has
@@ -1063,10 +1063,6 @@ HLE_EXPORT(D3DDevice_SetPalette)
             return;
         if (!palette_va) {
             g_pal_data[stage] = 0;
-            g_pal_sum[stage] = GREY_RAMP_SUM;
-            dev->lpVtbl->SetPalette(dev, stage, NULL);
-            if (g_bound_entry[stage] && g_bound_entry[stage]->p8)
-                g_bound_entry[stage]->pal_sum = GREY_RAMP_SUM;
             return;
         }
         data = HLE_MEM32(palette_va + 4) & 0x0FFFFFFFu;
@@ -1082,16 +1078,7 @@ HLE_EXPORT(D3DDevice_SetPalette)
             }
             return;
         }
-        /* Remembered rather than only forwarded: the Xbox reads the palette
-         * at each draw, so sync_palette re-reads it there. */
         g_pal_data[stage] = data;
-        g_pal_sum[stage] = palette_sum(data);
-        dev->lpVtbl->SetPalette(dev, stage,
-                                (const void *)HLE_PTR(CONTIG_BASE + data));
-        /* That re-baked whatever the host has on this stage, which is this
-         * entry if it is P8; mark it so a later bind does not bake again. */
-        if (g_bound_entry[stage] && g_bound_entry[stage]->p8)
-            g_bound_entry[stage]->pal_sum = g_pal_sum[stage];
     }
 #endif
 }
