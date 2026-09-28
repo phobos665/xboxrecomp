@@ -99,7 +99,7 @@ static texture_entry *g_bound_entry[MAX_STAGES];
  * the checksum of what the host stage palette holds (0: not known). */
 static uint32_t g_pal_data[MAX_STAGES];
 static uint32_t g_pal_sum[MAX_STAGES];
-static unsigned long g_pal_forwards, g_pal_rebakes, g_pal_first;
+static unsigned long g_pal_variants, g_pal_switches, g_pal_rebakes, g_pal_first;
 
 /* Stage 0 currently holds the title's own frame; see SetTexture below and
  * hle_d3d8_stage0_is_framebuffer(). */
@@ -537,40 +537,115 @@ static uint32_t palette_sum(uint32_t phys)
     return h ? h : 1u;
 }
 
+/* Give the host's stage palette the guest's current one.
+ *
+ * dev_SetPalette re-expands whatever texture the host has bound to that
+ * stage, and here that would be a texture baked for some other palette --
+ * overwriting it. So the stage is emptied first. */
+static void host_stage_palette(IDirect3DDevice8 *dev, uint32_t stage, uint32_t sum)
+{
+    if (g_pal_sum[stage] == sum)
+        return;
+    host_SetTexture(dev, stage, NULL);
+    dev->lpVtbl->SetPalette(dev, stage, g_pal_data[stage]
+        ? (const void *)HLE_PTR(CONTIG_BASE + g_pal_data[stage]) : NULL);
+    g_pal_sum[stage] = sum;
+}
+
+/* Expand a P8 entry's texels through the stage's current palette. */
+static void bake(IDirect3DDevice8 *dev, uint32_t stage, texture_entry *e,
+                 const texture_layout *t, uint32_t sum)
+{
+    host_stage_palette(dev, stage, sum);
+    d3d8_base_set_palette((IDirect3DBaseTexture8 *)e->host, stage);
+    upload(e->host, t);
+    e->pal_sum = sum;
+}
+
 /* Make the P8 texture bound to a stage show the palette the guest has for
- * that stage now.
+ * that stage now. Called before every draw.
  *
- * The host expands P8 to BGRA when it uploads and when its stage palette is
- * set, and at no other time -- binding a texture does not re-expand it. The
- * Xbox has no such step: the hardware reads the palette from memory at every
- * draw. So a sprite sheet drawn under two palettes (Marvel vs Capcom 2 colours
- * its characters that way) kept whichever palette it was first baked with,
- * and a palette edited in place without a new SetPalette never reached the
- * host at all.
+ * The host expands P8 to BGRA when it uploads, and binding a texture does not
+ * expand it again. The Xbox has no such step: the hardware reads the palette
+ * from memory at every draw. Marvel vs Capcom 2 colours its characters by
+ * drawing one sheet under several palettes, so a single host texture per sheet
+ * either kept the first palette it was baked with or, re-expanded at every
+ * change, spent half the main thread's time in d3d8_convert_linear_pixels.
  *
- * Called after every bind and before every draw. Setting the host palette
- * re-bakes the texture bound to that stage (dev_SetPalette), so that is the
- * one call used for both cases: a palette that changed, and a texture baked
- * with some other one. A 1 KB checksum per P8 stage per draw is the cost. */
+ * So a P8 sheet gets one host texture per palette it is drawn with -- each a
+ * cache entry of its own, found by the palette's checksum and evicted like any
+ * other -- and a draw switches the stage to the one that matches. A palette
+ * edited in place changes the checksum, and so the texture, on the next draw.
+ * The cost per P8 stage per draw is a 1 KB checksum. */
 static void sync_palette(IDirect3DDevice8 *dev, uint32_t stage)
 {
-    texture_entry *e = g_bound_entry[stage];
+    texture_entry *e = g_bound_entry[stage], *v = NULL;
+    unsigned long now;
+    texture_layout t;
     uint32_t sum;
+    int i;
 
     if (!e || !e->p8 || !e->host)
         return;
     sum = palette_sum(g_pal_data[stage]);
-    if (sum == g_pal_sum[stage] && sum == e->pal_sum)
+    if (e->pal_sum == sum)
         return;
-    if (sum != g_pal_sum[stage])
-        g_pal_forwards++;
-    else if (e->pal_sum)
-        g_pal_rebakes++;             /* baked under another palette before */
-    else
-        g_pal_first++;               /* just uploaded */
-    dev->lpVtbl->SetPalette(dev, stage, g_pal_data[stage]
-        ? (const void *)HLE_PTR(CONTIG_BASE + g_pal_data[stage]) : NULL);
-    g_pal_sum[stage] = e->pal_sum = sum;
+    if (!read_layout(e->va, &t))
+        return;
+    now = hle_d3d8_shadow_swaps();
+
+    /* Just uploaded, through no palette in particular: this one is the
+     * texture for the current palette, not a stale variant of it. */
+    if (!e->pal_sum) {
+        g_pal_first++;
+        bake(dev, stage, e, &t, sum);
+        host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)e->host);
+        return;
+    }
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->p8 && c->pal_sum == sum && c->va == e->va &&
+            c->data == e->data && c->format == e->format && c->size == e->size) {
+            v = c;
+            break;
+        }
+    }
+    if (v) {
+        g_pal_switches++;
+        /* The texels are shared by every variant, and only the one the bind
+         * found was checked this frame. */
+        if (v->checksum != e->checksum) {
+            v->checksum = e->checksum;
+            bake(dev, stage, v, &t, sum);
+            g_pal_rebakes++;
+        }
+    } else {
+        v = cache_slot(dev, now);
+        if (!v)
+            return;
+        if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, 0,
+                                      (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &v->host)) ||
+            !v->host) {
+            memset(v, 0, sizeof *v);
+            g_skip_create++;
+            return;
+        }
+        v->va = e->va;
+        v->data = e->data;
+        v->format = e->format;
+        v->size = e->size;
+        v->checksum = e->checksum;
+        v->checked_swap = now;
+        v->p8 = 1;
+        bake(dev, stage, v, &t, sum);
+        g_pal_variants++;
+    }
+    v->used_swap = now;
+    host_stage_palette(dev, stage, sum);
+    host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)v->host);
+    g_bound[stage] = v->host;
+    g_bound_entry[stage] = v;
 }
 
 void hle_d3d8_sync_palettes(IDirect3DDevice8 *dev)
@@ -823,11 +898,11 @@ static void report(void)
         fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds, "
                 "%lu refused by the host, %lu past the cache\n",
                 g_cube_count, g_cube_binds, g_cube_failed, g_cube_full);
-        if (g_pal_forwards || g_pal_rebakes || g_pal_first)
-            fprintf(stderr, "[HLE-D3D8] shadow palettes: %lu changed in place, "
-                    "%lu P8 binds re-baked under a different palette, %lu "
-                    "baked after upload\n",
-                    g_pal_forwards, g_pal_rebakes, g_pal_first);
+        if (g_pal_variants || g_pal_switches || g_pal_first)
+            fprintf(stderr, "[HLE-D3D8] shadow palettes: %lu baked after upload, "
+                    "%lu more made for another palette, %lu draws switched to "
+                    "one, %lu re-baked for new texels\n",
+                    g_pal_first, g_pal_variants, g_pal_switches, g_pal_rebakes);
         last = now;
     }
 }
@@ -908,7 +983,6 @@ HLE_EXPORT(D3DDevice_SetTexture)
          * not verified against hardware. */
         host_SetTexture(dev, stage,
                         (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
-        sync_palette(dev, stage);
         g_bound_count++;
         if (hle_d3d8_trace_on()) {
             int fb = 0, i;
