@@ -28,7 +28,9 @@
  * P8 is forwarded: the host expands palettised texels to BGRA at upload
  * through the palette of the stage the texture is bound to, and
  * D3DDevice_SetPalette at the end of this file supplies that palette from the
- * guest's own resource.
+ * guest's own resource. Because the expansion is baked, the palette a host
+ * texture was baked with is remembered, and it is baked again when it is
+ * drawn under a different one (sync_palette).
  *
  * Not handled, counted instead: cube and volume textures, surfaces bound as
  * textures, textures outside the contiguous window, and any format
@@ -82,11 +84,22 @@ typedef struct {
     /* The texels are the frame buffer's, so the content comes from the
      * host's finished frame and is refreshed every frame it is bound. */
     int                framebuffer;
+    /* P8: the host texture holds the texels expanded through a palette, and
+     * this is the checksum of that palette (0: not known, bake again). */
+    int                p8;
+    uint32_t           pal_sum;
 } texture_entry;
 
 static texture_entry g_textures[TEXTURE_CACHE];
 static int           g_texture_count;
 static IDirect3DTexture8 *g_bound[MAX_STAGES];
+static texture_entry *g_bound_entry[MAX_STAGES];
+
+/* Each stage's palette: where the guest keeps it (physical, 0 for none) and
+ * the checksum of what the host stage palette holds (0: not known). */
+static uint32_t g_pal_data[MAX_STAGES];
+static uint32_t g_pal_sum[MAX_STAGES];
+static unsigned long g_pal_forwards, g_pal_rebakes, g_pal_first;
 
 /* Stage 0 currently holds the title's own frame; see SetTexture below and
  * hle_d3d8_stage0_is_framebuffer(). */
@@ -463,6 +476,7 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
                 if (sum != e->checksum || refresh) {
                     e->checksum = sum;
                     upload(e->host, &t);
+                    e->pal_sum = 0;     /* baked through whichever palette */
                     g_reuploads++;
                 }
             }
@@ -497,9 +511,76 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e->size = size;
     e->checksum = level0_checksum(&t);
     e->checked_swap = e->used_swap = now;
+    e->p8 = t.fmt == XFMT_P8;
+    e->pal_sum = 0;
     upload(e->host, &t);
     g_uploads++;
     return e->host;
+}
+
+/* Checksum of a guest palette: 256 entries of ARGB8888. Never 0, which means
+ * "not known". */
+#define GREY_RAMP_SUM 0x9E3779B9u
+
+static uint32_t palette_sum(uint32_t phys)
+{
+    const uint8_t *p;
+    uint32_t h = 2166136261u, i;
+
+    if (!phys)
+        return GREY_RAMP_SUM;
+    p = (const uint8_t *)HLE_PTR(CONTIG_BASE + phys);
+    for (i = 0; i < 1024u; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+/* Make the P8 texture bound to a stage show the palette the guest has for
+ * that stage now.
+ *
+ * The host expands P8 to BGRA when it uploads and when its stage palette is
+ * set, and at no other time -- binding a texture does not re-expand it. The
+ * Xbox has no such step: the hardware reads the palette from memory at every
+ * draw. So a sprite sheet drawn under two palettes (Marvel vs Capcom 2 colours
+ * its characters that way) kept whichever palette it was first baked with,
+ * and a palette edited in place without a new SetPalette never reached the
+ * host at all.
+ *
+ * Called after every bind and before every draw. Setting the host palette
+ * re-bakes the texture bound to that stage (dev_SetPalette), so that is the
+ * one call used for both cases: a palette that changed, and a texture baked
+ * with some other one. A 1 KB checksum per P8 stage per draw is the cost. */
+static void sync_palette(IDirect3DDevice8 *dev, uint32_t stage)
+{
+    texture_entry *e = g_bound_entry[stage];
+    uint32_t sum;
+
+    if (!e || !e->p8 || !e->host)
+        return;
+    sum = palette_sum(g_pal_data[stage]);
+    if (sum == g_pal_sum[stage] && sum == e->pal_sum)
+        return;
+    if (sum != g_pal_sum[stage])
+        g_pal_forwards++;
+    else if (e->pal_sum)
+        g_pal_rebakes++;             /* baked under another palette before */
+    else
+        g_pal_first++;               /* just uploaded */
+    dev->lpVtbl->SetPalette(dev, stage, g_pal_data[stage]
+        ? (const void *)HLE_PTR(CONTIG_BASE + g_pal_data[stage]) : NULL);
+    g_pal_sum[stage] = e->pal_sum = sum;
+}
+
+void hle_d3d8_sync_palettes(IDirect3DDevice8 *dev)
+{
+    uint32_t s;
+
+    if (!dev)
+        return;
+    for (s = 0; s < MAX_STAGES; s++)
+        sync_palette(dev, s);
 }
 
 /* Cube textures a title renders into: its environment map. Only rendered
@@ -742,6 +823,11 @@ static void report(void)
         fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds, "
                 "%lu refused by the host, %lu past the cache\n",
                 g_cube_count, g_cube_binds, g_cube_failed, g_cube_full);
+        if (g_pal_forwards || g_pal_rebakes || g_pal_first)
+            fprintf(stderr, "[HLE-D3D8] shadow palettes: %lu changed in place, "
+                    "%lu P8 binds re-baked under a different palette, %lu "
+                    "baked after upload\n",
+                    g_pal_forwards, g_pal_rebakes, g_pal_first);
         last = now;
     }
 }
@@ -782,6 +868,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
 
             if (cube) {
                 g_bound[stage] = NULL;
+                g_bound_entry[stage] = NULL;
                 g_cube_binds++;
                 host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)cube);
                 g_bound_count++;
@@ -792,6 +879,15 @@ HLE_EXPORT(D3DDevice_SetTexture)
         }
         hle_d3d8_note_stage_texels(stage, texture ? HLE_MEM32(texture + 4) & 0x0FFFFFFFu : 0u);
         g_bound[stage] = host;
+        g_bound_entry[stage] = NULL;
+        {
+            int i;
+            for (i = 0; host && i < g_texture_count; i++)
+                if (g_textures[i].host == host) {
+                    g_bound_entry[stage] = &g_textures[i];
+                    break;
+                }
+        }
         if (stage == 0) {
             /* Whether this draw is one of the title's full-screen passes over
              * its own frame. Nothing else binds the frame buffer as stage 0,
@@ -812,6 +908,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
          * not verified against hardware. */
         host_SetTexture(dev, stage,
                         (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
+        sync_palette(dev, stage);
         g_bound_count++;
         if (hle_d3d8_trace_on()) {
             int fb = 0, i;
@@ -891,7 +988,11 @@ HLE_EXPORT(D3DDevice_SetPalette)
         if (!dev || stage >= 4u)
             return;
         if (!palette_va) {
+            g_pal_data[stage] = 0;
+            g_pal_sum[stage] = GREY_RAMP_SUM;
             dev->lpVtbl->SetPalette(dev, stage, NULL);
+            if (g_bound_entry[stage] && g_bound_entry[stage]->p8)
+                g_bound_entry[stage]->pal_sum = GREY_RAMP_SUM;
             return;
         }
         data = HLE_MEM32(palette_va + 4) & 0x0FFFFFFFu;
@@ -907,8 +1008,16 @@ HLE_EXPORT(D3DDevice_SetPalette)
             }
             return;
         }
+        /* Remembered rather than only forwarded: the Xbox reads the palette
+         * at each draw, so sync_palette re-reads it there. */
+        g_pal_data[stage] = data;
+        g_pal_sum[stage] = palette_sum(data);
         dev->lpVtbl->SetPalette(dev, stage,
                                 (const void *)HLE_PTR(CONTIG_BASE + data));
+        /* That re-baked whatever the host has on this stage, which is this
+         * entry if it is P8; mark it so a later bind does not bake again. */
+        if (g_bound_entry[stage] && g_bound_entry[stage]->p8)
+            g_bound_entry[stage]->pal_sum = g_pal_sum[stage];
     }
 #endif
 }

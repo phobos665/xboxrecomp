@@ -810,6 +810,9 @@ static unsigned long g_inline_begin_frame, g_inline_vdata_frame;
 static unsigned long g_inline_begin_max, g_inline_vdata_max;
 /* From hle_d3d8_texture.c: stage 0 holds the title's own frame. */
 int hle_d3d8_stage0_is_framebuffer(void);
+/* From hle_d3d8_texture.c: re-read each stage's guest palette, as the Xbox
+ * does at every draw, and re-bake a P8 texture drawn under a new one. */
+void hle_d3d8_sync_palettes(IDirect3DDevice8 *dev);
 /* Draws arriving on a guest thread other than the one that swaps. A loader
  * thread drawing to warm caches puts geometry through the host that no
  * presented frame ever contains -- it would count as drawn and never show. */
@@ -891,6 +894,7 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
     /* The title's render and texture stage states as they stand now, read
      * from its own state arrays (hle_d3d8_state.c). */
     hle_d3d8_shadow_apply_states(g_shadow);
+    hle_d3d8_sync_palettes(g_shadow);
     g_frame_draws++;
     return 1;
 }
