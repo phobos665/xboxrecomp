@@ -110,6 +110,9 @@ static void build_rows(void)
     r->kind  = ROW_INT; r->lo = 1; r->hi = 8; r->ival = &g_settings.resolution_scale;
     r++;
 
+#ifndef LAUNCHER_NO_WIDESCREEN
+    /* Hidden for a title built with recomp_add_launcher(... NO_WIDESCREEN),
+     * where a wider picture cannot be right; settings_save writes both off. */
     r->label = "Widescreen";
     r->help  = "Present at 16:9. This game has no widescreen mode of its own, so"
                " turn on Wide camera with it or the picture will be stretched.";
@@ -120,6 +123,7 @@ static void build_rows(void)
     r->help  = "See more to the sides rather than the same view stretched.";
     r->kind  = ROW_BOOL; r->ival = &g_wide_camera;
     r++;
+#endif
 
     r->label = "Texture sharpness";
     r->help  = "Sharpen textures seen at a glancing angle: floors, walls, roads.";
@@ -451,6 +455,11 @@ static int settings_save(void)
      * a player should not have to know that 0.75 is (4/3)/(16/9), and the
      * register is a per-game constant they have no way to choose. */
     g_settings.hor_plus = g_wide_camera ? 0.75 : 0.0;
+#ifdef LAUNCHER_NO_WIDESCREEN
+    /* Not offered, so not left on by an older file either. */
+    g_settings.widescreen = 0;
+    g_settings.hor_plus = 0.0;
+#endif
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
 
