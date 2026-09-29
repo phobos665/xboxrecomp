@@ -3014,6 +3014,20 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             host_SetRenderTarget(g_shadow, NULL, 0, 0, depth);
         }
     }
+    /* The back buffer is measured in the device's own (logical) size, not its
+     * surface's. A supersampling title draws into a surface wider than the
+     * device it created -- Dino Crisis 3 makes a 640x480 device and renders
+     * its scene into a 1280x480 surface, filtered down on present -- and the
+     * Xbox keeps viewports in the device's 640x480 units, scaling them for the
+     * surface itself. Taken at 1280, the viewport the reset below makes after
+     * the shadow pass was twice the host back buffer, and it stayed until the
+     * next SetViewport, which this title never makes: the characters, and
+     * everything else drawn after that pass, came out stretched two-fold to
+     * the right of where the game had them. */
+    if (kind == 0 && (w != g_shadow_width || h != g_shadow_height)) {
+        w = g_shadow_width;
+        h = g_shadow_height;
+    }
     g_target_width = w;
     g_target_height = h;
 
