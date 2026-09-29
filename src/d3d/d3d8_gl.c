@@ -1093,6 +1093,9 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 unsigned long xbox_D3D8ScreenCopyCount(void) { return 0; }
 void xbox_D3D8ScreenCopyShutdown(void) {}
 
+/* No Hor+ on this backend, so nothing for a title to widen. */
+float xbox_D3D8ClaimHorPlus(void) { return 1.0f; }
+
 BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
 {
     if (count)     *count = g_scissor_count;
