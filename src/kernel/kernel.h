@@ -787,6 +787,9 @@ BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
+/* DISPATCH_LEVEL across threads: the DPC runner takes it (kernel_hal.c). */
+int     xbox_DispatchLockEnterTimed(DWORD ms);
+void    xbox_DispatchLockLeave(void);
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);
 void xbox_hal_init_timers(void);

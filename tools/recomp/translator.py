@@ -736,10 +736,14 @@ class FunctionTranslator:
                 cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
-                         or last_setter in ("inc", "dec")
+                         or last_setter in ("inc", "dec", "rep-cmps")
                          or last_setter in BT_MODIFY)):
                 return True
-            if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
+            if m.startswith("rep") and ("cmps" in m or "scas" in m):
+                # repe cmpsb and friends set CF from the last pair compared
+                # (lifter._lift_rep_string); a jb/ja after one reads it.
+                last_setter = "rep-cmps"
+            elif m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
             elif m in _FLAGS_UNDEFINED:
                 last_setter = None
@@ -1723,6 +1727,10 @@ class BatchTranslator:
         # translated chunks.
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
+        # Wrappers recomp_manual.c defines around a generated sub_X_gen.
+        defined |= {info["call_name"]
+                    for info in (getattr(self.translator, "func_db", None) or {}).values()
+                    if info.get("call_name")}
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
@@ -1757,6 +1765,19 @@ class BatchTranslator:
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
+
+        # Wrapped functions: the body above is sub_X_gen, and what the
+        # generated code calls is the wrapper recomp_manual.c defines.
+        wrapped_db = getattr(self.translator, "func_db", None) or {}
+        wrappers = [(addr, info["call_name"])
+                    for addr, info in sorted(wrapped_db.items())
+                    if info.get("call_name")
+                    and info.get("call_name") != info.get("name")]
+        if wrappers:
+            header_lines.append("")
+            header_lines.append("/* Wrappers around generated bodies (defined by the project) */")
+            for addr, call_name in wrappers:
+                header_lines.append(f"void {call_name}(void);  /* 0x{addr:08X} */")
 
         if manual_decls:
             header_lines.append("")
@@ -1982,7 +2003,11 @@ class BatchTranslator:
             f"static const recomp_entry_t g_recomp_table[] = {{",
         ]
 
+        func_db = getattr(getattr(self, "translator", None), "func_db", None) or {}
         for addr, name, _ in translations:
+            # A wrapped function dispatches to its wrapper, not to the
+            # generated body it wraps (see call_name in __main__.py).
+            name = func_db.get(addr, {}).get("call_name") or name
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
 
         addrs = [addr for addr, _, _ in translations]

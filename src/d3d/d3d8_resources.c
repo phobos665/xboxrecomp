@@ -576,16 +576,20 @@ void d3d8_convert_linear_pixels(D3DFORMAT fmt, UINT width, UINT height,
 
     case D3DFMT_P8: {
         /* Palettized: expand each 8-bit index to BGRA through the
-         * texture stage's palette (identity default). */
+         * texture stage's palette (identity default). An entry is a
+         * D3DCOLOR, 0xAARRGGBB, so blue is the low byte. This had red and
+         * blue the other way round until 28 Sep 2026, which went unseen
+         * while only the grey ramp was ever expanded: Marvel vs Capcom 2's
+         * MARVEL logo came out blue and its CAPCOM edge cyan. */
         const DWORD *pal = d3d8_GetPalette(palette);
         for (y = 0; y < height; y++) {
             const BYTE *s = src + (size_t)y * width;
             BYTE *d = dst + (size_t)y * width * 4;
             for (x = 0; x < width; x++) {
                 DWORD c = pal[s[x]];
-                d[x * 4 + 0] = (BYTE)((c >> 16) & 0xFF);  /* B */
+                d[x * 4 + 0] = (BYTE)((c >>  0) & 0xFF);  /* B */
                 d[x * 4 + 1] = (BYTE)((c >>  8) & 0xFF);  /* G */
-                d[x * 4 + 2] = (BYTE)((c >>  0) & 0xFF);  /* R */
+                d[x * 4 + 2] = (BYTE)((c >> 16) & 0xFF);  /* R */
                 d[x * 4 + 3] = (BYTE)((c >> 24) & 0xFF);  /* A */
             }
         }

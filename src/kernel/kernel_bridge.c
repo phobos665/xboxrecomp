@@ -458,6 +458,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     free(s);
 
     bridge_run_thread_inline(fn, ctx1, ctx2);
+    xbox_GuestLiftedExit();   /* no longer running lifted code */
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
@@ -1520,13 +1521,13 @@ static void wait_log_note(const char *what, uint32_t object, uint32_t extra)
     }
 }
 
-static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
-                                        uint32_t timeout_va)
+/* An Xbox timeout as a GetTickCount64 deadline: 0 for none (wait forever),
+ * and *poll_only set when the wait must not block at all. */
+static ULONGLONG bridge_guest_deadline(uint32_t timeout_va, int *poll_only)
 {
     ULONGLONG deadline = 0;
-    int poll_only = 0;
-    unsigned spins = 0;
 
+    *poll_only = 0;
     if (timeout_va) {
         int64_t t = (int64_t)(((uint64_t)BRIDGE_MEM32(timeout_va + 4) << 32)
                               | BRIDGE_MEM32(timeout_va));
@@ -1539,13 +1540,81 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
             now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
             rest = t - now;
             if (rest <= 0)
-                poll_only = 1;
+                *poll_only = 1;
             else
                 deadline = GetTickCount64() + (ULONGLONG)(rest / 10000);
         } else {
-            poll_only = 1;
+            *poll_only = 1;
         }
     }
+    return deadline;
+}
+
+/* A set counter per guest event: what a notification event's waiters wake on.
+ *
+ * On the kernel, setting a notification event readies every thread already
+ * waiting on it, there and then; clearing it afterwards un-readies nobody.
+ * Waiting by polling SignalState alone loses that. Marvel vs Capcom 2 has two
+ * threads in D3DDevice_BlockUntilVerticalBlank, which clears the device's
+ * vblank event and waits on it. Whenever one of them woke first and went
+ * round again, its clear wiped the set before the other looked, and the other
+ * slept to the next vblank or the one after: 20-35% of frames took two or
+ * more vblanks, with the CPU idle and the event set exactly once a vblank.
+ *
+ * So each set (and pulse) bumps the event's generation, and a notification
+ * waiter returns when the generation moves, whatever SignalState says by
+ * then. Waiters sleep on the counter with WaitOnAddress, so a set wakes them
+ * at once rather than at the next Sleep(1). A small open-addressed table,
+ * keyed by the event's guest address; a full table degrades to the old
+ * polling for events it cannot hold. */
+#if defined(_MSC_VER)
+#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
+#endif
+
+#define EVENT_GEN_SLOTS 1024u
+static volatile LONG g_event_gen_va[EVENT_GEN_SLOTS];
+static volatile LONG g_event_gen[EVENT_GEN_SLOTS];
+
+static volatile LONG *event_generation(uint32_t va)
+{
+    uint32_t i, slot = (va >> 2) * 2654435761u % EVENT_GEN_SLOTS;
+
+    if (!va)
+        return NULL;
+    for (i = 0; i < EVENT_GEN_SLOTS; i++, slot = (slot + 1) % EVENT_GEN_SLOTS) {
+        LONG have = g_event_gen_va[slot];
+        if (have == (LONG)va)
+            return &g_event_gen[slot];
+        if (have == 0 &&
+            (InterlockedCompareExchange(&g_event_gen_va[slot], (LONG)va, 0) == 0 ||
+             g_event_gen_va[slot] == (LONG)va))
+            return &g_event_gen[slot];
+    }
+    return NULL;
+}
+
+/* A set or a pulse: wake whoever is waiting on this event now. */
+static void event_wake_waiters(uint32_t va)
+{
+    volatile LONG *gen = event_generation(va);
+    if (gen) {
+        InterlockedIncrement(gen);
+#ifdef _WIN32
+        WakeByAddressAll((PVOID)gen);
+#endif
+    }
+}
+
+static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
+                                        uint32_t timeout_va, uint32_t event_va)
+{
+    int poll_only;
+    ULONGLONG deadline = bridge_guest_deadline(timeout_va, &poll_only);
+    unsigned spins = 0;
+    /* Notification events only: a synchronisation event wakes one waiter,
+     * which consuming SignalState already models. */
+    volatile LONG *gen = sync ? NULL : event_generation(event_va);
+    LONG gen0 = gen ? *gen : 0;
 
     for (;;) {
         LONG cur = *state;
@@ -1553,6 +1622,75 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
             if (!sync || InterlockedCompareExchange(state, 0, cur) == cur)
                 return 0;                       /* STATUS_SUCCESS */
             continue;                           /* another waiter took it */
+        }
+        if (gen && *gen != gen0)
+            return 0;                           /* set while we waited */
+        if (poll_only || (deadline && GetTickCount64() >= deadline))
+            return 0x00000102u;                 /* STATUS_TIMEOUT */
+        if (gen) {
+#ifdef _WIN32
+            /* Sleep on the counter; a set wakes this at once. The 1 ms cap
+             * keeps timeouts and a missed wake from costing more than that. */
+            LONG seen = gen0;
+            WaitOnAddress((volatile VOID *)gen, &seen, sizeof seen, 1);
+#else
+            Sleep(1);
+#endif
+        } else if (++spins < 64) {
+            SwitchToThread();
+        } else {
+            Sleep(1);
+        }
+    }
+}
+
+/* KeWaitForMultipleObjects over guest events, by the same SignalState rule.
+ * WaitAny (type 1) returns STATUS_WAIT_0 + the index of the first signalled
+ * object, consuming it if it is a synchronisation event; WaitAll (type 0)
+ * returns STATUS_SUCCESS once every one is signalled, and consumes those.
+ *
+ * Timers (types 8 and 9) are waited the same way: the timer thread sets their
+ * SignalState when they fire, and shadow[] holds the host event a
+ * single-object wait on the same timer sleeps on, so consuming one here
+ * resets that too.
+ *
+ * ponytail: WaitAll checks and then consumes, not atomically, so a second
+ * waiter can take one object in between. The Xbox is uniprocessor and no
+ * title here has been seen to WaitAll on a contended event. */
+static uint32_t bridge_wait_guest_events(volatile LONG **state, const int *sync,
+                                         HANDLE *shadow, uint32_t count,
+                                         int wait_all, uint32_t timeout_va)
+{
+    int poll_only;
+    ULONGLONG deadline = bridge_guest_deadline(timeout_va, &poll_only);
+    unsigned spins = 0;
+    uint32_t i;
+
+    for (;;) {
+        if (wait_all) {
+            for (i = 0; i < count && *state[i] > 0; i++)
+                ;
+            if (i == count) {
+                for (i = 0; i < count; i++)
+                    if (sync[i]) {
+                        InterlockedExchange(state[i], 0);
+                        if (shadow[i])
+                            ResetEvent(shadow[i]);
+                    }
+                return 0;                       /* STATUS_SUCCESS */
+            }
+        } else {
+            for (i = 0; i < count; i++) {
+                LONG cur = *state[i];
+                if (cur > 0 &&
+                    (!sync[i] || InterlockedCompareExchange(state[i], 0, cur) == cur)) {
+                    /* A timer's shadow event is what a single-object wait
+                     * sleeps on; consumed here, it must not stay set there. */
+                    if (sync[i] && shadow[i])
+                        ResetEvent(shadow[i]);
+                    return i;                   /* STATUS_WAIT_0 + i */
+                }
+            }
         }
         if (poll_only || (deadline && GetTickCount64() >= deadline))
             return 0x00000102u;                 /* STATUS_TIMEOUT */
@@ -1582,6 +1720,8 @@ static void bridge_KeSetEvent(void)
     if (state) {
         /* KeSetEvent returns the event's previous state. */
         g_eax = (uint32_t)InterlockedExchange(state, 1);
+        event_wake_waiters(guest_va);            /* see event_generation */
+        xbox_FpsNoteSet(guest_va, g_eax != 0);   /* RECOMP_WAIT_PROFILE */
         return;
     }
 
@@ -1637,7 +1777,7 @@ static void bridge_KeWaitForSingleObject(void)
                     "at 0x%08X, waited on its SignalState\n",
                     sync ? "synchronisation" : "notification", object);
         }
-        g_eax = bridge_wait_guest_event(state, sync, timeout_ptr);
+        g_eax = bridge_wait_guest_event(state, sync, timeout_ptr, object);
         if (wait_log_wanted()) {
             /* Success or timeout, and with what timeout asked for: the two
              * say different things about why a loop goes round again. */
@@ -1658,6 +1798,13 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+
+    /* A synchronisation timer consumed through its shadow event is not
+     * signalled any more, and KeWaitForMultipleObjects reads that from the
+     * guest header -- so say so there too. */
+    if (g_eax == 0 && object >= 0x00010000u && object < GUEST_RAM_END - 8u &&
+        BRIDGE_MEM8(object) == 9u)
+        BRIDGE_MEM32(object + 4) = 0;
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2875,7 +3022,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
-        kernel_drain_dpcs();   /* deferred work, before due timers */
+        {
+            /* DPCs run at DISPATCH_LEVEL, so not while a guest thread is
+             * there (kernel_hal.c, RECOMP_DISPATCH_LOCK). */
+            int held = xbox_DispatchLockEnterTimed(100);
+            kernel_drain_dpcs();   /* deferred work, before due timers */
+            if (held)
+                xbox_DispatchLockLeave();
+        }
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -2895,8 +3049,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             LeaveCriticalSection(&g_timer_lock);
 
             /* Outside the lock: the routine can set or cancel timers. */
-            if (dpc)
+            if (dpc) {
+                int held = xbox_DispatchLockEnterTimed(100);
                 kernel_run_dpc(dpc, 0, 0);
+                if (held)
+                    xbox_DispatchLockLeave();
+            }
 
             /* Wake anyone parked on the timer's shadow event; a timer with no
              * DPC is just a kernel sleep. */
@@ -2948,11 +3106,15 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     }
     LeaveCriticalSection(&g_timer_lock);
 
-    /* A freshly set timer starts unsignaled, like the real KeSetTimer. */
+    /* A freshly set timer starts unsignaled, like the real KeSetTimer -- in
+     * the guest header as well as the shadow event, since
+     * KeWaitForMultipleObjects waits on the header. */
     {
         HANDLE ev = ke_shadow_lookup(timer_va);
-        if (ev)
+        if (ev) {
             ResetEvent(ev);
+            BRIDGE_MEM32(timer_va + 4) = 0;   /* SignalState */
+        }
     }
     g_eax = was_set;
 }
@@ -5060,9 +5222,20 @@ static void bridge_KeAlertThread(void)
 
 /* ── KeWaitForMultipleObjects (ordinal 158, 8 args)
  *
- * KeWaitForSingleObject is routed; the multiple-object sibling was not. Like
- * NtWaitForMultipleObjectsEx, the Objects[] array in guest memory holds 32-bit
- * handle tokens, so each is resolved before the native wait sees it. */
+ * Objects[] holds pointers to dispatcher objects, as KeWaitForSingleObject's
+ * argument does -- not handles. When every one is a guest event, the wait is
+ * done on their SignalState in guest memory, as the single-object bridge does.
+ *
+ * Before 29 Sep 2026 each pointer went to WaitForMultipleObjectsEx as though
+ * it were a handle, so every wait failed at once with STATUS_UNSUCCESSFUL and
+ * a signalled synchronisation event was never consumed. Marvel vs Capcom 2 has
+ * a thread that waits this way, on an event and a synchronisation timer
+ * (WaitAny, no timeout); it spun 1.6 million times a second for the whole run
+ * and now waits. (Its fights still stop presenting at the same point, so that
+ * is something else.)
+ *
+ * Anything else -- a thread, a semaphore, a mix -- keeps the host path, where
+ * the array is taken as handle tokens and each is resolved. */
 #define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
 
 static void bridge_KeWaitForMultipleObjects(void)
@@ -5073,6 +5246,9 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
     uint32_t timeout_va = STACK_ARG(6);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    volatile LONG *states[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    int syncs[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    HANDLE shadows[BRIDGE_MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
 
     if (count == 0) {
@@ -5081,9 +5257,49 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+
+    for (i = 0; i < count; i++) {
+        uint32_t o = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        wait_log_note("waits(m)", o, g_kernel_caller);
+        shadows[i] = NULL;
+        states[i] = bridge_guest_event(o, &syncs[i]);
+        if (!states[i] && o >= 0x00010000u && o < GUEST_RAM_END - 8u) {
+            /* A KTIMER: KeInitializeTimerEx built its header in guest memory,
+             * and the timer thread sets SignalState when it fires. */
+            uint8_t type = BRIDGE_MEM8(o);
+            if (type == 8u || type == 9u) {
+                states[i] = (volatile LONG *)((uintptr_t)o + 4u + g_xbox_mem_offset);
+                syncs[i] = (type == 9u);
+                shadows[i] = ke_shadow_lookup(o);
+            }
+        }
+        if (!states[i])
+            break;
+    }
+    if (i == count) {
+        g_eax = bridge_wait_guest_events(states, syncs, shadows, count,
+                                         wait_type == 0, timeout_va);
+        return;
+    }
+    {
+        static int said;
+        if (!said++) {
+            fprintf(stderr, "  [KERNEL] KeWaitForMultipleObjects: object %u "
+                            "(0x%08X) is not a guest event or timer; the wait "
+                            "goes to the host\n",
+                    i, BRIDGE_MEM32(objects_va + i * 4));
+            fflush(stderr);
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        /* As KeWaitForSingleObject does: a shadow object first, then a
+         * handle token. */
+        uint32_t o = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        handles[i] = ke_shadow_lookup(o);
+        if (!handles[i])
+            handles[i] = bridge_resolve_handle(o);
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
@@ -7535,6 +7751,17 @@ static void bridge_KePulseEvent(void)
 
     (void)increment;
     (void)wait;
+
+    /* A guest event: wake its current waiters and leave it clear, which is
+     * what a pulse is. The generation is what they wake on. */
+    {
+        volatile LONG *state = bridge_guest_event(guest_va, NULL);
+        if (state) {
+            g_eax = (uint32_t)InterlockedExchange(state, 0);
+            event_wake_waiters(guest_va);
+            return;
+        }
+    }
 
     h = ke_shadow_lookup(guest_va);
     if (!h)
@@ -10039,7 +10266,17 @@ static void kernel_thunk_dispatch(void)
          * right about that list. */
         int _guest_held = xbox_GuestLockDrop();
         xbox_GuestLiftedLeave();
-        bridge();
+        if (xbox_FpsWaitProfileOn()) {
+            /* RECOMP_WAIT_PROFILE: how long this call held the thread. */
+            LARGE_INTEGER _t0, _t1;
+            uint32_t _obj = STACK_ARG(0);
+            QueryPerformanceCounter(&_t0);
+            bridge();
+            QueryPerformanceCounter(&_t1);
+            xbox_FpsNoteKernel(ordinal, _t1.QuadPart - _t0.QuadPart, _obj);
+        } else {
+            bridge();
+        }
         /* Re-acquire first, then count. Counting first made a thread waiting
          * for the lock look like a thread running lifted code, so switching
          * the lock on -- which is meant to make overlap impossible -- took

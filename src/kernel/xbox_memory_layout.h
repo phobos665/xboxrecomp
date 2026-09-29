@@ -237,6 +237,10 @@ int  xbox_GuestLockOn(void);
 int  xbox_GuestConcurrencyOn(void);
 void xbox_GuestLiftedEnter(void);
 void xbox_GuestLiftedLeave(void);
+void xbox_GuestLiftedExit(void);
+/* DISPATCH_LEVEL stops the other guest threads (kernel_hal.c calls these). */
+void xbox_DispatchParkOthers(void);
+void xbox_DispatchReleaseOthers(void);
 void xbox_GuestConcurrencyReport(void);
 
 void xbox_Nv2aFlipGateArm(void);
@@ -286,6 +290,11 @@ void xbox_WatchdogStart(void);
  * increment each and nothing when it is off. */
 void xbox_FpsCountSwap(void);
 void xbox_FpsCountVblank(void);
+/* RECOMP_WAIT_PROFILE (recomp_fps.c): time a kernel call on the swapping
+ * thread; object is the first argument, used for KeWaitForSingleObject. */
+int  xbox_FpsWaitProfileOn(void);
+void xbox_FpsNoteKernel(unsigned ordinal, long long ticks, uint32_t object);
+void xbox_FpsNoteSet(uint32_t object, int was_signalled);
 
 /* Sampling profiler (recomp_sample.c). RECOMP_SAMPLE=<hz> samples every
  * thread's instruction pointer and reports by symbol and category. Call from
