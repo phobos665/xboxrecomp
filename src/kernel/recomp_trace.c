@@ -810,3 +810,32 @@ void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va)
         exit(4);
     }
 }
+
+/* ── Untranslated instructions ───────────────────────────────────────────
+ *
+ * The lifter emits RECOMP_UNIMPL(text, va) at every instruction it has no
+ * translation for, beside the bare comment it used to leave alone. The
+ * instruction is still a no-op; this only stops the omission being silent.
+ * RECOMP_UNIMPL_TRAP=1 aborts at the first hit, at the guest address of the
+ * cause rather than wherever the damage surfaces.
+ *
+ * Upstream (ee4eb97) defines this in the new-game template's
+ * recomp_manual.c, which would leave every existing title unable to link on
+ * its next re-lift. It is declared in recomp_types.h, so, like the tracing
+ * hooks above, it lives in the runtime. */
+void recomp_unimpl(const char *text, uint32_t va)
+{
+    static int printed;
+    const char *trap = getenv("RECOMP_UNIMPL_TRAP");
+    int stop = trap && *trap && *trap != '0';
+
+    if (printed < 50 || stop) {
+        printed++;
+        fprintf(stderr,
+                "[UNIMPL] untranslated instruction REACHED: `%s` at 0x%08X"
+                " (a no-op; set RECOMP_UNIMPL_TRAP=1 to stop here)\n",
+                text, va);
+        fflush(stderr);
+    }
+    if (stop) abort();
+}
