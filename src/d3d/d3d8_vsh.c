@@ -1368,7 +1368,15 @@ const float *d3d8_vsh_constants(void)
  * stretched.
  *
  * This is the 3D half only. A title's pre-transformed 2D layer never
- * goes through this register and is not widened by it. */
+ * goes through this register and is not widened by it.
+ *
+ * Nor is anything the title works out on the CPU from its own projection:
+ * frustum culling, portals, what is on screen. Those stay at 4:3, and the
+ * wider view shows the world missing past the old edges. A title project
+ * that widens the camera where the game builds it takes the factor with
+ * xbox_D3D8ClaimHorPlus, and the register is then left as uploaded. */
+static BOOL g_hor_plus_claimed;
+
 static float hor_plus_factor(void)
 {
     static float factor = -1.0f;
@@ -1385,6 +1393,17 @@ static float hor_plus_factor(void)
             fprintf(stderr, "D3D8 VSH: Hor+ scaling c[%d] by %.4f (experimental)\n",
                     d3d8_vsh_hor_plus_reg(), (double)factor);
     }
+    return factor;
+}
+
+float xbox_D3D8ClaimHorPlus(void)
+{
+    float factor = hor_plus_factor();
+
+    if (!g_hor_plus_claimed && factor != 1.0f)
+        fprintf(stderr, "D3D8 VSH: Hor+ %.4f is applied by the title's camera; "
+                "c[%d] is no longer scaled\n", (double)factor, d3d8_vsh_hor_plus_reg());
+    g_hor_plus_claimed = TRUE;
     return factor;
 }
 
@@ -1423,7 +1442,7 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
     }
 
     hp = hor_plus_factor();
-    if (hp != 1.0f) {
+    if (hp != 1.0f && !g_hor_plus_claimed) {
         int reg = d3d8_vsh_hor_plus_reg();
 
         if (reg >= start_reg && reg < end_reg) {
