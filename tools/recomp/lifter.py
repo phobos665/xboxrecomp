@@ -1469,7 +1469,10 @@ class Lifter:
         that are not known function starts.
         """
         if addr in self.func_db:
-            name = self.func_db[addr].get("name", f"sub_{addr:08X}")
+            # call_name: a function recomp_manual.c wraps is emitted as
+            # sub_X_gen but called as sub_X, the wrapper.
+            info = self.func_db[addr]
+            name = info.get("call_name") or info.get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
         else:
