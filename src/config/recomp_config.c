@@ -170,8 +170,27 @@ static int readable(const char *path)
 
 /* ------------------------------------------------------------ settings */
 
+/* Where a title needs something other than the common default to play
+ * right. These are only defaults: they are what the first-run file is
+ * written with, and the file, the launcher and the variables still win.
+ *
+ * A frame cap here means the title steps its game logic once per presented
+ * frame and was built for that rate, so anything faster runs the game
+ * faster -- until its logic is untied from the frame, which is per title
+ * work. */
+static const struct {
+    uint32_t    title_id;
+    const char *frame_cap;
+} g_title_defaults[] = {
+    /* Tenchu: Return from Darkness. At 60 the menus and the game run
+     * visibly fast (29 Sep 2026). */
+    { 0x41560026u, "30" },
+};
+
 void recomp_settings_defaults(RecompSettings *s)
 {
+    size_t i;
+
     if (!s)
         return;
     memset(s, 0, sizeof *s);
@@ -182,6 +201,12 @@ void recomp_settings_defaults(RecompSettings *s)
     s->anisotropy        = 1;
     s->fps_overlay       = 0;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
+
+    for (i = 0; i < sizeof g_title_defaults / sizeof g_title_defaults[0]; i++)
+        if (g_title_id && g_title_defaults[i].title_id == g_title_id
+                && g_title_defaults[i].frame_cap)
+            snprintf(s->frame_cap, sizeof s->frame_cap, "%s",
+                     g_title_defaults[i].frame_cap);
 }
 
 static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -433,13 +458,28 @@ static const char *from_file(const char *key)
     return from_table(key);
 }
 
+/* The title's own default for a key (g_title_defaults), for a setting no
+ * file names: no settings file could be written, or it predates the key. */
+static const char *from_title_default(const char *key)
+{
+    size_t i;
+
+    if (!key || !g_title_id || strcmp(key, "frame_cap") != 0)
+        return NULL;
+    for (i = 0; i < sizeof g_title_defaults / sizeof g_title_defaults[0]; i++)
+        if (g_title_defaults[i].title_id == g_title_id)
+            return g_title_defaults[i].frame_cap;
+    return NULL;
+}
+
 const char *recomp_config_lookup(const char *env_name, const char *key)
 {
     const char *v = env_name ? getenv(env_name) : NULL;
 
     if (v && *v)
         return v;
-    return from_file(key);
+    v = from_file(key);
+    return v ? v : from_title_default(key);
 }
 
 const char *recomp_config_path(void)

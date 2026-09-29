@@ -3412,6 +3412,32 @@ static int recomp_skip_video(const char *xbox_path)
     return 0;
 }
 
+/* The movie file the title most recently opened, as an Xbox path.
+ *
+ * A title that feeds the video library packets it reads itself
+ * (XMVPlaybackCreateFromPackets) never tells the library which file they
+ * come from, so the replacement in hle_xmv.c asks here. Tenchu: Return from
+ * Darkness opens each intro movie, reads its first packet, and hands the
+ * library that packet and two read callbacks. */
+static char s_last_movie[512];
+
+const char *xbox_LastMovieOpened(void)
+{
+    return s_last_movie[0] ? s_last_movie : NULL;
+}
+
+static void note_movie_open(const XBOX_ANSI_STRING *name)
+{
+    size_t n = name->Length;
+
+    if (!name->Buffer || n < 5 || n >= sizeof s_last_movie)
+        return;
+    if (_strnicmp(name->Buffer + n - 4, ".xmv", 4) != 0)
+        return;
+    memcpy(s_last_movie, name->Buffer, n);
+    s_last_movie[n] = '\0';
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -3441,6 +3467,7 @@ static NTSTATUS bridge_create_file_impl(
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
+        note_movie_open(&name);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
     }

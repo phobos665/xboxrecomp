@@ -236,6 +236,7 @@ static int read_cert(const char *xbe)
     fclose(f);
 
     g_title_id = *(uint32_t *)(cert + 0x08);
+    recomp_config_set_title(g_title_id);    /* for the title's own defaults */
     {   /* wszTitleName: 40 UTF-16 units at +0x0C, padded not terminated */
         int j, k = 0;
         for (j = 0; j < 40 && k < (int)sizeof g_title_name - 1; j++) {

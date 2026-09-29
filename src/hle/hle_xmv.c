@@ -115,6 +115,7 @@
 #define XMV_OFF_FRAMES   0xE8u
 #define XMV_OFF_DONE     0xECu
 #define XMV_OFF_PLAY     0xF0u   /* hle_xmv_play handle, 0 when not playing */
+#define XMV_OFF_STOPPED  0xF4u   /* XMVPlaybackTerminate was called */
 
 #define XMV_MAGIC 0x584D5648u   /* 'XMVH' */
 
@@ -181,6 +182,7 @@ HLE_ORIGINAL(XMVPlaybackDestroy);
 HLE_ORIGINAL(XMVPlaybackReleaseAudioStream);
 HLE_ORIGINAL(XMVPlaybackStopAudioStreams);
 HLE_ORIGINAL(XMVPlaybackGetAudioStream);
+HLE_ORIGINAL(XMVPlaybackTerminate);
 
 #define XMV_OTHERS_TO_XDK(name)                                               \
     do {                                                                       \
@@ -194,54 +196,115 @@ HLE_ORIGINAL(XMVPlaybackGetAudioStream);
         }                                                                      \
     } while (0)
 
-/* HRESULT XMVPlaybackCreate(DWORD flags, void *source, XMVPlayback **out) */
-HLE_EXPORT(XMVPlaybackCreate)
+/* A playback object of ours, playing `play` (an xmv_play handle, 0 for none)
+ * whose pictures are w x h. 0 when the guest heap is out. */
+static uint32_t xmv_make_playback(int play, uint32_t w, uint32_t h)
 {
-    uint32_t out_va = HLE_ARG(2);
-    uint32_t obj;
+    uint32_t obj = xbox_HeapAlloc(XMV_OBJ_SIZE, 16);
 
-    if (!xmv_enabled() || !out_va) {
-        HLE_RETURN(0x80004005u);           /* E_FAIL: let the title decide */
-        return;
-    }
-
-    obj = xbox_HeapAlloc(XMV_OBJ_SIZE, 16);
     if (!obj) {
         fprintf(stderr, "[XMV] no guest memory for a playback object\n");
-        HLE_RETURN(0x8007000Eu);           /* E_OUTOFMEMORY */
-        return;
+        return 0;
     }
     memset(HLE_PTR(obj), 0, XMV_OBJ_SIZE);
 
     /* What the title will read back through GetStreamInfo: the console's
      * standard frame until the file says otherwise, and no audio streams. */
-    HLE_MEM32(obj + XMV_OFF_WIDTH)  = 640u;
-    HLE_MEM32(obj + XMV_OFF_HEIGHT) = 480u;
+    HLE_MEM32(obj + XMV_OFF_WIDTH)  = play ? w : 640u;
+    HLE_MEM32(obj + XMV_OFF_HEIGHT) = play ? h : 480u;
     HLE_MEM32(obj + XMV_OFF_AUDIO_COUNT) = 0u;
 
     HLE_MEM32(obj + XMV_OFF_MAGIC)    = XMV_MAGIC;
     HLE_MEM32(obj + XMV_OFF_START_MS) = 0;    /* not started yet */
     HLE_MEM32(obj + XMV_OFF_FRAMES)   = 0;
     HLE_MEM32(obj + XMV_OFF_DONE)     = 0;
+    HLE_MEM32(obj + XMV_OFF_PLAY)     = (uint32_t)play;
+    return obj;
+}
+
+/* HRESULT XMVPlaybackCreate(DWORD flags, void *source, XMVPlayback **out) */
+HLE_EXPORT(XMVPlaybackCreate)
+{
+    uint32_t out_va = HLE_ARG(2);
+    uint32_t obj, w = 0, h = 0;
+    int play;
+
+    if (!xmv_enabled() || !out_va) {
+        HLE_RETURN(0x80004005u);           /* E_FAIL: let the title decide */
+        return;
+    }
 
     /* Play the file when it can be (hle_xmv_play.c: FFmpeg present, the file
      * found); otherwise the movie is reported over, as before. */
-    {
-        uint32_t w = 0, h = 0;
-        int play = xmv_play_open(HLE_ARG(1), &w, &h);
-        HLE_MEM32(obj + XMV_OFF_PLAY) = (uint32_t)play;
-        if (play) {
-            HLE_MEM32(obj + XMV_OFF_WIDTH)  = w;
-            HLE_MEM32(obj + XMV_OFF_HEIGHT) = h;
-        }
+    play = xmv_play_open(HLE_ARG(1), &w, &h);
+    obj = xmv_make_playback(play, w, h);
+    if (!obj) {
+        xmv_play_close(play);
+        HLE_RETURN(0x8007000Eu);           /* E_OUTOFMEMORY */
+        return;
     }
-
     HLE_MEM32(out_va) = obj;
 
     fprintf(stderr, "[XMV] playback created at 0x%08X, %s; the title's decoder "
                     "will not run (RECOMP_HLE_XMV=0 gives it back)\n", obj,
-            HLE_MEM32(obj + XMV_OFF_PLAY) ? "playing the file on the host"
-                                          : "reported over at once");
+            play ? "playing the file on the host" : "reported over at once");
+    fflush(stderr);
+    HLE_RETURN(0);
+}
+
+/* HRESULT XMVPlaybackCreateFromPackets(DWORD flags, void *first_packet,
+ *                                      DWORD context, GETNEXTPACKET next,
+ *                                      RELEASEPACKET release,
+ *                                      XMVPlayback **out)
+ *
+ * The other way to make a playback: the title reads the file itself and the
+ * library pulls each further packet through `next` (and hands it back through
+ * `release`), passing `context` to both. It sits at XMVPlaybackCreate + 0x22D
+ * in every build seen, and Create itself calls it.
+ *
+ * Tenchu: Return from Darkness plays its intros this way (0x0005F620 reads
+ * the first 4 KB, then calls it with flags 4 and its callbacks at 0x0005F950
+ * and 0x0005FA20). Left to the XDK's decoder there, Update answered status 3
+ * on every poll and never produced a picture, so the intros were black.
+ *
+ * Nothing here names the file, but the title opened it a moment ago: the
+ * kernel remembers the last .xmv opened, and the first packet -- the file's
+ * opening bytes -- must match it before it is played. A playback made here
+ * never calls the title's callbacks; its own reads just go unused. When the
+ * file cannot be named or does not match, the XDK's body runs as before. */
+HLE_ORIGINAL(XMVPlaybackCreateFromPackets);
+
+extern const char *xbox_LastMovieOpened(void);
+
+HLE_EXPORT(XMVPlaybackCreateFromPackets)
+{
+    uint32_t packet = HLE_ARG(1), out_va = HLE_ARG(5);
+    const char *path = xbox_LastMovieOpened();
+    uint32_t obj, w = 0, h = 0;
+    int play = 0;
+
+    if (xmv_enabled() && out_va && packet && path)
+        play = xmv_play_open_file(path, packet, 64u, &w, &h);
+    if (!play) {
+        fprintf(stderr, "[XMV] packet-fed playback%s%s: left to the title's decoder\n",
+                path ? " of " : "", path ? path : " (no movie file opened)");
+        fflush(stderr);
+        if (hle_original_XMVPlaybackCreateFromPackets) {
+            HLE_CALL_ORIGINAL(XMVPlaybackCreateFromPackets);
+            return;
+        }
+        HLE_RETURN(0x80004005u);
+        return;
+    }
+    obj = xmv_make_playback(play, w, h);
+    if (!obj) {
+        xmv_play_close(play);
+        HLE_RETURN(0x8007000Eu);
+        return;
+    }
+    HLE_MEM32(out_va) = obj;
+    fprintf(stderr, "[XMV] packet-fed playback created at 0x%08X for %s, playing the "
+                    "file on the host; the title's decoder will not run\n", obj, path);
     fflush(stderr);
     HLE_RETURN(0);
 }
@@ -378,6 +441,15 @@ HLE_EXPORT(XMVPlaybackUpdate)
 
     XMV_OTHERS_TO_XDK(XMVPlaybackUpdate);
 
+    if (HLE_MEM32(obj + XMV_OFF_STOPPED)) {
+        /* Terminated: the XDK's Update reports end of file from here on. */
+        if (status_va)
+            HLE_MEM32(status_va) = XMV_STATUS_ENDOFFILE;
+        HLE_MEM32(obj + XMV_OFF_DONE) = 1u;
+        HLE_RETURN(0);
+        return;
+    }
+
     started = HLE_MEM32(obj + XMV_OFF_START_MS);
     frames  = HLE_MEM32(obj + XMV_OFF_FRAMES) + 1u;
     HLE_MEM32(obj + XMV_OFF_FRAMES) = frames;
@@ -460,6 +532,33 @@ HLE_EXPORT(XMVPlaybackGetAudioStream)
 HLE_EXPORT(XMVPlaybackStopAudioStreams)
 {
     XMV_OTHERS_TO_XDK(XMVPlaybackStopAudioStreams);
+    HLE_RETURN(0);
+}
+
+/* void XMVPlaybackTerminate(XMVPlayback *p)
+ *
+ * Stops a playback early; every Update after it reports end of file. The
+ * XDK's body stops and releases the playback's DirectSound streams, hands
+ * back every packet it holds through the title's release callback, and sets
+ * the object's +0x74, which is what its Update then reports as status 2.
+ * Tenchu: Return from Darkness calls it (Create + 0x814) when Start is
+ * pressed during a movie, from 0x0005FCBD, before its next Update. Ignored,
+ * the opening -- all 6 minutes 46 of it -- could not be skipped.
+ *
+ * Here the host movie is closed at once, so its sound stops with the
+ * picture, and the object remembers it was stopped for Update. */
+HLE_EXPORT(XMVPlaybackTerminate)
+{
+    uint32_t obj = HLE_ARG(0);
+
+    XMV_OTHERS_TO_XDK(XMVPlaybackTerminate);
+    if (!HLE_MEM32(obj + XMV_OFF_STOPPED)) {
+        HLE_MEM32(obj + XMV_OFF_STOPPED) = 1u;
+        xmv_play_close((int)HLE_MEM32(obj + XMV_OFF_PLAY));
+        HLE_MEM32(obj + XMV_OFF_PLAY) = 0;
+        fprintf(stderr, "[XMV] playback 0x%08X terminated by the title\n", obj);
+        fflush(stderr);
+    }
     HLE_RETURN(0);
 }
 

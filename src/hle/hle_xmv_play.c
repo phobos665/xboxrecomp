@@ -200,10 +200,6 @@ static uint32_t movie_clock(movie *m)
 int xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height)
 {
     char path[300];
-    WCHAR host[MAX_PATH * 2];
-    FILE *f;
-    movie *m = NULL;
-    int i;
 
     if (!xbox_EnvSwitch("RECOMP_XMV_PLAY", 1))
         return 0;
@@ -212,6 +208,19 @@ int xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height)
                 source_va);
         return 0;
     }
+    return xmv_play_open_file(path, 0, 0, width, height);
+}
+
+int xmv_play_open_file(const char *path, uint32_t check_va, uint32_t check_len,
+                       uint32_t *width, uint32_t *height)
+{
+    WCHAR host[MAX_PATH * 2];
+    FILE *f;
+    movie *m = NULL;
+    int i;
+
+    if (!path || !xbox_EnvSwitch("RECOMP_XMV_PLAY", 1))
+        return 0;
     for (i = 0; i < MAX_MOVIES; i++)
         if (!g_movies[i].used) {
             m = &g_movies[i];
@@ -222,6 +231,20 @@ int xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height)
     if (!xbox_translate_path(path, host, MAX_PATH * 2) || !(f = _wfopen(host, L"rb"))) {
         fprintf(stderr, "[XMV] %s: not found on the host; the movie is skipped\n", path);
         return 0;
+    }
+    if (check_va && check_len) {
+        /* The title read these bytes from the file it is about to feed the
+         * library; if they are not this file's, the guess of which file that
+         * is was wrong, and playing it would show the wrong movie. */
+        uint8_t head[256];
+        size_t n = check_len < sizeof head ? check_len : sizeof head;
+        if (fread(head, 1, n, f) != n || memcmp(head, HLE_PTR(check_va), n) != 0) {
+            fprintf(stderr, "[XMV] %s: its first %u bytes are not the packet the title "
+                            "handed over; not played\n", path, (unsigned)n);
+            fclose(f);
+            return 0;
+        }
+        rewind(f);
     }
     memset(m, 0, sizeof *m);
     if (xmv_open_file(&m->dm, f) != 0) {
@@ -460,6 +483,12 @@ void xmv_play_close(int handle)
 int xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height)
 {
     (void)source_va; (void)width; (void)height;
+    return 0;
+}
+int xmv_play_open_file(const char *xbox_path, uint32_t check_va, uint32_t check_len,
+                       uint32_t *width, uint32_t *height)
+{
+    (void)xbox_path; (void)check_va; (void)check_len; (void)width; (void)height;
     return 0;
 }
 void xmv_play_start(int handle) { (void)handle; }

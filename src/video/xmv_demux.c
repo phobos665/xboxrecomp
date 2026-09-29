@@ -186,8 +186,21 @@ int xmv_next_video(xmv_demux *d, const uint8_t **data, uint32_t *size,
     }
     fh = rd32(d->packet + d->video_off);
     fsize = (fh & 0x1FFFFu) * 4u + 4u;
-    if (fsize + 4u > d->video_left)
-        return -1;
+    if (fsize + 4u > d->video_left) {
+        /* A packet's last picture can run a few bytes past the video area
+         * into the audio after it. Tenchu: Return from Darkness's opening
+         * (op_ntsc.xmv, 104 MB) does so by four bytes in its first packet,
+         * the one carrying the codec data, and nowhere else; of 1,400 packets
+         * in 13 files, every other one ends with zero or more bytes spare.
+         * The audio is already copied out of the packet, so the picture may
+         * have them. Anything past the packet itself is still refused: until
+         * 29 Sep 2026 this refused both, and that movie ended after its first
+         * ten pictures. */
+        if (d->frames_left != 1u ||
+            (uint64_t)d->video_off + 4u + fsize > d->packet_size)
+            return -1;
+        d->video_left = fsize + 4u;
+    }
     p = d->packet + d->video_off + 4u;
     /* The bitstream is stored as little-endian words: swap each in place so a
      * standard WMV2 decoder reads it. */

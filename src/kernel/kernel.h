@@ -563,6 +563,9 @@ typedef char  xbox_host_char;
 /* Host path produced by the most recent xbox_translate_path call. */
 const wchar_t *xbox_LastHostPath(void);
 
+/* The Xbox path of the last .xmv file the title opened, or NULL. */
+const char *xbox_LastMovieOpened(void);
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* ============================================================================

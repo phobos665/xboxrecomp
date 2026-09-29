@@ -201,9 +201,20 @@ class Disassembler:
         an unresolved indirect branch at run time.
 
         Decoding restarts at each such address and discards whatever instruction
-        straddled it. The garbage decoded from the table itself is left alone:
-        it is unreachable, because the block before it ends at the indirect
-        jump.
+        straddled it -- and every out-of-phase instruction that starts *inside*
+        one of the instructions the restart decodes. The straddler is only the
+        first of the misaligned run; the ones after it begin within the real
+        instructions and would be lifted in address order between them.
+        Tenchu's memcpy lost exactly that way: past its 4-entry tail table the
+        linear decode had `inc ebp` at 0x0030C88D and `or [esi+0x5F], bl` at
+        0x0030C88E, inside the real `mov eax, [ebp+8]` / `pop esi` / `pop edi`
+        at 0x0030C88C, so the 0-byte tail arm returned with ebp one higher and
+        the `leave` put esp one byte off. Every later push in the caller was
+        misaligned, and a std::string append overwrote the low byte of its own
+        `this`.
+
+        The garbage decoded from the table itself is left alone: it is
+        unreachable, because the block before it ends at the indirect jump.
         """
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
@@ -223,6 +234,9 @@ class Disassembler:
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
+                for inside in range(cs_insn.address + 1,
+                                    cs_insn.address + cs_insn.size):
+                    decoded.pop(inside, None)
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]

@@ -113,6 +113,19 @@ That mechanism has consequences worth knowing before you trust the output.
   different alias of the same physical page does not trap. Watch the address
   the writer actually uses, not the one you read it through.
 
+- **A store that starts outside the watch still counts.** A write is matched
+  by the address it faulted on, so a dword at `watch-3` or a 16-byte copy
+  ending inside the watch used to be stepped over as collateral. The watched
+  bytes are now compared across every collateral step, and a change is
+  reported as `write into 0x... by a store starting at 0x...`. That is how
+  Tenchu's corruption was found: a push through an `esp` one byte off, at
+  0x0246F7A1, landing on the low byte of a word at 0x0246F7A4.
+
+- **Two threads writing one page** used to crash the second: when one thread
+  finished its step and protected the page again before the other's
+  instruction ran, the handler declined the fault. It now opens the page again
+  and lets the step go ahead.
+
 - **The symbol can lie.** The name comes from the host RIP through dbghelp,
   and the linker folds identical functions, so a small lifted function can be
   reported under a neighbour's name. The `callers:` line is guest return
@@ -165,8 +178,14 @@ reach a point 25 seconds into its start-up within 90 seconds of watching one
 stack slot. No reports came out, because the collateral traps are stepped over
 silently by design; it simply never got there.
 
-So a watch is for guest data: heap, globals, image data, device pages. For a
-local, the practical route is the one that worked here -- have the runtime
+**Armed late, it can.** Tenchu's `std::string` append returned a `this` with
+its low byte cleared, and `RECOMP_WATCH_ARM_ON=Common` (the directory the
+title opens just before) with `RECOMP_WATCH_WRITE` on the append's `[ebp-8]`
+named the store in one run. The page only has to be busy for the few
+milliseconds between the arming open and the fault.
+
+So a watch is mostly for guest data: heap, globals, image data, device pages.
+For a local, the practical route is the one that worked here -- have the runtime
 print the frame pointer at the moment of interest, work the offset out from
 the lifted code, and read the value from a dump rather than trapping on it.
 The `[THROW]` report prints `esp`, `ebp` and `seh_ebp` for exactly that.

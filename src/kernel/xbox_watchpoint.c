@@ -89,6 +89,17 @@ static RECOMP_TLS void    *g_step_page;
 static RECOMP_TLS uint32_t g_step_va;
 static RECOMP_TLS uint32_t g_step_before;
 static RECOMP_TLS int      g_step_pending;
+/* Where the stepping instruction faulted, which is not necessarily on the
+ * first watch's page, and the host instruction that did it. */
+static RECOMP_TLS uint32_t  g_step_fault_va;
+static RECOMP_TLS uintptr_t g_step_rip;
+static RECOMP_TLS int       g_step_refaults;
+/* A collateral write is stepped over without a report -- but a store that
+ * *starts* before a watch and runs into it (a dword at watch-3, a 16-byte
+ * copy) is collateral by its start address and still changes the watched
+ * bytes. Snapshot them, and report after the step if they moved. */
+#define SNAP_BYTES 16
+static RECOMP_TLS uint8_t   g_step_snap[MAX_WATCH][SNAP_BYTES];
 
 static uint8_t *guest_base(void)
 {
@@ -369,10 +380,23 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     /* Already stepping on this thread means the step itself faulted on
      * something else. Do not recurse: put the page back and decline. */
     if (g_step_pending) {
-        protect_one(g_step_va, 4, arm_protection());
+        /* Another thread finished its own step and protected the page again
+         * before this thread's instruction ran. That is not the title's
+         * fault: open the page again and let the step go ahead. Declining
+         * here crashed the second writer, which is how a watch on a page two
+         * guest threads write took Tenchu down. */
+        if (++g_step_refaults < 1000) {
+            protect_one(va, 1, PAGE_READWRITE);
+            return 1;
+        }
+        protect_one(g_step_fault_va, 1, arm_protection());
         g_step_pending = 0;
+        g_step_refaults = 0;
         return 0;
     }
+    g_step_refaults = 0;
+    g_step_fault_va = va;
+    g_step_rip = (uintptr_t)ep->ContextRecord->Rip;
 
     idx = watch_covering(va);
     if (idx >= 0 && (is_write || g_watch_reads)) {
@@ -410,14 +434,19 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     } else {
         /* Collateral: some other address on the same page. Step over it
          * silently. */
+        int i;
         g_step_va = g_watch[0].va;
         g_step_before = 0;
         idx = -1;
+        for (i = 0; i < g_n_watch; i++) {
+            uint32_t n = g_watch[i].len < SNAP_BYTES ? g_watch[i].len : SNAP_BYTES;
+            memcpy(g_step_snap[i], guest_base() + g_watch[i].va, n);
+        }
     }
 
     /* Let the access happen, then trap immediately after it so the page can
      * be protected again -- and so the value it wrote can be read. */
-    protect_one(g_step_va, 4, PAGE_READWRITE);
+    protect_one(va, 1, PAGE_READWRITE);
     ep->ContextRecord->EFlags |= TRAP_FLAG;
     g_step_pending = idx >= 0 ? 1 : 2;   /* 2 = silent */
     fflush(stderr);
@@ -441,10 +470,32 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep)
                 g_step_before, now,
                 now == g_step_before ? "  (unchanged)" : "");
         fflush(stderr);
+    } else {
+        int i;
+        for (i = 0; i < g_n_watch; i++) {
+            uint32_t n = g_watch[i].len < SNAP_BYTES ? g_watch[i].len : SNAP_BYTES;
+            if (memcmp(g_step_snap[i], guest_base() + g_watch[i].va, n) == 0)
+                continue;
+            if (g_watch_budget-- <= 0)
+                break;
+            fprintf(stderr, "[WATCH] write into 0x%08X (thread %lu) by a store "
+                            "starting at 0x%08X, from ",
+                    g_watch[i].va, (unsigned long)GetCurrentThreadId(),
+                    g_step_fault_va);
+            print_symbol(g_step_rip);
+            fprintf(stderr, "\n[WATCH]   guest esp=0x%08X eax=0x%08X ecx=0x%08X "
+                            "edx=0x%08X esi=0x%08X edi=0x%08X\n",
+                    g_esp, g_eax, g_ecx, g_edx, g_esi, g_edi);
+            print_callers();
+            print_stack();
+            fprintf(stderr, "[WATCH]   0x%08X -> 0x%08X\n",
+                    *(uint32_t *)g_step_snap[i], guest_read32(g_watch[i].va));
+            fflush(stderr);
+        }
     }
 
     if (!g_disarmed)
-        protect_one(g_step_va, 4, arm_protection());
+        protect_one(g_step_fault_va, 1, arm_protection());
     (void)g_step_page;
     return 1;
 }

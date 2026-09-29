@@ -17,6 +17,13 @@
 /* Opens the movie `source_va` names (a guest string, the path the title gave
  * XMVPlaybackCreate). Returns a handle > 0 with the picture size, or 0. */
 int  xmv_play_open(uint32_t source_va, uint32_t *width, uint32_t *height);
+
+/* The same for a movie the title feeds the library itself, packet by packet
+ * (XMVPlaybackCreateFromPackets): `xbox_path` is the file the title opened,
+ * and the first `check_len` bytes at `check_va` -- the first packet the
+ * title read from it -- must match the file's, or this declines. */
+int  xmv_play_open_file(const char *xbox_path, uint32_t check_va, uint32_t check_len,
+                        uint32_t *width, uint32_t *height);
 void xmv_play_start(int handle);
 
 /* One poll: 0 no new picture, 1 a new picture (on the movie layer, and in
