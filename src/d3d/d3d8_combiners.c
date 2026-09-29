@@ -998,10 +998,14 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
         }
     }
 
-    hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
-                    NULL, NULL, "main", "ps_5_0",
-                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                    &code, &errors);
+    {
+        long long started = d3d8_compile_clock();
+        hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
+                        NULL, NULL, "main", "ps_5_0",
+                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                        &code, &errors);
+        d3d8_compile_note(0, started);
+    }
     if (FAILED(hr)) {
         fprintf(stderr, "NV2A combiners: HLSL compile failed: %s\n",
                 errors ? (char *)ID3D10Blob_GetBufferPointer(errors)
@@ -1095,6 +1099,44 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 /* ================================================================
  * Initialization / Shutdown
  * ================================================================ */
+
+/* Runtime compile timing (d3d8_internal.h). */
+static volatile LONG     g_compiles[3];
+static volatile LONG64   g_compile_ticks[3];
+static LONG64            g_compile_qpf, g_compile_last_report;
+
+long long d3d8_compile_clock(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+void d3d8_compile_note(int kind, long long started)
+{
+    LARGE_INTEGER now;
+
+    if (kind < 0 || kind > 2)
+        return;
+    QueryPerformanceCounter(&now);
+    if (!g_compile_qpf) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_compile_qpf = f.QuadPart;
+        g_compile_last_report = now.QuadPart;
+    }
+    InterlockedIncrement(&g_compiles[kind]);
+    InterlockedAdd64(&g_compile_ticks[kind], now.QuadPart - started);
+    if (now.QuadPart - g_compile_last_report >= 5 * g_compile_qpf) {
+        g_compile_last_report = now.QuadPart;
+        fprintf(stderr, "[D3D8] runtime shader compiles so far: combiner %ld (%.0f ms), "
+                "fixed-function %ld (%.0f ms), vertex program %ld (%.0f ms)\n",
+                g_compiles[0], g_compile_ticks[0] * 1000.0 / g_compile_qpf,
+                g_compiles[1], g_compile_ticks[1] * 1000.0 / g_compile_qpf,
+                g_compiles[2], g_compile_ticks[2] * 1000.0 / g_compile_qpf);
+        fflush(stderr);
+    }
+}
 
 HRESULT d3d8_combiners_init(void)
 {

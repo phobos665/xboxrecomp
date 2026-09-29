@@ -1471,6 +1471,11 @@ HLE_EXPORT(D3DDevice_Clear)
 static LARGE_INTEGER g_swap_last;
 static long long g_swap_gate_ticks, g_swap_body_ticks, g_swap_frame_ticks;
 static unsigned long g_swap_timed;
+/* Inside frame_end_shadow: running a deferred frame's queue (the frame's
+ * drawing, under RECOMP_HLE_D3D8_DEFER) and the host present. The longest
+ * of each too, since a stall is one frame, not an average. */
+static long long g_swap_flush_ticks, g_swap_present_ticks;
+static long long g_swap_flush_max, g_swap_present_max;
 
 static void swap_timing_report(void)
 {
@@ -1485,7 +1490,15 @@ static void swap_timing_report(void)
             "title's Swap %.2f ms, rest of frame %.2f ms (per frame)\n",
             g_swap_timed, (double)g_swap_gate_ticks * ms,
             (double)g_swap_body_ticks * ms, (double)g_swap_frame_ticks * ms);
+    fprintf(stderr, "[HLE-D3D8]   of which: deferred draw %.2f ms (worst %.1f), host "
+            "present %.2f ms (worst %.1f)\n",
+            (double)g_swap_flush_ticks * ms,
+            (double)g_swap_flush_max * ms * (double)g_swap_timed,
+            (double)g_swap_present_ticks * ms,
+            (double)g_swap_present_max * ms * (double)g_swap_timed);
     g_swap_gate_ticks = g_swap_body_ticks = g_swap_frame_ticks = 0;
+    g_swap_flush_ticks = g_swap_present_ticks = 0;
+    g_swap_flush_max = g_swap_present_max = 0;
     g_swap_timed = 0;
 }
 
@@ -1594,7 +1607,15 @@ static void frame_end_shadow(void)
         /* Deferred frames (RECOMP_HLE_D3D8_DEFER): the frame's device calls
          * run now, before anything reads the result -- the capture boundary,
          * the dump, the present. */
-        hle_d3d8_defer_flush();
+        {
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            hle_d3d8_defer_flush();
+            QueryPerformanceCounter(&b);
+            g_swap_flush_ticks += b.QuadPart - a.QuadPart;
+            if (b.QuadPart - a.QuadPart > g_swap_flush_max)
+                g_swap_flush_max = b.QuadPart - a.QuadPart;
+        }
 
         /* Textures this frame drew with, checked again now that the frame
          * is finished (hle_d3d8_texture.c). */
@@ -1637,7 +1658,15 @@ static void frame_end_shadow(void)
         g_inline_vdata_frame = 0;
         g_frame_draws = 0;
         overlay_frame();                 /* after the dump: not in the captures */
-        host_Swap(g_shadow, 0);
+        {
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            host_Swap(g_shadow, 0);
+            QueryPerformanceCounter(&b);
+            g_swap_present_ticks += b.QuadPart - a.QuadPart;
+            if (b.QuadPart - a.QuadPart > g_swap_present_max)
+                g_swap_present_max = b.QuadPart - a.QuadPart;
+        }
         if (!g_shadow_last_report) {
             g_shadow_last_report = now;
         } else if (now - g_shadow_last_report >= 5000) {

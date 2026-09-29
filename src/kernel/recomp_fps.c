@@ -32,6 +32,7 @@
 static volatile LONG64 s_swaps;
 static volatile LONG64 s_vblanks;
 static volatile LONG   s_started;
+static volatile LONG   s_span[5];        /* frames spanning 0, 1, 2, 3, 4+ vblanks */
 
 static DWORD WINAPI fps_reporter(LPVOID param)
 {
@@ -81,6 +82,10 @@ static DWORD WINAPI fps_reporter(LPVOID param)
                 (double)(vblanks - prev_vblanks) / window,
                 (double)swaps / elapsed,
                 (double)(vblanks - base_vblanks) / elapsed, elapsed);
+        fprintf(stderr, "[FPS]   vblanks per frame: 0:%ld 1:%ld 2:%ld 3:%ld 4+:%ld\n",
+                InterlockedExchange(&s_span[0], 0), InterlockedExchange(&s_span[1], 0),
+                InterlockedExchange(&s_span[2], 0), InterlockedExchange(&s_span[3], 0),
+                InterlockedExchange(&s_span[4], 0));
         fflush(stderr);
         prev = now;
         prev_swaps = swaps;
@@ -115,11 +120,23 @@ static void fps_start_once(void)
 
 /* The title presented a frame. The reporter starts at the first one, so the
  * first window is not padded with the boot. */
+/* How many vblanks each presented frame spanned: 1 everywhere is 60 fps,
+ * and a frame rate between 30 and 60 is a mix of 1s and 2s. Which frames
+ * took two says whether the title was late or chose to wait. Printed with
+ * the [FPS] line; reset each window. s_span is declared at the top. */
 void xbox_FpsCountSwap(void)
 {
+    static LONG64 last = -1;
+    LONG64 v = InterlockedCompareExchange64(&s_vblanks, 0, 0);
+
     if (!s_started)
         fps_start_once();
     InterlockedIncrement64(&s_swaps);
+    if (last >= 0) {
+        LONG64 d = v - last;
+        InterlockedIncrement(&s_span[d < 0 ? 0 : d > 4 ? 4 : (int)d]);
+    }
+    last = v;
 }
 
 /* The kernel delivered a vblank to the title's ISR. */
