@@ -1163,7 +1163,9 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
     if len(first.operands) < 2:
         return None
 
-    result = _make_condition(second.mnemonic, first.mnemonic, first.operands)
+    # Same normalised form the snapshot and the recorded state use.
+    result = _make_condition(second.mnemonic,
+                             *normalise_zero_test(first.mnemonic, first.operands))
     if not result:
         return None
 
@@ -1402,6 +1404,31 @@ def detect_setjmp_helpers(func_db, xbe_data, verbose=False):
               f"longjmp {fmt(found.get('longjmp'))}", file=sys.stderr)
 
     return found.get("setjmp"), found.get("longjmp")
+
+
+def normalise_zero_test(mnemonic, ops):
+    """`test X, X` is `cmp X, 0`, and saying so keeps a branch alive.
+
+    The two leave every flag identical: both compute X, so ZF, SF and PF come
+    out the same, and both clear CF and OF. What differs is only how the
+    snapshot reconstructs them -- a cmp answers `je` with `_fa == _fb`, a test
+    with `(_fa & _fb) == 0` -- and that difference is enough to stop two
+    predecessors merging at a join. `_merge_flag_states` requires one
+    operation across all of them, so a block reached by `cmp [x], 0` on one
+    edge and `test eax, eax` on the other inherits no state at all, and its
+    jcc compiles as the `_flags` fallback, which nothing ever assigns: the
+    branch is never taken.
+
+    Normalising here is what makes that merge legal rather than forcing one
+    through. After it the two predecessors really are the same operation on
+    the same width, which is what the merge was asking for.
+    """
+    if (mnemonic == "test" and len(ops) == 2
+            and ops[0].type == "reg" and ops[1].type == "reg"
+            and ops[0].reg and ops[0].reg == ops[1].reg):
+        return "cmp", [ops[0], Operand(type="imm", imm=0,
+                                       mem_size=ops[0].mem_size)]
+    return mnemonic, ops
 
 
 class Lifter:
@@ -2384,10 +2411,14 @@ class Lifter:
         # _fa and _fb are already masked to the operand width, so their
         # unsigned comparison is CF at that width.
         if self.needs_cf:
-            if kind == "cmp":
+            zero_rhs = (ops[1].type == "imm" and not ops[1].imm)
+            if kind == "cmp" and not zero_rhs:
                 out.append("_cf = (int)(_fa < _fb);")
             else:
-                out.append("_cf = 0; /* test/cmp-logical clears CF */")
+                # An unsigned value is never below zero, so a compare against
+                # it cannot borrow -- which is also why `test X, X` normalises
+                # onto this form without disturbing CF.
+                out.append("_cf = 0; /* nothing borrows from zero */")
         return out
 
     def _lift_cmp(self, insn, ops):
@@ -2398,7 +2429,8 @@ class Lifter:
     def _lift_test(self, insn, ops):
         if len(ops) < 2:
             return ["/* test: bad operands */"]
-        return self._snapshot_flags(insn, ops, "test")
+        kind, ops = normalise_zero_test("test", ops)
+        return self._snapshot_flags(insn, ops, kind)
 
     # ── Control flow ──
 
@@ -3980,12 +4012,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # for any later jcc, and that one reads the snapshot. Emit the
             # snapshot here too or those temps are stale - which silently sends
             # every reusing branch the wrong way.
+            # Snapshot and record the same normalised form, or a later jcc
+            # reads `cmp X, 0` state out of `test X, X` temps.
+            last_flag_setter, last_flag_ops = normalise_zero_test(
+                flag_insn.mnemonic, list(flag_insn.operands))
             if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
                 stmts.extend(lifter._snapshot_flags(
-                    flag_insn, flag_insn.operands, flag_insn.mnemonic))
+                    flag_insn, last_flag_ops, last_flag_setter))
             stmts.append(stmt)
-            last_flag_setter = flag_insn.mnemonic
-            last_flag_ops = list(flag_insn.operands)
             i += consumed
             continue
 
@@ -4100,16 +4134,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
         flag_mnem = (curr.mnemonic[5:] if curr.mnemonic.startswith("lock ")
                      else curr.mnemonic)
         if flag_mnem in FLAG_SETTERS:
-            last_flag_setter = flag_mnem
-            last_flag_ops = list(curr.operands)
+            last_flag_setter, last_flag_ops = normalise_zero_test(
+                flag_mnem, list(curr.operands))
         elif flag_mnem in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
         elif flag_mnem in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
-            last_flag_setter = flag_mnem
-            last_flag_ops = list(curr.operands)
+            last_flag_setter, last_flag_ops = normalise_zero_test(
+                flag_mnem, list(curr.operands))
         elif curr.mnemonic in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
         elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
