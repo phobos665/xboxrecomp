@@ -108,6 +108,7 @@ RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
 RECOMP_TLS RecompMmx g_mm0,g_mm1,g_mm2,g_mm3,g_mm4,g_mm5,g_mm6,g_mm7;
 volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
+RECOMP_TLS uint32_t g_icall_saved_esp, g_icall_dispatch_form;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
 
