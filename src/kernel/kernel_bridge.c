@@ -1550,12 +1550,71 @@ static ULONGLONG bridge_guest_deadline(uint32_t timeout_va, int *poll_only)
     return deadline;
 }
 
+/* A set counter per guest event: what a notification event's waiters wake on.
+ *
+ * On the kernel, setting a notification event readies every thread already
+ * waiting on it, there and then; clearing it afterwards un-readies nobody.
+ * Waiting by polling SignalState alone loses that. Marvel vs Capcom 2 has two
+ * threads in D3DDevice_BlockUntilVerticalBlank, which clears the device's
+ * vblank event and waits on it. Whenever one of them woke first and went
+ * round again, its clear wiped the set before the other looked, and the other
+ * slept to the next vblank or the one after: 20-35% of frames took two or
+ * more vblanks, with the CPU idle and the event set exactly once a vblank.
+ *
+ * So each set (and pulse) bumps the event's generation, and a notification
+ * waiter returns when the generation moves, whatever SignalState says by
+ * then. Waiters sleep on the counter with WaitOnAddress, so a set wakes them
+ * at once rather than at the next Sleep(1). A small open-addressed table,
+ * keyed by the event's guest address; a full table degrades to the old
+ * polling for events it cannot hold. */
+#if defined(_MSC_VER)
+#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
+#endif
+
+#define EVENT_GEN_SLOTS 1024u
+static volatile LONG g_event_gen_va[EVENT_GEN_SLOTS];
+static volatile LONG g_event_gen[EVENT_GEN_SLOTS];
+
+static volatile LONG *event_generation(uint32_t va)
+{
+    uint32_t i, slot = (va >> 2) * 2654435761u % EVENT_GEN_SLOTS;
+
+    if (!va)
+        return NULL;
+    for (i = 0; i < EVENT_GEN_SLOTS; i++, slot = (slot + 1) % EVENT_GEN_SLOTS) {
+        LONG have = g_event_gen_va[slot];
+        if (have == (LONG)va)
+            return &g_event_gen[slot];
+        if (have == 0 &&
+            (InterlockedCompareExchange(&g_event_gen_va[slot], (LONG)va, 0) == 0 ||
+             g_event_gen_va[slot] == (LONG)va))
+            return &g_event_gen[slot];
+    }
+    return NULL;
+}
+
+/* A set or a pulse: wake whoever is waiting on this event now. */
+static void event_wake_waiters(uint32_t va)
+{
+    volatile LONG *gen = event_generation(va);
+    if (gen) {
+        InterlockedIncrement(gen);
+#ifdef _WIN32
+        WakeByAddressAll((PVOID)gen);
+#endif
+    }
+}
+
 static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
-                                        uint32_t timeout_va)
+                                        uint32_t timeout_va, uint32_t event_va)
 {
     int poll_only;
     ULONGLONG deadline = bridge_guest_deadline(timeout_va, &poll_only);
     unsigned spins = 0;
+    /* Notification events only: a synchronisation event wakes one waiter,
+     * which consuming SignalState already models. */
+    volatile LONG *gen = sync ? NULL : event_generation(event_va);
+    LONG gen0 = gen ? *gen : 0;
 
     for (;;) {
         LONG cur = *state;
@@ -1564,12 +1623,24 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
                 return 0;                       /* STATUS_SUCCESS */
             continue;                           /* another waiter took it */
         }
+        if (gen && *gen != gen0)
+            return 0;                           /* set while we waited */
         if (poll_only || (deadline && GetTickCount64() >= deadline))
             return 0x00000102u;                 /* STATUS_TIMEOUT */
-        if (++spins < 64)
-            SwitchToThread();
-        else
+        if (gen) {
+#ifdef _WIN32
+            /* Sleep on the counter; a set wakes this at once. The 1 ms cap
+             * keeps timeouts and a missed wake from costing more than that. */
+            LONG seen = gen0;
+            WaitOnAddress((volatile VOID *)gen, &seen, sizeof seen, 1);
+#else
             Sleep(1);
+#endif
+        } else if (++spins < 64) {
+            SwitchToThread();
+        } else {
+            Sleep(1);
+        }
     }
 }
 
@@ -1649,6 +1720,8 @@ static void bridge_KeSetEvent(void)
     if (state) {
         /* KeSetEvent returns the event's previous state. */
         g_eax = (uint32_t)InterlockedExchange(state, 1);
+        event_wake_waiters(guest_va);            /* see event_generation */
+        xbox_FpsNoteSet(guest_va, g_eax != 0);   /* RECOMP_WAIT_PROFILE */
         return;
     }
 
@@ -1704,7 +1777,7 @@ static void bridge_KeWaitForSingleObject(void)
                     "at 0x%08X, waited on its SignalState\n",
                     sync ? "synchronisation" : "notification", object);
         }
-        g_eax = bridge_wait_guest_event(state, sync, timeout_ptr);
+        g_eax = bridge_wait_guest_event(state, sync, timeout_ptr, object);
         if (wait_log_wanted()) {
             /* Success or timeout, and with what timeout asked for: the two
              * say different things about why a loop goes round again. */
@@ -7679,6 +7752,17 @@ static void bridge_KePulseEvent(void)
     (void)increment;
     (void)wait;
 
+    /* A guest event: wake its current waiters and leave it clear, which is
+     * what a pulse is. The generation is what they wake on. */
+    {
+        volatile LONG *state = bridge_guest_event(guest_va, NULL);
+        if (state) {
+            g_eax = (uint32_t)InterlockedExchange(state, 0);
+            event_wake_waiters(guest_va);
+            return;
+        }
+    }
+
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -10182,7 +10266,17 @@ static void kernel_thunk_dispatch(void)
          * right about that list. */
         int _guest_held = xbox_GuestLockDrop();
         xbox_GuestLiftedLeave();
-        bridge();
+        if (xbox_FpsWaitProfileOn()) {
+            /* RECOMP_WAIT_PROFILE: how long this call held the thread. */
+            LARGE_INTEGER _t0, _t1;
+            uint32_t _obj = STACK_ARG(0);
+            QueryPerformanceCounter(&_t0);
+            bridge();
+            QueryPerformanceCounter(&_t1);
+            xbox_FpsNoteKernel(ordinal, _t1.QuadPart - _t0.QuadPart, _obj);
+        } else {
+            bridge();
+        }
         /* Re-acquire first, then count. Counting first made a thread waiting
          * for the lock look like a thread running lifted code, so switching
          * the lock on -- which is meant to make overlap impossible -- took
