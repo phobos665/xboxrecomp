@@ -560,9 +560,8 @@ static void shadow_create(uint32_t pp_va)
         shadow_viewport_constants(&whole);
     }
 
-    /* Until the first draw applies the title's own states: nothing culled and
-     * no texture. Lighting stays off for good (hle_d3d8_state.c): lights and
-     * the material are not forwarded, and an unlit vertex keeps its colour. */
+    /* Until the first draw applies the title's own states: nothing culled, no
+     * texture and no lighting. */
     host_SetRenderState(g_shadow, D3DRS_CULLMODE, D3DCULL_NONE);
     host_SetRenderState(g_shadow, D3DRS_LIGHTING, FALSE);
     host_SetTexture(g_shadow, 0, NULL);
@@ -1109,6 +1108,9 @@ HLE_ORIGINAL(D3DDevice_SetVertexShader);
 HLE_ORIGINAL(D3DDevice_SelectVertexShader);
 HLE_ORIGINAL(D3DDevice_LoadVertexShaderProgram);
 HLE_ORIGINAL(D3DDevice_SetTransform);
+HLE_ORIGINAL(D3DDevice_SetMaterial);
+HLE_ORIGINAL(D3DDevice_SetLight);
+HLE_ORIGINAL(D3DDevice_LightEnable);
 HLE_ORIGINAL(D3DDevice_SetViewport);
 HLE_ORIGINAL(D3DDevice_SetScissors);
 HLE_ORIGINAL(D3DDevice_CopyRects);
@@ -2599,6 +2601,77 @@ HLE_EXPORT(D3DDevice_SetTransform)
         if (xbox_transform_state_to_host(state, &host_state))
             host_SetTransform(g_shadow, (D3DTRANSFORMSTATETYPE)host_state, &m);
     }
+#endif
+}
+
+/* Fixed-function lighting: the material, the lights and which are on.
+ *
+ * Unforwarded, the host had no lights, so D3DRS_LIGHTING was held off
+ * (hle_d3d8_state.c) and lit geometry came out in its unlit colour. Dino
+ * Crisis 3's map draws its rooms as position-and-normal meshes with no
+ * texture and no vertex colour, lit by the material: every room was a flat
+ * white silhouette. D3DMATERIAL8 (17 floats) and D3DLIGHT8 (a type and 25
+ * floats) are laid out the same on the Xbox and the PC, so they are copied
+ * as they are. XDK 5558: all three stdcall, SetMaterial ret 4, SetLight and
+ * LightEnable ret 8. */
+
+/* HRESULT D3DDevice_SetMaterial(const D3DMATERIAL8 *pMaterial) */
+HLE_EXPORT(D3DDevice_SetMaterial)
+{
+    static int seen;
+    uint32_t material = HLE_ARG(0);
+
+    first_call(&seen, "D3DDevice_SetMaterial", material);
+    if (original_missing(hle_original_D3DDevice_SetMaterial, "D3DDevice_SetMaterial"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetMaterial);
+#ifdef _WIN32
+    if (g_shadow && material) {
+        D3DMATERIAL8 m;
+        memcpy(&m, HLE_PTR(material), sizeof m);
+        host_SetMaterial(g_shadow, &m);
+    }
+#endif
+}
+
+/* HRESULT D3DDevice_SetLight(DWORD Index, const D3DLIGHT8 *pLight) */
+HLE_EXPORT(D3DDevice_SetLight)
+{
+    static int seen;
+    uint32_t index = HLE_ARG(0);
+#ifdef _WIN32
+    uint32_t light = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_SetLight", index);
+    if (original_missing(hle_original_D3DDevice_SetLight, "D3DDevice_SetLight"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_SetLight);
+#ifdef _WIN32
+    if (g_shadow && light) {
+        D3DLIGHT8 l;
+        memcpy(&l, HLE_PTR(light), sizeof l);
+        host_SetLight(g_shadow, index, &l);
+    }
+#endif
+}
+
+/* HRESULT D3DDevice_LightEnable(DWORD Index, BOOL bEnable) */
+HLE_EXPORT(D3DDevice_LightEnable)
+{
+    static int seen;
+    uint32_t index = HLE_ARG(0);
+#ifdef _WIN32
+    uint32_t enable = HLE_ARG(1);
+#endif
+
+    first_call(&seen, "D3DDevice_LightEnable", index);
+    if (original_missing(hle_original_D3DDevice_LightEnable, "D3DDevice_LightEnable"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_LightEnable);
+#ifdef _WIN32
+    if (g_shadow)
+        host_LightEnable(g_shadow, index, enable ? TRUE : FALSE);
 #endif
 }
 

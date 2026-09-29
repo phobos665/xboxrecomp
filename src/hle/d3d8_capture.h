@@ -99,8 +99,9 @@ extern "C" {
  * refuses anything else rather than guessing: captures are cheap to retake.
  * Version 1 was the title-level format; its chunk numbers mean different
  * things here. Version 3 added render targets and input current values,
- * version 4 cube textures and the face a render target names. */
-#define D3D8CAP_VERSION      5u
+ * version 4 cube textures and the face a render target names, version 6
+ * fixed-function lights and the material. */
+#define D3D8CAP_VERSION      6u
 
 /* The conventional extension. .gitignore has it: a capture contains the
  * title's own textures and vertices, so it is game content and must never be
@@ -133,7 +134,10 @@ enum {
     D3D8CAP_VS_VERTEX_DATA      = 22, /* D3D8CapVsVertexData */
     D3D8CAP_CUBE_TEXTURE        = 23, /* D3D8CapCubeTexture */
     D3D8CAP_SCISSORS            = 24, /* D3D8CapScissors (version 5) */
-    D3D8CAP_CHUNK_KINDS         = 25  /* one past the last, for per-kind counters */
+    D3D8CAP_MATERIAL            = 25, /* D3D8CapMaterial (version 6) */
+    D3D8CAP_LIGHT               = 26, /* D3D8CapLight */
+    D3D8CAP_LIGHT_ENABLE        = 27, /* D3D8CapLightEnable */
+    D3D8CAP_CHUNK_KINDS         = 28  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -170,6 +174,12 @@ typedef struct { uint32_t x, y, width, height; float min_z, max_z; } D3D8CapView
  * whether they were exclusive, and the first rectangle (the only one the
  * host applies). count 0 is "off". */
 typedef struct { uint32_t count, exclusive; D3D8CapRect rect; } D3D8CapScissors;
+
+/* D3DMATERIAL8 and D3DLIGHT8 as words: 17 floats, and a D3DLIGHTTYPE then
+ * 25 floats. The same layout on the Xbox and the PC. */
+typedef struct { uint32_t words[17]; } D3D8CapMaterial;
+typedef struct { uint32_t index; uint32_t words[26]; } D3D8CapLight;
+typedef struct { uint32_t index, enable; } D3D8CapLightEnable;
 
 /* texture_id 0 is SetTexture(stage, NULL). */
 typedef struct { uint32_t stage, texture_id; } D3D8CapSetTexture;

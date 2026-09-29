@@ -241,6 +241,32 @@ static void rec_transform(DWORD state, const D3DMATRIX *m)
     chunk(D3D8CAP_TRANSFORM, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
+static void rec_material(const D3DMATERIAL8 *m)
+{
+    D3D8CapMaterial c;
+
+    memcpy(c.words, m, sizeof c.words);
+    chunk(D3D8CAP_MATERIAL, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+static void rec_light(DWORD index, const D3DLIGHT8 *l)
+{
+    D3D8CapLight c;
+
+    c.index = index;
+    memcpy(c.words, l, sizeof c.words);
+    chunk(D3D8CAP_LIGHT, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+static void rec_light_enable(DWORD index, BOOL enable)
+{
+    D3D8CapLightEnable c;
+
+    c.index = index;
+    c.enable = enable ? 1u : 0u;
+    chunk(D3D8CAP_LIGHT_ENABLE, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
 static void rec_scissors(UINT count, BOOL exclusive, const D3DRECT *rect)
 {
     D3D8CapScissors c;
@@ -460,6 +486,15 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
         const D3DMATRIX *m = d3d8_GetTransform((D3DTRANSFORMSTATETYPE)transforms[i]);
         if (m)
             rec_transform(transforms[i], m);
+    }
+    /* Lights and the material: a title sets them once for a scene, long
+     * before the frame a capture starts on. */
+    rec_material(d3d8_GetMaterial());
+    for (i = 0; i < (int)d3d8_GetNumLights(); i++) {
+        const D3DLIGHT8 *l = d3d8_GetLight((DWORD)i);
+        if (l)
+            rec_light((DWORD)i, l);
+        rec_light_enable((DWORD)i, d3d8_GetLightEnable((DWORD)i));
     }
     dev->lpVtbl->GetViewport(dev, &vp);
     rec_viewport(&vp);
@@ -869,6 +904,70 @@ HRESULT host_SetTransform(IDirect3DDevice8 *dev, D3DTRANSFORMSTATETYPE state,
     if (g_cap && matrix)
         rec_transform((DWORD)state, matrix);
     return dev->lpVtbl->SetTransform(dev, state, matrix);
+}
+
+static void op_material(const void *arg)
+{
+    host_SetMaterial(hle_d3d8_shadow_device(), (const D3DMATERIAL8 *)arg);
+}
+
+HRESULT host_SetMaterial(IDirect3DDevice8 *dev, const D3DMATERIAL8 *material)
+{
+    if (!material)
+        return E_INVALIDARG;
+    if (hle_d3d8_defer_recording()) {
+        hle_d3d8_defer_op(op_material, material, sizeof *material);
+        return S_OK;
+    }
+    if (g_cap)
+        rec_material(material);
+    return dev->lpVtbl->SetMaterial(dev, material);
+}
+
+typedef struct { DWORD index; D3DLIGHT8 light; } dq_light;
+
+static void op_light(const void *arg)
+{
+    const dq_light *p = (const dq_light *)arg;
+    host_SetLight(hle_d3d8_shadow_device(), p->index, &p->light);
+}
+
+HRESULT host_SetLight(IDirect3DDevice8 *dev, DWORD index, const D3DLIGHT8 *light)
+{
+    if (!light)
+        return E_INVALIDARG;
+    if (hle_d3d8_defer_recording()) {
+        dq_light p;
+        p.index = index;
+        p.light = *light;
+        hle_d3d8_defer_op(op_light, &p, sizeof p);
+        return S_OK;
+    }
+    if (g_cap)
+        rec_light(index, light);
+    return dev->lpVtbl->SetLight(dev, index, light);
+}
+
+typedef struct { DWORD index; BOOL enable; } dq_light_enable;
+
+static void op_light_enable(const void *arg)
+{
+    const dq_light_enable *p = (const dq_light_enable *)arg;
+    host_LightEnable(hle_d3d8_shadow_device(), p->index, p->enable);
+}
+
+HRESULT host_LightEnable(IDirect3DDevice8 *dev, DWORD index, BOOL enable)
+{
+    if (hle_d3d8_defer_recording()) {
+        dq_light_enable p;
+        p.index = index;
+        p.enable = enable;
+        hle_d3d8_defer_op(op_light_enable, &p, sizeof p);
+        return S_OK;
+    }
+    if (g_cap)
+        rec_light_enable(index, enable);
+    return dev->lpVtbl->LightEnable(dev, index, enable);
 }
 
 typedef struct { UINT count; BOOL exclusive; } dq_scissors;
