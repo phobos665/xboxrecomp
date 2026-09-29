@@ -5,6 +5,9 @@
 #
 #     recomp_add_launcher(timesplitters2_launcher timesplitters2_recomp.exe)
 #
+# (add NO_WIDESCREEN for a title where the widescreen options must not be
+# offered; see below)
+#
 # and gets <name>.exe beside the game, reading the game's own XBE for the
 # name it shows and the settings file it writes.
 #
@@ -50,6 +53,15 @@ if(WIN32)
         target_link_libraries(${TARGET} PRIVATE
             xbox_config user32 gdi32 xinput9_1_0
         )
+        # recomp_add_launcher(<target> <exe> NO_WIDESCREEN): a title where
+        # widescreen cannot be right hides Widescreen and Wide camera, and
+        # the launcher writes both off. A 2D fighter is the case: its stage
+        # bounds and walls are built for 4:3, so a wider view shows space the
+        # fighters cannot reach.
+        cmake_parse_arguments(_launcher "NO_WIDESCREEN" "" "" ${ARGN})
+        if(_launcher_NO_WIDESCREEN)
+            target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NO_WIDESCREEN=1)
+        endif()
         if(MSVC)
             target_compile_options(${TARGET} PRIVATE
                 /W4 $<$<NOT:$<CONFIG:Debug>>:/O2>)
