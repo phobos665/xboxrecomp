@@ -98,6 +98,10 @@ HRESULT host_SetTextureStageState(IDirect3DDevice8 *dev, DWORD stage,
 HRESULT host_SetTransform(IDirect3DDevice8 *dev, D3DTRANSFORMSTATETYPE state,
                           const D3DMATRIX *matrix);
 HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport);
+/* Fixed-function lighting: the material and up to d3d8_GetNumLights() lights. */
+HRESULT host_SetMaterial(IDirect3DDevice8 *dev, const D3DMATERIAL8 *material);
+HRESULT host_SetLight(IDirect3DDevice8 *dev, DWORD index, const D3DLIGHT8 *light);
+HRESULT host_LightEnable(IDirect3DDevice8 *dev, DWORD index, BOOL enable);
 /* The Xbox scissor (xbox_D3D8SetScissors); the first rectangle is recorded. */
 void    host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
 HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage,
