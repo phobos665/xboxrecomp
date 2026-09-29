@@ -231,10 +231,21 @@ static float rt_scale_y(void)
     return (float)g_device_state.height / (float)g_device_state.present_height;
 }
 
+static void present_scene(void);
+
+/* Every way a frame reaches the screen comes through here: put the scene
+ * on it, at the shape d3d8_display_wide_now gives for this frame, then
+ * note the frame done. */
+static void present_resolve(void)
+{
+    present_scene();
+    d3d8_display_frame_done();
+}
+
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
-static void present_resolve(void)
+static void present_scene(void)
 {
     D3D8DeviceState *s = &g_device_state;
     D3D8DisplayFit fit;
@@ -1629,7 +1640,7 @@ static void apply_host_viewport(void)
  * frame is a run of 3D draws and then a run of 2D ones. */
 void d3d8_SetTwoDSqueeze(BOOL on)
 {
-    if (!d3d8_display_policy()->widescreen)
+    if (!d3d8_display_wide_now())
         on = FALSE;
     if (g_2d_squeeze == (on ? TRUE : FALSE))
         return;

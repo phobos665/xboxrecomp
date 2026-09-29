@@ -43,6 +43,14 @@ typedef struct D3D8DisplayPolicy {
 
 const D3D8DisplayPolicy *d3d8_display_policy(void);
 
+/* Whether the frame being drawn is shown at 16:9: the widescreen setting,
+ * unless the title has said the screen it is on is 4:3
+ * (xbox_D3D8SetWideFrames). Everything that treats a frame as widescreen
+ * -- the 2D squeeze, the shape at present -- asks this. */
+int  d3d8_display_wide_now(void);
+/* A frame has been presented (it notes each change of shape in the log). */
+void d3d8_display_frame_done(void);
+
 /* The size the scene is rendered at, for a guest presenting at guest_w by
  * guest_h. Equal to the guest's own size when nothing is scaled. */
 void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
