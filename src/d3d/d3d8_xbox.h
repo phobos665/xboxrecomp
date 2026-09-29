@@ -1171,6 +1171,16 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height);
 void xbox_D3D8SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
 BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
 
+/* Hor+ done by the title rather than the renderer. RECOMP_HOR_PLUS widens a
+ * 4:3 title's view by scaling the projection register as it is uploaded,
+ * which the title's own culling never sees: past the old 4:3 edges the world
+ * is missing. A title project that has found where its game builds the
+ * projection widens it there instead -- aspect divided by the factor
+ * returned -- and from this call on the register is no longer scaled (it
+ * still marks which programs are 3D). 1.0 means no widening is wanted, and
+ * is what a backend without Hor+ returns. */
+float xbox_D3D8ClaimHorPlus(void);
+
 /* The Xbox's CopyRects, for the one case a title uses it for in anger:
    copying the finished frame into a texture it then draws over the scene.
    The host's own back buffer is the source, because the guest's is empty --
