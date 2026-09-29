@@ -50,6 +50,14 @@ ID3D11RenderTargetView *d3d8_GetCurrentRTV(void);
  * projection. Only matters in widescreen, where the two need different
  * horizontal treatment. */
 void d3d8_SetTwoDSqueeze(BOOL on);
+
+/* Runtime shader compiles, timed (d3d8_combiners.c). kind: 0 combiner pixel
+ * shader, 1 fixed-function pixel shader, 2 vertex program. Reported every
+ * few seconds with the count and the milliseconds they took, because a
+ * compile inside a frame is a stall the frame rate shows and the profile
+ * attributes to D3DCOMPILER_47. */
+long long d3d8_compile_clock(void);
+void      d3d8_compile_note(int kind, long long started);
 BOOL d3d8_GetTwoDSqueeze(void);
 /* Whether a draw's own vertices span the guest's full width, which is
  * what separates a backdrop or a fade from a HUD element. */

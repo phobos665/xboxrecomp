@@ -514,8 +514,12 @@ static ID3D11PixelShader *ff_ps_get_shader(UINT sig)
     if (!src) return NULL;
     build_ps_source(sig, src, FF_PS_SRC_SIZE);
 
-    hr = D3DCompile(src, strlen(src), "ps_ffp", NULL, NULL,
-                    "main", "ps_5_0", 0, 0, &blob, &errors);
+    {
+        long long started = d3d8_compile_clock();
+        hr = D3DCompile(src, strlen(src), "ps_ffp", NULL, NULL,
+                        "main", "ps_5_0", 0, 0, &blob, &errors);
+        d3d8_compile_note(1, started);
+    }
     free(src);
 
     if (FAILED(hr)) {
