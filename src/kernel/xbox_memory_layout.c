@@ -678,9 +678,121 @@ int xbox_GuestConcurrencyOn(void)
     return g_concurrency_on;
 }
 
+/* One guest thread at DISPATCH_LEVEL stops the others.
+ *
+ * On the Xbox's single CPU a thread at DISPATCH_LEVEL is the only thing
+ * running until it lowers, and titles build on that: Marvel vs Capcom 2's
+ * ADX sound thread runs its server at DISPATCH_LEVEL, guarded only by a busy
+ * flag, and its main thread edits the same stream buffers at PASSIVE_LEVEL.
+ * Here the two run on two host cores, and a watchpoint saw both write one
+ * ring buffer's positions. No failure has been traced to that yet.
+ *
+ * The parking points are the bridge boundaries every guest thread already
+ * passes (the Lifted enter/leave pair): g_park_running counts guest threads
+ * in lifted code. A thread raising to DISPATCH_LEVEL (xbox_DispatchParkOthers,
+ * from kernel_hal.c) becomes the owner and waits for that count to drain;
+ * any other thread coming back from a bridge waits while an owner exists.
+ *
+ * Both waits are bounded. A thread spinning in lifted code never reaches a
+ * boundary, and one raised thread blocking on another would be a deadlock;
+ * past the bound each side proceeds and the first time says so. Off by
+ * default; RECOMP_DISPATCH_LOCK=1, the same switch as the DPC hold-off. */
+static volatile LONG  g_park_running;
+static volatile DWORD g_park_owner;
+static HANDLE         g_park_free;     /* manual reset, set when no owner */
+static int            g_park_on = -1;
+
+static int park_on(void)
+{
+    if (g_park_on < 0) {
+        HANDLE ev = CreateEventW(NULL, TRUE, TRUE, NULL);
+        if (InterlockedCompareExchangePointer((PVOID *)&g_park_free, ev, NULL))
+            CloseHandle(ev);
+        g_park_on = xbox_EnvSwitch("RECOMP_DISPATCH_LOCK", 0);
+    }
+    return g_park_on;
+}
+
+void xbox_DispatchParkOthers(void)
+{
+    ULONGLONG deadline;
+    DWORD me = GetCurrentThreadId();
+
+    if (!park_on())
+        return;
+    g_park_owner = me;
+    ResetEvent(g_park_free);
+    /* This thread is inside a bridge, so it is not counted itself. */
+    if (g_park_running <= 0)
+        return;
+    deadline = GetTickCount64() + 50;
+    while (g_park_running > 0) {
+        if (GetTickCount64() >= deadline) {
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 3) {
+                fprintf(stderr, "  [KERNEL] DISPATCH_LEVEL: %ld other guest "
+                                "thread(s) still in lifted code after 50 ms; "
+                                "going on without them (RECOMP_DISPATCH_LOCK)\n",
+                        (long)g_park_running);
+                fflush(stderr);
+            }
+            return;
+        }
+        SwitchToThread();
+    }
+}
+
+void xbox_DispatchReleaseOthers(void)
+{
+    if (!park_on())
+        return;
+    g_park_owner = 0;
+    SetEvent(g_park_free);
+}
+
+/* A guest thread leaving lifted code for good (its thread function returned). */
+void xbox_GuestLiftedExit(void)
+{
+    if (park_on())
+        InterlockedDecrement(&g_park_running);
+}
+
+static void park_enter(void)
+{
+    DWORD me;
+    ULONGLONG deadline = 0;
+
+    if (!park_on())
+        return;
+    me = GetCurrentThreadId();
+    for (;;) {
+        DWORD owner;
+        InterlockedIncrement(&g_park_running);
+        owner = g_park_owner;
+        if (!owner || owner == me)
+            return;
+        InterlockedDecrement(&g_park_running);
+        if (!deadline)
+            deadline = GetTickCount64() + 100;
+        else if (GetTickCount64() >= deadline) {
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 3) {
+                fprintf(stderr, "  [KERNEL] DISPATCH_LEVEL held 100 ms by "
+                                "thread %lu; this thread goes on "
+                                "(RECOMP_DISPATCH_LOCK)\n", (unsigned long)owner);
+                fflush(stderr);
+            }
+            InterlockedIncrement(&g_park_running);
+            return;
+        }
+        WaitForSingleObject(g_park_free, 10);
+    }
+}
+
 void xbox_GuestLiftedEnter(void)
 {
     LONG n;
+    park_enter();
     if (!xbox_GuestConcurrencyOn())
         return;
     n = InterlockedIncrement(&g_lifted_now);
@@ -696,6 +808,8 @@ void xbox_GuestLiftedEnter(void)
 
 void xbox_GuestLiftedLeave(void)
 {
+    if (park_on())
+        InterlockedDecrement(&g_park_running);
     if (!xbox_GuestConcurrencyOn())
         return;
     InterlockedDecrement(&g_lifted_now);

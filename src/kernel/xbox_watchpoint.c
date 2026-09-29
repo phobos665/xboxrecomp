@@ -380,8 +380,11 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
             disarm_all("report budget exhausted (RECOMP_WATCH_BUDGET)");
             return 1;
         }
-        fprintf(stderr, "[WATCH] %s to 0x%08X from ",
-                is_write ? "write" : "read", va);
+        /* The host thread too: two writers of one structure on different
+         * threads is a race the uniprocessor console never had. */
+        fprintf(stderr, "[WATCH] %s to 0x%08X (thread %lu) from ",
+                is_write ? "write" : "read", va,
+                (unsigned long)GetCurrentThreadId());
         print_symbol((uintptr_t)ep->ContextRecord->Rip);
         fprintf(stderr, "\n");
         {

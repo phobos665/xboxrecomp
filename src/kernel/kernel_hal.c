@@ -14,6 +14,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
 #include "recomp_config.h"
+#include <stdio.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -33,6 +34,97 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* DISPATCH_LEVEL, for the whole processor.
+ *
+ * The Xbox has one CPU. A thread that raises to DISPATCH_LEVEL stops the
+ * scheduler, every other thread and every DPC until it lowers again, and
+ * titles rely on exactly that as a lock. With the level kept per thread,
+ * nothing was excluded. Marvel vs Capcom 2's ADX sound thread runs its server
+ * at DISPATCH_LEVEL while its main thread edits the same stream buffers at
+ * PASSIVE_LEVEL, and a watchpoint saw both threads write one ring buffer's
+ * positions. That is the hazard; no failure has been traced to it yet.
+ *
+ * So crossing into DISPATCH_LEVEL takes one recursive host lock and parks
+ * the other guest threads at their next bridge boundary
+ * (xbox_DispatchParkOthers, xbox_memory_layout.c); lowering below it releases
+ * both. The timer thread holds the lock while it runs DPCs
+ * (xbox_DispatchLockEnterTimed). Interrupt service routines are not held
+ * off: on hardware they arrive above DISPATCH_LEVEL.
+ *
+ * Off by default: RECOMP_DISPATCH_LOCK=1 turns it on. Measured on MvC2 it
+ * did not change the fight freeze (a disassembly miss, since seeded), and it
+ * changes threading for every title, so it waits for a title that needs it. */
+static CRITICAL_SECTION g_dispatch_cs;
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+static int g_dispatch_on = -1;
+
+static BOOL CALLBACK dispatch_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_dispatch_cs);
+    return TRUE;
+}
+
+static int dispatch_lock_on(void)
+{
+    if (g_dispatch_on < 0) {
+        InitOnceExecuteOnce(&g_dispatch_once, dispatch_init, NULL, NULL);
+        g_dispatch_on = xbox_EnvSwitch("RECOMP_DISPATCH_LOCK", 0);
+    }
+    return g_dispatch_on;
+}
+
+/* Called on the level changing from old to new, on this thread. */
+static void dispatch_transition(KIRQL old, KIRQL now)
+{
+    if (!dispatch_lock_on())
+        return;
+    if (old < DISPATCH_LEVEL && now >= DISPATCH_LEVEL) {
+        EnterCriticalSection(&g_dispatch_cs);
+        xbox_DispatchParkOthers();     /* and no other guest thread runs */
+    } else if (old >= DISPATCH_LEVEL && now < DISPATCH_LEVEL) {
+        xbox_DispatchReleaseOthers();
+        LeaveCriticalSection(&g_dispatch_cs);
+    }
+}
+
+/* For the thread that runs DPCs. Waits up to ms for no guest thread to be at
+ * DISPATCH_LEVEL, and returns whether it got the lock (pair it with
+ * xbox_DispatchLockLeave). Bounded because the lock is only as good as the
+ * raise/lower pairs feeding it: a title that raises and never lowers, or
+ * blocks while raised, would otherwise stop every DPC for the rest of the
+ * run. Past the bound the DPCs run anyway and the first time says so. */
+int xbox_DispatchLockEnterTimed(DWORD ms)
+{
+    ULONGLONG deadline;
+
+    if (!dispatch_lock_on())
+        return 0;
+    if (TryEnterCriticalSection(&g_dispatch_cs))
+        return 1;
+    deadline = GetTickCount64() + ms;
+    do {
+        Sleep(0);
+        if (TryEnterCriticalSection(&g_dispatch_cs))
+            return 1;
+    } while (GetTickCount64() < deadline);
+    {
+        static int said;
+        if (!said++) {
+            fprintf(stderr, "  [KERNEL] DPCs held off %lu ms by a thread at "
+                            "DISPATCH_LEVEL; running them anyway "
+                            "(RECOMP_DISPATCH_LOCK)\n", (unsigned long)ms);
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
+void xbox_DispatchLockLeave(void)
+{
+    LeaveCriticalSection(&g_dispatch_cs);
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -47,6 +139,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
+    dispatch_transition(old, NewIrql);
     g_current_irql = NewIrql;
     return old;
 }
@@ -63,6 +156,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
             g_current_irql, NewIrql);
     }
 
+    dispatch_transition(g_current_irql, NewIrql);
     g_current_irql = NewIrql;
 }
 
@@ -72,6 +166,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
+    dispatch_transition(old, DISPATCH_LEVEL);
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }

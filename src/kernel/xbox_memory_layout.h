@@ -237,6 +237,10 @@ int  xbox_GuestLockOn(void);
 int  xbox_GuestConcurrencyOn(void);
 void xbox_GuestLiftedEnter(void);
 void xbox_GuestLiftedLeave(void);
+void xbox_GuestLiftedExit(void);
+/* DISPATCH_LEVEL stops the other guest threads (kernel_hal.c calls these). */
+void xbox_DispatchParkOthers(void);
+void xbox_DispatchReleaseOthers(void);
 void xbox_GuestConcurrencyReport(void);
 
 void xbox_Nv2aFlipGateArm(void);
