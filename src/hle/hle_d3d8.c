@@ -1882,7 +1882,17 @@ static const DXGI_FORMAT FLOATN_FORMAT[5] = {
  * (shadow_expand_vertices), so they read from the prefix and every other
  * offset moves up by its size. A declaration the host cannot take -- another
  * stream, or a format with no DXGI equivalent -- leaves has_declaration 0,
- * and its draws are skipped and counted. */
+ * and its draws are skipped and counted.
+ *
+ * A stream 0 register at an offset that is not a multiple of four is copied
+ * into the prefix as it is, like a register from another stream. D3D11 wants
+ * every element on a four-byte boundary, and the prefix is always a multiple
+ * of four, so such a register would land misaligned on the host however much
+ * it moved up. Dino Crisis 3's skinned meshes are FLOAT3 position and normal,
+ * FLOAT2 texture coordinates, SHORT3 bone indices at 32 and FLOAT3 weights at
+ * 38 -- straight after a six-byte type, so the weights sat at host offset 50,
+ * came back wrong, and every character exploded into screen-sized dark
+ * triangles over the scene. */
 static void shadow_read_declaration(int slot, uint32_t handle)
 {
     static int notes;
@@ -1912,7 +1922,8 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             packed++;
             shift += (UINT)floats * 4u;
-        } else if (HLE_MEM32(attr) != 0u && xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
+        } else if ((HLE_MEM32(attr) != 0u || (HLE_MEM32(attr + 4u) & 3u)) &&
+                   xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
             packed++;
             shift += (size + 3u) & ~3u;
         }
@@ -1946,7 +1957,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             out += (UINT)floats * 4u;
         } else if (!xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
             refused = 1;
-        } else if (stream != 0u) {
+        } else if (stream != 0u || (offset & 3u)) {
             p->packed_offset[packed] = offset;
             p->packed_out[packed] = out;
             p->packed_format[packed] = format;
@@ -3233,8 +3244,10 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
         }
     }
     shift = p->expanded_bytes;
-    out_stride = in_stride + shift;
-    out = malloc((size_t)vertices * out_stride);
+    /* Rounded up, so the host stride is a multiple of four even when the
+     * title's is not (Dino Crisis 3's skinned vertex is 50 bytes). */
+    out_stride = shift + ((in_stride + 3u) & ~3u);
+    out = calloc((size_t)vertices, out_stride);
     if (!out) {
         *failed = 1;
         return NULL;
