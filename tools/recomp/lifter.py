@@ -669,23 +669,30 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
+        # comiss uses unsigned condition codes (CF, ZF), and an unordered
+        # result (either operand NaN) sets ZF, PF and CF together. So on NaN
+        # ja/jae are false but jb/jbe/je are TRUE and jne is false -- the
+        # opposite of C's ordered <, <=, == and !=, which the lifter used to
+        # emit. Written as the negations of the conditions that are false on
+        # NaN, so no isnan() is needed. Found by tools.conformance's
+        # sse_comiss_conditions; _make_lahf_value already had it right.
+        un = f"({a} != {a} || {b} != {b})"
         if jcc in ("ja", "jnbe"):
             return f"({a} > {b})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({a} >= {b})", desc
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return f"(!({a} >= {b}))", desc
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"(!({a} > {b}))", desc
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return f"(!({a} < {b} || {a} > {b}))", desc
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
-        if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
-        if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"({a} < {b} || {a} > {b})", desc
+        if jcc in ("jp", "jpe"):
+            return f"{un} /* {jcc}: unordered/NaN */", desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!{un}) /* {jcc}: ordered */", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -3562,16 +3569,27 @@ class Lifter:
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
+        # A C cast truncates, and is undefined where the hardware returns the
+        # integer indefinite 0x80000000. cvtss2si rounds under MXCSR instead
+        # (nearest-even by default), so it lifted 1.5 as 1 rather than 2:
+        # found by tools.conformance's sse_cvtss2si. MMX_CVT_F2I does both
+        # conversions with the CPU's own instruction.
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = 1 if m == "cvttss2si" else 0
+                return [_fmt_operand_write(
+                    ops[0], f"MMX_CVT_F2I((float){_sse_read(ops[1])}, {trunc})")
+                    + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                trunc = 1 if m == "cvttsd2si" else 0
+                return [_fmt_operand_write(
+                    ops[0], f"SSE_CVT_D2I((double){_sse_read(ops[1])}, {trunc})")
+                    + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]

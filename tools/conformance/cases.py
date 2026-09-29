@@ -414,6 +414,40 @@ CASES = [
     Case("sse_zero_idiom", "xorps xmm,xmm is the zeroing idiom",
          ["movaps xmm0, xmmword ptr [eax]", "xorps xmm0, xmm0"], _SSE, "sse"),
 
+    # Scalar SSE: the float maths of every later-XDK title (Dino Crisis 3 has
+    # 42,000 movss, 5,500 addss, 3,700 comiss), none of which had a case.
+    Case("sse_scalar_arith",
+         "addss/subss/mulss/divss/sqrtss work on lane 0 and keep lanes 1-3",
+         ["movaps xmm0, xmmword ptr [eax]",
+          "movaps xmm1, xmmword ptr [eax+16]",
+          "movaps xmm2, xmm0", "addss xmm2, xmm1",
+          "movaps xmm3, xmm0", "subss xmm3, xmm1",
+          "movaps xmm4, xmm0", "mulss xmm4, xmm1",
+          "movaps xmm5, xmm0", "divss xmm5, xmm1",
+          "movaps xmm6, xmm0", "sqrtss xmm6, xmm1"], _SSE, "sse"),
+    Case("sse_comiss_conditions",
+         "comiss sets ZF/PF/CF; each unsigned condition reads them. An "
+         "unordered compare (NaN) sets all three, so below, below-or-equal "
+         "and equal are TRUE and not-equal is false",
+         ["movss xmm0, dword ptr [eax]",
+          "comiss xmm0, dword ptr [eax+16]",
+          "seta cl", "setae ch", "setb dl", "setbe dh",
+          "sete bl", "setne bh",
+          "movzx eax, cl", "movzx esi, ch", "shl esi, 1", "or eax, esi",
+          "movzx esi, dl", "shl esi, 2", "or eax, esi",
+          "movzx esi, dh", "shl esi, 3", "or eax, esi",
+          "movzx esi, bl", "shl esi, 4", "or eax, esi",
+          "movzx esi, bh", "shl esi, 5", "or eax, esi"], _SSE, "sse"),
+    Case("sse_cvttss2si", "cvttss2si truncates toward zero; out of range is "
+         "0x80000000", ["movss xmm0, dword ptr [eax]", "cvttss2si eax, xmm0"],
+         _SSE, "sse"),
+    Case("sse_cvtss2si", "cvtss2si rounds under MXCSR (nearest-even by "
+         "default): 1.5 -> 2 and -2.5 -> -2, not truncation",
+         ["movss xmm0, dword ptr [eax]", "cvtss2si eax, xmm0"], _SSE, "sse"),
+    Case("sse_cvtsi2ss", "cvtsi2ss writes lane 0 only",
+         ["movaps xmm1, xmmword ptr [eax+16]",
+          "mov ecx, dword ptr [eax]", "cvtsi2ss xmm1, ecx"], _SSE, "sse"),
+
     # SF is the sign bit at the operand's width. Evaluating an 8- or 16-bit
     # test as int32 makes 0x80..0xFF look positive, so the branch goes the same
     # way regardless -- found by the whole-function corpus, kept here so the
