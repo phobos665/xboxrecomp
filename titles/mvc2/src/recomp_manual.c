@@ -106,6 +106,142 @@ extern RECOMP_MANUAL_TLS uint32_t g_icall_saved_esp;
  * means this title was lifted before the macros published it. */
 extern RECOMP_MANUAL_TLS uint32_t g_icall_dispatch_form;
 
+/* ── MvC2: shop points (RECOMP_MVC2_MAX_POINTS) ────────────── */
+
+/*
+ * Opt-in: set the shop's points balance to 9999 so the player can buy
+ * characters, art and colours through the game's own shop. Off by default.
+ * RECOMP_MVC2_MAX_POINTS=1, or `max_points = 1` in the title's settings file
+ * (the environment wins). See docs/technical/mvc2-unlocks.md.
+ *
+ * The balance is a u16 at guest 0x676422; the shop spends from it and caps it
+ * at 9999 (sub_0001A9D0). Two functions write it from outside the shop:
+ *
+ *   sub_001DEBA0  a new profile's defaults
+ *   sub_001DFB40  save block -> live state; al == 1 on entry is the path taken
+ *                 after a successful load, and the only one that writes the
+ *                 balance. The other al values copy other things and are left
+ *                 alone.
+ *
+ * Each wrapper runs the generated body and then overwrites the balance.
+ * Nothing is done at save time (sub_001E06B0), so the balance and anything
+ * bought with it are saved into the real profile.
+ */
+#include "recomp_config.h"
+
+extern void sub_001DEBA0_gen(void);
+extern void sub_001DFB40_gen(void);
+
+#define MVC2_POINTS_VA  0x00676422u
+#define MVC2_POINTS_MAX 9999u        /* the shop's own cap, 0x270F */
+
+static int mvc2_max_points_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = recomp_config_bool("RECOMP_MVC2_MAX_POINTS", "max_points", 0);
+    return enabled;
+}
+
+static void mvc2_apply_max_points(const char *where)
+{
+    *(volatile uint16_t *)((uintptr_t)MVC2_POINTS_VA + g_xbox_mem_offset) =
+        (uint16_t)MVC2_POINTS_MAX;
+    fprintf(stderr, "[MVC2] shop points set to %u (RECOMP_MVC2_MAX_POINTS, %s)\n",
+            MVC2_POINTS_MAX, where);
+    fflush(stderr);
+}
+
+/* A new profile's defaults. */
+void sub_001DEBA0(void)
+{
+    sub_001DEBA0_gen();
+    if (mvc2_max_points_enabled())
+        mvc2_apply_max_points("new profile");
+}
+
+/* Save block -> live state. al is the mode; only al == 1 (after a
+ * successful load) writes the balance. Read it before the body clobbers eax. */
+void sub_001DFB40(void)
+{
+    uint8_t mode = (uint8_t)g_eax;
+    sub_001DFB40_gen();
+    if (mode == 1 && mvc2_max_points_enabled())
+        mvc2_apply_max_points("profile loaded");
+}
+
+/* ── MvC2: CRI ADX's idle thread ───────────────────────────── */
+
+/*
+ * sub_001FFFF0 is the idle thread CRI's ADX middleware starts: it counts
+ * (0x593BB0) until its quit flag (0x593BC8) is set, then exits. On the Xbox
+ * it runs only when nothing else wants the one CPU, so it measures idle time.
+ * Here it had a host core to itself and spun it at 100% for the whole run --
+ * and, never reaching a kernel call, it could not be parked while another
+ * guest thread was at DISPATCH_LEVEL (RECOMP_DISPATCH_LOCK), which is what
+ * MvC2's ADX sound thread relies on.
+ *
+ * So the wait yields: one count and a millisecond's sleep per pass, outside
+ * lifted code. The count is only ever an idle measure, so its rate does not
+ * matter. Then the generated body runs, finds the flag set, and does the
+ * thread's exit path as before.
+ */
+extern void sub_001FFFF0_gen(void);
+void xbox_GuestLiftedEnter(void);
+void xbox_GuestLiftedLeave(void);
+__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+
+#define MVC2_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(va) + g_xbox_mem_offset))
+
+void sub_001FFFF0(void)
+{
+    while (!MVC2_MEM32(0x00593BC8u)) {
+        MVC2_MEM32(0x00593BB0u) += 1;
+        xbox_GuestLiftedLeave();
+        Sleep(1);
+        xbox_GuestLiftedEnter();
+    }
+    sub_001FFFF0_gen();
+}
+
+/* ── MvC2: the ring-buffer error trap (diagnostic) ─────────── */
+
+/*
+ * sub_00200F20 is `jmp $`: CRI ADX's default error callback for its stream
+ * ring buffers, which the title reaches with code -3 when a buffer's
+ * positions disagree (sub_002011D0). Wrapped to say what it saw first.
+ * Kept: it costs nothing until it fires, and a stream error is otherwise a
+ * silent hang.
+ */
+extern void sub_00200F20_gen(void);
+extern RECOMP_MANUAL_TLS uint32_t g_ecx, g_edx, g_ebx, g_esi, g_edi;
+
+void sub_00200F20(void)
+{
+    uint32_t sp = g_esp, ctx = MVC2_MEM32(sp + 4), code = MVC2_MEM32(sp + 8);
+    uint32_t objs[2] = { ctx, 0x00685740u };
+    int i, k;
+
+    fprintf(stderr, "[MVC2] ADX ring-buffer error trap: ctx 0x%08X code %d "
+            "ret 0x%08X; ebx %08X esi %08X edi %08X ecx %08X edx %08X\n",
+            ctx, (int)code, MVC2_MEM32(sp), g_ebx, g_esi, g_edi, g_ecx, g_edx);
+    for (k = 0; k < 2; k++) {
+        uint32_t o = objs[k];
+        if (o < 0x10000u || o > 0x03FFFF00u)
+            continue;
+        fprintf(stderr, "[MVC2]   object 0x%08X:", o);
+        for (i = 0; i < 0x40; i += 4)
+            fprintf(stderr, " %08X", MVC2_MEM32(o + i));
+        fputc('\n', stderr);
+    }
+    fprintf(stderr, "[MVC2]   guest stack:");
+    for (i = 0; i < 24; i++)
+        fprintf(stderr, " %08X", MVC2_MEM32(sp + i * 4));
+    fputc('\n', stderr);
+    fflush(stderr);
+    sub_00200F20_gen();
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
@@ -152,7 +288,13 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
      * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
      */
 
-    (void)xbox_va;
+    /* MvC2 shop points wrappers (above), so an indirect call reaches them
+     * as well as a direct one. */
+    if (xbox_va == 0x001DEBA0u) return sub_001DEBA0;
+    if (xbox_va == 0x001DFB40u) return sub_001DFB40;
+    if (xbox_va == 0x001FFFF0u) return sub_001FFFF0;   /* ADX idle thread */
+    if (xbox_va == 0x00200F20u) return sub_00200F20;   /* ADX error trap */
+
     return (recomp_func_t)0;
 }
 

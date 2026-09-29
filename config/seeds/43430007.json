@@ -130,5 +130,101 @@
  {
   "start": "0x000256F0",
   "note": "Indirect-call target in the attract-mode fight, via sub_001E2800's object-update list. Starts straight after a ret with no padding. Unresolved, the cdecl call's recovery over-popped 4 bytes per call and the main thread's esp climbed into the heap."
+ },
+ {
+  "start": "0x0005B868",
+  "note": "Tail of character 0x0B's handler sub_0005B7F0 (table 0x2EE668), reached by its je after a float compare: push 1; push 2; push esi; call 0x4F490; pop esi; pop ebx; ret. Starts straight after a ret with no padding. Stubbed, the branch skipped the tail and left esi/ebx on the stack; about 10 s into a match every caller returned with wrong registers and the game loop ran logic without ever reaching Swap (the fight freeze)."
+ },
+ {
+  "start": "0x00064B0B",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000BE06C",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000BE7BC",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000BE892",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000D0398",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000E2B54",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000ECB7D",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000ECB88",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000ECC17",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x000ECC22",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x0013F855",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x0016875C",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x00168832",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001A2389",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001A41F7",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001A7BEF",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001B17B5",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001B9743",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001BB713",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001C97C0",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001D2A29",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001D3D31",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x001D6991",
+  "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
  }
 ]
