@@ -766,7 +766,11 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    /* The contiguous arena's own free. Handing these to xbox_HeapFree freed
+     * nothing: the heap does not own the window, so every block stayed in use
+     * (see xbox_ContiguousAlloc). */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
