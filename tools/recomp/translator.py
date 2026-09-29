@@ -905,7 +905,8 @@ class FunctionTranslator:
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
         from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
-                             _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
+                             _EFLAGS_SETTERS, _FLAGS_UNDEFINED,
+                             _BARE_STRING_COMPARES, _has_xmm_operand)
 
         last_setter = None
         for insn in instructions:
@@ -927,6 +928,11 @@ class FunctionTranslator:
             if m.startswith("rep") and ("cmps" in m or "scas" in m):
                 # repe cmpsb and friends set CF from the last pair compared
                 # (lifter._lift_rep_string); a jb/ja after one reads it.
+                last_setter = "rep-cmps"
+            elif (m in _BARE_STRING_COMPARES
+                    and not _has_xmm_operand(getattr(insn, "operands", []))):
+                # A bare cmpsd is the rep form run once and sets CF the same
+                # way. Without this a `cmpsd; jb` used an undeclared _cf.
                 last_setter = "rep-cmps"
             elif m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
@@ -1275,9 +1281,12 @@ class FunctionTranslator:
             lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
         # Add _flags variable if function has conditional instructions
+        # String compares write _flags themselves (the rep forms, and since
+        # they are lifted, the bare ones), with or without a jcc after them.
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
+            or "cmps" in insn.mnemonic or "scas" in insn.mnemonic
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
