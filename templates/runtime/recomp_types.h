@@ -1082,7 +1082,10 @@ extern volatile uint64_t g_icall_guard_misses;
  * `site` is the guest address of the `call` instruction. Under
  * RECOMP_ICALL_FEEDBACK the runtime records which targets each site reaches
  * (icall_sites.dump), which is what lets the lifter guard a site with direct
- * calls on the next generation. Everything else is RECOMP_ICALL_SAFE.
+ * calls on the next generation. Everything else is RECOMP_ICALL_SAFE, line
+ * for line -- including this fork's not-code log with the saved esp and the
+ * g_icall_saved_esp / g_icall_dispatch_form hand-off to the fail log, which
+ * upstream's copy of the macro predates. Keep the two in step.
  */
 #define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
@@ -1090,7 +1093,7 @@ extern volatile uint64_t g_icall_guard_misses;
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
-        recomp_icall_not_code_log(_va); \
+        recomp_icall_not_code_log(_va, (saved_esp)); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
@@ -1100,6 +1103,7 @@ extern volatile uint64_t g_icall_guard_misses;
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
