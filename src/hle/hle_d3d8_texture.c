@@ -100,6 +100,7 @@ static texture_entry *g_bound_entry[MAX_STAGES];
 static uint32_t g_pal_data[MAX_STAGES];
 static uint32_t g_pal_sum[MAX_STAGES];
 static unsigned long g_pal_variants, g_pal_switches, g_pal_rebakes, g_pal_first;
+static unsigned long g_midframe_changes;
 
 /* Stage 0 currently holds the title's own frame; see SetTexture below and
  * hle_d3d8_stage0_is_framebuffer(). */
@@ -218,22 +219,52 @@ static int read_layout(uint32_t va, texture_layout *t)
     return 1;
 }
 
-/* FNV-1a over level 0, or over 4096 evenly spaced bytes of a large one. A
- * sampled checksum can miss a small change; it is the price of checking every
- * bound texture once per frame. */
+/* A checksum of the texture's contents, every byte of every level.
+ *
+ * This used to be FNV-1a over 4096 evenly spaced bytes of level 0, on the
+ * theory that a sample is enough to notice a change. It is not, for a title
+ * that updates a texture a piece at a time. Marvel vs Capcom 2 streams its
+ * fighters' animation frames into their sprite sheets tile by tile, the way
+ * the Dreamcast original wrote VRAM, and most tiles fall between the sampled
+ * bytes: 74 re-uploads in 120 s of fighting, and the sprites (and the load
+ * screen's portraits) showed blocks of stale frames that stayed there, even
+ * with the game paused.
+ *
+ * Word at a time, so hashing the few megabytes a frame binds costs about a
+ * millisecond. RECOMP_HLE_D3D8_TEX_SAMPLED=1 restores the old sample, for
+ * comparison. */
 static uint32_t level0_checksum(const texture_layout *t)
 {
+    static int sampled = -1;
     const uint8_t *p = (const uint8_t *)HLE_PTR(CONTIG_BASE + t->phys);
-    uint32_t n = t->linear
-        ? t->guest_pitch * level_rows(t->fmt, t->height)
-        : d3d8_row_pitch((D3DFORMAT)t->fmt, t->width) * level_rows(t->fmt, t->height);
-    uint32_t h = 2166136261u, i, step = n > 4096 ? n / 4096 : 1;
 
-    for (i = 0; i < n; i += step) {
-        h ^= p[i];
-        h *= 16777619u;
+    if (sampled < 0)
+        sampled = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_SAMPLED", 0);
+    if (sampled) {
+        uint32_t n = t->linear
+            ? t->guest_pitch * level_rows(t->fmt, t->height)
+            : d3d8_row_pitch((D3DFORMAT)t->fmt, t->width) * level_rows(t->fmt, t->height);
+        uint32_t h = 2166136261u, i, step = n > 4096 ? n / 4096 : 1;
+
+        for (i = 0; i < n; i += step) {
+            h ^= p[i];
+            h *= 16777619u;
+        }
+        return h;
     }
-    return h;
+    {
+        uint64_t h = 0x9E3779B97F4A7C15ull, w;
+        uint32_t n = t->bytes, i;
+
+        for (i = 0; i + 8 <= n; i += 8) {
+            memcpy(&w, p + i, 8);
+            h = (h ^ w) * 0x100000001B3ull;
+            h ^= h >> 29;
+        }
+        for (; i < n; i++)
+            h = (h ^ p[i]) * 0x100000001B3ull;
+        return (uint32_t)(h ^ (h >> 32));
+    }
 }
 
 static void upload(IDirect3DTexture8 *host, const texture_layout *t)
@@ -463,17 +494,29 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     }
     if (e) {
         e->used_swap = now;
-        if (!e->rendered && e->checked_swap != now) {
+        /* RECOMP_HLE_D3D8_TEX_EVERY_BIND=1: check the texels at every bind,
+         * not only the first bind of a frame. A title that rewrites one
+         * texture between two draws of the same frame -- a sprite fighter
+         * streaming each character's animation frame through it -- otherwise
+         * draws the second with the first one's texels. Counted either way
+         * it is on, as "changed mid-frame". */
+        static int every_bind = -1;
+        if (every_bind < 0)
+            every_bind = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_EVERY_BIND", 0);
+        if (!e->rendered && (e->checked_swap != now || every_bind)) {
             /* RECOMP_HLE_D3D8_TEX_REFRESH=1: upload every bound texture once
              * a frame regardless of the checksum, to tell a stale cache from
              * a wrong draw. */
             static int refresh = -1;
+            int same_frame = e->checked_swap == now;
             if (refresh < 0)
                 refresh = getenv("RECOMP_HLE_D3D8_TEX_REFRESH") ? 1 : 0;
             e->checked_swap = now;
             if (read_layout(va, &t)) {
                 uint32_t sum = level0_checksum(&t);
-                if (sum != e->checksum || refresh) {
+                if (sum != e->checksum || (refresh && !same_frame)) {
+                    if (same_frame && sum != e->checksum)
+                        g_midframe_changes++;
                     e->checksum = sum;
                     upload(e->host, &t);
                     e->pal_sum = 0;     /* baked through whichever palette */
@@ -898,6 +941,9 @@ static void report(void)
         fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds, "
                 "%lu refused by the host, %lu past the cache\n",
                 g_cube_count, g_cube_binds, g_cube_failed, g_cube_full);
+        if (g_midframe_changes)
+            fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed mid-frame "
+                    "(RECOMP_HLE_D3D8_TEX_EVERY_BIND)\n", g_midframe_changes);
         if (g_pal_variants || g_pal_switches || g_pal_first)
             fprintf(stderr, "[HLE-D3D8] shadow palettes: %lu baked after upload, "
                     "%lu more made for another palette, %lu draws switched to "
