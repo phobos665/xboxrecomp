@@ -75,6 +75,10 @@ typedef struct Buffer {
     uint32_t iface;              /* the IDirectSoundBuffer the game holds */
     uint32_t data, size, format;
     int      output;             /* samples we can send to the host */
+    /* IDirectSoundBuffer_Pause: the model is stopped with its cursor kept,
+     * and paused_flags holds the play flags to resume with. */
+    int      paused;
+    uint32_t paused_flags;
     RecompDsoundBufferModel model;        /* what the game is told */
     RecompDsoundBufferModel output_model; /* what has been sent */
 } Buffer;
@@ -364,6 +368,7 @@ enum {
     DS_CALL_BUF_PLAY,
     DS_CALL_BUF_STOP,
     DS_CALL_BUF_STOPEX,
+    DS_CALL_BUF_PAUSE,
     DS_CALL_BUF_GETSTATUS,
     DS_CALL_BUF_GETCURRENTPOSITION,
     DS_CALL_BUF_SETCURRENTPOSITION,
@@ -376,6 +381,7 @@ static const char *const g_ds_call_names[DS_CALL_COUNT] = {
     "IDirectSoundBuffer_Play",
     "IDirectSoundBuffer_Stop",
     "IDirectSoundBuffer_StopEx",
+    "IDirectSoundBuffer_Pause/PauseEx",
     "IDirectSoundBuffer_GetStatus",
     "IDirectSoundBuffer_GetCurrentPosition",
     "IDirectSoundBuffer_SetCurrentPosition",
@@ -491,8 +497,10 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
     continuing = b->model.playing && b->output_model.playing &&
                  !(flags & RECOMP_DSOUND_PLAY_FROMSTART);
     result = recomp_dsound_buffer_play(&b->model, flags, now);
-    if (result == RECOMP_DSOUND_OK)
+    if (result == RECOMP_DSOUND_OK) {
+        b->paused = 0;
         resync_output(b, continuing);
+    }
     unlock();
     HLE_RETURN(result);
 }
@@ -507,6 +515,7 @@ static void stop(uint32_t iface)
     if (b) {
         pump(b, now);
         recomp_dsound_buffer_stop(&b->model, now);
+        b->paused = 0;
         resync_output(b, 0);
     }
     unlock();
@@ -530,7 +539,68 @@ HLE_EXPORT(IDirectSoundBuffer_StopEx)
     HLE_RETURN(HLE_ARG(0) ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
 }
 
-/* HRESULT IDirectSoundBuffer_GetStatus(this, DWORD *status) */
+/* DSBPAUSE_RESUME, DSBPAUSE_PAUSE, DSBPAUSE_SYNCHPLAYBACK. */
+enum { DSBPAUSE_RESUME = 0u, DSBPAUSE_PAUSE = 1u, DSBPAUSE_SYNCHPLAYBACK = 2u };
+
+/* Pause keeps the cursor and stops the clock; resume continues from it.
+ *
+ * Dino Crisis 3 (XDK 5558) fades its music out by setting the volume to
+ * -64 dB, calling Pause(DSBPAUSE_PAUSE), then spinning on DirectSoundDoWork
+ * until GetStatus stops saying PLAYING, and only then calling Stop. Pause was
+ * not replaced, so the model never heard of it, GetStatus said PLAYING for
+ * ever, and the title hung for good straight after its difficulty select.
+ *
+ * SYNCHPLAYBACK pauses too: it holds the buffer so that several can be
+ * resumed together, which from the title's side looks the same. */
+static uint32_t pause_buffer(uint32_t iface, uint32_t how)
+{
+    uint64_t now = now_ms();
+    Buffer *b;
+
+    if (iface == 0u)
+        return RECOMP_DSOUND_POINTER_ERROR;
+    if (how > DSBPAUSE_SYNCHPLAYBACK)
+        return RECOMP_DSOUND_INVALID_PARAM;
+    lock();
+    b = find(iface);
+    if (b) {
+        pump(b, now);
+        recomp_dsound_buffer_cursor(&b->model, now);
+        if (how == DSBPAUSE_RESUME) {
+            if (b->paused) {
+                b->paused = 0;
+                if (recomp_dsound_buffer_play(&b->model, b->paused_flags, now)
+                        == RECOMP_DSOUND_OK)
+                    resync_output(b, 0);
+            }
+        } else if (b->model.playing) {
+            b->paused = 1;
+            b->paused_flags = b->model.play_flags & RECOMP_DSOUND_PLAY_LOOPING;
+            recomp_dsound_buffer_stop(&b->model, now);
+            resync_output(b, 0);
+        }
+    }
+    unlock();
+    return RECOMP_DSOUND_OK;
+}
+
+/* HRESULT IDirectSoundBuffer_Pause(this, DWORD dwPause) */
+HLE_EXPORT(IDirectSoundBuffer_Pause)
+{
+    g_ds_calls[DS_CALL_BUF_PAUSE]++;
+    HLE_RETURN(pause_buffer(HLE_ARG(0), HLE_ARG(1)));
+}
+
+/* HRESULT IDirectSoundBuffer_PauseEx(this, REFERENCE_TIME rtTimestamp,
+ * DWORD dwPause). A scheduled pause is taken now, as StopEx's stop is. */
+HLE_EXPORT(IDirectSoundBuffer_PauseEx)
+{
+    g_ds_calls[DS_CALL_BUF_PAUSE]++;
+    HLE_RETURN(pause_buffer(HLE_ARG(0), HLE_ARG(3)));
+}
+
+/* HRESULT IDirectSoundBuffer_GetStatus(this, DWORD *status)
+ * DSBSTATUS_PLAYING 1, DSBSTATUS_PAUSED 2, DSBSTATUS_LOOPING 4. */
 HLE_EXPORT(IDirectSoundBuffer_GetStatus)
 {
     g_ds_calls[DS_CALL_BUF_GETSTATUS]++;
@@ -547,6 +617,8 @@ HLE_EXPORT(IDirectSoundBuffer_GetStatus)
         recomp_dsound_buffer_cursor(&b->model, now);
         if (b->model.playing)
             status = 1u | ((b->model.play_flags & RECOMP_DSOUND_PLAY_LOOPING) ? 4u : 0u);
+        else if (b->paused)
+            status = 2u | ((b->paused_flags & RECOMP_DSOUND_PLAY_LOOPING) ? 4u : 0u);
     }
     unlock();
     HLE_MEM32(out) = status;          /* never played here: not playing */

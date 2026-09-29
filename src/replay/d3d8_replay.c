@@ -806,6 +806,40 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         r->dev->lpVtbl->SetTransform(r->dev, (D3DTRANSFORMSTATETYPE)p->state, &m);
         break;
     }
+    case D3D8CAP_MATERIAL: {
+        const D3D8CapMaterial *p = c->data;
+        D3DMATERIAL8 m;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        memcpy(&m, p->words, sizeof m);
+        r->dev->lpVtbl->SetMaterial(r->dev, &m);
+        break;
+    }
+    case D3D8CAP_LIGHT: {
+        const D3D8CapLight *p = c->data;
+        D3DLIGHT8 l;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        memcpy(&l, p->words, sizeof l);
+        r->dev->lpVtbl->SetLight(r->dev, p->index, &l);
+        break;
+    }
+    case D3D8CAP_LIGHT_ENABLE: {
+        const D3D8CapLightEnable *p = c->data;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        r->dev->lpVtbl->LightEnable(r->dev, p->index, p->enable ? TRUE : FALSE);
+        break;
+    }
     case D3D8CAP_VIEWPORT: {
         const D3D8CapViewport *p = c->data;
         D3DVIEWPORT8 vp;

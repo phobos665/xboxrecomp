@@ -1,5 +1,5 @@
 /*
- * d3d8_capture -- round-trip the frame capture container (format version 4).
+ * d3d8_capture -- round-trip the frame capture container (format version 6).
  *
  * Writes a synthetic host-level capture -- a snapshot and a frame, using every
  * chunk kind -- reads it back, and asserts every field and every payload byte
@@ -422,7 +422,7 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 4 && D3D8CAP_VERSION == 4, "the version is 4");
+    check(h->version == 6 && D3D8CAP_VERSION == 6, "the version is 6");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 

@@ -2978,53 +2978,176 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  *
  * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
  * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
+ *
+ * Freed blocks are reused. The arena was bump-only on the assumption that
+ * contiguous blocks are framebuffers and pushbuffers, allocated once. Dino
+ * Crisis 3 also takes each stage's data from here, megabytes at a time, and
+ * frees it again -- and MmFreeContiguousMemory handed the address to the
+ * general heap, which does not own it, so nothing ever came back. Its front
+ * end left 62 MB of the 64 MB window "in use"; the first stage's 5 MB request
+ * then returned NULL, the title read the stage file into NULL + offset, over
+ * its own code and data, and called through what the file put there (the
+ * 0x04XX04XX "function pointers" of its long-standing crash). */
 static uint32_t g_contig_next =
     XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW;
 
-/* What each contiguous block is, so its size can be answered later.
+/* Every contiguous block, live or free, in address order.
  *
- * The arena is a bump allocator and blocks are never freed, so this only ever
- * grows and needs no free list -- but MmQueryAllocationSize has to be able to
- * answer for these addresses, and without a record the only honest answer is
- * zero. DirectSound allocates its DSP buffers here and then asks how big they
- * are; a zero told it the block was not real, and it retried, which is why a
- * run spent 103 of its last 400 kernel calls back in
- * MmAllocateContiguousMemoryEx.
+ * MmQueryAllocationSize has to be able to answer for these addresses, and
+ * without a record the only honest answer is zero. DirectSound allocates its
+ * DSP buffers here and then asks how big they are; a zero told it the block
+ * was not real, and it retried, which is why a run spent 103 of its last 400
+ * kernel calls back in MmAllocateContiguousMemoryEx.
+ *
+ * `size` is what the caller asked for, `span` the page-rounded extent the
+ * block owns. Free blocks are reused first-fit, split when the remainder is a
+ * page or more, and merged with free neighbours; a free block at the top of
+ * the arena is given back to the bump pointer.
  */
-#define XBOX_CONTIG_MAX_BLOCKS 512
-static struct { uint32_t addr, size; } g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+#define XBOX_CONTIG_MAX_BLOCKS 4096
+#define XBOX_CONTIG_PAGE       4096u
+static struct {
+    uint32_t addr, size, span;
+    int      free;
+} g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
 static int g_contig_block_count;
+static uint32_t g_contig_frees, g_contig_reuses;
+
+static uint32_t contig_round(uint32_t n)
+{
+    return (n + XBOX_CONTIG_PAGE - 1u) & ~(XBOX_CONTIG_PAGE - 1u);
+}
+
+/* Insert a block record at index i, shifting the rest up. 0 if full. */
+static int contig_insert(int i, uint32_t addr, uint32_t size, uint32_t span,
+                         int free)
+{
+    if (g_contig_block_count >= XBOX_CONTIG_MAX_BLOCKS)
+        return 0;
+    memmove(&g_contig_blocks[i + 1], &g_contig_blocks[i],
+            (size_t)(g_contig_block_count - i) * sizeof g_contig_blocks[0]);
+    g_contig_blocks[i].addr = addr;
+    g_contig_blocks[i].size = size;
+    g_contig_blocks[i].span = span;
+    g_contig_blocks[i].free = free;
+    g_contig_block_count++;
+    return 1;
+}
+
+static void contig_remove(int i)
+{
+    memmove(&g_contig_blocks[i], &g_contig_blocks[i + 1],
+            (size_t)(g_contig_block_count - i - 1) * sizeof g_contig_blocks[0]);
+    g_contig_block_count--;
+}
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
-    uint32_t result;
+    uint32_t result, span;
+    int i;
 
-    if (alignment < 4096) alignment = 4096;
+    if (alignment < XBOX_CONTIG_PAGE) alignment = XBOX_CONTIG_PAGE;
+    span = contig_round(size ? size : 1u);
+
+    /* First fit among freed blocks. Only a block that already starts on the
+     * alignment is taken: every block starts on a page, and asking for more
+     * than a page is rare enough that the bump pointer can serve it. */
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t spare;
+        if (!g_contig_blocks[i].free || g_contig_blocks[i].span < span ||
+            (g_contig_blocks[i].addr & (alignment - 1u)))
+            continue;
+        spare = g_contig_blocks[i].span - span;
+        if (spare >= XBOX_CONTIG_PAGE &&
+            contig_insert(i + 1, g_contig_blocks[i].addr + span, 0u, spare, 1))
+            g_contig_blocks[i].span = span;
+        g_contig_blocks[i].free = 0;
+        g_contig_blocks[i].size = size;
+        g_contig_reuses++;
+        result = g_contig_blocks[i].addr;
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        return result;
+    }
+
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
     /* Leave the top of the window for GPU instance memory. */
-    if ((uint64_t)result + size >
+    if ((uint64_t)result + span >
             (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
                 - XBOX_GPU_INSTANCE_DEFAULT) {
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
+        uint32_t live = 0;
+        for (i = 0; i < g_contig_block_count; i++)
+            if (!g_contig_blocks[i].free)
+                live += g_contig_blocks[i].span;
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u "
+                        "used; %u live in blocks, %u frees, %u reuses)\n",
                 size, g_contig_next - XBOX_CONTIG_BASE,
-                (unsigned)XBOX_CONTIG_SIZE);
+                (unsigned)XBOX_CONTIG_SIZE, live, g_contig_frees,
+                g_contig_reuses);
         fflush(stderr);
         return 0;
     }
 
-    g_contig_next = result + size;
+    /* The gap an alignment above a page leaves is a free block too. */
+    if (result > g_contig_next)
+        contig_insert(g_contig_block_count, g_contig_next, 0u,
+                      result - g_contig_next, 1);
+    g_contig_next = result + span;
 
-    if (g_contig_block_count < XBOX_CONTIG_MAX_BLOCKS) {
-        g_contig_blocks[g_contig_block_count].addr = result;
-        g_contig_blocks[g_contig_block_count].size = size;
-        g_contig_block_count++;
+    if (!contig_insert(g_contig_block_count, result, size, span, 0)) {
+        static int said;
+        if (!said++) {
+            fprintf(stderr, "  [CONTIG] more than %d blocks: later ones cannot "
+                            "be freed\n", XBOX_CONTIG_MAX_BLOCKS);
+            fflush(stderr);
+        }
     }
 
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
+}
+
+/* MmFreeContiguousMemory. Returns 0 when `xbox_va` is not the start of a live
+ * block this arena handed out (a pinned MmAllocateContiguousMemoryEx address,
+ * say), which the caller may then treat as not contiguous at all. */
+int xbox_ContiguousFree(uint32_t xbox_va)
+{
+    int i;
+
+    for (i = 0; i < g_contig_block_count; i++)
+        if (g_contig_blocks[i].addr == xbox_va && !g_contig_blocks[i].free)
+            break;
+    if (i == g_contig_block_count)
+        return 0;
+
+    g_contig_blocks[i].free = 1;
+    g_contig_blocks[i].size = 0u;
+    if (++g_contig_frees <= 4) {
+        fprintf(stderr, "  [CONTIG] free #%u va=0x%08X (%u bytes)\n",
+                g_contig_frees, xbox_va, g_contig_blocks[i].span);
+        fflush(stderr);
+    }
+
+    /* Merge with a free neighbour on either side. */
+    if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free &&
+        g_contig_blocks[i].addr + g_contig_blocks[i].span == g_contig_blocks[i + 1].addr) {
+        g_contig_blocks[i].span += g_contig_blocks[i + 1].span;
+        contig_remove(i + 1);
+    }
+    if (i > 0 && g_contig_blocks[i - 1].free &&
+        g_contig_blocks[i - 1].addr + g_contig_blocks[i - 1].span == g_contig_blocks[i].addr) {
+        g_contig_blocks[i - 1].span += g_contig_blocks[i].span;
+        contig_remove(i);
+        i--;
+    }
+
+    /* A free block at the top goes back to the bump pointer. */
+    if (i == g_contig_block_count - 1 &&
+        g_contig_blocks[i].addr + g_contig_blocks[i].span == g_contig_next) {
+        g_contig_next = g_contig_blocks[i].addr;
+        contig_remove(i);
+    }
+    return 1;
 }
 
 /* Walk the contiguous blocks this runtime handed out.
@@ -3035,14 +3158,15 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * contiguous allocation. Rather than have each title name the address, the
  * APU can look for it.
  *
- * Returns 0 when `index` is past the end, so a caller can just count up.
+ * Returns 0 when `index` is past the end, so a caller can just count up. A
+ * freed block reads as size 0.
  */
 int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size)
 {
     if (index < 0 || index >= g_contig_block_count)
         return 0;
     if (addr) *addr = g_contig_blocks[index].addr;
-    if (size) *size = g_contig_blocks[index].size;
+    if (size) *size = g_contig_blocks[index].free ? 0u : g_contig_blocks[index].size;
     return 1;
 }
 
@@ -3217,6 +3341,8 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     /* Contiguous memory is a separate arena, and a caller asking about a
      * block from MmAllocateContiguousMemory is asking the same question. */
     for (i = 0; i < g_contig_block_count; i++) {
+        if (g_contig_blocks[i].free)
+            continue;
         if (xbox_va >= g_contig_blocks[i].addr &&
             xbox_va <  g_contig_blocks[i].addr + g_contig_blocks[i].size)
             return g_contig_blocks[i].size - (xbox_va - g_contig_blocks[i].addr);
