@@ -226,5 +226,65 @@
  {
   "start": "0x001D6991",
   "note": "Called but never detected: starts straight after a ret with no padding, like 0x0005B868 (the fight freeze). Found by listing the lift's unresolved-call stubs whose preceding byte is a ret; most are tails of fighter move/state handlers. Stubbed, a call here skips the code and returns with the handler's saved registers still on the stack."
+ },
+ {
+  "start": "0x00038FB0",
+  "note": "Indirect-call target in the fight, via sub_001E2800's object-update list (position += velocity). Starts straight after a ret with no padding. Unresolved, each call over-popped the stack (RECOMP_ABI_CHECK: sub_001E2800 esp-too-high) and the heap walk faulted at about 95 s."
+ },
+ {
+  "start": "0x00039210",
+  "note": "Indirect-call target in the fight, via sub_001E2800's object-update list (position += velocity). Starts straight after a ret with no padding. Unresolved, each call over-popped the stack (RECOMP_ABI_CHECK: sub_001E2800 esp-too-high) and the heap walk faulted at about 95 s."
+ },
+ {
+  "start": "0x00018CE0",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00022C30",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00039B40",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00039CC0",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00039E40",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x0008F380",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x0016D650",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00172510",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00173CF0",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00178060",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00178160",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x0017A8A0",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
+ },
+ {
+  "start": "0x00197D70",
+  "note": "Callback installed with `mov dword ptr [reg+disp], imm` and never detected: it starts straight after a ret with no padding and dispatches through a switch table instead of reaching a ret, so the immediate-reference probe rejected it (upstream 26de405 addresses that probe). Found by a static scan of immediate stores into .text; 0x39B40/0x39CC0/0x39E40 were seen unresolved in fights."
  }
 ]
