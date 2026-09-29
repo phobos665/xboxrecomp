@@ -119,6 +119,53 @@ static int guest_readable(uint32_t va, uint32_t bytes)
     return va >= 0x80000000u && (uint64_t)va + bytes <= 0x80000000ull + 0x04000000ull;
 }
 
+/* How far this title's buffer settings sit from the XDK 5344 offsets above.
+ *
+ * Later DirectSounds moved the buffer block (data, size, play and loop
+ * regions) up four bytes. Measured from each title's own
+ * CDirectSoundBufferSettings_SetBufferData and SetLoopRegion: XDK 4721, 5028
+ * and 5344 keep the data pointer at +0xB8 and the size at +0xBC; 5558 and 5849
+ * at +0xBC and +0xC0, with the loop region at +0xCC/+0xD0 instead of
+ * +0xC8/+0xCC. The voice fields did not move. Read with the old offsets, every
+ * buffer on a later XDK "had" its data pointer as its size and something else
+ * as its data, and played nothing: Dino Crisis 3 (5558) was silent, and
+ * Future Perfect, Outrun 2 and Black (5849) are the same build family.
+ *
+ * The DSOUND library's build number comes from the XBE's library version
+ * table, mapped with the headers at the base address: the count at +0x160, the
+ * table at +0x164, 16-byte entries of an 8-byte name and major, minor, build
+ * and flags as 16-bit words. The move landed between 5344 and 5558; no title
+ * here is in between, so 5455 is the guess and the log names the build. */
+static uint32_t buffer_field_shift(void)
+{
+    static int shift = -1;
+    uint32_t base = 0x00010000u, count, table, i, build = 0;
+
+    if (shift >= 0)
+        return (uint32_t)shift;
+    shift = 0;
+    if (!guest_readable(base + 0x160u, 8u))
+        return 0u;
+    count = HLE_MEM32(base + 0x160u);
+    table = HLE_MEM32(base + 0x164u);
+    if (count > 64u || !guest_readable(table, count * 16u))
+        return 0u;
+    for (i = 0; i < count; i++) {
+        const char *name = (const char *)HLE_PTR(table + i * 16u);
+        if (memcmp(name, "DSOUND\0", 7) == 0) {
+            build = HLE_MEM32(table + i * 16u + 12u) & 0xFFFFu;
+            break;
+        }
+    }
+    if (build >= 5455u)
+        shift = 4;
+    fprintf(stderr, "[DSOUND] XDK DSOUND library build %u: buffer settings at "
+                    "+0x%X (data) and +0x%X (size)\n", build,
+            0xB8u + (uint32_t)shift, 0xBCu + (uint32_t)shift);
+    fflush(stderr);
+    return (uint32_t)shift;
+}
+
 /* 0 when either pointer on the way is not guest memory. Buffer Release is not
  * replaced, so a buffer the title freed keeps its slot here until a change is
  * noticed, and its settings pointers then hold whatever reused that memory.
@@ -127,9 +174,12 @@ static int guest_readable(uint32_t va, uint32_t bytes)
  * the slot. */
 static uint32_t setting(uint32_t iface, uint32_t offset)
 {
-    uint32_t holder = voice_field(offset) ? iface - 0x0Cu : iface;
+    int voice = voice_field(offset);
+    uint32_t holder = voice ? iface - 0x0Cu : iface;
     uint32_t object;
 
+    if (!voice)
+        offset += buffer_field_shift();
     if (!guest_readable(holder, 4u))
         return 0u;
     object = HLE_MEM32(holder);
