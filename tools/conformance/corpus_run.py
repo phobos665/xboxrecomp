@@ -170,6 +170,7 @@ volatile uint64_t g_icall_count;
 RECOMP_TLS uint32_t g_icall_saved_esp, g_icall_dispatch_form;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
+void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
 
 """
 
