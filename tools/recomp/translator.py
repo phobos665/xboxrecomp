@@ -27,6 +27,9 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
+_SSE_COMPARES = ("comiss", "comisd", "ucomiss", "ucomisd")
+
+
 def _merge_flag_states(states):
     """Merge comparable snapshots without requiring identical source operands.
 
@@ -40,6 +43,19 @@ def _merge_flag_states(states):
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
+    # The SSE compares snapshot their operands too (_fca/_fcb, lifter.py), and
+    # every condition after one reads only that snapshot, so predecessors that
+    # compared different operands still agree. comiss and ucomiss differ only
+    # in which NaNs raise an exception; comisd compares doubles into the same
+    # double-typed snapshot. Refusing this merge left the jcc on the _flags
+    # fallback, which is never taken: Dino Crisis 3 does its float maths in
+    # SSE, and a `comiss` falling into a `jbe` that another `comiss` also
+    # jumps to is how its collision tests read -- so the player walked
+    # through walls.
+    if first[0] in _SSE_COMPARES:
+        if all(kind in _SSE_COMPARES for kind, _ in states[1:]):
+            return first
+        return None
     if first[0] in ("cmp", "test") and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
         for kind, ops in states[1:]:
