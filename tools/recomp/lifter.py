@@ -3974,6 +3974,15 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+def _is_rep_compare(insn):
+    """REPE/REPNE CMPS or SCAS -- the prefixed forms that write `_flags`."""
+    if not insn.mnemonic.startswith("rep"):
+        return False
+    text = f"{insn.mnemonic} {getattr(insn, 'op_str', '') or ''}"
+    return any(f in text for f in ("cmpsb", "cmpsw", "cmpsd",
+                                   "scasb", "scasw", "scasd"))
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -4119,6 +4128,19 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 curr, curr.operands, preserve_carry=preserve)
         else:
             results = lifter.lift_instruction(insns[i])
+            # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
+            # but `_flags` would keep whatever it last held -- 0 on entry --
+            # so the je after it read "not equal" where the hardware reads
+            # the ZF of the instruction before. MSVC's basic_string::compare
+            # is `xor eax, eax; repe cmpsb; je` with the count = the shorter
+            # length, so comparing against an empty string took the wrong
+            # arm. Load the incoming ZF first, when a tracked setter has one.
+            # (_cf needs nothing: only an iteration writes it.)
+            if _is_rep_compare(curr) and last_flag_setter:
+                zf = _make_condition("je", last_flag_setter, last_flag_ops)
+                if zf:
+                    stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
+                                 " /* ZF in: a zero count keeps it */")
         stmts.extend(results)
 
         # Track flag-setting instructions.
