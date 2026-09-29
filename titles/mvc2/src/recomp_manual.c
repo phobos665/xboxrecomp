@@ -242,6 +242,30 @@ void sub_00200F20(void)
     sub_00200F20_gen();
 }
 
+/* ── MvC2: deferred frames on by default ───────────────────── */
+
+/*
+ * MvC2 writes each fighter's new animation tiles into its sprite sheet after
+ * queueing the draws that sample it, which is correct on the console because
+ * the NV2A reaches those draws later. Drawn at the call, the shadow renderer
+ * showed the previous pose's tiles for a frame whenever a pose changed -- the
+ * sprite flicker (measured: 874 textures changed after the frame drew with
+ * them in 120 s; 0 with deferral). So this title runs deferred
+ * (RECOMP_HLE_D3D8_DEFER, src/hle/hle_d3d8_record.h) unless the player has
+ * said otherwise: set before main, and only if the variable is not already
+ * set, so RECOMP_HLE_D3D8_DEFER=0 still turns it off.
+ */
+#if defined(_MSC_VER)
+static void __cdecl mvc2_defaults(void)
+{
+    if (!getenv("RECOMP_HLE_D3D8_DEFER"))
+        _putenv("RECOMP_HLE_D3D8_DEFER=1");
+}
+#pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU")) void (__cdecl *mvc2_defaults_init)(void) = mvc2_defaults;
+#pragma comment(linker, "/include:mvc2_defaults_init")
+#endif
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
