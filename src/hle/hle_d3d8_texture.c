@@ -691,14 +691,76 @@ static void sync_palette(IDirect3DDevice8 *dev, uint32_t stage)
     g_bound_entry[stage] = v;
 }
 
-void hle_d3d8_sync_palettes(IDirect3DDevice8 *dev)
+/* At the end of a frame: which textures this frame drew with have different
+ * texels now than when it drew with them?
+ *
+ * The shadow renderer draws at the call; the NV2A draws when it reaches the
+ * command in the push buffer, which can be after the CPU has written a
+ * texture it was told to draw with. A title that queues a sprite's draws and
+ * only then writes that frame's tiles is correct on the console and one frame
+ * behind here. This counts it, so the question has a number. */
+static unsigned long g_changed_after_draw, g_frames_changed_after_draw;
+
+void hle_d3d8_texture_frame_end(void)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    int i, any = 0;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *e = &g_textures[i];
+        if (!e->host || e->rendered || e->framebuffer || e->used_swap != now)
+            continue;
+        if (!read_layout(e->va, &t) || level0_checksum(&t) == e->checksum)
+            continue;
+        g_changed_after_draw++;
+        any = 1;
+    }
+    if (any)
+        g_frames_changed_after_draw++;
+}
+
+static void op_sync_palettes(const void *arg)
 {
     uint32_t s;
+    IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
 
+    (void)arg;
     if (!dev)
         return;
     for (s = 0; s < MAX_STAGES; s++)
         sync_palette(dev, s);
+}
+
+/* Before a draw. Deferred, it runs where the draw runs, so the palette is
+ * read when the draw is executed. */
+void hle_d3d8_sync_palettes(IDirect3DDevice8 *dev)
+{
+    if (!dev)
+        return;
+    if (hle_d3d8_defer_recording())
+        hle_d3d8_defer_op(op_sync_palettes, NULL, 0);
+    else
+        op_sync_palettes(NULL);
+}
+
+/* The palette a stage uses, in order with the draws around it. */
+static void op_set_pal_data(const void *arg)
+{
+    const uint32_t *a = (const uint32_t *)arg;
+    g_pal_data[a[0]] = a[1];
+}
+
+static void set_pal_data(uint32_t stage, uint32_t data)
+{
+    uint32_t a[2];
+
+    a[0] = stage;
+    a[1] = data;
+    if (hle_d3d8_defer_recording())
+        hle_d3d8_defer_op(op_set_pal_data, a, sizeof a);
+    else
+        op_set_pal_data(a);
 }
 
 /* Cube textures a title renders into: its environment map. Only rendered
@@ -941,6 +1003,10 @@ static void report(void)
         fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds, "
                 "%lu refused by the host, %lu past the cache\n",
                 g_cube_count, g_cube_binds, g_cube_failed, g_cube_full);
+        if (g_frames_changed_after_draw)
+            fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed after the frame "
+                    "drew with them, in %lu frames\n", g_changed_after_draw,
+                    g_frames_changed_after_draw);
         if (g_midframe_changes)
             fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed mid-frame "
                     "(RECOMP_HLE_D3D8_TEX_EVERY_BIND)\n", g_midframe_changes);
@@ -955,6 +1021,15 @@ static void report(void)
 #endif /* _WIN32 */
 
 HLE_ORIGINAL(D3DDevice_SetTexture);
+
+#ifdef _WIN32
+static void shadow_set_texture(uint32_t stage, uint32_t texture);
+static void op_set_texture(const void *arg)
+{
+    const uint32_t *a = (const uint32_t *)arg;
+    shadow_set_texture(a[0], a[1]);
+}
+#endif
 
 /* HRESULT D3DDevice_SetTexture(DWORD Stage, IDirect3DBaseTexture8 *pTexture) */
 HLE_EXPORT(D3DDevice_SetTexture)
@@ -975,6 +1050,23 @@ HLE_EXPORT(D3DDevice_SetTexture)
     }
     HLE_CALL_ORIGINAL(D3DDevice_SetTexture);
 #ifdef _WIN32
+    /* Deferred (RECOMP_HLE_D3D8_DEFER), the host side runs when the frame is
+     * executed, so the texels are read then -- as the NV2A reads them when it
+     * reaches the draw, not when the title issued it. */
+    if (hle_d3d8_defer_recording()) {
+        uint32_t a[2];
+        a[0] = stage;
+        a[1] = texture;
+        hle_d3d8_defer_op(op_set_texture, a, sizeof a);
+    } else {
+        shadow_set_texture(stage, texture);
+    }
+#endif
+}
+
+#ifdef _WIN32
+static void shadow_set_texture(uint32_t stage, uint32_t texture)
+{
     {
         IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
         IDirect3DTexture8 *host = NULL;
@@ -1044,8 +1136,8 @@ HLE_EXPORT(D3DDevice_SetTexture)
         }
         report();
     }
-#endif
 }
+#endif
 
 /* Does the draw about to be made sample the title's own frame at stage 0?
  *
@@ -1108,7 +1200,7 @@ HLE_EXPORT(D3DDevice_SetPalette)
         if (!dev || stage >= 4u)
             return;
         if (!palette_va) {
-            g_pal_data[stage] = 0;
+            set_pal_data(stage, 0);
             return;
         }
         data = HLE_MEM32(palette_va + 4) & 0x0FFFFFFFu;
@@ -1124,7 +1216,7 @@ HLE_EXPORT(D3DDevice_SetPalette)
             }
             return;
         }
-        g_pal_data[stage] = data;
+        set_pal_data(stage, data);
     }
 #endif
 }
