@@ -2,7 +2,10 @@
  * xbox_adpcm.c -- Xbox ADPCM (format tag 0x69) block decoder.
  *
  * From doaxbv-re (https://github.com/NoRain211/doaxbv-re,
- * recomp-runtime/xbox_adpcm.c), GPL-3.0. Unchanged apart from this header.
+ * recomp-runtime/xbox_adpcm.c), GPL-3.0. Changed here: the reserved header
+ * byte is no longer validated and the step index is clamped rather than
+ * refused (the same fix as upstream xboxrecomp 9935d82 made to the LLE
+ * decoder in src/apu/apu_state.h).
  */
 #include "xbox_adpcm.h"
 
@@ -27,17 +30,21 @@ int xbox_adpcm_decode_block(
         pcm_samples < XBOX_ADPCM_BLOCK_SAMPLES * channels) {
         return 0;
     }
-    for (unsigned channel = 0u; channel < channels; ++channel) {
-        if (block[channel * 4u + 2u] > 88u || block[channel * 4u + 3u] != 0u) {
-            return 0;
-        }
-    }
-
+    /* The fourth header byte is RESERVED, not validated: the MCPX does not
+     * refuse a block over it, and titles ship blocks where it is non-zero
+     * (Jet Set Radio Future ends every ADPCM buffer in a 0x08 pad, and
+     * 3.5-4.4% of its blocks were silenced by refusing them). The step index
+     * is clamped for the same reason -- and it must be clamped, not trusted,
+     * because step_table has 89 entries. It is read as int8_t, as the LLE
+     * decoder in src/apu/apu_state.h reads it, so a byte above 127 clamps
+     * to 0. */
     for (unsigned channel = 0u; channel < channels; ++channel) {
         const uint8_t *header = block + channel * 4u;
         int predictor = header[0] | (header[1] << 8);
-        int index = header[2];
+        int index = (int8_t)header[2];
 
+        if (index < 0) index = 0;
+        if (index > 88) index = 88;
         if (predictor >= 32768) {
             predictor -= 65536;
         }
