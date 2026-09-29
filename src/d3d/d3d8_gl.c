@@ -1093,6 +1093,8 @@ void xbox_D3D8ScreenCopyShutdown(void) {}
 
 /* No Hor+ on this backend, so nothing for a title to widen. */
 float xbox_D3D8ClaimHorPlus(void) { return 1.0f; }
+/* Nor widescreen by screen. */
+void xbox_D3D8SetWideFrames(BOOL wide) { (void)wide; }
 
 BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
 {

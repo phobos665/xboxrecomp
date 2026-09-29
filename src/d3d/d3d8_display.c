@@ -80,6 +80,40 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
     return &g_policy;
 }
 
+/* Widescreen by screen. A 4:3-only title that has been widened can have
+ * screens that should not be: TimeSplitters 2's front end is laid out
+ * for 4:3 and mixes 3D backdrops with 2D panels, so neither stretching
+ * it nor squeezing its 2D leaves it right, while its levels are fine at
+ * 16:9. The title project knows which screen it is on and says so between
+ * frames; the frames it calls 4:3 are shown between bars, their 2D left
+ * alone. */
+static int      g_title_narrow;
+static int      g_title_said, g_last_wide = -1;
+static unsigned g_frames;
+
+void xbox_D3D8SetWideFrames(BOOL wide)
+{
+    g_title_said = 1;
+    g_title_narrow = wide ? 0 : 1;
+}
+
+int d3d8_display_wide_now(void)
+{
+    return d3d8_display_policy()->widescreen && !g_title_narrow;
+}
+
+void d3d8_display_frame_done(void)
+{
+    int wide = d3d8_display_wide_now();
+
+    g_frames++;
+    if (g_title_said && d3d8_display_policy()->widescreen && wide != g_last_wide) {
+        fprintf(stderr, "D3D8 display: frame %u on at %s\n", g_frames,
+                wide ? "16:9" : "4:3");
+        g_last_wide = wide;
+    }
+}
+
 void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
                              UINT *scene_w, UINT *scene_h)
 {
@@ -92,9 +126,7 @@ void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
 void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
                                UINT *shape_w, UINT *shape_h)
 {
-    const D3D8DisplayPolicy *p = d3d8_display_policy();
-
-    if (p->widescreen) {
+    if (d3d8_display_wide_now()) {
         /* The frame is anamorphic: the title squeezed a 16:9 view into
          * whatever buffer it renders to, and the display is meant to
          * stretch it back. Presenting it at its own shape would be the

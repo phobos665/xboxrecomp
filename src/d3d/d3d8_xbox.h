@@ -1187,6 +1187,13 @@ BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
  * is what a backend without Hor+ returns. */
 float xbox_D3D8ClaimHorPlus(void);
 
+/* Widescreen by screen, for a 4:3 title widened with Hor+ whose menus
+ * cannot be. FALSE: the frames drawn from now on are shown at 4:3 between
+ * bars, with their 2D left unsqueezed; TRUE (the default) puts them back
+ * at 16:9. Holds until changed, so call it between frames. Without
+ * widescreen, nothing. */
+void xbox_D3D8SetWideFrames(BOOL wide);
+
 /* The Xbox's CopyRects, for the one case a title uses it for in anger:
    copying the finished frame into a texture it then draws over the scene.
    The host's own back buffer is the source, because the guest's is empty --
