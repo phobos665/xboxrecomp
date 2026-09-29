@@ -145,7 +145,8 @@ enum {
     D3D8CAP_MATERIAL            = 25, /* D3D8CapMaterial (version 6) */
     D3D8CAP_LIGHT               = 26, /* D3D8CapLight */
     D3D8CAP_LIGHT_ENABLE        = 27, /* D3D8CapLightEnable */
-    D3D8CAP_CHUNK_KINDS         = 28  /* one past the last, for per-kind counters */
+    D3D8CAP_TWOD_PLACEMENT      = 28, /* D3D8CapTwoDPlacement (version 6) */
+    D3D8CAP_CHUNK_KINDS         = 29  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -188,6 +189,9 @@ typedef struct { uint32_t count, exclusive; D3D8CapRect rect; } D3D8CapScissors;
 typedef struct { uint32_t words[17]; } D3D8CapMaterial;
 typedef struct { uint32_t index; uint32_t words[26]; } D3D8CapLight;
 typedef struct { uint32_t index, enable; } D3D8CapLightEnable;
+/* xbox_D3D8SetTwoDPlacement: where the next screen-space draws go in
+ * widescreen (XBOX_D3D8_2D_*), and the title's tag for the call site. */
+typedef struct { uint32_t placement, tag; } D3D8CapTwoDPlacement;
 
 /* texture_id 0 is SetTexture(stage, NULL). */
 typedef struct { uint32_t stage, texture_id; } D3D8CapSetTexture;

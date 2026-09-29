@@ -280,6 +280,15 @@ static void rec_scissors(UINT count, BOOL exclusive, const D3DRECT *rect)
     chunk(D3D8CAP_SCISSORS, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
+static void rec_two_d_placement(int placement, uint32_t tag)
+{
+    D3D8CapTwoDPlacement c;
+
+    c.placement = (uint32_t)placement;
+    c.tag = tag;
+    chunk(D3D8CAP_TWOD_PLACEMENT, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
 static void rec_viewport(const D3DVIEWPORT8 *vp)
 {
     D3D8CapViewport c;
@@ -502,6 +511,11 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
         UINT count; BOOL exclusive; D3DRECT rect;
         xbox_D3D8GetScissors(&count, &exclusive, &rect);
         rec_scissors(count, exclusive, &rect);
+    }
+    {
+        uint32_t tag;
+        int placement = xbox_D3D8GetTwoDPlacement(&tag);
+        rec_two_d_placement(placement, tag);
     }
 
     for (s = 0; rs && s < CAPTURE_RENDER_STATES; s++)
@@ -992,6 +1006,28 @@ void host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
     if (g_cap)
         rec_scissors(count, exclusive, count && rects ? &rects[0] : NULL);
     xbox_D3D8SetScissors(count, exclusive, rects);
+}
+
+typedef struct { int placement; uint32_t tag; } dq_two_d_placement;
+
+static void op_two_d_placement(const void *arg)
+{
+    const dq_two_d_placement *p = (const dq_two_d_placement *)arg;
+    host_SetTwoDPlacement(p->placement, p->tag);
+}
+
+void host_SetTwoDPlacement(int placement, uint32_t tag)
+{
+    if (hle_d3d8_defer_recording()) {
+        dq_two_d_placement p;
+        p.placement = placement;
+        p.tag = tag;
+        hle_d3d8_defer_op(op_two_d_placement, &p, sizeof p);
+        return;
+    }
+    if (g_cap)
+        rec_two_d_placement(placement, tag);
+    xbox_D3D8SetTwoDPlacement(placement, tag);
 }
 
 static void op_viewport(const void *arg)

@@ -104,6 +104,9 @@ HRESULT host_SetLight(IDirect3DDevice8 *dev, DWORD index, const D3DLIGHT8 *light
 HRESULT host_LightEnable(IDirect3DDevice8 *dev, DWORD index, BOOL enable);
 /* The Xbox scissor (xbox_D3D8SetScissors); the first rectangle is recorded. */
 void    host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
+/* xbox_D3D8SetTwoDPlacement, recorded. A title project calls this rather
+ * than the device's own, so a capture replays with the same placements. */
+void    host_SetTwoDPlacement(int placement, uint32_t tag);
 HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage,
                         IDirect3DBaseTexture8 *texture);
 HRESULT host_SetVertexShader(IDirect3DDevice8 *dev, DWORD handle);
