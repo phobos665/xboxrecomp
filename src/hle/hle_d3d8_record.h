@@ -62,6 +62,29 @@ int hle_d3d8_capture_active(void);
  * executable. */
 void hle_d3d8_capture_next_frame(void);
 
+/* ------------------------------------------------------- deferred frames
+ *
+ * RECOMP_HLE_D3D8_DEFER=1 (or `defer_draws = 1` in the title's settings
+ * file): the shadow renderer queues a frame's device calls instead of making
+ * them, and runs the queue at the frame's end (hle_d3d8_defer_flush). That is
+ * when the NV2A would reach them: the title's own D3D writes commands into a
+ * push buffer the GPU consumes later, so a title may write a texture after
+ * queueing the draw that samples it and still be correct on the console.
+ * Marvel vs Capcom 2 writes each fighter's new animation tiles that way, and
+ * drawing at the call showed the previous pose's tiles for one frame.
+ *
+ * State and draw calls below are queued with copies of what they point at.
+ * Creation, locking and vertex-program declarations run at the call. HLE code
+ * whose effect depends on guest memory at execution time -- binding a guest
+ * texture, choosing its palette -- queues itself with hle_d3d8_defer_op. */
+int  hle_d3d8_defer_on(void);
+/* On, and not the thread currently running the queue: calls should queue. */
+int  hle_d3d8_defer_recording(void);
+/* Queue fn(copy of arg). The copy lives until fn has run. */
+void hle_d3d8_defer_op(void (*fn)(const void *arg), const void *arg, size_t size);
+/* Run everything queued, in order. Safe to call when nothing is. */
+void hle_d3d8_defer_flush(void);
+
 /* ----------------------------------------------------------- device calls */
 
 HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,

@@ -813,6 +813,9 @@ int hle_d3d8_stage0_is_framebuffer(void);
 /* From hle_d3d8_texture.c: re-read each stage's guest palette, as the Xbox
  * does at every draw, and re-bake a P8 texture drawn under a new one. */
 void hle_d3d8_sync_palettes(IDirect3DDevice8 *dev);
+/* From hle_d3d8_texture.c: at the end of a frame, textures whose texels
+ * changed after the frame drew with them. */
+void hle_d3d8_texture_frame_end(void);
 /* Draws arriving on a guest thread other than the one that swaps. A loader
  * thread drawing to warm caches puts geometry through the host that no
  * presented frame ever contains -- it would count as drawn and never show. */
@@ -1587,6 +1590,15 @@ static void frame_end_shadow(void)
             g_shadow_thread_notes++;
         }
         g_shadow_swap_thread = thread;
+
+        /* Deferred frames (RECOMP_HLE_D3D8_DEFER): the frame's device calls
+         * run now, before anything reads the result -- the capture boundary,
+         * the dump, the present. */
+        hle_d3d8_defer_flush();
+
+        /* Textures this frame drew with, checked again now that the frame
+         * is finished (hle_d3d8_texture.c). */
+        hle_d3d8_texture_frame_end();
 
         g_shadow_swaps++;
         /* The frame boundary for capture: closes the frame being recorded, or

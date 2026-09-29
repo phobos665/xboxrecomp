@@ -46,6 +46,7 @@
 #include "d3d8_combiners.h"
 #include "d3d8_capture.h"
 #include "hle_d3d8_record.h"
+#include "recomp_config.h"   /* RECOMP_HLE_D3D8_DEFER / defer_draws */
 
 /* hle_d3d8.c: the shadow device, or NULL. */
 IDirect3DDevice8 *hle_d3d8_shadow_device(void);
@@ -610,11 +611,174 @@ start:
     capture_snapshot(dev);
 }
 
+/* --------------------------------------------------------- deferred frames */
+
+/* The queue: records of [header][payload], each header naming the function
+ * that runs the payload. One per process, guarded by one lock, because the
+ * title's draws can come from more than one guest thread and the order they
+ * arrive in is the order the push buffer would have held them. */
+typedef struct {
+    uint32_t size;                       /* payload bytes */
+    uint32_t pad;
+    void (*fn)(const void *arg);
+} defer_header;
+
+#define DEFER_ALIGN(n)  (((n) + 15u) & ~(size_t)15u)
+#define DEFER_LIMIT     (64u * 1024u * 1024u)   /* run early past this */
+
+static uint8_t          *g_dq;
+static size_t            g_dq_len, g_dq_cap;
+static CRITICAL_SECTION  g_dq_cs;
+static INIT_ONCE         g_dq_once = INIT_ONCE_STATIC_INIT;
+static volatile DWORD    g_dq_runner;    /* thread running the queue, or 0 */
+static int               g_defer = -1;
+static unsigned long     g_dq_flushes, g_dq_early, g_dq_ops_run;
+
+static BOOL CALLBACK dq_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_dq_cs);
+    return TRUE;
+}
+
+int hle_d3d8_defer_on(void)
+{
+    if (g_defer < 0) {
+        InitOnceExecuteOnce(&g_dq_once, dq_init, NULL, NULL);
+        g_defer = recomp_config_bool("RECOMP_HLE_D3D8_DEFER", "defer_draws", 0);
+        if (g_defer) {
+            fprintf(stderr, "[HLE-D3D8] deferred frames: device calls run at the "
+                    "frame's end (RECOMP_HLE_D3D8_DEFER)\n");
+            fflush(stderr);
+        }
+    }
+    return g_defer;
+}
+
+int hle_d3d8_defer_recording(void)
+{
+    return hle_d3d8_defer_on() && g_dq_runner != GetCurrentThreadId();
+}
+
+void hle_d3d8_defer_op(void (*fn)(const void *arg), const void *arg, size_t size)
+{
+    size_t need = sizeof(defer_header) + DEFER_ALIGN(size);
+    defer_header *h;
+
+    EnterCriticalSection(&g_dq_cs);
+    if (g_dq_len + need > g_dq_cap) {
+        size_t cap = g_dq_cap ? g_dq_cap * 2 : (size_t)1 << 20;
+        uint8_t *grown;
+        while (cap < g_dq_len + need)
+            cap *= 2;
+        grown = (uint8_t *)realloc(g_dq, cap);
+        if (!grown) {
+            /* No room: run what is queued and then this, in order. */
+            LeaveCriticalSection(&g_dq_cs);
+            hle_d3d8_defer_flush();
+            g_dq_runner = GetCurrentThreadId();
+            fn(arg);
+            g_dq_runner = 0;
+            return;
+        }
+        g_dq = grown;
+        g_dq_cap = cap;
+    }
+    h = (defer_header *)(g_dq + g_dq_len);
+    h->size = (uint32_t)size;
+    h->pad = 0;
+    h->fn = fn;
+    if (size)
+        memcpy(h + 1, arg, size);
+    g_dq_len += need;
+    LeaveCriticalSection(&g_dq_cs);
+
+    /* A title that goes a long way between swaps (a loading screen that
+     * draws without presenting) must not grow the queue without bound. */
+    if (g_dq_len > DEFER_LIMIT) {
+        g_dq_early++;
+        hle_d3d8_defer_flush();
+    }
+}
+
+void hle_d3d8_defer_flush(void)
+{
+    size_t off;
+
+    if (g_defer <= 0)
+        return;
+    EnterCriticalSection(&g_dq_cs);
+    g_dq_runner = GetCurrentThreadId();
+    for (off = 0; off < g_dq_len; ) {
+        defer_header *h = (defer_header *)(g_dq + off);
+        h->fn(h->size ? (const void *)(h + 1) : NULL);
+        off += sizeof(defer_header) + DEFER_ALIGN(h->size);
+        g_dq_ops_run++;
+    }
+    g_dq_len = 0;
+    g_dq_runner = 0;
+    g_dq_flushes++;
+    LeaveCriticalSection(&g_dq_cs);
+    if ((g_dq_flushes & 4095u) == 1) {
+        fprintf(stderr, "[HLE-D3D8] deferred frames: %lu flushes (%lu early), "
+                "%lu calls run\n", g_dq_flushes, g_dq_early, g_dq_ops_run);
+        fflush(stderr);
+    }
+}
+
+/* Payload helpers for the wrappers below: a fixed part, then up to two
+ * variable-length copies of what the call points at. */
+static void defer_call(void (*fn)(const void *), const void *fixed, size_t fixed_size,
+                       const void *a, size_t a_size, const void *b, size_t b_size)
+{
+    uint8_t stack[256], *p = stack;
+    size_t total = DEFER_ALIGN(fixed_size) + DEFER_ALIGN(a_size) + b_size;
+
+    if (total > sizeof stack) {
+        p = (uint8_t *)malloc(total);
+        if (!p)
+            return;
+    }
+    memcpy(p, fixed, fixed_size);
+    if (a_size)
+        memcpy(p + DEFER_ALIGN(fixed_size), a, a_size);
+    if (b_size)
+        memcpy(p + DEFER_ALIGN(fixed_size) + DEFER_ALIGN(a_size), b, b_size);
+    hle_d3d8_defer_op(fn, p, total);
+    if (p != stack)
+        free(p);
+}
+
+#define DEFER_PART_A(arg, fixed_type) \
+    ((const uint8_t *)(arg) + DEFER_ALIGN(sizeof(fixed_type)))
+#define DEFER_PART_B(arg, fixed_type, a_size) \
+    (DEFER_PART_A(arg, fixed_type) + DEFER_ALIGN(a_size))
+
 /* ------------------------------------------------------------ device calls */
+
+typedef struct { DWORD count, flags; D3DCOLOR color; float z; DWORD stencil; } dq_clear;
+
+static void op_clear(const void *arg)
+{
+    const dq_clear *c = (const dq_clear *)arg;
+    host_Clear(hle_d3d8_shadow_device(), c->count,
+               c->count ? (const D3DRECT *)DEFER_PART_A(arg, dq_clear) : NULL,
+               c->flags, c->color, c->z, c->stencil);
+}
 
 HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,
                    DWORD flags, D3DCOLOR color, float z, DWORD stencil)
 {
+    if (hle_d3d8_defer_recording()) {
+        dq_clear c;
+        c.count = rects ? count : 0;
+        c.flags = flags;
+        c.color = color;
+        c.z = z;
+        c.stencil = stencil;
+        defer_call(op_clear, &c, sizeof c, rects, (size_t)c.count * sizeof *rects, NULL, 0);
+        return S_OK;
+    }
     if (g_cap) {
         D3D8CapClear c;
         D3D8CapRect r[16];
@@ -640,63 +804,192 @@ HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,
 
 HRESULT host_Swap(IDirect3DDevice8 *dev, DWORD flags)
 {
+    hle_d3d8_defer_flush();              /* the frame is drawn before it shows */
     return dev->lpVtbl->Swap(dev, flags);
+}
+
+typedef struct { DWORD a, b, c; } dq_3;
+
+static void op_render_state(const void *arg)
+{
+    const dq_3 *p = (const dq_3 *)arg;
+    host_SetRenderState(hle_d3d8_shadow_device(), (D3DRENDERSTATETYPE)p->a, p->b);
 }
 
 HRESULT host_SetRenderState(IDirect3DDevice8 *dev, D3DRENDERSTATETYPE state, DWORD value)
 {
+    if (hle_d3d8_defer_recording()) {
+        dq_3 p = { (DWORD)state, value, 0 };
+        hle_d3d8_defer_op(op_render_state, &p, sizeof p);
+        return S_OK;
+    }
     if (g_cap)
         rec_render_state((DWORD)state, value);
     return dev->lpVtbl->SetRenderState(dev, state, value);
 }
 
+static void op_stage_state(const void *arg)
+{
+    const dq_3 *p = (const dq_3 *)arg;
+    host_SetTextureStageState(hle_d3d8_shadow_device(), p->a,
+                              (D3DTEXTURESTAGESTATETYPE)p->b, p->c);
+}
+
 HRESULT host_SetTextureStageState(IDirect3DDevice8 *dev, DWORD stage,
                                   D3DTEXTURESTAGESTATETYPE type, DWORD value)
 {
+    if (hle_d3d8_defer_recording()) {
+        dq_3 p = { stage, (DWORD)type, value };
+        hle_d3d8_defer_op(op_stage_state, &p, sizeof p);
+        return S_OK;
+    }
     if (g_cap)
         rec_stage_state(stage, (DWORD)type, value);
     return dev->lpVtbl->SetTextureStageState(dev, stage, type, value);
 }
 
+typedef struct { DWORD state; D3DMATRIX m; } dq_transform;
+
+static void op_transform(const void *arg)
+{
+    const dq_transform *p = (const dq_transform *)arg;
+    host_SetTransform(hle_d3d8_shadow_device(), (D3DTRANSFORMSTATETYPE)p->state, &p->m);
+}
+
 HRESULT host_SetTransform(IDirect3DDevice8 *dev, D3DTRANSFORMSTATETYPE state,
                           const D3DMATRIX *matrix)
 {
+    if (hle_d3d8_defer_recording() && matrix) {
+        dq_transform p;
+        p.state = (DWORD)state;
+        p.m = *matrix;
+        hle_d3d8_defer_op(op_transform, &p, sizeof p);
+        return S_OK;
+    }
     if (g_cap && matrix)
         rec_transform((DWORD)state, matrix);
     return dev->lpVtbl->SetTransform(dev, state, matrix);
 }
 
+typedef struct { UINT count; BOOL exclusive; } dq_scissors;
+
+static void op_scissors(const void *arg)
+{
+    const dq_scissors *p = (const dq_scissors *)arg;
+    host_SetScissors(p->count, p->exclusive,
+                     p->count ? (const D3DRECT *)DEFER_PART_A(arg, dq_scissors) : NULL);
+}
+
 void host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
 {
+    if (hle_d3d8_defer_recording()) {
+        dq_scissors p;
+        p.count = rects ? count : 0;
+        p.exclusive = exclusive;
+        defer_call(op_scissors, &p, sizeof p, rects, (size_t)p.count * sizeof *rects,
+                   NULL, 0);
+        return;
+    }
     if (g_cap)
         rec_scissors(count, exclusive, count && rects ? &rects[0] : NULL);
     xbox_D3D8SetScissors(count, exclusive, rects);
 }
 
+static void op_viewport(const void *arg)
+{
+    host_SetViewport(hle_d3d8_shadow_device(), (const D3DVIEWPORT8 *)arg);
+}
+
 HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport)
 {
+    if (hle_d3d8_defer_recording() && viewport) {
+        hle_d3d8_defer_op(op_viewport, viewport, sizeof *viewport);
+        return S_OK;
+    }
     if (g_cap && viewport)
         rec_viewport(viewport);
     return dev->lpVtbl->SetViewport(dev, viewport);
 }
 
+typedef struct { DWORD stage; IDirect3DBaseTexture8 *texture; } dq_set_texture;
+
+static void op_host_set_texture(const void *arg)
+{
+    const dq_set_texture *p = (const dq_set_texture *)arg;
+    host_SetTexture(hle_d3d8_shadow_device(), p->stage, p->texture);
+}
+
 HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage, IDirect3DBaseTexture8 *texture)
 {
+    if (hle_d3d8_defer_recording()) {
+        dq_set_texture p;
+        p.stage = stage;
+        p.texture = texture;
+        hle_d3d8_defer_op(op_host_set_texture, &p, sizeof p);
+        return S_OK;
+    }
     if (g_cap)
         rec_set_texture(stage, texture);
     return dev->lpVtbl->SetTexture(dev, stage, texture);
 }
 
+static void op_vertex_shader(const void *arg)
+{
+    host_SetVertexShader(hle_d3d8_shadow_device(), *(const DWORD *)arg);
+}
+
 HRESULT host_SetVertexShader(IDirect3DDevice8 *dev, DWORD handle)
 {
+    if (hle_d3d8_defer_recording()) {
+        hle_d3d8_defer_op(op_vertex_shader, &handle, sizeof handle);
+        return S_OK;
+    }
     if (g_cap)
         rec_set_vertex_shader(handle);
     return dev->lpVtbl->SetVertexShader(dev, handle);
 }
 
+typedef struct { DWORD type; UINT prims, stride; } dq_draw_up;
+
+static void op_draw_up(const void *arg)
+{
+    const dq_draw_up *p = (const dq_draw_up *)arg;
+    host_DrawPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type, p->prims,
+                         DEFER_PART_A(arg, dq_draw_up), p->stride);
+}
+
+typedef struct {
+    DWORD type;
+    UINT min_index, num_vertices, prims, stride;
+    DWORD index_format;
+    uint32_t index_bytes;
+} dq_draw_indexed_up;
+
+static void op_draw_indexed_up(const void *arg)
+{
+    const dq_draw_indexed_up *p = (const dq_draw_indexed_up *)arg;
+    host_DrawIndexedPrimitiveUP(hle_d3d8_shadow_device(), (D3DPRIMITIVETYPE)p->type,
+                                p->min_index, p->num_vertices, p->prims,
+                                DEFER_PART_A(arg, dq_draw_indexed_up),
+                                (D3DFORMAT)p->index_format,
+                                DEFER_PART_B(arg, dq_draw_indexed_up, p->index_bytes),
+                                p->stride);
+}
+
 HRESULT host_DrawPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,
                              UINT prims, const void *vertices, UINT stride)
 {
+    if (hle_d3d8_defer_recording() && vertices && stride) {
+        dq_draw_up p;
+        uint64_t bytes = (uint64_t)d3d8_up_vertices_read(type, prims) * stride;
+        if (bytes > DEFER_LIMIT)
+            return E_FAIL;
+        p.type = (DWORD)type;
+        p.prims = prims;
+        p.stride = stride;
+        defer_call(op_draw_up, &p, sizeof p, vertices, (size_t)bytes, NULL, 0);
+        return S_OK;
+    }
     if (g_cap && vertices && stride) {
         D3D8CapDrawUp c;
         uint64_t bytes = (uint64_t)d3d8_up_vertices_read(type, prims) * stride;
@@ -718,6 +1011,25 @@ HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type
                                     const void *indices, D3DFORMAT index_format,
                                     const void *vertices, UINT stride)
 {
+    if (hle_d3d8_defer_recording() && indices && vertices && stride) {
+        dq_draw_indexed_up p;
+        UINT index_size = index_format == D3DFMT_INDEX32 ? 4u : 2u;
+        uint64_t ibytes = (uint64_t)d3d8_up_indices_read(type, prims) * index_size;
+        /* From the base the indices are relative to, through the last vertex. */
+        uint64_t vbytes = (uint64_t)(min_index + num_vertices) * stride;
+        if (ibytes > DEFER_LIMIT || vbytes > DEFER_LIMIT)
+            return E_FAIL;
+        p.type = (DWORD)type;
+        p.min_index = min_index;
+        p.num_vertices = num_vertices;
+        p.prims = prims;
+        p.stride = stride;
+        p.index_format = (DWORD)index_format;
+        p.index_bytes = (uint32_t)ibytes;
+        defer_call(op_draw_indexed_up, &p, sizeof p, indices, (size_t)ibytes,
+                   vertices, (size_t)vbytes);
+        return S_OK;
+    }
     if (g_cap && indices && vertices && stride) {
         D3D8CapDrawIndexedUp c;
         UINT index_size = index_format == D3DFMT_INDEX32 ? 4u : 2u;
@@ -792,9 +1104,20 @@ HRESULT host_UnlockRect(IDirect3DTexture8 *texture, UINT level)
     return hr;
 }
 
+static void op_release_texture(const void *arg)
+{
+    host_ReleaseTexture(*(IDirect3DTexture8 *const *)arg);
+}
+
 ULONG host_ReleaseTexture(IDirect3DTexture8 *texture)
 {
     IDirect3DBaseTexture8 *object = (IDirect3DBaseTexture8 *)texture;
+
+    /* Queued draws may still name it: released where the queue reaches. */
+    if (hle_d3d8_defer_recording()) {
+        hle_d3d8_defer_op(op_release_texture, &texture, sizeof texture);
+        return 0;
+    }
     ULONG left = texture->lpVtbl->Release(texture);
     int i;
 
@@ -815,12 +1138,45 @@ ULONG host_ReleaseTexture(IDirect3DTexture8 *texture)
 
 /* ------------------------------------------------------- render targets */
 
+typedef struct {
+    IDirect3DBaseTexture8 *texture;
+    UINT level, face;
+    IDirect3DSurface8 *depth;
+} dq_render_target;
+
+static void op_render_target(const void *arg)
+{
+    const dq_render_target *p = (const dq_render_target *)arg;
+
+    if (FAILED(host_SetRenderTarget(hle_d3d8_shadow_device(), p->texture, p->level,
+                                    p->face, p->depth))) {
+        /* Queued, the caller was told it worked and cannot take its
+         * fallback (a scratch target, then the back buffer). Say so. */
+        static int said;
+        if (!said++) {
+            fprintf(stderr, "[HLE-D3D8] deferred frames: the host refused a render "
+                    "target; the draws aimed at it go where the last target was\n");
+            fflush(stderr);
+        }
+    }
+}
+
 HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DBaseTexture8 *texture,
                              UINT level, UINT face, IDirect3DSurface8 *depth)
 {
     IDirect3DSurface8 *surface = NULL;
     D3D8CubeInfo cube;
     HRESULT hr;
+
+    if (hle_d3d8_defer_recording()) {
+        dq_render_target p;
+        p.texture = texture;
+        p.level = level;
+        p.face = face;
+        p.depth = depth;
+        hle_d3d8_defer_op(op_render_target, &p, sizeof p);
+        return S_OK;
+    }
 
     if (texture && d3d8_cube_info(texture, &cube)) {
         IDirect3DCubeTexture8 *c = (IDirect3DCubeTexture8 *)texture;
@@ -898,8 +1254,17 @@ BOOL host_vsh_same_microcode(DWORD handle, const DWORD *microcode, int insn_coun
            memcmp(have, microcode, (size_t)insn_count * 4 * sizeof(DWORD)) == 0;
 }
 
+static void op_vsh_delete(const void *arg)
+{
+    host_vsh_delete_shader(*(const DWORD *)arg);
+}
+
 HRESULT host_vsh_delete_shader(DWORD handle)
 {
+    if (hle_d3d8_defer_recording()) {
+        hle_d3d8_defer_op(op_vsh_delete, &handle, sizeof handle);
+        return S_OK;
+    }
     if (g_cap) {
         D3D8CapVsHandle c;
 
@@ -909,8 +1274,46 @@ HRESULT host_vsh_delete_shader(DWORD handle)
     return d3d8_vsh_delete_shader(handle);
 }
 
+typedef struct { int first, count; } dq_constants;
+
+static void op_vsh_constants(const void *arg)
+{
+    const dq_constants *p = (const dq_constants *)arg;
+    host_vsh_set_constant(p->first, (const float *)DEFER_PART_A(arg, dq_constants),
+                          p->count);
+}
+
+typedef struct { int enabled; float scale[4], offset[4]; } dq_screenspace;
+
+static void op_vsh_screenspace(const void *arg)
+{
+    const dq_screenspace *p = (const dq_screenspace *)arg;
+    host_vsh_set_screenspace(p->enabled ? p->scale : NULL, p->enabled ? p->offset : NULL);
+}
+
+typedef struct { int reg; float v[4]; } dq_vertex_data;
+
+static void op_vsh_vertex_data(const void *arg)
+{
+    const dq_vertex_data *p = (const dq_vertex_data *)arg;
+    host_vsh_set_vertex_data(p->reg, p->v);
+}
+
+static void op_ps_token(const void *arg)
+{
+    host_combiners_set_pixel_shader(*(const DWORD *)arg);
+}
+
 void host_vsh_set_constant(int first_reg, const float *data, int count)
 {
+    if (hle_d3d8_defer_recording() && data && count > 0) {
+        dq_constants p;
+        p.first = first_reg;
+        p.count = count;
+        defer_call(op_vsh_constants, &p, sizeof p, data,
+                   (size_t)count * 4 * sizeof(float), NULL, 0);
+        return;
+    }
     if (g_cap)
         rec_vs_constants(first_reg, data, count);
     d3d8_vsh_set_constant(first_reg, data, count);
@@ -925,6 +1328,17 @@ HRESULT host_vsh_set_declaration(DWORD handle, const D3D8VshInput *inputs, int c
 
 void host_vsh_set_screenspace(const float scale[4], const float offset[4])
 {
+    if (hle_d3d8_defer_recording()) {
+        dq_screenspace p;
+        memset(&p, 0, sizeof p);
+        p.enabled = scale && offset;
+        if (p.enabled) {
+            memcpy(p.scale, scale, sizeof p.scale);
+            memcpy(p.offset, offset, sizeof p.offset);
+        }
+        hle_d3d8_defer_op(op_vsh_screenspace, &p, sizeof p);
+        return;
+    }
     if (g_cap && scale && offset)
         rec_vs_screenspace(1, scale, offset);
     d3d8_vsh_set_screenspace(scale, offset);
@@ -932,6 +1346,13 @@ void host_vsh_set_screenspace(const float scale[4], const float offset[4])
 
 void host_vsh_set_vertex_data(int reg, const float value[4])
 {
+    if (hle_d3d8_defer_recording() && value) {
+        dq_vertex_data p;
+        p.reg = reg;
+        memcpy(p.v, value, sizeof p.v);
+        hle_d3d8_defer_op(op_vsh_vertex_data, &p, sizeof p);
+        return;
+    }
     if (g_cap && value)
         rec_vs_vertex_data(reg, value);
     d3d8_vsh_set_vertex_data(reg, value);
@@ -939,6 +1360,10 @@ void host_vsh_set_vertex_data(int reg, const float value[4])
 
 void host_combiners_set_pixel_shader(DWORD token)
 {
+    if (hle_d3d8_defer_recording()) {
+        hle_d3d8_defer_op(op_ps_token, &token, sizeof token);
+        return;
+    }
     if (g_cap)
         rec_ps_token(token);
     d3d8_combiners_set_pixel_shader(token);
