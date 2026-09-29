@@ -487,8 +487,15 @@ def main():
             # wrap: recomp_manual.c defines sub_X itself and calls the generated
             # body as sub_X_gen. So do NOT add these to `manual` (the body is
             # still needed) -- just rename them so the emitted body is sub_X_gen.
+            #
+            # Only the body. Every call to the function, and its dispatch-table
+            # entry, must still name sub_X -- the wrapper -- or the wrapper is
+            # defined and never reached. Renaming "name" alone did exactly that:
+            # the first title to wrap anything (Marvel vs Capcom 2, 29 Sep
+            # 2026) had its generated callers call sub_X_gen directly.
             for addr in wrap & known:
                 translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
+                translator.func_db[addr]["call_name"] = f"sub_{addr:08X}"
 
             # skip - wrap: defined by hand and not wrapped -> declare-only, which
             # is exactly what membership in `manual` produces.
