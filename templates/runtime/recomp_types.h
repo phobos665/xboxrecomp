@@ -1197,6 +1197,22 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
 #endif
 }
 
+/* CVTSD2SI / CVTTSD2SI: the same rule for a double. A C cast is neither --
+ * it truncates, and is undefined where the hardware returns the indefinite
+ * value -- so cvtsd2si of 1.5 came out 1 instead of 2. */
+static inline int32_t SSE_CVT_D2I(double v, int truncate)
+{
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttsd_si32(_mm_set_sd(v))
+                    : _mm_cvtsd_si32(_mm_set_sd(v));
+#else
+    double rounded = truncate ? trunc(v) : nearbyint(v);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return (int32_t)0x80000000u;       /* integer indefinite */
+    return (int32_t)rounded;
+#endif
+}
+
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
 {
     RecompMmx r;
