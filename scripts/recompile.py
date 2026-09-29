@@ -119,7 +119,10 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     if work:
         lift += ["--disasm-dir", str(work / "disasm"),
                  "--func-id-dir", str(work / "func_id"),
-                 "-o", str(work / "recomp")]
+                 "-o", str(work / "recomp"),
+                 # Per-site indirect-call targets (tools.recomp.icall_feedback
+                 # merge --sites-db): this title's, not the shared default.
+                 "--icall-sites", str(work / "recomp" / "icall_sites.json")]
     # A title project copied from templates/new-game: the generated sources
     # go where its CMakeLists globs them, and the functions its
     # recomp_manual.c defines by hand are left out of the generated set so
