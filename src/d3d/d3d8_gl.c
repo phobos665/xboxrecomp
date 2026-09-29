@@ -1096,6 +1096,19 @@ float xbox_D3D8ClaimHorPlus(void) { return 1.0f; }
 /* Nor widescreen by screen. */
 void xbox_D3D8SetWideFrames(BOOL wide) { (void)wide; }
 
+/* No widescreen 2D squeeze on this backend, so nothing to place. */
+void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag)
+{
+    (void)placement; (void)tag;
+}
+
+int xbox_D3D8GetTwoDPlacement(uint32_t *tag)
+{
+    if (tag)
+        *tag = 0;
+    return 0;
+}
+
 BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
 {
     if (count)     *count = g_scissor_count;

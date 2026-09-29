@@ -263,10 +263,19 @@ static void present_resolve(void)
  * worked out itself, rather than through its projection. See
  * d3d8_SetTwoDSqueeze. */
 static BOOL g_2d_squeeze;
+/* Whether the draw in hand is screen-space at all, widescreen or not: the
+ * shader path's verdict before the widescreen gate. For the tag report. */
+static BOOL g_2d_screen_space;
+/* Where the title says its next screen-space draws belong
+ * (xbox_D3D8SetTwoDPlacement), and which of its call sites they come from. */
+static int      g_2d_placement = XBOX_D3D8_2D_AUTO;
+static uint32_t g_2d_tag;
 
 /* The widescreen 2D squeeze (see apply_host_viewport) as a horizontal
- * factor about a centre, both in host pixels of the scene. FALSE when no
- * squeeze applies to the draw in hand.
+ * factor about an anchor, both in host pixels of the scene. FALSE when no
+ * squeeze applies to the draw in hand. The anchor is the middle of the
+ * picture, or its left or right edge for a draw the title has pinned
+ * there: a health bar in a 4:3 corner stays in the 16:9 corner.
  *
  * Everything that positions a 2D draw in pixels has to go through this
  * together. The viewport alone is not enough: a title that clips a menu
@@ -284,9 +293,16 @@ static BOOL two_d_squeeze(float *k_out, float *cx_out)
     if (!(k > 0.0f && k < 1.0f))
         return FALSE;
     *k_out = k;
-    *cx_out = (float)g_device_state.width * 0.5f;
+    if (g_2d_placement == XBOX_D3D8_2D_LEFT)
+        *cx_out = 0.0f;
+    else if (g_2d_placement == XBOX_D3D8_2D_RIGHT)
+        *cx_out = (float)g_device_state.width;
+    else
+        *cx_out = (float)g_device_state.width * 0.5f;
     return TRUE;
 }
+
+static void two_d_tag_frame(void);
 
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
@@ -297,6 +313,7 @@ static void present_scene(void)
     D3D8DisplayFit fit;
     RECT rc;
 
+    two_d_tag_frame();
     if (!rhi_swapchain_view() || !s->rhi_scene_srv)
         return;
 
@@ -1246,13 +1263,11 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
 
-    /* A screen-space draw covering the whole width is a backdrop or a
-     * fade, and must span the widescreen picture rather than be squeezed
-     * into the middle of it with the HUD. After prepare_draw, which is
-     * what decides whether this is a screen-space draw at all. */
-    if (d3d8_GetTwoDSqueeze() &&
-        d3d8_draw_escapes_squeeze(pVertexData, VertexStreamZeroStride, vertex_count))
-        d3d8_SetTwoDSqueeze(FALSE);
+    /* Where a screen-space draw goes in widescreen: squeezed to 4:3 with
+     * the HUD, or spanning the picture like a backdrop or a fade. After
+     * prepare_draw, which is what decides whether this is a screen-space
+     * draw at all. */
+    d3d8_place_2d_draw(pVertexData, VertexStreamZeroStride, vertex_count);
     d3d8_states_apply();
 
     rhi_set_topology(topology);
@@ -1300,13 +1315,11 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
 
-    /* A screen-space draw covering the whole width is a backdrop or a
-     * fade, and must span the widescreen picture rather than be squeezed
-     * into the middle of it with the HUD. After prepare_draw, which is
-     * what decides whether this is a screen-space draw at all. */
-    if (d3d8_GetTwoDSqueeze() &&
-        d3d8_draw_escapes_squeeze(pVertexData, VertexStreamZeroStride, NumVertices))
-        d3d8_SetTwoDSqueeze(FALSE);
+    /* Where a screen-space draw goes in widescreen: squeezed to 4:3 with
+     * the HUD, or spanning the picture like a backdrop or a fade. After
+     * prepare_draw, which is what decides whether this is a screen-space
+     * draw at all. */
+    d3d8_place_2d_draw(pVertexData, VertexStreamZeroStride, NumVertices);
     d3d8_states_apply();
 
     rhi_set_topology(topology);
@@ -1616,6 +1629,7 @@ static void apply_host_viewport(void)
  * frame is a run of 3D draws and then a run of 2D ones. */
 void d3d8_SetTwoDSqueeze(BOOL on)
 {
+    g_2d_screen_space = on ? TRUE : FALSE;
     if (!d3d8_display_wide_now())
         on = FALSE;
     if (g_2d_squeeze == (on ? TRUE : FALSE))
@@ -1626,55 +1640,20 @@ void d3d8_SetTwoDSqueeze(BOOL on)
 
 BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
 
-/* Does this draw cover the guest's full width, and so escape the 2D
- * squeeze?
- *
- * A screen-space draw that spans the screen is a backdrop, a fade, a
- * letterbox bar or a video frame, and squeezing it leaves the sides of a
- * widescreen picture showing whatever was behind. One that does not is a
- * HUD element, which belongs in the centred box. The difference is the
- * draw's own extent, so measure it rather than keep a list of elements.
+/* The horizontal extent a screen-space draw can reach, in the title's own
+ * screen pixels: its vertices, clipped by the scissor. FALSE when the
+ * positions cannot be found.
  *
  * The vertices are the ones handed to the draw: everything reaches this
  * device as DrawPrimitiveUP, including the draws the title sourced from
  * a vertex buffer -- the HLE reads those itself and passes the bytes.
  * Position sits at the offset the program's own declaration gives for
- * the register it copies oPos from.
- *
- * When any of that is unavailable the answer is FALSE, which keeps the
- * squeeze. That is the safe way to be wrong: a squeezed backdrop is
- * visibly odd in one place, a stretched HUD is subtly wrong everywhere.
- */
-/* Whether the bound textures make a draw a pass over the whole screen
- * rather than a picture placed on it: stage 0 is nothing or a single
- * texel (flat colour), or some stage holds a copy of the frame.
- *
- * Only stage 0 is asked about pictures. A title leaves textures bound on
- * stages its shader never reads, so a later stage holding something
- * large says nothing; TimeSplitters 2's glow passes, for one, have the
- * frame on stage 0 and a 1x1 white texture on stage 1. */
-static BOOL draw_is_screen_pass(void)
-{
-    IDirect3DBaseTexture8 *tex;
-    UINT w = 0, h = 0;
-    DWORD s;
-
-    for (s = 0; s < 4; s++) {
-        tex = d3d8_GetStageTexture(s);
-        if (tex && IDirect3DBaseTexture8_GetType(tex) == D3DRTYPE_TEXTURE &&
-            ((D3D8Texture *)tex)->screen_copy)
-            return TRUE;
-    }
-    tex = d3d8_GetStageTexture(0);
-    if (!tex)
-        return TRUE;
-    return d3d8_base_size(tex, &w, &h) && w <= 1 && h <= 1;
-}
-
-BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
+ * the register it copies oPos from. */
+static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
+                        float *lo_out, float *hi_out)
 {
     const unsigned char *p = (const unsigned char *)vertices;
-    UINT offset = 0, i, guest_w;
+    UINT offset = 0, i;
     int reg = d3d8_vsh_bound_pos_input();
     float lo = 3.4e38f, hi = -3.4e38f;
 
@@ -1683,10 +1662,6 @@ BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
     if (!d3d8_vsh_bound_input_offset(reg, &offset))
         return FALSE;
     if (offset + sizeof(float) > stride)
-        return FALSE;
-
-    guest_w = d3d8_GetGuestWidth();
-    if (!guest_w)
         return FALSE;
 
     /* Every vertex, not a sample of them. A backdrop is not always a
@@ -1717,6 +1692,59 @@ BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
         if ((float)g_scissor.left > lo)  lo = (float)g_scissor.left;
         if ((float)g_scissor.right < hi) hi = (float)g_scissor.right;
     }
+
+    *lo_out = lo;
+    *hi_out = hi;
+    return TRUE;
+}
+
+/* Whether the bound textures make a draw a pass over the whole screen
+ * rather than a picture placed on it: stage 0 is nothing or a single
+ * texel (flat colour), or some stage holds a copy of the frame.
+ *
+ * Only stage 0 is asked about pictures. A title leaves textures bound on
+ * stages its shader never reads, so a later stage holding something
+ * large says nothing; TimeSplitters 2's glow passes, for one, have the
+ * frame on stage 0 and a 1x1 white texture on stage 1. */
+static BOOL draw_is_screen_pass(void)
+{
+    IDirect3DBaseTexture8 *tex;
+    UINT w = 0, h = 0;
+    DWORD s;
+
+    for (s = 0; s < 4; s++) {
+        tex = d3d8_GetStageTexture(s);
+        if (tex && IDirect3DBaseTexture8_GetType(tex) == D3DRTYPE_TEXTURE &&
+            ((D3D8Texture *)tex)->screen_copy)
+            return TRUE;
+    }
+    tex = d3d8_GetStageTexture(0);
+    if (!tex)
+        return TRUE;
+    return d3d8_base_size(tex, &w, &h) && w <= 1 && h <= 1;
+}
+
+/* Does this draw cover the guest's full width, and so escape the 2D
+ * squeeze?
+ *
+ * A screen-space draw that spans the screen is a backdrop, a fade, a
+ * letterbox bar or a video frame, and squeezing it leaves the sides of a
+ * widescreen picture showing whatever was behind. One that does not is a
+ * HUD element, which belongs in the centred box. The difference is the
+ * draw's own extent (draw_extent), so measure it rather than keep a list
+ * of elements -- unless the title keeps the list (xbox_D3D8SetTwoDPlacement).
+ *
+ * When the extent is unavailable the answer is FALSE, which keeps the
+ * squeeze. That is the safe way to be wrong: a squeezed backdrop is
+ * visibly odd in one place, a stretched HUD is subtly wrong everywhere.
+ */
+BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
+{
+    UINT guest_w = d3d8_GetGuestWidth();
+    float lo, hi;
+
+    if (!guest_w || !draw_extent(vertices, stride, count, &lo, &hi))
+        return FALSE;
 
     /* How much of the width the draw covers, in the title's own screen
      * pixels. Coverage rather than "touches both edges": this title
@@ -1749,6 +1777,132 @@ BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
         return ((hi - lo) >= (float)guest_w * 0.98f && draw_is_screen_pass())
                ? TRUE : FALSE;
     return ((hi - lo) >= (float)guest_w * 0.75f) ? TRUE : FALSE;
+}
+
+/* RECOMP_D3D8_2D_TAGS=1: every 120 frames, each placement tag the title
+ * set, with its screen-space draws and the extent they reached (clipped by
+ * the scissor, in the title's pixels). This is how a title project builds
+ * its placement table: it tags draws with the code that made them, and
+ * this says what each tag actually drew. */
+typedef struct TwoDTagStat {
+    uint32_t      tag;
+    int           placement;
+    unsigned long draws;
+    float         lo, hi;       /* everything the tag drew in the window */
+    float         widest;       /* its widest single draw */
+} TwoDTagStat;
+
+static TwoDTagStat   g_tag_stats[256];
+static int           g_tag_count;
+static int           g_tag_log = -1;
+static unsigned long g_tag_frames;
+
+static int two_d_tag_log(void)
+{
+    if (g_tag_log < 0) {
+        const char *v = getenv("RECOMP_D3D8_2D_TAGS");
+        g_tag_log = v && *v && strcmp(v, "0") != 0;
+    }
+    return g_tag_log;
+}
+
+static void two_d_tag_note(const void *vertices, UINT stride, UINT count)
+{
+    TwoDTagStat *t = NULL;
+    float lo, hi;
+    int i;
+
+    for (i = 0; i < g_tag_count; i++)
+        if (g_tag_stats[i].tag == g_2d_tag && g_tag_stats[i].placement == g_2d_placement) {
+            t = &g_tag_stats[i];
+            break;
+        }
+    if (!t) {
+        if (g_tag_count == (int)(sizeof g_tag_stats / sizeof g_tag_stats[0]))
+            return;
+        t = &g_tag_stats[g_tag_count++];
+        t->tag = g_2d_tag;
+        t->placement = g_2d_placement;
+        t->draws = 0;
+        t->lo = 3.4e38f;
+        t->hi = -3.4e38f;
+        t->widest = 0.0f;
+    }
+    t->draws++;
+    if (draw_extent(vertices, stride, count, &lo, &hi)) {
+        if (lo < t->lo) t->lo = lo;
+        if (hi > t->hi) t->hi = hi;
+        if (hi - lo > t->widest) t->widest = hi - lo;
+    }
+}
+
+static void two_d_tag_frame(void)
+{
+    static const char *names[] = { "auto", "stretch", "centre", "left", "right" };
+    UINT guest_w = d3d8_GetGuestWidth();
+    int i;
+
+    if (g_tag_log <= 0 || ++g_tag_frames % 120 != 0)
+        return;
+    fprintf(stderr, "[2D-TAGS] frame %lu: %d tag(s)\n", g_tag_frames, g_tag_count);
+    for (i = 0; i < g_tag_count; i++) {
+        const TwoDTagStat *t = &g_tag_stats[i];
+        int pl = t->placement >= 0 && t->placement <= XBOX_D3D8_2D_RIGHT ? t->placement : 0;
+
+        fprintf(stderr, "[2D-TAGS]   tag %08X %-7s draws %6lu  x %7.1f..%7.1f (%5.1f%%) "
+                "widest %5.1f%%\n", t->tag, names[pl], t->draws, t->lo, t->hi,
+                t->hi >= t->lo && guest_w ? (t->hi - t->lo) * 100.0f / (float)guest_w : 0.0f,
+                guest_w ? t->widest * 100.0f / (float)guest_w : 0.0f);
+    }
+    fflush(stderr);
+    g_tag_count = 0;
+}
+
+void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag)
+{
+    if (placement < XBOX_D3D8_2D_AUTO || placement > XBOX_D3D8_2D_RIGHT)
+        placement = XBOX_D3D8_2D_AUTO;
+    g_2d_tag = tag;
+    if (placement == g_2d_placement)
+        return;
+    g_2d_placement = placement;
+    /* The anchor moved: a squeezed viewport already in place has to follow.
+     * The scissor is recomputed at the next draw's state apply. */
+    if (g_2d_squeeze)
+        apply_host_viewport();
+}
+
+int xbox_D3D8GetTwoDPlacement(uint32_t *tag)
+{
+    if (tag)
+        *tag = g_2d_tag;
+    return g_2d_placement;
+}
+
+/* Once per screen-space draw, after the shader path has said it is one:
+ * where it goes in widescreen. The title's placement when it gave one,
+ * otherwise the renderer's judgement from the draw's extent. */
+void d3d8_place_2d_draw(const void *vertices, UINT stride, UINT count)
+{
+    if (!g_2d_screen_space)
+        return;
+    if (two_d_tag_log())
+        two_d_tag_note(vertices, stride, count);
+    if (!g_2d_squeeze)
+        return;
+    switch (g_2d_placement) {
+    case XBOX_D3D8_2D_STRETCH:
+        d3d8_SetTwoDSqueeze(FALSE);
+        break;
+    case XBOX_D3D8_2D_CENTRE:
+    case XBOX_D3D8_2D_LEFT:
+    case XBOX_D3D8_2D_RIGHT:
+        break;
+    default:
+        if (d3d8_draw_escapes_squeeze(vertices, stride, count))
+            d3d8_SetTwoDSqueeze(FALSE);
+        break;
+    }
 }
 
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPORT8 *pViewport)

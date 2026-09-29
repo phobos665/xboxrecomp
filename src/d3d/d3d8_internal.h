@@ -66,6 +66,10 @@ BOOL d3d8_GetTwoDSqueeze(void);
  * extent under the scissor (and, with RECOMP_WIDESCREEN_2D=centre, only a
  * whole-screen pass). */
 BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count);
+/* Once per draw after the shader path: place a screen-space draw in
+ * widescreen, by the title's placement (xbox_D3D8SetTwoDPlacement) or else
+ * by d3d8_draw_escapes_squeeze. */
+void d3d8_place_2d_draw(const void *vertices, UINT stride, UINT count);
 /* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
 BOOL                 d3d8_GetScissor(RhiRect *out);
 UINT                 d3d8_GetGuestHeight(void);

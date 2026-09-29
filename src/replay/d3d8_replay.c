@@ -37,6 +37,11 @@
  *                    the same as setting RECOMP_D3D8_BACKEND. Replaying one
  *                    capture through two backends and diffing the images is
  *                    scripts/replay_ab.py.
+ *   --place <tag>=<p>  replay the title's widescreen 2D placement for tag
+ *                    (hex, or "all") as p: auto, stretch, centre, left or
+ *                    right. Repeatable. Needs RECOMP_WIDESCREEN=1 to show,
+ *                    and is how a title project tries its placement table
+ *                    on a captured frame instead of a run.
  *
  * A player, not an emulator. A capture holds the calls shadow mode
  * made on the host renderer after all of its Xbox conversion (d3d8_capture.h),
@@ -92,6 +97,10 @@ static int  g_dump_target;
  * gone to, held from that moment, since later state still runs. */
 static IDirect3DDevice8  *g_replay_dev;
 static IDirect3DSurface8 *g_target_at_limit;
+/* --place: placements to use instead of the captured ones, by tag. */
+typedef struct { uint32_t tag; int all; int placement; } PlaceOverride;
+static PlaceOverride g_place[256];
+static int           g_place_count;
 static long g_draw_index;           /* draws seen in this loop */
 static DWORD g_cur_vs, g_cur_token;
 #define LIST_TEX_IDS 8192
@@ -898,6 +907,24 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         r->dev->lpVtbl->SetViewport(r->dev, &vp);
         break;
     }
+    case D3D8CAP_TWOD_PLACEMENT: {
+        const D3D8CapTwoDPlacement *p = c->data;
+        int placement, k;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        placement = (int)p->placement;
+        for (k = 0; k < g_place_count; k++)
+            if (g_place[k].all || g_place[k].tag == p->tag)
+                placement = g_place[k].placement;
+        if (g_list_draws)
+            fprintf(stderr, "[2d placement] tag %08lX: %d%s\n", (unsigned long)p->tag,
+                    placement, placement != (int)p->placement ? " (from --place)" : "");
+        xbox_D3D8SetTwoDPlacement(placement, p->tag);
+        break;
+    }
     case D3D8CAP_SCISSORS: {
         const D3D8CapScissors *p = c->data;
         D3DRECT rect;
@@ -1081,7 +1108,8 @@ static void usage(void)
         "usage: d3d8_replay <capture%s> [--out <prefix>] [--loops <n>]\n"
         "                   [--dump-every] [--hold] [--quiet]\n"
         "                   [--no-combiners] [--draws <n>] [--skip-draw <n>]\n"
-        "                   [--list-draws] [--dump-target] [--present] [--backend <name>]\n",
+        "                   [--list-draws] [--dump-target] [--present] [--backend <name>]\n"
+        "                   [--place <tag|all>=<placement>]...\n",
         D3D8CAP_EXTENSION);
 }
 
@@ -1124,6 +1152,28 @@ int main(int argc, char **argv)
             g_list_draws = 1;
         else if (!strcmp(argv[i], "--dump-target"))
             g_dump_target = 1;
+        else if (!strcmp(argv[i], "--place") && i + 1 < argc) {
+            const char *a = argv[++i], *eq = strchr(a, '=');
+            static const char *names[] = { "auto", "stretch", "centre", "left", "right" };
+            int p;
+
+            if (!eq || g_place_count == (int)(sizeof g_place / sizeof g_place[0])) {
+                usage();
+                return 2;
+            }
+            for (p = 0; p < 5 && strcmp(eq + 1, names[p]) != 0; p++)
+                ;
+            if (p == 5 && !strcmp(eq + 1, "center"))
+                p = XBOX_D3D8_2D_CENTRE;
+            if (p == 5) {
+                usage();
+                return 2;
+            }
+            g_place[g_place_count].all = !strncmp(a, "all=", 4);
+            g_place[g_place_count].tag = (uint32_t)strtoul(a, NULL, 16);
+            g_place[g_place_count].placement = p;
+            g_place_count++;
+        }
         else if (argv[i][0] == '-') {
             usage();
             return 2;
