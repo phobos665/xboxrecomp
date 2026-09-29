@@ -59,6 +59,17 @@ def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=N
     return paths
 
 
+def _parse_force_returns(items):
+    """Parse --force-return ADDR=VALUE pairs into {addr: value}."""
+    out = {}
+    for item in items or ():
+        if "=" not in item:
+            raise SystemExit(f"--force-return wants ADDR=VALUE, got {item!r}")
+        addr, _, value = item.partition("=")
+        out[int(addr, 0)] = int(value, 0) & 0xFFFFFFFF  # -1 is 0xFFFFFFFF
+    return out
+
+
 def _load_addrs(path):
     """Load a JSON address list (or {addr: name} map) as a set of ints."""
     if not path:
@@ -249,6 +260,11 @@ def main():
                         help="Path to abi_functions.json (overrides --abi-dir)")
     parser.add_argument("--skip-binary-check", action="store_true",
                         help="Allow disassembly recorded for a different binary")
+    parser.add_argument("--icall-sites", metavar="FILE", default=None,
+                        help="Per-site indirect-call targets from "
+                             "tools.recomp.icall_feedback merge --sites-db "
+                             "(default: icall_sites.json in the -o directory; "
+                             "scripts/recompile.py passes the --work-dir one)")
     parser.add_argument("--manual-functions", metavar="FILE",
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
@@ -290,6 +306,15 @@ def main():
                              "frontier measure that rises with progress, unlike "
                              "kernel calls (flat once startup ends) or raw "
                              "indirect-call counts (inflated by spin loops)")
+    parser.add_argument("--force-return", metavar="ADDR=VALUE",
+                        action="append", default=[],
+                        help="Make a function hand its callers a constant "
+                             "instead of what it computed, e.g. "
+                             "0x0015D780=0. Repeatable. A bring-up probe for "
+                             "a title waiting on a service the runtime does "
+                             "not implement yet: the body still runs, only "
+                             "the answer changes, and the emitted code is "
+                             "inert unless RECOMP_FORCE_RETURN is set")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -347,8 +372,16 @@ def main():
         output_dir=args.output_dir,
         trace_functions=_load_addrs(args.trace_functions),
         trace_all_entries=args.trace_all_entries,
+        force_returns=_parse_force_returns(args.force_return),
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
+        # Per title, never the shared tools output: two titles lifted side
+        # by side would otherwise guard one game's call sites with the
+        # other's targets. Without --icall-sites it follows -o.
+        icall_sites_json_path=args.icall_sites or os.path.join(
+            args.output_dir or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "output"),
+            "icall_sites.json"),
     )
 
     t_load = time.time() - t0

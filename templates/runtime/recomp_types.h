@@ -112,6 +112,11 @@ extern ptrdiff_t g_xbox_mem_offset;
  *
  * These replace a hardcoded 0x00400000 cutoff that was only ever right for one
  * title -- see the comment where they are defined in xbox_memory_layout.c. */
+/* --force-return: read once at startup, so the check at each forced ret is a
+ * load rather than a getenv. Zero unless RECOMP_FORCE_RETURN is set, which is
+ * what lets a build carrying forced functions behave normally by default. */
+extern int g_force_return;
+
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
 
@@ -382,6 +387,7 @@ void recomp_stub_missing(uint32_t va);
 #include "recomp_icall_feedback.h"
 #else
 #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
+#define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
 #endif
 
 /**
@@ -683,6 +689,36 @@ static inline uint32_t ROR32(uint32_t val, int n) {
     return n ? ((val >> n) | (val << (32 - n))) : val;
 }
 
+/* rcl/rcr: rotate through the carry flag.
+ *
+ * The carry is a bit sitting one place above the operand's top bit, so the
+ * rotation is over width+1 bits. That is also why a count is reduced modulo
+ * width+1 for the 8- and 16-bit forms rather than modulo the width: a byte
+ * rotates through nine positions, not eight. The 32-bit form takes the count
+ * masked to five bits and no further, which is already inside 33.
+ *
+ * `cf` carries in and out.
+ */
+static inline uint32_t RC_ROT(uint32_t val, unsigned n, int *cf,
+                              unsigned width, int left) {
+    unsigned mod = width + 1u;
+    uint64_t mask = (width >= 32u) ? 0xFFFFFFFFull
+                                   : ((((uint64_t)1 << width) - 1u));
+    uint64_t x = (((uint64_t)(*cf & 1)) << width) | ((uint64_t)val & mask);
+
+    n &= 31u;
+    if (width < 32u)
+        n %= mod;
+    if (n) {
+        uint64_t full = (((uint64_t)1 << mod) - 1u);
+        x = left ? ((x << n) | (x >> (mod - n)))
+                 : ((x >> n) | (x << (mod - n)));
+        x &= full;
+    }
+    *cf = (int)((x >> width) & 1);
+    return (uint32_t)(x & mask);
+}
+
 static inline uint8_t ROL8(uint8_t val, int n) {
     n = (n & 31) % 8;
     return n ? (uint8_t)((val << n) | (val >> (8 - n))) : val;
@@ -915,6 +951,22 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 #define RECOMP_ABI_CALL_POP(va, fn, pop) (fn)()
 #endif
 
+/* A guarded arm of an indirect call. When a recorded run saw a call site
+ * reach only a few translated functions, the lifter compares the target
+ * against each and calls the match directly (RECOMP_ABI_CALL), falling back
+ * to RECOMP_ICALL_SAFE_AT for anything else -- so an unseen target is slow,
+ * never wrong. Under RECOMP_ICALL_FEEDBACK the arms are counted, so a run
+ * can say how often the guards held; otherwise they cost nothing. */
+#ifdef RECOMP_ICALL_FEEDBACK
+extern volatile uint64_t g_icall_guard_hits;
+extern volatile uint64_t g_icall_guard_misses;
+#define RECOMP_ICALL_GUARD_HIT()  ((void)g_icall_guard_hits++)
+#define RECOMP_ICALL_GUARD_MISS() ((void)g_icall_guard_misses++)
+#else
+#define RECOMP_ICALL_GUARD_HIT()  ((void)0)
+#define RECOMP_ICALL_GUARD_MISS() ((void)0)
+#endif
+
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.
  *
@@ -1014,6 +1066,37 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
         recomp_icall_not_code_log(_va, (saved_esp)); \
         g_esp = (saved_esp); eax = 0; break; \
     } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+} while(0)
+
+/**
+ * RECOMP_ICALL_SAFE_AT - RECOMP_ICALL_SAFE that also names the call SITE.
+ *
+ * `site` is the guest address of the `call` instruction. Under
+ * RECOMP_ICALL_FEEDBACK the runtime records which targets each site reaches
+ * (icall_sites.dump), which is what lets the lifter guard a site with direct
+ * calls on the next generation. Everything else is RECOMP_ICALL_SAFE, line
+ * for line -- including this fork's not-code log with the saved esp and the
+ * g_icall_saved_esp / g_icall_dispatch_form hand-off to the fail log, which
+ * upstream's copy of the macro predates. Keep the two in step.
+ */
+#define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, (saved_esp)); \
+        g_esp = (saved_esp); eax = 0; break; \
+    } \
+    RECOMP_ICALL_OBSERVE_SITE((site), _va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
@@ -1348,5 +1431,24 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * The recomp_funcs.h header (generated) declares all translated
  * function prototypes.
  * ================================================================ */
+
+/* An instruction the lifter has no translation for.
+ *
+ * The lifter used to emit a bare "TODO: mnemonic" C comment at such a site,
+ * and a comment is a no-op: the instruction vanished, the guest carried
+ * on, and nothing at runtime could say the site had been reached. Wreckless
+ * died inside RtlAllocateHeap because `bsf` was a comment; Half-Life 2 painted
+ * its intro red because `cvtpi2ps` was. Each was found by working backwards
+ * from a subsystem failure that had nothing to do with the cause.
+ *
+ * Now the site calls this, with the instruction text and its guest address.
+ * The instruction is STILL a no-op -- this changes no behaviour -- but the run
+ * names the untranslated sites it reached (the first fifty hits, in
+ * src/kernel/recomp_trace.c), and with RECOMP_UNIMPL_TRAP=1 it stops at the
+ * first one. The lifter
+ * keeps the comment beside the call so `grep TODO:` over a gen tree still
+ * enumerates every site whether or not it is ever reached. */
+void recomp_unimpl(const char *text, uint32_t va);
+#define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
 
 #endif /* RECOMP_TYPES_H */
