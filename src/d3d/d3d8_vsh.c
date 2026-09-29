@@ -1340,8 +1340,8 @@ float xbox_D3D8ClaimHorPlus(void)
     float factor = hor_plus_factor();
 
     if (!g_hor_plus_claimed && factor != 1.0f)
-        fprintf(stderr, "D3D8 VSH: Hor+ %.4f is applied by the title's camera; "
-                "c[%d] is no longer scaled\n", (double)factor, d3d8_vsh_hor_plus_reg());
+        fprintf(stderr, "D3D8 VSH: Hor+ %.4f taken over by the caller; "
+                "c[%d] is left as uploaded\n", (double)factor, d3d8_vsh_hor_plus_reg());
     g_hor_plus_claimed = TRUE;
     return factor;
 }
