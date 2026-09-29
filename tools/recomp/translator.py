@@ -365,7 +365,8 @@ class FunctionTranslator:
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
                  trace_functions=None, trace_all_entries=False,
-                 icall_sites=None):
+                 icall_sites=None,
+                 force_returns=None):
         """
         xbe_data: bytes - raw XBE file contents
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
@@ -389,6 +390,7 @@ class FunctionTranslator:
         # calls plateau once startup is done, and a raw indirect-call count is
         # inflated by whichever loop happens to be spinning.
         self.trace_all_entries = bool(trace_all_entries)
+        self.force_returns = dict(force_returns or {})
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
@@ -1188,6 +1190,26 @@ class FunctionTranslator:
         # kept coming up. The lifter emits the matching exit trace at each ret.
         self.lifter.trace_exit_name = name if start in self.trace_functions else None
 
+        # --force-return: hand this function's callers a constant.
+        #
+        # Bring-up keeps arriving at the same shape. A title waits on a
+        # service the runtime does not implement yet; the function that
+        # reports "is it finished" answers no for ever; everything past it is
+        # unreachable and therefore untestable. Shin Megami Tensei: Nine does
+        # exactly this -- its title screen asks whether the intro movie has
+        # ended, and its XMV decoder never reaches end of stream.
+        #
+        # What people resort to instead is editing the generated C by hand,
+        # which buries the shortcut in hundreds of megabytes of output where
+        # nothing names it and nobody else can reproduce the run. As a
+        # generation option it is on the command line, it lands in the
+        # title's build script, and the emitted code is inert unless
+        # RECOMP_FORCE_RETURN is set at run time.
+        #
+        # It is a probe, not a fix: the body still runs and its side effects
+        # still happen, only the answer changes.
+        self.lifter.force_return_value = self.force_returns.get(start)
+
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
         # and must NOT be declared locally, otherwise the local shadows
@@ -1581,7 +1603,8 @@ class BatchTranslator:
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, trace_all_entries=False,
-                 icall_sites_json_path=None):
+                 icall_sites_json_path=None,
+                 force_returns=None):
         self.xbe_path = xbe_path
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
@@ -1662,7 +1685,8 @@ class BatchTranslator:
             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
             trace_functions=trace_functions,
             trace_all_entries=trace_all_entries,
-            icall_sites=self.icall_sites)
+            icall_sites=self.icall_sites,
+            force_returns=force_returns)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
         self.translator.discover_jump_table_entries()
