@@ -167,11 +167,10 @@ static void seq_parse(const char *env)
     }
 }
 
-static void seq_input(RecompInputGamepad *g)
+/* Whether an input script is driving this run (RECOMP_INPUT_SEQ), parsing
+ * it the first time. */
+static int seq_active(void)
 {
-    unsigned long long t;
-    int i, k;
-
     if (s_seq_count < 0) {
         const char *env = getenv("RECOMP_INPUT_SEQ");
         s_seq_count = 0;
@@ -181,7 +180,38 @@ static void seq_input(RecompInputGamepad *g)
             fflush(stderr);
         }
     }
-    if (!s_seq_count)
+    return s_seq_count > 0;
+}
+
+/* A script is for a run that goes the same way every time, and a pad left
+ * connected on the desk does not: a resting stick's drift walked
+ * TimeSplitters 2's name-entry cursor off END, so the script's A typed
+ * letters instead of finishing and the run never left the menus. While a
+ * script runs it is the only input on port 0, unless
+ * RECOMP_INPUT_SEQ_PAD=1 asks for the pad as well. */
+static int seq_owns_pad(void)
+{
+    static int with_pad = -1;
+
+    if (!seq_active())
+        return 0;
+    if (with_pad < 0) {
+        const char *v = getenv("RECOMP_INPUT_SEQ_PAD");
+
+        with_pad = v && *v && strcmp(v, "0") != 0;
+        if (!with_pad)
+            fprintf(stderr, "  [PAD] the input script replaces the pad on port 0 "
+                    "(RECOMP_INPUT_SEQ_PAD=1 to have both)\n");
+    }
+    return !with_pad;
+}
+
+static void seq_input(RecompInputGamepad *g)
+{
+    unsigned long long t;
+    int i, k;
+
+    if (!seq_active())
         return;
     if (!s_seq_t0)
         s_seq_t0 = GetTickCount64();
@@ -251,7 +281,7 @@ bool recomp_input_host_sample_port(unsigned port, RecompInputGamepad *gamepad)
     if (gamepad == NULL)
         return false;
     memset(gamepad, 0, sizeof *gamepad);
-    if (recomp_bindings_sample(port, &pad)) {
+    if (!(port == 0 && seq_owns_pad()) && recomp_bindings_sample(port, &pad)) {
         gamepad->buttons = (uint16_t)pad.wButtons;
         for (i = 0; i < RECOMP_INPUT_ANALOG_BUTTON_COUNT; i++)
             gamepad->analog_buttons[i] = pad.bAnalogButtons[i];
