@@ -474,11 +474,10 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
  * Compiled shader objects
  * ================================================================ */
 
-static ID3D11VertexShader  *g_vs = NULL;
-static ID3DBlob            *g_vs_blob = NULL;
-static ID3D11Buffer        *g_vs_cb = NULL;      /* VS transform CB (b0) */
-static ID3D11Buffer        *g_vs_light_cb = NULL; /* VS lighting CB (b1) */
-static ID3D11Buffer        *g_ps_cb = NULL;       /* PS constant buffer */
+static RhiShader *g_vs = NULL;
+static RhiBuffer *g_vs_cb = NULL;       /* VS transform CB (b0) */
+static RhiBuffer *g_vs_light_cb = NULL; /* VS lighting CB (b1) */
+static RhiBuffer *g_ps_cb = NULL;       /* PS constant buffer */
 
 /* Fixed-function PS cache, keyed by per-stage texture signature.
  * The texture object declarations must match the dimensions of the SRVs
@@ -488,8 +487,8 @@ static ID3D11Buffer        *g_ps_cb = NULL;       /* PS constant buffer */
 #define FF_PS_CACHE_SIZE 16
 
 typedef struct {
-    UINT               sig;
-    ID3D11PixelShader *ps;
+    UINT       sig;
+    RhiShader *ps;
 } FfPsCacheEntry;
 
 static FfPsCacheEntry g_ff_ps_cache[FF_PS_CACHE_SIZE];
@@ -497,12 +496,12 @@ static int g_ff_ps_cache_count = 0;
 
 /* Get (compiling if needed) the fixed-function pixel shader for a texture
  * signature. Returns NULL and logs on compile failure. */
-static ID3D11PixelShader *ff_ps_get_shader(UINT sig)
+static RhiShader *ff_ps_get_shader(UINT sig)
 {
-    ID3DBlob *blob = NULL, *errors = NULL;
-    ID3D11PixelShader *ps;
+    RhiShaderSource ss;
+    RhiShader *ps;
     char *src;
-    HRESULT hr;
+    char err[4096];
     int i;
 
     for (i = 0; i < g_ff_ps_cache_count; i++) {
@@ -514,31 +513,28 @@ static ID3D11PixelShader *ff_ps_get_shader(UINT sig)
     if (!src) return NULL;
     build_ps_source(sig, src, FF_PS_SRC_SIZE);
 
+    memset(&ss, 0, sizeof ss);
+    ss.hlsl = src;
+    ss.len = strlen(src);
+    ss.name = "ps_ffp";
+    ss.entry = "main";
+    ss.target = "ps_5_0";
     {
         long long started = d3d8_compile_clock();
-        hr = d3d8_compile_hlsl(src, strlen(src), "ps_ffp", NULL,
-                               "main", "ps_5_0", 0, &blob, &errors);
+        ps = rhi_shader_create(RHI_STAGE_PIXEL, &ss, err, sizeof err);
         d3d8_compile_note(1, started);
     }
     free(src);
 
-    if (FAILED(hr)) {
+    if (!ps) {
         fprintf(stderr, "D3D8: PS compile failed (sig 0x%02X): %s\n", sig,
-                errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
-        if (errors) ID3D10Blob_Release(errors);
+                err[0] ? err : "unknown");
         return NULL;
     }
 
-    hr = ID3D11Device_CreatePixelShader(d3d8_GetD3D11Device(),
-        ID3D10Blob_GetBufferPointer(blob),
-        ID3D10Blob_GetBufferSize(blob),
-        NULL, &ps);
-    ID3D10Blob_Release(blob);
-    if (FAILED(hr)) return NULL;
-
     if (g_ff_ps_cache_count >= FF_PS_CACHE_SIZE) {
         /* Evict the oldest entry */
-        ID3D11PixelShader_Release(g_ff_ps_cache[0].ps);
+        rhi_shader_destroy(g_ff_ps_cache[0].ps);
         memmove(&g_ff_ps_cache[0], &g_ff_ps_cache[1],
                 (FF_PS_CACHE_SIZE - 1) * sizeof(FfPsCacheEntry));
         g_ff_ps_cache_count--;
@@ -623,14 +619,14 @@ typedef struct {
 } PSConstants;
 
 /* ================================================================
- * Input layout cache (FVF → ID3D11InputLayout)
+ * Input layout cache (FVF -> vertex layout)
  * ================================================================ */
 
 #define MAX_LAYOUT_CACHE 32
 
 typedef struct {
-    DWORD               fvf;
-    ID3D11InputLayout  *layout;
+    DWORD            fvf;
+    RhiVertexLayout *layout;
 } LayoutCacheEntry;
 
 static LayoutCacheEntry g_layout_cache[MAX_LAYOUT_CACHE];
@@ -653,12 +649,11 @@ static UINT fvf_texcoord_size(DWORD fvf, UINT t)
  * missing, we add dummy elements at offset 0 — the shader ignores them
  * via the Flags constant buffer.
  */
-static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
+static RhiVertexLayout *get_or_create_layout(DWORD fvf)
 {
-    D3D11_INPUT_ELEMENT_DESC elems[16];
+    RhiVertexElement elems[16];
     UINT elem_count = 0;
     UINT offset = 0;
-    HRESULT hr;
     int i;
 
     for (i = 0; i < g_layout_cache_count; i++) {
@@ -668,78 +663,70 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
 
     /* POSITION */
     if (d3d8_fvf_transformed(fvf)) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"POSITION", 0, RHI_FORMAT_R32G32B32A32_FLOAT, 0, offset};
         elem_count++;
     } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"POSITION", 0, RHI_FORMAT_R32G32B32_FLOAT, 0, offset};
         elem_count++;
     }
     offset = d3d8_fvf_position_bytes(fvf);
 
     /* NORMAL */
     if (fvf & D3DFVF_NORMAL) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"NORMAL", 0, RHI_FORMAT_R32G32B32_FLOAT, 0, offset};
         elem_count++; offset += 12;
     } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"NORMAL", 0, RHI_FORMAT_R32G32B32_FLOAT, 0, 0};
         elem_count++;
     }
 
     /* COLOR0 (Diffuse) */
     if (fvf & D3DFVF_DIFFUSE) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"COLOR", 0, RHI_FORMAT_R8G8B8A8_UNORM, 0, offset};
         elem_count++; offset += 4;
     } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"COLOR", 0, RHI_FORMAT_R8G8B8A8_UNORM, 0, 0};
         elem_count++;
     }
 
     /* COLOR1 (Specular) */
     if (fvf & D3DFVF_SPECULAR) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"COLOR", 1, RHI_FORMAT_R8G8B8A8_UNORM, 0, offset};
         elem_count++; offset += 4;
     } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"COLOR", 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (RhiVertexElement){"COLOR", 1, RHI_FORMAT_R8G8B8A8_UNORM, 0, 0};
         elem_count++;
     }
 
     /* TEXCOORD0-3 */
     {
         UINT tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
-        static const DXGI_FORMAT tc_fmt[5] = {
-            DXGI_FORMAT_R32G32_FLOAT,      /* 2 (default) */
-            DXGI_FORMAT_R32_FLOAT,         /* 1 */
-            DXGI_FORMAT_R32G32_FLOAT,      /* 2 */
-            DXGI_FORMAT_R32G32B32_FLOAT,   /* 3 */
-            DXGI_FORMAT_R32G32B32A32_FLOAT /* 4 */
+        static const RhiFormat tc_fmt[5] = {
+            RHI_FORMAT_R32G32_FLOAT,      /* 2 (default) */
+            RHI_FORMAT_R32_FLOAT,         /* 1 */
+            RHI_FORMAT_R32G32_FLOAT,      /* 2 */
+            RHI_FORMAT_R32G32B32_FLOAT,   /* 3 */
+            RHI_FORMAT_R32G32B32A32_FLOAT /* 4 */
         };
         UINT t;
         for (t = 0; t < 4; t++) {
             if (t < tex_count) {
                 UINT size = fvf_texcoord_size(fvf, t);
-                DXGI_FORMAT f = tc_fmt[size];
-                elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"TEXCOORD", t, f, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
+                RhiFormat f = tc_fmt[size];
+                elems[elem_count] = (RhiVertexElement){"TEXCOORD", t, f, 0, offset};
                 elem_count++; offset += size * 4;
             } else {
-                elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"TEXCOORD", t, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+                elems[elem_count] = (RhiVertexElement){"TEXCOORD", t, RHI_FORMAT_R32G32_FLOAT, 0, 0};
                 elem_count++;
             }
         }
     }
 
     {
-        ID3D11InputLayout *layout = NULL;
-        hr = ID3D11Device_CreateInputLayout(
-            d3d8_GetD3D11Device(),
-            elems, elem_count,
-            ID3D10Blob_GetBufferPointer(g_vs_blob),
-            ID3D10Blob_GetBufferSize(g_vs_blob),
-            &layout);
+        RhiVertexLayout *layout = rhi_vertex_layout_create(elems, elem_count, g_vs);
 
-        if (FAILED(hr)) {
-            fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX: 0x%08lX\n", fvf, hr);
-            layout = NULL;
-        }
+        if (!layout)
+            fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX\n", fvf);
 
         if (g_layout_cache_count < MAX_LAYOUT_CACHE) {
             g_layout_cache[g_layout_cache_count].fvf = fvf;
@@ -834,25 +821,22 @@ static void mat4_inverse(float *out, const float *m)
 
 HRESULT d3d8_shaders_init(void)
 {
-    ID3DBlob *errors = NULL;
-    D3D11_BUFFER_DESC cbd;
-    HRESULT hr;
+    RhiShaderSource ss;
+    RhiBufferDesc cbd;
+    char err[4096];
 
     /* Compile vertex shader */
-    hr = d3d8_compile_hlsl(g_vs_source, strlen(g_vs_source), "vs_ffp",
-                           NULL, "main", "vs_5_0", 0, &g_vs_blob, &errors);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: VS compile failed: %s\n",
-                errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
-        if (errors) ID3D10Blob_Release(errors);
-        return hr;
+    memset(&ss, 0, sizeof ss);
+    ss.hlsl = g_vs_source;
+    ss.len = strlen(g_vs_source);
+    ss.name = "vs_ffp";
+    ss.entry = "main";
+    ss.target = "vs_5_0";
+    g_vs = rhi_shader_create(RHI_STAGE_VERTEX, &ss, err, sizeof err);
+    if (!g_vs) {
+        fprintf(stderr, "D3D8: VS compile failed: %s\n", err[0] ? err : "unknown");
+        return E_FAIL;
     }
-
-    hr = ID3D11Device_CreateVertexShader(d3d8_GetD3D11Device(),
-        ID3D10Blob_GetBufferPointer(g_vs_blob),
-        ID3D10Blob_GetBufferSize(g_vs_blob),
-        NULL, &g_vs);
-    if (FAILED(hr)) return hr;
 
     /* Compile the default (all-2D) pixel shader */
     g_ff_ps_cache_count = 0;
@@ -862,23 +846,20 @@ HRESULT d3d8_shaders_init(void)
 
     /* Create VS transform constant buffer (b0) */
     memset(&cbd, 0, sizeof(cbd));
-    cbd.ByteWidth = (sizeof(VSTransformConstants) + 15) & ~15;
-    cbd.Usage = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    cbd.size = (sizeof(VSTransformConstants) + 15) & ~15;
+    cbd.usage = RHI_USAGE_DYNAMIC;
+    cbd.bind = RHI_BIND_UNIFORM;
+    cbd.cpu_access = RHI_CPU_WRITE;
 
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vs_cb);
-    if (FAILED(hr)) return hr;
+    if (!(g_vs_cb = rhi_buffer_create(&cbd, NULL))) return E_FAIL;
 
     /* Create VS lighting constant buffer (b1) */
-    cbd.ByteWidth = (sizeof(VSLightingConstants) + 15) & ~15;
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vs_light_cb);
-    if (FAILED(hr)) return hr;
+    cbd.size = (sizeof(VSLightingConstants) + 15) & ~15;
+    if (!(g_vs_light_cb = rhi_buffer_create(&cbd, NULL))) return E_FAIL;
 
     /* Create PS constant buffer */
-    cbd.ByteWidth = (sizeof(PSConstants) + 15) & ~15;
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_ps_cb);
-    if (FAILED(hr)) return hr;
+    cbd.size = (sizeof(PSConstants) + 15) & ~15;
+    if (!(g_ps_cb = rhi_buffer_create(&cbd, NULL))) return E_FAIL;
 
     fprintf(stderr, "D3D8: Fixed-function shaders compiled OK (multi-texture + lighting + fog)\n");
     return S_OK;
@@ -887,23 +868,18 @@ HRESULT d3d8_shaders_init(void)
 void d3d8_shaders_shutdown(void)
 {
     int i;
-    for (i = 0; i < g_layout_cache_count; i++) {
-        if (g_layout_cache[i].layout)
-            ID3D11InputLayout_Release(g_layout_cache[i].layout);
-    }
+    for (i = 0; i < g_layout_cache_count; i++)
+        rhi_vertex_layout_destroy(g_layout_cache[i].layout);
     g_layout_cache_count = 0;
 
-    for (i = 0; i < g_ff_ps_cache_count; i++) {
-        if (g_ff_ps_cache[i].ps)
-            ID3D11PixelShader_Release(g_ff_ps_cache[i].ps);
-    }
+    for (i = 0; i < g_ff_ps_cache_count; i++)
+        rhi_shader_destroy(g_ff_ps_cache[i].ps);
     g_ff_ps_cache_count = 0;
 
-    if (g_ps_cb)       { ID3D11Buffer_Release(g_ps_cb); g_ps_cb = NULL; }
-    if (g_vs_light_cb) { ID3D11Buffer_Release(g_vs_light_cb); g_vs_light_cb = NULL; }
-    if (g_vs_cb)       { ID3D11Buffer_Release(g_vs_cb); g_vs_cb = NULL; }
-    if (g_vs)          { ID3D11VertexShader_Release(g_vs); g_vs = NULL; }
-    if (g_vs_blob)     { ID3D10Blob_Release(g_vs_blob); g_vs_blob = NULL; }
+    rhi_buffer_destroy(g_ps_cb);       g_ps_cb = NULL;
+    rhi_buffer_destroy(g_vs_light_cb); g_vs_light_cb = NULL;
+    rhi_buffer_destroy(g_vs_cb);       g_vs_cb = NULL;
+    rhi_shader_destroy(g_vs);          g_vs = NULL;
 }
 
 /* ================================================================
@@ -912,30 +888,28 @@ void d3d8_shaders_shutdown(void)
 
 static void ff_vs_prepare_draw(DWORD fvf)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    ID3D11InputLayout *layout;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    RhiVertexLayout *layout;
+    void *mapped;
     const D3DMATRIX *world, *view, *proj;
     const DWORD *rs;
-    HRESULT hr;
     UINT tex_count;
 
-    if (!ctx || !g_vs) return;
+    if (!d3d8_GetD3D11Context() || !g_vs) return;
 
     rs = d3d8_GetRenderStates();
     tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
 
-    ID3D11DeviceContext_VSSetShader(ctx, g_vs, NULL, 0);
+    rhi_set_shader(RHI_STAGE_VERTEX, g_vs);
 
     /* Bind input layout */
     layout = get_or_create_layout(fvf);
     if (layout)
-        ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+        rhi_set_vertex_layout(layout);
 
     /* ---- VS Transform CB (b0) ---- */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vs_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        VSTransformConstants *cb = (VSTransformConstants *)mapped.pData;
+    mapped = rhi_buffer_map(g_vs_cb, RHI_MAP_WRITE_DISCARD);
+    if (mapped) {
+        VSTransformConstants *cb = (VSTransformConstants *)mapped;
         UINT i;
         memset(cb, 0, sizeof(*cb));
 
@@ -1033,13 +1007,13 @@ static void ff_vs_prepare_draw(DWORD fvf)
             cb->texcoord_index[i] = ts ? ts[D3DTSS_TEXCOORDINDEX] : (UINT)i;
         }
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_cb, 0);
+        rhi_buffer_unmap(g_vs_cb);
     }
 
     /* ---- VS Lighting CB (b1) ---- */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vs_light_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        VSLightingConstants *lb = (VSLightingConstants *)mapped.pData;
+    mapped = rhi_buffer_map(g_vs_light_cb, RHI_MAP_WRITE_DISCARD);
+    if (mapped) {
+        VSLightingConstants *lb = (VSLightingConstants *)mapped;
         const D3DMATERIAL8 *mat = d3d8_GetMaterial();
         UINT i, active_count = 0;
         memset(lb, 0, sizeof(*lb));
@@ -1098,24 +1072,22 @@ static void ff_vs_prepare_draw(DWORD fvf)
         }
         lb->num_lights = active_count;
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vs_light_cb, 0);
+        rhi_buffer_unmap(g_vs_light_cb);
     }
 
     {
-        ID3D11Buffer *vs_cbs[2] = { g_vs_cb, g_vs_light_cb };
-        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 2, vs_cbs);
+        RhiBuffer *vs_cbs[2] = { g_vs_cb, g_vs_light_cb };
+        rhi_set_uniform_buffers(RHI_STAGE_VERTEX, 0, 2, vs_cbs);
     }
 }
 
 void d3d8_shaders_prepare_draw(DWORD handle)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    ID3D11PixelShader *ps;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    RhiShader *ps;
+    void *mapped;
     const DWORD *rs;
-    HRESULT hr;
 
-    if (!ctx) return;
+    if (!d3d8_GetD3D11Context()) return;
     if (d3d8_vsh_prepare_draw(handle)) {
         /* A program that never reads the projection's first column is
          * placing vertices in screen coordinates it worked out itself. */
@@ -1136,13 +1108,13 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     if (!g_ps_cb) return;
     ps = ff_ps_get_shader(ff_ps_compute_signature());
     if (!ps) return;
-    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    rhi_set_shader(RHI_STAGE_PIXEL, ps);
     rs = d3d8_GetRenderStates();
 
     /* ---- PS Constant Buffer ---- */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_ps_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        PSConstants *pc = (PSConstants *)mapped.pData;
+    mapped = rhi_buffer_map(g_ps_cb, RHI_MAP_WRITE_DISCARD);
+    if (mapped) {
+        PSConstants *pc = (PSConstants *)mapped;
         UINT stage;
         memset(pc, 0, sizeof(*pc));
 
@@ -1226,8 +1198,8 @@ void d3d8_shaders_prepare_draw(DWORD handle)
             pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2];
         }
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);
+        rhi_buffer_unmap(g_ps_cb);
     }
 
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_ps_cb);
+    rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 0, 1, &g_ps_cb);
 }

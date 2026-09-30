@@ -9,7 +9,7 @@
  *
  * This module translates NV2A vertex shader microcode into HLSL source
  * code, compiles it with D3DCompile, and caches the resulting
- * ID3D11VertexShader for use by the D3D8->D3D11 compatibility layer.
+ * host vertex shader (rhi.h) for use by the D3D8 compatibility layer.
  *
  * Decoding the microcode and running it on the CPU is not here. That half
  * needs no graphics API, so it lives in src/kernel/nv2a_vsh.{c,h} and builds
@@ -28,9 +28,10 @@
 #ifndef XBOXRECOMP_D3D8_VSH_H
 #define XBOXRECOMP_D3D8_VSH_H
 
-#include <d3d11.h>
 #include <stdint.h>
 #include <windows.h>
+
+#include "rhi.h"
 
 #include "../kernel/nv2a_vsh.h"
 
@@ -65,12 +66,13 @@ extern "C" {
  */
 /**
  * One vertex register a program reads, laid out as the title's vertex
- * declaration says: the DXGI format of the bytes stored in the vertex and
+ * declaration says: the format of the bytes stored in the vertex (an
+ * RhiFormat, which is the DXGI number captures store) and
  * their offset from the start of a stream 0 vertex.
  */
 typedef struct D3D8VshInput {
     int         reg;        /* v0..v15 */
-    DXGI_FORMAT format;
+    RhiFormat   format;
     UINT        offset;
 } D3D8VshInput;
 
