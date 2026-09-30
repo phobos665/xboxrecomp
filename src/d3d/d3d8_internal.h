@@ -76,7 +76,7 @@ BOOL d3d8_GetTwoDSqueeze(void);
  * what separates a backdrop or a fade from a HUD element. */
 BOOL d3d8_draw_spans_guest_width(const void *vertices, UINT stride, UINT count);
 /* The scissor rectangle to draw with, if one is on (xbox_D3D8SetScissors). */
-BOOL                 d3d8_GetScissor(D3D11_RECT *out);
+BOOL                 d3d8_GetScissor(RhiRect *out);
 UINT                 d3d8_GetGuestHeight(void);
 UINT                 d3d8_GetBackbufferHeight(void);
 
