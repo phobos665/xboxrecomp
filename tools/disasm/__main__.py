@@ -136,10 +136,10 @@ def main():
 def _load_seed_functions(path, observed=None):
     """Load seed function addresses from a JSON file.
 
-    Entries marked "observed" (a run actually called or started a thread
-    there) are also added to `observed`. Entries written by seed_from_log
-    before the field existed say "observed at runtime" in their note, and
-    count too. (Upstream xboxrecomp 1409a7d, #164.)
+    Entries marked "observed" (tools.seed_from_log writes them: a run
+    actually called or started a thread there) are also added to `observed`.
+    Entries written by seed_from_log before it set the field say so in their
+    note, and count too.
     """
     import json
     with open(path) as f:
