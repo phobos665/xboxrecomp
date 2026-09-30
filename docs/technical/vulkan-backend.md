@@ -331,12 +331,20 @@ fix, so do not stack a second."* Concretely, the Vulkan backend must:
   is API-independent;
 - set `frontFace = VK_FRONT_FACE_CLOCKWISE`, which is what
   `FrontCounterClockwise = FALSE` means;
-- then invert *that one field only*, to `VK_FRONT_FACE_COUNTER_CLOCKWISE`, to
-  pay for the negative viewport height.
+- and **do not invert it.**
 
-One inversion, on `frontFace`, in one place, with a comment saying it pays for
-the viewport and nothing else. Anything else and geometry culls inside-out in a
-way that looks like a depth bug and gets debugged as one for a day.
+> **Corrected 30 Sep 2026, by measurement.** This section originally said to
+> invert `frontFace` a second time "to pay for the negative viewport height".
+> That is wrong. The negative height makes the framebuffer image the one D3D
+> draws, so every triangle winds on the screen exactly as it does under D3D11,
+> and Vulkan decides facing in those same framebuffer coordinates (y down): its
+> `CLOCKWISE` is D3D's clockwise. The inversion only applies against an
+> *unflipped* viewport. With it, TimeSplitters 2's tunnel walls were culled away
+> and its frames matched D3D11 at 21.8 dB; without it, 54 dB. The mapping is
+> `raster_front_face()` in `src/d3d/rhi_vulkan.c`.
+
+Anything else and geometry culls inside-out in a way that looks like a depth
+bug and gets debugged as one for a day -- which is what the inversion did.
 
 ### 4.5 Pipelines
 

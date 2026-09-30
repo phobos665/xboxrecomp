@@ -23,6 +23,9 @@ static const RhiBackend *const g_backends[] = {
 #if defined(_WIN32)
     &rhi_d3d11_backend,
 #endif
+#if defined(RHI_HAVE_VULKAN)
+    &rhi_vulkan_backend,
+#endif
     NULL
 };
 
@@ -48,7 +51,25 @@ int rhi_select_backend(const char *name)
 
 const char *rhi_backend_name(void) { return g_rhi ? g_rhi->name : "none"; }
 
-int      rhi_device_create(const RhiDeviceDesc *d)     { return g_rhi ? g_rhi->device_create(d) : -1; }
+/* A backend that was asked for and cannot start (no loader, no Vulkan 1.3
+ * device, no shader compiler) gives way to the default, said once, rather
+ * than leaving the title with no picture at all. */
+int rhi_device_create(const RhiDeviceDesc *d)
+{
+    if (!g_rhi)
+        return -1;
+    if (g_rhi->device_create(d) == 0)
+        return 0;
+    if (g_rhi != g_backends[0] && g_backends[0]) {
+        fprintf(stderr, "[RHI] the %s renderer could not start; using %s\n",
+                g_rhi->name, g_backends[0]->name);
+        fflush(stderr);
+        g_rhi->device_destroy();
+        g_rhi = g_backends[0];
+        return g_rhi->device_create(d);
+    }
+    return -1;
+}
 void     rhi_device_destroy(void)                      { if (g_rhi) g_rhi->device_destroy(); }
 int      rhi_device_ready(void)                        { return g_rhi && g_rhi->device_ready(); }
 RhiView *rhi_swapchain_view(void)                      { return g_rhi ? g_rhi->swapchain_view() : NULL; }

@@ -1035,6 +1035,67 @@ static UINT up_ring_upload(UpRing *ring, const void *data, UINT size)
     return offset;
 }
 
+/* RECOMP_D3D8_STAGE0_PROBE=<n>: the host image bound at texture stage 0
+ * for the n-th draw since the device was made, read back and written as
+ * stage0_draw<n>.bmp in the working directory. It reads what the GPU will
+ * sample, through rhi_image_readback, so the same probe run under two
+ * backends says whether they were given the same texels -- the question
+ * that separates an upload fault from a sampling or shading one. */
+static void stage0_probe(void)
+{
+    static long want = -2, n;
+    RhiImage *img;
+    RhiImageDesc d;
+    uint8_t *px;
+    char path[64];
+    FILE *f;
+
+    if (want == -2) {
+        const char *v = getenv("RECOMP_D3D8_STAGE0_PROBE");
+        want = (v && *v) ? atol(v) : -1;
+    }
+    if (want < 0 || n++ != want)
+        return;
+    img = g_cur_textures[0] ? d3d8_base_resource(g_cur_textures[0]) : NULL;
+    if (!img) {
+        fprintf(stderr, "D3D8 stage 0 probe: draw %ld has no texture at stage 0\n", want);
+        return;
+    }
+    rhi_image_get_desc(img, &d);
+    if (d.type != RHI_IMAGE_2D || rhi_format_row_pitch(d.format, d.width) != d.width * 4u) {
+        fprintf(stderr, "D3D8 stage 0 probe: draw %ld's texture is format %u; only 32-bit "
+                "2D images are written\n", want, (unsigned)d.format);
+        return;
+    }
+    px = (uint8_t *)malloc((size_t)d.width * d.height * 4u);
+    if (!px || rhi_image_readback(img, 0, px, d.width * 4u) != 0) {
+        free(px);
+        return;
+    }
+    snprintf(path, sizeof path, "stage0_draw%ld.bmp", want);
+    if ((f = fopen(path, "wb")) != NULL) {
+        uint8_t hdr[54];
+        UINT y, x;
+        memset(hdr, 0, sizeof hdr);
+        hdr[0] = 'B'; hdr[1] = 'M';
+        *(uint32_t *)(hdr + 2) = 54u + d.width * d.height * 4u;
+        *(uint32_t *)(hdr + 10) = 54;
+        *(uint32_t *)(hdr + 14) = 40;
+        *(int32_t *)(hdr + 18) = (int32_t)d.width;
+        *(int32_t *)(hdr + 22) = (int32_t)d.height;
+        *(uint16_t *)(hdr + 26) = 1;
+        *(uint16_t *)(hdr + 28) = 32;
+        fwrite(hdr, 1, sizeof hdr, f);
+        for (y = d.height; y-- > 0; )           /* bottom-up; the bytes as the image holds them */
+            for (x = 0; x < d.width; x++)
+                fwrite(px + ((size_t)y * d.width + x) * 4u, 1, 4, f);
+        fclose(f);
+        fprintf(stderr, "D3D8 stage 0 probe: draw %ld, %ux%u format %u, written to %s\n",
+                want, d.width, d.height, (unsigned)d.format, path);
+    }
+    free(px);
+}
+
 static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 {
     (void)self;
@@ -1050,6 +1111,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     d3d8_states_apply();
 
     rhi_set_topology(topology);
+    stage0_probe();
     rhi_draw(vertex_count, StartVertex);
     return S_OK;
 }
@@ -1069,6 +1131,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     d3d8_states_apply();
 
     rhi_set_topology(topology);
+    stage0_probe();
     rhi_draw_indexed(index_count, StartIndex, (int32_t)g_cur_ib_base_vertex);
     return S_OK;
 }
@@ -1147,6 +1210,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     d3d8_states_apply();
 
     rhi_set_topology(topology);
+    stage0_probe();
     rhi_draw(vertex_count, 0);
 
     /* Restore previous VB binding if any */
@@ -1200,6 +1264,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     d3d8_states_apply();
 
     rhi_set_topology(topology);
+    stage0_probe();
     rhi_draw_indexed(index_count, 0, 0);
 
     /* Restore previous bindings */

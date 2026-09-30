@@ -27,6 +27,9 @@
  *                    clears after the nth draw are skipped too).
  *   --skip-draw <n>  leave out draw n (0-based).
  *   --list-draws     print every draw with the state it runs under.
+ *   --dump-target    write the render target bound when the frame ends
+ *                    instead of the back buffer: with --draws, the way to see
+ *                    an offscreen pass that is composited to the screen later.
  *   --present        also write <prefix>NNN_present.bmp: the frame as it
  *                    reaches the swap chain, after the display resolve, which
  *                    the scene image (the default) never shows.
@@ -84,6 +87,11 @@ static int g_no_combiners;
 static long g_max_draws = -1;
 static long g_skip_draw = -1;
 static int  g_list_draws;
+static int  g_dump_target;
+/* --dump-target with --draws: the target the first undrawn draw would have
+ * gone to, held from that moment, since later state still runs. */
+static IDirect3DDevice8  *g_replay_dev;
+static IDirect3DSurface8 *g_target_at_limit;
 static long g_draw_index;           /* draws seen in this loop */
 static DWORD g_cur_vs, g_cur_token;
 #define LIST_TEX_IDS 8192
@@ -131,6 +139,8 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
                 (unsigned long)rs[D3DRS_COLORWRITEENABLE], (unsigned long)rs[D3DRS_STENCILENABLE],
                 (unsigned long)rs[D3DRS_FILLMODE], (unsigned long)rs[D3DRS_SHADEMODE]);
     }
+    if (g_dump_target && n == g_max_draws && g_replay_dev && !g_target_at_limit)
+        g_replay_dev->lpVtbl->GetRenderTarget(g_replay_dev, &g_target_at_limit);
     if (g_max_draws >= 0 && n >= g_max_draws)
         return 0;
     return n != g_skip_draw;
@@ -246,7 +256,16 @@ static void dump_bmp(IDirect3DDevice8 *dev, const char *path)
     D3DSURFACE_DESC desc;
     D3DLOCKED_RECT lr;
 
-    if (FAILED(dev->lpVtbl->GetBackBuffer(dev, 0, 0, &surf)) || !surf)
+    if (g_dump_target && g_target_at_limit) {
+        surf = g_target_at_limit;               /* the reference passes to surf */
+        g_target_at_limit = NULL;
+    } else if (g_dump_target) {
+        dev->lpVtbl->GetRenderTarget(dev, &surf);
+    }
+    /* No target of its own (NULL) is the device's: the back buffer. */
+    if (!surf && FAILED(dev->lpVtbl->GetBackBuffer(dev, 0, 0, &surf)))
+        return;
+    if (!surf)
         return;
     if (FAILED(surf->lpVtbl->GetDesc(surf, &desc)) ||
         FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
@@ -1062,7 +1081,7 @@ static void usage(void)
         "usage: d3d8_replay <capture%s> [--out <prefix>] [--loops <n>]\n"
         "                   [--dump-every] [--hold] [--quiet]\n"
         "                   [--no-combiners] [--draws <n>] [--skip-draw <n>]\n"
-        "                   [--list-draws] [--present] [--backend <name>]\n",
+        "                   [--list-draws] [--dump-target] [--present] [--backend <name>]\n",
         D3D8CAP_EXTENSION);
 }
 
@@ -1103,6 +1122,8 @@ int main(int argc, char **argv)
             backend = argv[++i];
         else if (!strcmp(argv[i], "--list-draws"))
             g_list_draws = 1;
+        else if (!strcmp(argv[i], "--dump-target"))
+            g_dump_target = 1;
         else if (argv[i][0] == '-') {
             usage();
             return 2;
@@ -1154,6 +1175,7 @@ int main(int argc, char **argv)
         d3d8cap_close_read(cap);
         return 1;
     }
+    g_replay_dev = r.dev;
     xbox_D3D8SetPresentInterval(0);      /* never wait for vblank: this is a tool */
     xbox_D3D8KeepPresented(present);
     if (SUCCEEDED(r.dev->lpVtbl->GetDepthStencilSurface(r.dev, &r.device_depth)) &&
