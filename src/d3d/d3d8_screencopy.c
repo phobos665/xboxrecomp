@@ -253,6 +253,9 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     rhi_output_restore(&saved);
     rhi_view_destroy(rtv);
     g.copies++;
+    /* A draw sampling this is re-presenting the frame, and has to cover
+     * the whole of it; see d3d8_draw_escapes_squeeze. */
+    tex->screen_copy = TRUE;
     return S_OK;
 }
 

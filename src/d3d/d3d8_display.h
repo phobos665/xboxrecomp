@@ -35,6 +35,13 @@ typedef struct D3D8DisplayPolicy {
      * renders 4:3 content that then gets stretched. The kernel reads the
      * same variable to answer XC_VIDEO. */
     int  widescreen;
+    /* RECOMP_WIDESCREEN_2D=centre: in widescreen, every 2D draw is kept at
+     * 4:3 in the middle, backdrops included, and only whole-screen passes
+     * (flat fades, effects over a copy of the frame) span the picture.
+     * The default, auto, lets any 2D draw most of the screen wide span it,
+     * which suits a title whose backdrops are separate from its HUD and
+     * leaves seams in one that composes its menus from both. */
+    int  centre_2d;
     /* RECOMP_ANISO=<1..16>, the anisotropy to force on textures the title
      * already filters linearly. 1 leaves every sampler as the title asked
      * for it. */
@@ -42,6 +49,14 @@ typedef struct D3D8DisplayPolicy {
 } D3D8DisplayPolicy;
 
 const D3D8DisplayPolicy *d3d8_display_policy(void);
+
+/* Whether the frame being drawn is shown at 16:9: the widescreen setting,
+ * unless the title has said the screen it is on is 4:3
+ * (xbox_D3D8SetWideFrames). Everything that treats a frame as widescreen
+ * -- the 2D squeeze, the shape at present -- asks this. */
+int  d3d8_display_wide_now(void);
+/* A frame has been presented (it notes each change of shape in the log). */
+void d3d8_display_frame_done(void);
 
 /* The size the scene is rendered at, for a guest presenting at guest_w by
  * guest_h. Equal to the guest's own size when nothing is scaled. */

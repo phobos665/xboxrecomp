@@ -1187,6 +1187,39 @@ BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
  * is what a backend without Hor+ returns. */
 float xbox_D3D8ClaimHorPlus(void);
 
+/* Widescreen by screen, for a 4:3 title widened with Hor+ whose menus
+ * cannot be. FALSE: the frames drawn from now on are shown at 4:3 between
+ * bars, with their 2D left unsqueezed; TRUE (the default) puts them back
+ * at 16:9. Holds until changed, so call it between frames. Without
+ * widescreen, nothing. */
+void xbox_D3D8SetWideFrames(BOOL wide);
+
+/* Where the title's next screen-space draws belong in widescreen, for a title
+ * that knows what it is drawing. A 4:3-only title's 2D is squeezed back to
+ * 4:3 so the 16:9 stretch leaves it in proportion; the renderer can only
+ * guess which pieces should instead span the picture (backdrops, fades), and
+ * a guess made from the vertices changes as they animate. A title project
+ * that can tell -- from which of its functions made the draw -- says so here.
+ *
+ *   AUTO     the renderer's own judgement (RECOMP_WIDESCREEN_2D); the default
+ *   STRETCH  span the widescreen picture
+ *   CENTRE   keep at 4:3, centred
+ *   LEFT     keep at 4:3, pinned to the left edge of the picture
+ *   RIGHT    keep at 4:3, pinned to the right edge
+ *
+ * Holds until changed; 3D draws ignore it; without widescreen nothing is
+ * squeezed and it has no effect. `tag` names the title's call site for
+ * RECOMP_D3D8_2D_TAGS=1, which reports each tag's draws and extent. */
+enum {
+    XBOX_D3D8_2D_AUTO = 0,
+    XBOX_D3D8_2D_STRETCH,
+    XBOX_D3D8_2D_CENTRE,
+    XBOX_D3D8_2D_LEFT,
+    XBOX_D3D8_2D_RIGHT
+};
+void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag);
+int  xbox_D3D8GetTwoDPlacement(uint32_t *tag);
+
 /* The Xbox's CopyRects, for the one case a title uses it for in anger:
    copying the finished frame into a texture it then draws over the scene.
    The host's own back buffer is the source, because the guest's is empty --

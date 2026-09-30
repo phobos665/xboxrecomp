@@ -67,6 +67,7 @@ typedef struct RecompSettings {
     int  widescreen;            /* 0 or 1 */
     double hor_plus;            /* 0 leaves the camera alone; 0.75 is 4:3->16:9 */
     int  hor_plus_register;     /* per title; 60 for TimeSplitters 2 */
+    char widescreen_2d[16];     /* "auto" or "centre": where 2D goes in widescreen */
     int  anisotropy;            /* 1..16 */
     char frame_cap[16];         /* "adaptive", "60", "30", "0" */
     int  fps_overlay;           /* 0 or 1 */
