@@ -22,6 +22,7 @@ IDirect3DDevice8 *d3d8_GetDevice(void);
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include "rhi.h"
 
 /* ================================================================
  * D3D11 device accessors (implemented in d3d8_device.c)
