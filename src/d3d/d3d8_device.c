@@ -66,6 +66,8 @@ typedef struct D3D8DeviceState {
     ID3D11Texture2D          *scene_texture;  /* NULL while unscaled */
     ID3D11ShaderResourceView *scene_srv;      /* the finished frame, to read */
     ID3D11RenderTargetView   *present_rtv;    /* the back buffer; NULL unscaled */
+    RhiView                  *rhi_scene_srv;  /* the same two, as rhi.h views */
+    RhiView                  *rhi_present_rtv;
     D3DFORMAT               backbuffer_format;
 
     /* State tracking */
@@ -263,6 +265,8 @@ static void present_resolve(void)
             ID3D11DeviceContext_OMSetRenderTargets(s->d3d11_context, 0, NULL, NULL);
             ID3D11RenderTargetView_Release(s->present_rtv);
             s->present_rtv = NULL;
+            rhi_view_destroy(s->rhi_present_rtv);
+            s->rhi_present_rtv = NULL;
 
             if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(s->swap_chain, 0, w, h,
                                                         DXGI_FORMAT_UNKNOWN, 0)) &&
@@ -271,6 +275,7 @@ static void present_resolve(void)
                 ID3D11Device_CreateRenderTargetView(s->d3d11_device,
                                                      (ID3D11Resource *)bb, NULL,
                                                      &s->present_rtv);
+                s->rhi_present_rtv = rhi_d3d11_wrap_view(s->present_rtv, RHI_VIEW_RENDER_TARGET);
                 ID3D11Texture2D_Release(bb);
                 s->swap_width = w;
                 s->swap_height = h;
@@ -291,7 +296,7 @@ static void present_resolve(void)
         d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
     }
-    d3d8_display_resolve(s->scene_srv, s->width, s->height, s->present_rtv, fit);
+    d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, s->rhi_present_rtv, fit);
 }
 
 /* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
@@ -507,6 +512,10 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
             hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
                                                       (ID3D11Resource *)back_buffer,
                                                       NULL, &state->present_rtv);
+        if (SUCCEEDED(hr)) {
+            state->rhi_scene_srv = rhi_d3d11_wrap_view(state->scene_srv, RHI_VIEW_SAMPLED);
+            state->rhi_present_rtv = rhi_d3d11_wrap_view(state->present_rtv, RHI_VIEW_RENDER_TARGET);
+        }
         if (FAILED(hr))
             fprintf(stderr, "D3D8 display: the %ux%u scene target could not be "
                     "made (0x%08lX); nothing will be drawn\n",
@@ -645,6 +654,8 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         if (s->default_dsv) { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
         if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
         if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
+        rhi_view_destroy(s->rhi_scene_srv); s->rhi_scene_srv = NULL;
+        rhi_view_destroy(s->rhi_present_rtv); s->rhi_present_rtv = NULL;
         if (s->scene_srv) { ID3D11ShaderResourceView_Release(s->scene_srv); s->scene_srv = NULL; }
         if (s->scene_texture) { ID3D11Texture2D_Release(s->scene_texture); s->scene_texture = NULL; }
         if (s->present_rtv) { ID3D11RenderTargetView_Release(s->present_rtv); s->present_rtv = NULL; }
@@ -2008,6 +2019,7 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
 
     hr = d3d11_create_device_and_swap_chain(&g_device_state, pPP);
     if (FAILED(hr)) return hr;
+    rhi_d3d11_adopt(g_device_state.d3d11_device, g_device_state.d3d11_context);
 
     hr = d3d11_create_render_targets(&g_device_state);
     if (FAILED(hr)) return hr;

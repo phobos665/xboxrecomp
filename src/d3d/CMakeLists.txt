@@ -15,6 +15,8 @@ if(WIN32)
         d3d8_screencopy.c
         d3d8_display.c
         d3d8_compile.c
+        rhi.c
+        rhi_d3d11.c
     )
     # gdi32: the overlay renders its text with GDI rather than an embedded font.
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler gdi32)
