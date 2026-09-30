@@ -92,8 +92,8 @@ static int create(void)
     ID3D11ShaderResourceView_AddRef(g.back_srv);
     (void)back;
 
-    hr = D3DCompile(kSource, sizeof kSource - 1, "screencopy", NULL, NULL,
-                    "vs_main", "vs_4_0", 0, 0, &code, &err);
+    hr = d3d8_compile_hlsl(kSource, sizeof kSource - 1, "screencopy", NULL,
+                           "vs_main", "vs_4_0", 0, &code, &err);
     if (FAILED(hr)) {
         if (err) { fprintf(stderr, "D3D8 screen copy: %s\n",
                            (const char *)ID3D10Blob_GetBufferPointer(err));
@@ -107,8 +107,8 @@ static int create(void)
     code = NULL;
     if (FAILED(hr)) { fail("CreateVertexShader", hr); return 0; }
 
-    hr = D3DCompile(kSource, sizeof kSource - 1, "screencopy", NULL, NULL,
-                    "ps_main", "ps_4_0", 0, 0, &code, &err);
+    hr = d3d8_compile_hlsl(kSource, sizeof kSource - 1, "screencopy", NULL,
+                           "ps_main", "ps_4_0", 0, &code, &err);
     if (FAILED(hr)) {
         if (err) { fprintf(stderr, "D3D8 screen copy: %s\n",
                            (const char *)ID3D10Blob_GetBufferPointer(err));

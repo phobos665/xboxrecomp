@@ -207,11 +207,12 @@ D3D8CapReader *d3d8cap_open(const char *path, char *err, size_t err_bytes)
         d3d8cap_close_read(r);
         return NULL;
     }
-    /* Exact, not a range: a capture is cheap to retake, and silently
-     * mis-reading an older layout would show up as a corrupt image rather
-     * than an error. */
-    if (h->version != D3D8CAP_VERSION) {
-        cap_err(err, err_bytes, "capture version does not match this build");
+    /* A range whose floor moves with every layout change (see
+     * D3D8CAP_VERSION_MIN_READ): silently mis-reading an older layout would
+     * show up as a corrupt image rather than an error, so anything below the
+     * floor or newer than this build is refused. */
+    if (h->version < D3D8CAP_VERSION_MIN_READ || h->version > D3D8CAP_VERSION) {
+        cap_err(err, err_bytes, "capture version is not one this build reads");
         d3d8cap_close_read(r);
         return NULL;
     }

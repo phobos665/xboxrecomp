@@ -58,6 +58,13 @@ void d3d8_SetTwoDSqueeze(BOOL on);
  * attributes to D3DCOMPILER_47. */
 long long d3d8_compile_clock(void);
 void      d3d8_compile_note(int kind, long long started);
+/* Every HLSL compile in the renderer goes through here (d3d8_compile.c):
+ * D3DCompile's arguments less the include handler and effect flags, which
+ * no caller uses. RECOMP_D3D8_HLSL_DIR=<dir> writes each distinct source. */
+HRESULT   d3d8_compile_hlsl(const char *src, size_t len, const char *name,
+                            const D3D_SHADER_MACRO *macros,
+                            const char *entry, const char *target, UINT flags,
+                            ID3DBlob **code, ID3DBlob **errors);
 BOOL d3d8_GetTwoDSqueeze(void);
 /* Whether a draw's own vertices span the guest's full width, which is
  * what separates a backdrop or a fade from a HUD element. */

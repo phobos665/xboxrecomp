@@ -1000,10 +1000,10 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
 
     {
         long long started = d3d8_compile_clock();
-        hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
-                        NULL, NULL, "main", "ps_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                        &code, &errors);
+        hr = d3d8_compile_hlsl(hlsl, (size_t)len, "ps_combiner",
+                               NULL, "main", "ps_5_0",
+                               D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                               &code, &errors);
         d3d8_compile_note(0, started);
     }
     if (FAILED(hr)) {

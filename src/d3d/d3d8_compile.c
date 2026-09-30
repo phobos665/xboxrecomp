@@ -1,0 +1,122 @@
+/**
+ * One place where the renderer compiles HLSL.
+ *
+ * Eight call sites in seven files used to call D3DCompile directly: the
+ * combiner and vertex-program generators, the fixed-function pair, and the
+ * overlay, screen copy, movie and display-resolve shaders. A second backend
+ * needs them to go through one door -- a Vulkan build compiles the same HLSL
+ * with DXC to SPIR-V instead (docs/technical/vulkan-backend.md, section 4.3) --
+ * and so does anyone who wants to see what the generators actually emit.
+ *
+ * RECOMP_D3D8_HLSL_DIR=<dir> writes every distinct source compiled into that
+ * directory, once each, as a file that compiles on its own: the entry point
+ * and target are in its first line and any macros are written out as
+ * #defines. Replaying a capture with it set collects a title's whole shader
+ * set without running the title, which is the corpus for testing the
+ * generators against a different compiler.
+ */
+
+#include "d3d8_internal.h"
+
+#include <d3dcompiler.h>
+#include <stdio.h>
+#include <string.h>
+
+/* FNV-1a over the source, the macros, the entry point and the target: the
+ * same text under a different target is a different shader. */
+static uint32_t hlsl_hash(const char *src, size_t len,
+                          const D3D_SHADER_MACRO *macros,
+                          const char *entry, const char *target)
+{
+    uint32_t h = 2166136261u;
+    size_t i;
+
+#define MIX(p, n) for (i = 0; i < (n); i++) { h ^= (uint8_t)(p)[i]; h *= 16777619u; }
+    MIX(src, len);
+    for (; macros && macros->Name; macros++) {
+        MIX(macros->Name, strlen(macros->Name) + 1);
+        if (macros->Definition)
+            MIX(macros->Definition, strlen(macros->Definition) + 1);
+    }
+    MIX(entry, strlen(entry) + 1);
+    MIX(target, strlen(target) + 1);
+#undef MIX
+    return h;
+}
+
+/* Hashes already written. A title produces a few hundred distinct shaders,
+ * so a full table just stops recording rather than growing. Zero marks an
+ * empty slot; a source that hashes to zero is written every time, which is
+ * harmless. */
+#define HLSL_SEEN_SLOTS 4096u
+static volatile LONG g_hlsl_seen[HLSL_SEEN_SLOTS];
+
+static int hlsl_first_sighting(uint32_t hash)
+{
+    uint32_t i, slot = hash % HLSL_SEEN_SLOTS;
+
+    if (!hash)
+        return 1;
+    for (i = 0; i < HLSL_SEEN_SLOTS; i++, slot = (slot + 1) % HLSL_SEEN_SLOTS) {
+        LONG have = InterlockedCompareExchange(&g_hlsl_seen[slot], (LONG)hash, 0);
+        if (have == 0)
+            return 1;
+        if (have == (LONG)hash)
+            return 0;
+    }
+    return 0;
+}
+
+static const char *hlsl_dump_dir(void)
+{
+    static int checked;
+    static const char *dir;
+
+    if (!checked) {
+        const char *v = getenv("RECOMP_D3D8_HLSL_DIR");
+        dir = (v && *v) ? v : NULL;
+        if (dir) {
+            CreateDirectoryA(dir, NULL);
+            fprintf(stderr, "[D3D8] writing every compiled HLSL source to %s\n", dir);
+        }
+        checked = 1;
+    }
+    return dir;
+}
+
+static void hlsl_dump(const char *src, size_t len, const char *name,
+                      const D3D_SHADER_MACRO *macros,
+                      const char *entry, const char *target)
+{
+    const char *dir = hlsl_dump_dir();
+    uint32_t hash;
+    char path[MAX_PATH];
+    FILE *f;
+
+    if (!dir)
+        return;
+    hash = hlsl_hash(src, len, macros, entry, target);
+    if (!hlsl_first_sighting(hash))
+        return;
+    snprintf(path, sizeof path, "%s\\%s-%s-%s-%08X.hlsl",
+             dir, name ? name : "shader", entry, target, hash);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    fprintf(f, "// entry=%s target=%s name=%s\n", entry, target, name ? name : "");
+    for (; macros && macros->Name; macros++)
+        fprintf(f, "#define %s %s\n", macros->Name,
+                macros->Definition ? macros->Definition : "");
+    fwrite(src, 1, len, f);
+    fclose(f);
+}
+
+HRESULT d3d8_compile_hlsl(const char *src, size_t len, const char *name,
+                          const D3D_SHADER_MACRO *macros,
+                          const char *entry, const char *target, UINT flags,
+                          ID3DBlob **code, ID3DBlob **errors)
+{
+    hlsl_dump(src, len, name, macros, entry, target);
+    return D3DCompile(src, (SIZE_T)len, name, macros, NULL, entry, target,
+                      flags, 0, code, errors);
+}

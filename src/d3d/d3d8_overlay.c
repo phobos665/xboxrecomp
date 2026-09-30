@@ -120,8 +120,8 @@ static int overlay_create(void)
     hr = ID3D11Device_CreateBuffer(dev, &bd, NULL, &g.cb);
     if (FAILED(hr)) { overlay_fail("CreateBuffer", hr); return 0; }
 
-    hr = D3DCompile(kShaderSource, sizeof kShaderSource - 1, "overlay", NULL, NULL,
-                    "vs_main", "vs_4_0", 0, 0, &code, &err);
+    hr = d3d8_compile_hlsl(kShaderSource, sizeof kShaderSource - 1, "overlay", NULL,
+                           "vs_main", "vs_4_0", 0, &code, &err);
     if (FAILED(hr)) {
         if (err) fprintf(stderr, "D3D8 overlay: %s\n", (const char *)ID3D10Blob_GetBufferPointer(err));
         if (err) ID3D10Blob_Release(err);
@@ -134,8 +134,8 @@ static int overlay_create(void)
     code = NULL;
     if (FAILED(hr)) { overlay_fail("CreateVertexShader", hr); return 0; }
 
-    hr = D3DCompile(kShaderSource, sizeof kShaderSource - 1, "overlay", NULL, NULL,
-                    "ps_main", "ps_4_0", 0, 0, &code, &err);
+    hr = d3d8_compile_hlsl(kShaderSource, sizeof kShaderSource - 1, "overlay", NULL,
+                           "ps_main", "ps_4_0", 0, &code, &err);
     if (FAILED(hr)) {
         if (err) fprintf(stderr, "D3D8 overlay: %s\n", (const char *)ID3D10Blob_GetBufferPointer(err));
         if (err) ID3D10Blob_Release(err);
