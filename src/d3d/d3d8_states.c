@@ -412,7 +412,7 @@ void d3d8_states_apply(void)
     RhiRect scissor;
     BOOL scissor_on;
 
-    if (!rs || !d3d8_GetD3D11Context()) return;
+    if (!rs || !rhi_device_ready()) return;
 
     scissor_on = d3d8_GetScissor(&scissor);
     update_blend_state(rs);

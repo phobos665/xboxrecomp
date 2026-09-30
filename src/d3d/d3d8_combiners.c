@@ -1178,7 +1178,7 @@ BOOL d3d8_combiners_prepare_draw(void)
     if (g_ps_token == 0)
         return FALSE;
 
-    if (!d3d8_GetD3D11Context() || !g_combiner_cb)
+    if (!rhi_device_ready() || !g_combiner_cb)
         return FALSE;
 
     rs = d3d8_GetRenderStates();

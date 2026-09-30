@@ -1496,7 +1496,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     if (!d3d8_vsh_is_programmable(handle) || !g_vsh_cb || !g_vsh_vdata_cb)
         return FALSE;
 
-    if (!d3d8_GetD3D11Context()) return FALSE;
+    if (!rhi_device_ready()) return FALSE;
 
     /* Resolve handle to shader slot */
     slot = (int)(handle - 0x10000);

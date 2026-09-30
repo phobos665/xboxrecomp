@@ -29,9 +29,6 @@ IDirect3DDevice8 *d3d8_GetDevice(void);
  * ================================================================ */
 
 IDirect3DDevice8    *d3d8_GetDevice(void);
-ID3D11Device        *d3d8_GetD3D11Device(void);
-ID3D11DeviceContext *d3d8_GetD3D11Context(void);
-IDXGISwapChain      *d3d8_GetSwapChain(void);
 /* The host back buffer's size, which is what clip space maps onto. */
 UINT                 d3d8_GetBackBufferWidth(void);
 UINT                 d3d8_GetBackBufferHeight(void);

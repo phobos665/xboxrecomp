@@ -109,7 +109,7 @@ static int movie_create(void)
     if (g.tried)
         return g.vs != NULL;
     g.tried = 1;
-    if (!d3d8_GetD3D11Device()) {
+    if (!rhi_device_ready()) {
         g.failed = 1;
         return 0;
     }

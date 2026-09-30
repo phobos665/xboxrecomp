@@ -97,7 +97,7 @@ static int create(void)
     if (g.failed) return 0;
     if (g.tried) return g.back_srv != NULL;
     g.tried = 1;
-    if (!d3d8_GetD3D11Device() || !d3d8_GetSwapChain()) { g.failed = 1; return 0; }
+    if (!rhi_device_ready()) { g.failed = 1; return 0; }
 
     /* The scene the title has been drawing into, which is the swap chain's
      * own back buffer only while nothing is scaled. Reading the back
@@ -197,7 +197,7 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     UINT back_w = d3d8_GetBackBufferWidth(), back_h = d3d8_GetBackBufferHeight();
     void *mapped;
 
-    if (!d3d8_GetD3D11Device() || !tex || !tex->image || !back_w || !back_h)
+    if (!rhi_device_ready() || !tex || !tex->image || !back_w || !back_h)
         return E_INVALIDARG;
     if (!create())
         return E_FAIL;

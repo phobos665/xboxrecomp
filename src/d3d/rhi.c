@@ -8,11 +8,52 @@
 
 #include "rhi_backend.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #if defined(_WIN32)
 const RhiBackend *g_rhi = &rhi_d3d11_backend;
 #else
 const RhiBackend *g_rhi = NULL;
 #endif
+
+/* Every backend this build carries, first is the default. */
+static const RhiBackend *const g_backends[] = {
+#if defined(_WIN32)
+    &rhi_d3d11_backend,
+#endif
+    NULL
+};
+
+int rhi_select_backend(const char *name)
+{
+    int i;
+
+    if (!name || !*name)
+        name = getenv("RECOMP_D3D8_BACKEND");
+    if (!name || !*name)
+        return 0;
+    for (i = 0; g_backends[i]; i++) {
+        if (strcmp(g_backends[i]->name, name) == 0) {
+            g_rhi = g_backends[i];
+            return 0;
+        }
+    }
+    fprintf(stderr, "[RHI] renderer backend \"%s\" is not in this build; using %s\n",
+            name, g_rhi ? g_rhi->name : "none");
+    fflush(stderr);
+    return -1;
+}
+
+const char *rhi_backend_name(void) { return g_rhi ? g_rhi->name : "none"; }
+
+int      rhi_device_create(const RhiDeviceDesc *d)     { return g_rhi ? g_rhi->device_create(d) : -1; }
+void     rhi_device_destroy(void)                      { if (g_rhi) g_rhi->device_destroy(); }
+int      rhi_device_ready(void)                        { return g_rhi && g_rhi->device_ready(); }
+RhiView *rhi_swapchain_view(void)                      { return g_rhi ? g_rhi->swapchain_view() : NULL; }
+int      rhi_swapchain_resize(uint32_t w, uint32_t h)  { return g_rhi ? g_rhi->swapchain_resize(w, h) : -1; }
+int32_t  rhi_present(uint32_t interval)                { return g_rhi ? g_rhi->present(interval) : -1; }
 
 RhiBuffer *rhi_buffer_create(const RhiBufferDesc *d, const void *init) { return g_rhi->buffer_create(d, init); }
 void  rhi_buffer_destroy(RhiBuffer *b)                  { if (b) g_rhi->buffer_destroy(b); }

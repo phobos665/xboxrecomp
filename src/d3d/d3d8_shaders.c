@@ -894,7 +894,7 @@ static void ff_vs_prepare_draw(DWORD fvf)
     const DWORD *rs;
     UINT tex_count;
 
-    if (!d3d8_GetD3D11Context() || !g_vs) return;
+    if (!rhi_device_ready() || !g_vs) return;
 
     rs = d3d8_GetRenderStates();
     tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
@@ -1087,7 +1087,7 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     void *mapped;
     const DWORD *rs;
 
-    if (!d3d8_GetD3D11Context()) return;
+    if (!rhi_device_ready()) return;
     if (d3d8_vsh_prepare_draw(handle)) {
         /* A program that never reads the projection's first column is
          * placing vertices in screen coordinates it worked out itself. */
