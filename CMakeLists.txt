@@ -42,6 +42,32 @@ endif()
 
 # Option to build examples
 
+# ── SDL3 ───────────────────────────────────────────────────────
+# The host platform layer: pads (every platform, all controllers, with
+# XInput kept behind RECOMP_PAD_API=xinput on Windows), and on POSIX the
+# window and audio. Built statically from third_party/SDL (release-3.4.16,
+# `git submodule update --init third_party/SDL`) so nothing ships beside
+# the executable; a system SDL3 is the fallback when the submodule is not
+# checked out. Everything below links SDL3::SDL3.
+if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/SDL/CMakeLists.txt)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    # Not used by the runtime; leaving them out keeps the build short.
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+    set(SDL_GPU OFF CACHE BOOL "" FORCE)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/SDL EXCLUDE_FROM_ALL)
+    if(NOT TARGET SDL3::SDL3)
+        add_library(SDL3::SDL3 ALIAS SDL3-static)
+    endif()
+else()
+    find_package(SDL3 CONFIG REQUIRED)
+endif()
+
 # ── Runtime Libraries ─────────────────────────────────────────
 
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic

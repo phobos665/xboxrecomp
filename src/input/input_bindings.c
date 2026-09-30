@@ -12,8 +12,13 @@
  * Sources are resolved to key codes and pad indices at load time, so a poll
  * does no string work. A poll reads each distinct key once (KeyCache) and
  * each pad once, because a title polls its pads several times a frame.
+ *
+ * Pads are read through recomp_pad.h: SDL3 by default, XInput on Windows
+ * when the file's "pad_api" or RECOMP_PAD_API says so. The keyboard is
+ * read with GetAsyncKeyState on Windows and not yet anywhere else.
  */
 #include "input_bindings.h"
+#include "recomp_pad.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +29,8 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
-#  include <xinput.h>
+#else
+#  include <time.h>
 #endif
 
 #define MAX_SOURCES 4
@@ -116,9 +122,7 @@ static const struct { const char *control, *pad, *key; } DEFAULTS[] = {
 
 enum { SRC_NONE, SRC_KEY, SRC_PAD_BUTTON, SRC_PAD_TRIGGER, SRC_PAD_AXIS };
 
-/* Pad buttons, in the order PAD_BUTTONS names them. Kept as an index rather
- * than an XInput mask so this file parses a config on a host with no
- * <xinput.h>. */
+/* Pad buttons, in the order PAD_BUTTONS names them. */
 enum {
     PB_A, PB_B, PB_X, PB_Y, PB_LSHOULDER, PB_RSHOULDER, PB_START, PB_BACK,
     PB_LTHUMB, PB_RTHUMB, PB_DPAD_UP, PB_DPAD_DOWN, PB_DPAD_LEFT, PB_DPAD_RIGHT,
@@ -141,11 +145,11 @@ typedef struct {
     Source src[MAX_SOURCES];
 } Binding;
 
-enum { DEV_NONE, DEV_KEYBOARD, DEV_XINPUT };
+enum { DEV_NONE, DEV_KEYBOARD, DEV_PAD };
 
 typedef struct {
     int device;
-    int pad;                /* XInput index when device == DEV_XINPUT */
+    int pad;                /* recomp_pad slot when device == DEV_PAD */
     int deadzone;
     int has_key;            /* any key: source, so the port works with no pad */
     Binding bind[CONTROL_COUNT];
@@ -278,7 +282,7 @@ static void defaults_for(Controller *c, int port)
     int i, bad = 0;
 
     memset(c, 0, sizeof *c);
-    c->device = DEV_XINPUT;
+    c->device = DEV_PAD;
     c->pad = port;
     c->deadzone = DEADZONE_DEFAULT;
     for (i = 0; i < (int)(sizeof DEFAULTS / sizeof DEFAULTS[0]); i++) {
@@ -435,9 +439,12 @@ static void set_device(Controller *c, const char *name)
     } else if (strcmp(name, "none") == 0 || !*name) {
         c->device = DEV_NONE;
         c->pad = -1;
-    } else if (strncmp(name, "xinput:", 7) == 0) {
-        int n = (int)strtol(name + 7, NULL, 10);
-        c->device = DEV_XINPUT;
+    } else if (strncmp(name, "gamepad:", 8) == 0 || strncmp(name, "xinput:", 7) == 0) {
+        /* "gamepad:N" is the N-th pad through whichever API reads pads;
+         * "xinput:N" is the name files written before SDL3 used, and means
+         * the same slot. */
+        int n = (int)strtol(strchr(name, ':') + 1, NULL, 10);
+        c->device = DEV_PAD;
         c->pad = (n >= 0 && n < PORTS) ? n : 0;
     }
 }
@@ -495,7 +502,7 @@ static const char *parse_controller(const char *p, int index, int *bad)
     /* "port" may come after "bindings", so the defaults this started from
      * could be the wrong port's. Only the pad index differs, and only when
      * the file did not say. */
-    if (seen_port && tmp.device == DEV_XINPUT && tmp.pad == index && index != port)
+    if (seen_port && tmp.device == DEV_PAD && tmp.pad == index && index != port)
         tmp.pad = port;
     tmp.has_key = 0;
     for (i = 0; i < CONTROL_COUNT; i++) {
@@ -525,7 +532,14 @@ static int parse_config(const char *text)
         if (*p != ':')
             return 0;
         p = ws(p + 1);
-        if (strcmp(key, "controllers") == 0 && *p == '[') {
+        if (strcmp(key, "pad_api") == 0 && *p == '"') {
+            char api[16];
+            p = jstring(p, api, sizeof api);
+            if (!p)
+                return 0;
+            recomp_pad_set_api(strcmp(api, "xinput") == 0 ? RECOMP_PAD_API_XINPUT
+                                                          : RECOMP_PAD_API_SDL);
+        } else if (strcmp(key, "controllers") == 0 && *p == '[') {
             p = ws(p + 1);
             while (*p && *p != ']') {
                 p = parse_controller(p, index++, &bad);
@@ -631,10 +645,10 @@ static void describe(Controller *c, char *out, size_t n)
 {
     if (c->device == DEV_KEYBOARD)
         snprintf(out, n, "keyboard");
-    else if (c->device == DEV_XINPUT && c->has_key)
-        snprintf(out, n, "XInput pad %d + keyboard", c->pad);
-    else if (c->device == DEV_XINPUT)
-        snprintf(out, n, "XInput pad %d", c->pad);
+    else if (c->device == DEV_PAD && c->has_key)
+        snprintf(out, n, "%s pad %d + keyboard", recomp_pad_api_name(), c->pad + 1);
+    else if (c->device == DEV_PAD)
+        snprintf(out, n, "%s pad %d", recomp_pad_api_name(), c->pad + 1);
     else
         snprintf(out, n, "nothing");
 }
@@ -683,41 +697,24 @@ const char *recomp_bindings_device_name(unsigned port)
 
 /* ---- reading the host -------------------------------------------------- */
 
-#if defined(_WIN32)
-
-/* XInputGetState on an empty slot costs about a millisecond, and a title
- * polls its pads several times a frame: an unplugged port would cost more
- * than the game. An empty slot is re-checked once a second, a full one every
- * poll. */
-static int pad_state(int index, XINPUT_STATE *out)
+static unsigned long long now_ms(void)
 {
-    static XINPUT_STATE cached[PORTS];
-    static int connected[PORTS];
-    static ULONGLONG retry_at[PORTS];
-    ULONGLONG now = GetTickCount64();
-
-    if (index < 0 || index >= PORTS)
-        return 0;
-    if (!connected[index] && now < retry_at[index])
-        return 0;
-    memset(&cached[index], 0, sizeof cached[index]);
-    if (XInputGetState((DWORD)index, &cached[index]) == ERROR_SUCCESS) {
-        connected[index] = 1;
-    } else {
-        connected[index] = 0;
-        retry_at[index] = now + 1000;
-    }
-    *out = cached[index];
-    return connected[index];
+#if defined(_WIN32)
+    return GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+#endif
 }
 
-static const WORD PAD_BITS[PB_COUNT] = {
-    XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
-    XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
-    XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_BACK,
-    XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB,
-    XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN,
-    XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT
+static const unsigned short PAD_BITS[PB_COUNT] = {
+    RECOMP_PAD_A, RECOMP_PAD_B, RECOMP_PAD_X, RECOMP_PAD_Y,
+    RECOMP_PAD_LEFT_SHOULDER, RECOMP_PAD_RIGHT_SHOULDER,
+    RECOMP_PAD_START, RECOMP_PAD_BACK,
+    RECOMP_PAD_LEFT_THUMB, RECOMP_PAD_RIGHT_THUMB,
+    RECOMP_PAD_DPAD_UP, RECOMP_PAD_DPAD_DOWN,
+    RECOMP_PAD_DPAD_LEFT, RECOMP_PAD_DPAD_RIGHT
 };
 
 /* One answer per key per sample: 24 controls can name the same key twice and
@@ -742,42 +739,46 @@ static const WORD PAD_BITS[PB_COUNT] = {
 typedef struct { unsigned char state[256]; } KeyCache;
 
 static unsigned char g_key_state[256];
-static DWORD g_key_state_at;
+static unsigned long long g_key_state_at;
 
 static int key_down(KeyCache *kc, int vk)
 {
     (void)kc;
     if (vk <= 0 || vk > 255)
         return 0;
+#if defined(_WIN32)
     if (!g_key_state[vk])
         g_key_state[vk] = (GetAsyncKeyState(vk) & 0x8000) ? 2 : 1;
     return g_key_state[vk] == 2;
+#else
+    return 0;           /* no keyboard source off Windows yet */
+#endif
 }
 
 /* Start of a sample: drop answers older than the window above. */
 static void key_cache_tick(void)
 {
-    DWORD now = GetTickCount();
+    unsigned long long now = now_ms();
     if (now - g_key_state_at >= KEY_CACHE_TTL_MS) {
         memset(g_key_state, 0, sizeof g_key_state);
         g_key_state_at = now;
     }
 }
 
-static int axis_value(const XINPUT_GAMEPAD *g, int axis)
+static int axis_value(const RecompPadState *g, int axis)
 {
     switch (axis) {
-    case AXIS_LX: return g->sThumbLX;
-    case AXIS_LY: return g->sThumbLY;
-    case AXIS_RX: return g->sThumbRX;
-    default:      return g->sThumbRY;
+    case AXIS_LX: return g->lx;
+    case AXIS_LY: return g->ly;
+    case AXIS_RX: return g->rx;
+    default:      return g->ry;
     }
 }
 
 /* Every source reads as a 0..255 magnitude, whatever it is: that is what
  * makes a trigger bindable to a key and a button bindable to a stick. */
 static int source_magnitude(const Source *s, KeyCache *kc,
-                            const XINPUT_STATE *pad, int have_pad, int deadzone)
+                            const RecompPadState *pad, int have_pad, int deadzone)
 {
     switch (s->kind) {
     case SRC_KEY:
@@ -785,23 +786,23 @@ static int source_magnitude(const Source *s, KeyCache *kc,
     case SRC_PAD_BUTTON:
         if (!have_pad)
             return 0;
-        return (pad->Gamepad.wButtons & PAD_BITS[s->arg]) ? 255 : 0;
+        return (pad->buttons & PAD_BITS[s->arg]) ? 255 : 0;
     case SRC_PAD_TRIGGER: {
-        /* A resting XInput trigger can read a few units above zero, and a
-         * title that treats any non-zero analog button as pressed would
-         * fire forever. Below XInput's own recommended threshold is "not
+        /* A resting trigger can read a few units above zero, and a title
+         * that treats any non-zero analog button as pressed would fire
+         * forever. Below XInput's own recommended threshold is "not
          * pressed"; above it the value passes through untouched. */
         int t;
         if (!have_pad)
             return 0;
-        t = s->arg ? pad->Gamepad.bRightTrigger : pad->Gamepad.bLeftTrigger;
+        t = s->arg ? pad->right_trigger : pad->left_trigger;
         return t < TRIGGER_THRESHOLD ? 0 : t;
     }
     case SRC_PAD_AXIS: {
         int v, span;
         if (!have_pad)
             return 0;
-        v = axis_value(&pad->Gamepad, s->arg) * s->sign;
+        v = axis_value(pad, s->arg) * s->sign;
         if (v <= deadzone)
             return 0;
         if (v > 32767)
@@ -824,9 +825,13 @@ static void say_first_press(unsigned port, const char *control)
     static int said[PORTS];
 
     if (port < PORTS && !said[port]) {
+        char name[64];
         said[port] = 1;
-        fprintf(stderr, "[INPUT] port %u first press: %s (%s)\n", port + 1,
-                control, g_ctl[port].label);
+        name[0] = '\0';
+        if (g_ctl[port].device == DEV_PAD)
+            recomp_pad_name(g_ctl[port].pad, name, sizeof name);
+        fprintf(stderr, "[INPUT] port %u first press: %s (%s%s%s)\n", port + 1,
+                control, g_ctl[port].label, name[0] ? ": " : "", name);
         fflush(stderr);
     }
 }
@@ -835,7 +840,7 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
 {
     Controller *c;
     KeyCache kc;
-    XINPUT_STATE pad;
+    RecompPadState pad;
     int have_pad = 0, i;
     int axis[4] = { 0, 0, 0, 0 };
 
@@ -851,8 +856,8 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     memset(&kc, 0, sizeof kc);
     key_cache_tick();
     memset(&pad, 0, sizeof pad);
-    if (c->device == DEV_XINPUT)
-        have_pad = pad_state(c->pad, &pad);
+    if (c->device == DEV_PAD)
+        have_pad = recomp_pad_read(c->pad, &pad);
 
     for (i = 0; i < CONTROL_COUNT; i++) {
         int mag = 0, s;
@@ -897,46 +902,33 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
 
 unsigned recomp_bindings_present_mask(void)
 {
-    static ULONGLONG next;
+    static unsigned long long next;
     static unsigned mask;
-    ULONGLONG now;
+    unsigned long long now;
     int i;
 
     recomp_bindings_init();
-    now = GetTickCount64();
+    now = now_ms();
     if (mask && now < next)
         return mask;
     next = now + 250;
     mask = 0;
     for (i = 0; i < PORTS; i++) {
         Controller *c = &g_ctl[i];
-        if (c->device == DEV_KEYBOARD || (c->device == DEV_XINPUT && c->has_key)) {
+        if (c->device == DEV_KEYBOARD || (c->device == DEV_PAD && c->has_key)) {
             mask |= 1u << i;
-        } else if (c->device == DEV_XINPUT) {
-            XINPUT_STATE st;
-            if (pad_state(c->pad, &st))
+        } else if (c->device == DEV_PAD) {
+            RecompPadState st;
+            if (recomp_pad_read(c->pad, &st))
                 mask |= 1u << i;
         }
     }
     return mask;
 }
 
-#else /* not Windows: nothing to read from yet, but the config still parses */
-
-int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
+void recomp_bindings_rumble(unsigned port, unsigned short low, unsigned short high)
 {
     recomp_bindings_init();
-    if (!out)
-        return 0;
-    memset(out, 0, sizeof *out);
-    (void)port;
-    return 0;
+    if (port < PORTS && g_ctl[port].device == DEV_PAD)
+        recomp_pad_rumble(g_ctl[port].pad, low, high);
 }
-
-unsigned recomp_bindings_present_mask(void)
-{
-    recomp_bindings_init();
-    return g_ctl[0].device != DEV_NONE ? 1u : 0u;
-}
-
-#endif

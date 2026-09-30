@@ -328,10 +328,15 @@ HLE_EXPORT(XInputSetState)
     if (fb) {
         uint16_t left = *(uint16_t *)HLE_PTR(fb + FEEDBACK_LEFT_MOTOR);
         uint16_t right = *(uint16_t *)HLE_PTR(fb + FEEDBACK_RIGHT_MOTOR);
+        uint32_t port;
         lock();
         result = recomp_input_set_feedback(&g_model, handle, left, right)
                  ? ERR_SUCCESS : ERR_DEVICE_NOT_CONNECTED;
         unlock();
+        /* And to the pad itself, which recomp_pad drives through SDL3 or
+         * XInput -- so a DualSense rumbles as an Xbox pad would. */
+        if (result == ERR_SUCCESS && recomp_input_port_for_handle(handle, &port))
+            recomp_bindings_rumble(port, left, right);
         HLE_MEM32(fb) = result;
     }
     HLE_RETURN(result);

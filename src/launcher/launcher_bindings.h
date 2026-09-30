@@ -31,11 +31,11 @@ extern const char *const bind_control_names[BIND_CONTROLS];
 /* The same, as a player would read them. */
 extern const char *const bind_control_labels[BIND_CONTROLS];
 
-typedef enum { BIND_DEV_NONE, BIND_DEV_XINPUT, BIND_DEV_KEYBOARD } BindDevice;
+typedef enum { BIND_DEV_NONE, BIND_DEV_PAD, BIND_DEV_KEYBOARD } BindDevice;
 
 typedef struct BindPort {
     BindDevice device;
-    int        pad;                       /* xinput index, 0..3 */
+    int        pad;                       /* pad slot, 0..3 */
     int        deadzone;
     /* One pad source and one keyboard source per control, which is the
      * shape the defaults have and the shape a player thinks in. A file
@@ -44,8 +44,13 @@ typedef struct BindPort {
     char key_src[BIND_CONTROLS][BIND_SOURCE_LEN];
 } BindPort;
 
+/* Which API reads the pads, for every port and every game: SDL3 reads
+ * every kind of controller, XInput only Xbox ones. The file's "pad_api". */
+enum { BIND_PAD_API_SDL = 0, BIND_PAD_API_XINPUT = 1 };
+
 typedef struct BindConfig {
     BindPort port[BIND_PORTS];
+    int      pad_api;                     /* BIND_PAD_API_* */
 } BindConfig;
 
 /* The built-in mapping, the same one the runtime falls back to with no

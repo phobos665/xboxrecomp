@@ -113,7 +113,10 @@ def device_choices():
     choices = [("keyboard", "Keyboard")]
     for index in range(MAX_PADS):
         state = "connected" if index in present else "absent"
-        choices.append(("xinput:%d" % index, "XInput pad %d - %s" % (index, state)))
+        # The runtime reads pads through SDL3 by default, which numbers
+        # them in the order they were connected; this tool can only ask
+        # XInput, so "connected" is XInput's view of the same slot.
+        choices.append(("gamepad:%d" % index, "Gamepad %d - %s" % (index + 1, state)))
     choices.append(("none", "Nothing"))
     return choices
 
