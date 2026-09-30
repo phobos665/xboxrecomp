@@ -109,7 +109,7 @@ static int overlay_create(void)
     if (g.failed) return 0;
     if (g.tried) return g.texture != NULL;
     g.tried = 1;
-    if (!d3d8_GetD3D11Device()) { g.failed = 1; return 0; }
+    if (!rhi_device_ready()) { g.failed = 1; return 0; }
 
     memset(&td, 0, sizeof td);
     td.type = RHI_IMAGE_2D;

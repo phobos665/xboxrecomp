@@ -15,6 +15,13 @@
 typedef struct RhiBackend {
     const char *name;
 
+    int      (*device_create)(const RhiDeviceDesc *);
+    void     (*device_destroy)(void);
+    int      (*device_ready)(void);
+    RhiView *(*swapchain_view)(void);
+    int      (*swapchain_resize)(uint32_t, uint32_t);
+    int32_t  (*present)(uint32_t);
+
     RhiBuffer *(*buffer_create)(const RhiBufferDesc *, const void *);
     void  (*buffer_destroy)(RhiBuffer *);
     void *(*buffer_map)(RhiBuffer *, uint32_t);

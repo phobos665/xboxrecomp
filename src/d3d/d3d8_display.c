@@ -230,7 +230,7 @@ static int create(UINT taps)
 
     if (g.failed) return 0;
     if (g.tried && g.taps == taps) return g.ps != NULL;
-    if (!d3d8_GetD3D11Device()) { g.failed = 1; return 0; }
+    if (!rhi_device_ready()) { g.failed = 1; return 0; }
 
     /* The tap count follows the window, not the scale: a window of a
      * different shape from the scene gets a different ratio, and one

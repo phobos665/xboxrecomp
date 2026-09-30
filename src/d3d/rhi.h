@@ -298,6 +298,35 @@ enum { RHI_CLEAR_DEPTH = 1, RHI_CLEAR_STENCIL = 2 };
 
 /* ---- the calls ----------------------------------------------------------------- */
 
+/* The device and its swap chain */
+typedef struct {
+    void    *window;            /* the native window: an HWND on Windows */
+    uint32_t width, height;     /* the swap chain's size */
+    uint32_t buffer_count;
+    uint32_t windowed;
+    uint32_t debug;             /* ask for the debug / validation layer */
+} RhiDeviceDesc;
+
+/* Chooses the backend before the device is created. NULL or "" means
+ * RECOMP_D3D8_BACKEND, and that unset means d3d11. Returns 0 when the
+ * named backend exists; otherwise it says so and keeps d3d11. */
+int         rhi_select_backend(const char *name);
+const char *rhi_backend_name(void);
+int         rhi_device_create(const RhiDeviceDesc *desc);   /* 0 on success */
+void        rhi_device_destroy(void);
+/* Whether a device exists: the test the renderer makes before touching
+ * the GPU at all (it used to ask for the D3D11 device pointer). */
+int         rhi_device_ready(void);
+/* The render-target view of the swap chain's back buffer, which the
+ * display resolve draws into; NULL while it is being recreated. */
+RhiView    *rhi_swapchain_view(void);
+/* Follow the window: new back buffers of this size. 0 on success. */
+int         rhi_swapchain_resize(uint32_t width, uint32_t height);
+/* Show the back buffer. interval 0 must not block (vulkan-backend.md,
+ * section 4.10). Returns the backend's status, 0 or positive on success
+ * (D3D11 passes its HRESULT through). */
+int32_t     rhi_present(uint32_t interval);
+
 /* Buffers */
 RhiBuffer *rhi_buffer_create(const RhiBufferDesc *desc, const void *initial);
 void       rhi_buffer_destroy(RhiBuffer *b);
@@ -389,8 +418,8 @@ void rhi_clear_depth(RhiView *v, uint32_t flags, float depth, uint8_t stencil);
 
 /* ---- backends ----------------------------------------------------------------- */
 
-/* The D3D11 backend is handed the device and immediate context the device
- * code created. Later the backend will create them itself. */
+/* For a test that makes its own D3D11 device: hand it to the backend in
+ * place of rhi_device_create (no swap chain). */
 int  rhi_d3d11_adopt(void *id3d11_device, void *id3d11_context);
 /* For the D3D11-only code that has not moved behind this interface yet:
  * the native object behind a handle. */

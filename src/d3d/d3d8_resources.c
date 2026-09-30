@@ -793,7 +793,7 @@ static HRESULT __stdcall vb_Unlock(IDirect3DVertexBuffer8 *self)
     vb->dirty = TRUE;
 
     /* Upload to GPU */
-    if (d3d8_GetD3D11Context() && vb->buffer) {
+    if (rhi_device_ready() && vb->buffer) {
         rhi_buffer_update(vb->buffer, vb->sys_mem);
         vb->dirty = FALSE;
     }
@@ -918,7 +918,7 @@ static HRESULT __stdcall ib_Unlock(IDirect3DIndexBuffer8 *self)
     ib->locked = FALSE;
     ib->dirty = TRUE;
 
-    if (d3d8_GetD3D11Context() && ib->buffer) {
+    if (rhi_device_ready() && ib->buffer) {
         rhi_buffer_update(ib->buffer, ib->sys_mem);
         ib->dirty = FALSE;
     }
@@ -1190,7 +1190,7 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
     if (rx + rw > sf->width || ry + rh > sf->height) return E_INVALIDARG;
     if (!rw || !rh) return E_INVALIDARG;
 
-    if (!d3d8_GetD3D11Context()) return E_FAIL;
+    if (!rhi_device_ready()) return E_FAIL;
 
     rhi_image_get_desc(sf->image, &id);
     if (id.samples > 1) {
@@ -1264,7 +1264,7 @@ static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *self)
         return S_OK;
     }
 
-    if (!d3d8_GetD3D11Context()) {
+    if (!rhi_device_ready()) {
         free(sf->locked_bits);
         sf->locked_bits = NULL;
         sf->locked = FALSE;
@@ -1419,7 +1419,7 @@ static void d3d8_upload_mip_level(RhiImage *image, D3DFORMAT fmt,
     const BYTE *upload_data = src_data;
     UINT upload_pitch = src_row_pitch;
 
-    if (!d3d8_GetD3D11Context() || !image) return;
+    if (!rhi_device_ready() || !image) return;
 
     /* Step 1: unswizzle swizzled formats into linear storage. */
     if (!d3d8_format_is_compressed(fmt) && d3d8_format_is_swizzled(fmt)) {
@@ -1723,10 +1723,8 @@ void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
 
     if (type == D3DRTYPE_VOLUMETEXTURE) {
         D3D8VolumeTexture *vol = (D3D8VolumeTexture *)texture;
-        ID3D11DeviceContext *ctx;
         if (!d3d8_format_is_palettized(vol->d3d8_format)) return;
-        ctx = d3d8_GetD3D11Context();
-        if (!ctx) return;
+        if (!rhi_device_ready()) return;
         palette = vol->palette;
         for (UINT lvl = 0; lvl < vol->levels; lvl++) {
             UINT w = vol_level_width(vol, lvl);
@@ -2168,7 +2166,6 @@ static HRESULT __stdcall voltex_LockBox(IDirect3DVolumeTexture8 *self, UINT Leve
 static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Level)
 {
     D3D8VolumeTexture *vol = (D3D8VolumeTexture *)self;
-    ID3D11DeviceContext *ctx;
     UINT w, h, d, bpp, rows;
     BYTE *src, *linear = NULL, *converted = NULL;
     const BYTE *upload_data;
@@ -2177,8 +2174,7 @@ static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Le
 
     if (Level >= vol->levels || !vol->locked) return E_FAIL;
 
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx || !vol->image) { vol->locked = FALSE; return E_FAIL; }
+    if (!rhi_device_ready() || !vol->image) { vol->locked = FALSE; return E_FAIL; }
 
     w = vol_level_width(vol, Level);
     h = vol_level_height(vol, Level);

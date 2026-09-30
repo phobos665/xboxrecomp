@@ -34,10 +34,6 @@
 #define MAX_LIGHTS           8
 
 typedef struct D3D8DeviceState {
-    /* D3D11 objects */
-    ID3D11Device            *d3d11_device;
-    ID3D11DeviceContext     *d3d11_context;
-    IDXGISwapChain          *swap_chain;
 
     /* The device's own depth buffer and a view of it */
     RhiImage               *depth_image;
@@ -62,8 +58,6 @@ typedef struct D3D8DeviceState {
      * rendered for a 640x480 guest, and only where it lands changes. */
     UINT                    swap_width;
     UINT                    swap_height;
-    ID3D11RenderTargetView   *present_rtv;    /* the swap chain's back buffer */
-    RhiView                  *rhi_present_rtv;  /* the same, as an rhi.h view */
     RhiImage                 *rhi_scene_image;  /* what every draw goes to */
     RhiView                  *rhi_scene_srv;    /* the finished frame, to read */
     RhiView                  *rhi_default_rtv;  /* "the back buffer" to a title */
@@ -162,9 +156,9 @@ void d3d8_PresentFrame(void)
     }
 
     /* Present the backbuffer (VSync = 1) */
-    if (g_device_state.swap_chain) {
+    if (rhi_device_ready()) {
         present_resolve();
-        IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+        rhi_present(1);
     }
 }
 
@@ -173,9 +167,6 @@ void d3d8_PresentFrame(void)
  * ================================================================ */
 
 IDirect3DDevice8    *d3d8_GetDevice(void) { return &g_device; }
-ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_device; }
-ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
-IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 UINT d3d8_GetBackBufferWidth(void)  { return g_device_state.width; }
 UINT d3d8_GetBackBufferHeight(void) { return g_device_state.height; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
@@ -235,7 +226,7 @@ static void present_resolve(void)
     D3D8DisplayFit fit;
     RECT rc;
 
-    if (!s->present_rtv || !s->rhi_scene_srv)
+    if (!rhi_swapchain_view() || !s->rhi_scene_srv)
         return;
 
     /* Follow the window. DXGI stretches the back buffer to the client
@@ -247,38 +238,11 @@ static void present_resolve(void)
         UINT w = (UINT)(rc.right - rc.left), h = (UINT)(rc.bottom - rc.top);
 
         if (w && h && (w != s->swap_width || h != s->swap_height)) {
-            ID3D11RenderTargetView *saved_rtv = NULL;
-            ID3D11DepthStencilView *saved_dsv = NULL;
-            ID3D11Texture2D *bb = NULL;
-
-            /* ResizeBuffers wants every reference to the old back buffer
-             * gone, including any the context still holds. */
-            ID3D11DeviceContext_OMGetRenderTargets(s->d3d11_context, 1,
-                                                    &saved_rtv, &saved_dsv);
-            ID3D11DeviceContext_OMSetRenderTargets(s->d3d11_context, 0, NULL, NULL);
-            ID3D11RenderTargetView_Release(s->present_rtv);
-            s->present_rtv = NULL;
-            rhi_view_destroy(s->rhi_present_rtv);
-            s->rhi_present_rtv = NULL;
-
-            if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(s->swap_chain, 0, w, h,
-                                                        DXGI_FORMAT_UNKNOWN, 0)) &&
-                SUCCEEDED(IDXGISwapChain_GetBuffer(s->swap_chain, 0,
-                                                    &IID_ID3D11Texture2D, (void **)&bb))) {
-                ID3D11Device_CreateRenderTargetView(s->d3d11_device,
-                                                     (ID3D11Resource *)bb, NULL,
-                                                     &s->present_rtv);
-                s->rhi_present_rtv = rhi_d3d11_wrap_view(s->present_rtv, RHI_VIEW_RENDER_TARGET);
-                ID3D11Texture2D_Release(bb);
+            if (rhi_swapchain_resize(w, h) == 0) {
                 s->swap_width = w;
                 s->swap_height = h;
             }
-
-            ID3D11DeviceContext_OMSetRenderTargets(s->d3d11_context, 1,
-                                                    &saved_rtv, saved_dsv);
-            if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
-            if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
-            if (!s->present_rtv)
+            if (!rhi_swapchain_view())
                 return;                 /* try again on the next frame */
         }
     }
@@ -289,7 +253,7 @@ static void present_resolve(void)
         d3d8_display_output_shape(s->width, s->height, &shape_w, &shape_h);
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
     }
-    d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, s->rhi_present_rtv, fit);
+    d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, rhi_swapchain_view(), fit);
 }
 
 /* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
@@ -300,7 +264,7 @@ static void present_resolve(void)
  * render-target pixels, as on the Xbox; when the host renders larger than
  * the guest they will need scaling, like the viewport. */
 static BOOL       g_scissor_enabled;
-static D3D11_RECT g_scissor;
+static RhiRect    g_scissor;
 static UINT       g_scissor_count;
 static BOOL       g_scissor_exclusive;
 static D3DRECT    g_scissor_rect;
@@ -344,10 +308,10 @@ BOOL d3d8_GetScissor(RhiRect *out)
         /* Stored as the title gave them, converted here, so the stored
          * rectangle stays comparable with anything else in guest pixels
          * and GetScissors keeps answering in the title's own units. */
-        out->left   = (int32_t)(LONG)(g_scissor.left   * sx);
-        out->top    = (int32_t)(LONG)(g_scissor.top    * sy);
-        out->right  = (int32_t)(LONG)(g_scissor.right  * sx);
-        out->bottom = (int32_t)(LONG)(g_scissor.bottom * sy);
+        out->left   = (int32_t)(g_scissor.left   * sx);
+        out->top    = (int32_t)(g_scissor.top    * sy);
+        out->right  = (int32_t)(g_scissor.right  * sx);
+        out->bottom = (int32_t)(g_scissor.bottom * sy);
     }
     return g_scissor_enabled;
 }
@@ -380,92 +344,46 @@ UINT                 d3d8_GetNumLights(void) {
 }
 
 /* ================================================================
- * D3D11 initialization helpers
+ * Device creation (the backend makes the device and swap chain)
  * ================================================================ */
 
-static HRESULT d3d11_create_device_and_swap_chain(
+static HRESULT create_device_and_swap_chain(
     D3D8DeviceState *state,
     D3DPRESENT_PARAMETERS *pp)
 {
-    DXGI_SWAP_CHAIN_DESC scd;
-    D3D_FEATURE_LEVEL feature_level;
-    UINT create_flags = 0;
-    HRESULT hr;
+    RhiDeviceDesc dd;
 
+    rhi_select_backend(NULL);
+    memset(&dd, 0, sizeof(dd));
+    dd.window = pp->hDeviceWindow;
+    dd.width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
+    dd.height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+    dd.buffer_count = pp->BackBufferCount ? pp->BackBufferCount : 1;
+    dd.windowed = pp->Windowed ? 1 : 0;
 #ifdef _DEBUG
-    create_flags |= D3D11_CREATE_DEVICE_DEBUG;
+    dd.debug = 1;
 #endif
-
-    memset(&scd, 0, sizeof(scd));
-    scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
-    scd.BufferDesc.Width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
-    scd.BufferDesc.Height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
-    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator = 60;
-    scd.BufferDesc.RefreshRate.Denominator = 1;
-    /* SHADER_INPUT as well: a title that post-processes its own image reads
-     * the finished frame back (d3d8_screencopy.c), and that reads this. */
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
-    scd.OutputWindow = pp->hDeviceWindow;
-    scd.SampleDesc.Count = 1;
-    scd.SampleDesc.Quality = 0;
-    scd.Windowed = pp->Windowed;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    hr = D3D11CreateDeviceAndSwapChain(
-        NULL,
-        D3D_DRIVER_TYPE_HARDWARE,
-        NULL,
-        create_flags,
-        NULL, 0,
-        D3D11_SDK_VERSION,
-        &scd,
-        &state->swap_chain,
-        &state->d3d11_device,
-        &feature_level,
-        &state->d3d11_context
-    );
-
-    /* The debug layer is only present with Graphics Tools installed. Without
-     * it a Debug build would have no device at all. */
-    if (FAILED(hr) && (create_flags & D3D11_CREATE_DEVICE_DEBUG)) {
-        fprintf(stderr, "D3D8: D3D11 debug layer unavailable (0x%08lX), creating without it\n", hr);
-        create_flags &= ~(UINT)D3D11_CREATE_DEVICE_DEBUG;
-        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                                           create_flags, NULL, 0, D3D11_SDK_VERSION,
-                                           &scd, &state->swap_chain, &state->d3d11_device,
-                                           &feature_level, &state->d3d11_context);
-    }
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
-        return hr;
-    }
+    if (rhi_device_create(&dd) != 0)
+        return E_FAIL;
 
     state->hwnd = pp->hDeviceWindow;
 
     /* The swap chain matches the window and the guest's presentation size;
      * the scene is whatever the display policy makes of it. */
-    state->present_width = scd.BufferDesc.Width;
-    state->present_height = scd.BufferDesc.Height;
-    state->swap_width = scd.BufferDesc.Width;
-    state->swap_height = scd.BufferDesc.Height;
+    state->present_width = dd.width;
+    state->present_height = dd.height;
+    state->swap_width = dd.width;
+    state->swap_height = dd.height;
     d3d8_display_scene_size(state->present_width, state->present_height,
                             &state->width, &state->height);
 
     return S_OK;
 }
 
-static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
+static HRESULT create_render_targets(D3D8DeviceState *state)
 {
-    ID3D11Texture2D *back_buffer = NULL;
     RhiImageDesc depth_desc;
     HRESULT hr;
-
-    hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
-                                   &IID_ID3D11Texture2D,
-                                   (void **)&back_buffer);
-    if (FAILED(hr)) return hr;
 
     {
         RhiImageDesc sd;
@@ -501,17 +419,12 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
             state->rhi_scene_srv = rhi_view_create(state->rhi_scene_image,
                                                    RHI_VIEW_SAMPLED, NULL);
         if (state->rhi_scene_srv)
-            hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
-                                                      (ID3D11Resource *)back_buffer,
-                                                      NULL, &state->present_rtv);
-        if (SUCCEEDED(hr))
-            state->rhi_present_rtv = rhi_d3d11_wrap_view(state->present_rtv, RHI_VIEW_RENDER_TARGET);
+            hr = S_OK;
         if (FAILED(hr))
             fprintf(stderr, "D3D8 display: the %ux%u scene target could not be "
                     "made (0x%08lX); nothing will be drawn\n",
                     state->width, state->height, (unsigned long)hr);
     }
-    ID3D11Texture2D_Release(back_buffer);
     if (FAILED(hr)) return hr;
 
     /* Create depth stencil */
@@ -639,13 +552,9 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         rhi_view_destroy(s->depth_view); s->depth_view = NULL;
         rhi_image_destroy(s->depth_image); s->depth_image = NULL;
         rhi_view_destroy(s->rhi_scene_srv); s->rhi_scene_srv = NULL;
-        rhi_view_destroy(s->rhi_present_rtv); s->rhi_present_rtv = NULL;
         rhi_view_destroy(s->rhi_default_rtv); s->rhi_default_rtv = NULL;
         rhi_image_destroy(s->rhi_scene_image); s->rhi_scene_image = NULL;
-        if (s->present_rtv) { ID3D11RenderTargetView_Release(s->present_rtv); s->present_rtv = NULL; }
-        if (s->swap_chain) { IDXGISwapChain_Release(s->swap_chain); s->swap_chain = NULL; }
-        if (s->d3d11_context) { ID3D11DeviceContext_Release(s->d3d11_context); s->d3d11_context = NULL; }
-        if (s->d3d11_device) { ID3D11Device_Release(s->d3d11_device); s->d3d11_device = NULL; }
+        rhi_device_destroy();
         g_device_initialized = FALSE;
     }
     return (ULONG)ref;
@@ -732,7 +641,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
     }
 
     present_resolve();
-    return IDXGISwapChain_Present(g_device_state.swap_chain, 1, 0);
+    return (HRESULT)rhi_present(1);
 }
 
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuffer, DWORD Type, IDirect3DSurface8 **ppSurface)
@@ -1537,7 +1446,7 @@ static void apply_host_viewport(void)
     float sx = rt_scale_x(), sy = rt_scale_y();
     RhiViewport hv;
 
-    if (!g_device_state.d3d11_context)
+    if (!rhi_device_ready())
         return;
 
     hv.x         = (FLOAT)vp->X * sx;
@@ -1835,7 +1744,7 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
     }
 
     present_resolve();
-    return IDXGISwapChain_Present(g_device_state.swap_chain, g_present_interval, 0);
+    return (HRESULT)rhi_present(g_present_interval);
 }
 
 /* ================================================================
@@ -1951,11 +1860,10 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
 
     if (!pPP->hDeviceWindow) pPP->hDeviceWindow = hFocusWindow;
 
-    hr = d3d11_create_device_and_swap_chain(&g_device_state, pPP);
+    hr = create_device_and_swap_chain(&g_device_state, pPP);
     if (FAILED(hr)) return hr;
-    rhi_d3d11_adopt(g_device_state.d3d11_device, g_device_state.d3d11_context);
 
-    hr = d3d11_create_render_targets(&g_device_state);
+    hr = create_render_targets(&g_device_state);
     if (FAILED(hr)) return hr;
 
     /* The device's own depth buffer, bound as the current depth surface.

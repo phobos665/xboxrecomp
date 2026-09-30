@@ -149,6 +149,9 @@ struct RhiSampler      { ID3D11SamplerState *s; };
 
 static ID3D11Device        *g_dev;
 static ID3D11DeviceContext *g_ctx;
+static IDXGISwapChain      *g_swap;
+static ID3D11RenderTargetView *g_present_rtv;
+static RhiView             *g_present_view;
 
 int rhi_d3d11_adopt(void *device, void *context)
 {
@@ -219,6 +222,136 @@ RhiImage *rhi_d3d11_wrap_image(void *native)
     img->refs = 1;
     ID3D11Resource_AddRef(res);
     return img;
+}
+
+static void staging_release(void);
+
+/* ---- the device and swap chain -------------------------------------------------------- */
+
+static void release_back_buffer_view(void)
+{
+    if (g_present_view) {
+        ID3D11View_Release(((struct RhiView *)g_present_view)->v);
+        free(g_present_view);
+        g_present_view = NULL;
+    }
+    if (g_present_rtv) {
+        ID3D11RenderTargetView_Release(g_present_rtv);
+        g_present_rtv = NULL;
+    }
+}
+
+static int make_back_buffer_view(void)
+{
+    ID3D11Texture2D *bb = NULL;
+    HRESULT hr = IDXGISwapChain_GetBuffer(g_swap, 0, &IID_ID3D11Texture2D, (void **)&bb);
+
+    if (FAILED(hr))
+        return -1;
+    hr = ID3D11Device_CreateRenderTargetView(g_dev, (ID3D11Resource *)bb, NULL, &g_present_rtv);
+    ID3D11Texture2D_Release(bb);
+    if (FAILED(hr)) {
+        g_present_rtv = NULL;
+        return -1;
+    }
+    g_present_view = rhi_d3d11_wrap_view(g_present_rtv, RHI_VIEW_RENDER_TARGET);
+    return g_present_view ? 0 : -1;
+}
+
+static int d_device_create(const RhiDeviceDesc *dd)
+{
+    DXGI_SWAP_CHAIN_DESC scd;
+    D3D_FEATURE_LEVEL feature_level;
+    UINT create_flags = dd->debug ? D3D11_CREATE_DEVICE_DEBUG : 0;
+    HRESULT hr;
+
+    memset(&scd, 0, sizeof(scd));
+    scd.BufferCount = dd->buffer_count ? dd->buffer_count : 1;
+    scd.BufferDesc.Width = dd->width;
+    scd.BufferDesc.Height = dd->height;
+    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.BufferDesc.RefreshRate.Numerator = 60;
+    scd.BufferDesc.RefreshRate.Denominator = 1;
+    /* SHADER_INPUT as well: a title that post-processes its own image reads
+     * the finished frame back (d3d8_screencopy.c), and that reads this. */
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
+    scd.OutputWindow = (HWND)dd->window;
+    scd.SampleDesc.Count = 1;
+    scd.SampleDesc.Quality = 0;
+    scd.Windowed = dd->windowed ? TRUE : FALSE;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
+                                       NULL, 0, D3D11_SDK_VERSION, &scd, &g_swap, &g_dev,
+                                       &feature_level, &g_ctx);
+
+    /* The debug layer is only present with Graphics Tools installed. Without
+     * it a Debug build would have no device at all. */
+    if (FAILED(hr) && (create_flags & D3D11_CREATE_DEVICE_DEBUG)) {
+        fprintf(stderr, "D3D8: D3D11 debug layer unavailable (0x%08lX), creating without it\n", hr);
+        create_flags &= ~(UINT)D3D11_CREATE_DEVICE_DEBUG;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                           create_flags, NULL, 0, D3D11_SDK_VERSION,
+                                           &scd, &g_swap, &g_dev, &feature_level, &g_ctx);
+    }
+
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: Failed to create D3D11 device: 0x%08lX\n", hr);
+        g_swap = NULL;
+        g_dev = NULL;
+        g_ctx = NULL;
+        return -1;
+    }
+    if (make_back_buffer_view() != 0) {
+        fprintf(stderr, "D3D8: the swap chain's back buffer has no render-target view\n");
+        return -1;
+    }
+    return 0;
+}
+
+static void d_device_destroy(void)
+{
+    staging_release();
+    release_back_buffer_view();
+    if (g_swap) { IDXGISwapChain_Release(g_swap); g_swap = NULL; }
+    if (g_ctx)  { ID3D11DeviceContext_Release(g_ctx); g_ctx = NULL; }
+    if (g_dev)  { ID3D11Device_Release(g_dev); g_dev = NULL; }
+}
+
+static int d_device_ready(void)
+{
+    return g_dev != NULL && g_ctx != NULL;
+}
+
+static RhiView *d_swapchain_view(void)
+{
+    return g_present_view;
+}
+
+static int d_swapchain_resize(uint32_t w, uint32_t h)
+{
+    ID3D11RenderTargetView *saved_rtv = NULL;
+    ID3D11DepthStencilView *saved_dsv = NULL;
+    int ok = -1;
+
+    if (!g_swap)
+        return -1;
+    /* ResizeBuffers wants every reference to the old back buffer gone,
+     * including any the context still holds. */
+    ID3D11DeviceContext_OMGetRenderTargets(g_ctx, 1, &saved_rtv, &saved_dsv);
+    ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 0, NULL, NULL);
+    release_back_buffer_view();
+    if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(g_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, 0)))
+        ok = make_back_buffer_view();
+    ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &saved_rtv, saved_dsv);
+    if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
+    if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
+    return ok;
+}
+
+static int32_t d_present(uint32_t interval)
+{
+    return g_swap ? (int32_t)IDXGISwapChain_Present(g_swap, interval, 0) : -1;
 }
 
 /* ---- buffers -------------------------------------------------------------------- */
@@ -396,6 +529,12 @@ static struct {
     ID3D11Texture2D *tex;
     D3D11_TEXTURE2D_DESC desc;
 } g_staging;
+
+static void staging_release(void)
+{
+    if (g_staging.tex) ID3D11Texture2D_Release(g_staging.tex);
+    g_staging.tex = NULL;
+}
 
 static int d_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitch)
 {
@@ -977,6 +1116,8 @@ static void d_clear_depth(RhiView *v, uint32_t flags, float z, uint8_t s)
 
 const RhiBackend rhi_d3d11_backend = {
     "d3d11",
+    d_device_create, d_device_destroy, d_device_ready, d_swapchain_view, d_swapchain_resize,
+    d_present,
     d_buffer_create, d_buffer_destroy, d_buffer_map, d_buffer_unmap, d_buffer_update,
     d_image_create, d_image_retain, d_image_destroy, d_image_get_desc, d_image_update, d_image_readback,
     d_view_create, d_view_destroy, d_view_image,
