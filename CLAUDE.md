@@ -308,6 +308,14 @@ one bundled with VS 2019 Build Tools; there is no VS 2022 and none is needed.
 Build with `--game-only` → run → read stderr → classify → fix → rebuild. Most project time
 lives here.
 
+**Give every scripted or test run its own saves: `RECOMP_SAVE_DIR=<fresh folder>`.** Saves
+live in FATX partition images (`Partition0-5.img`), by default in
+`%LOCALAPPDATA%\xboxrecomp` -- shared by every title and by the player's own games. A run
+without the switch reads and writes the player's real saves, and inherits whatever the run
+before it saved, which makes runs depend on each other (on 30 Sep 2026 that looked like an
+input regression). Every run's log says which it got: `[PATH] saves in <dir> (RECOMP_SAVE_DIR)`.
+The images are sparse, so a fresh folder per run costs almost nothing.
+
 **Before reading a wild pointer as a memory-model problem, spend three runs on
 `docs/technical/memory-watchpoints.md`.** `RECOMP_TRAP_NULL`, `RECOMP_FIND_VALUE`
 and `RECOMP_WATCH_WRITE` answer "who holds this" and "what wrote this" in a
