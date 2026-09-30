@@ -49,9 +49,10 @@ if(WIN32)
         endif()
         # xbox_config carries the settings file's format, so the launcher
         # and the runtime cannot disagree about what they are writing and
-        # reading. xinput is the pad; the rest is in every Windows.
+        # reading. xbox_input is the pads (recomp_pad.h: SDL3, or XInput),
+        # the same code the game reads them with; the rest is in every Windows.
         target_link_libraries(${TARGET} PRIVATE
-            xbox_config user32 gdi32 xinput9_1_0
+            xbox_config xbox_input user32 gdi32
         )
         # recomp_add_launcher(<target> <exe> NO_WIDESCREEN): a title where
         # widescreen cannot be right hides Widescreen and Wide camera, and

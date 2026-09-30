@@ -125,7 +125,7 @@ class CaptureDialog(tk.Toplevel):
         if pad_index is None:
             hint += "  This controller is on the keyboard, so pads are ignored."
         else:
-            hint += "  XInput pad %d is being watched too." % pad_index
+            hint += "  Gamepad %d is being watched too." % (pad_index + 1)
         _label(frame, hint, fg=TEXT_DIM, font=FONT_SMALL).pack(anchor="w")
         row = tk.Frame(frame, bg=PANEL)
         row.pack(anchor="w", pady=(16, 0))
@@ -359,8 +359,7 @@ class App:
                 width=2).pack(side="left", padx=(4, 0))
 
     def capture(self, name, label, replace):
-        pad = self.controller["device"]
-        pad_index = int(pad[7:]) if pad.startswith("xinput:") else None
+        pad_index = bindings.pad_index(self.controller["device"])
 
         def done(source):
             if source is None:

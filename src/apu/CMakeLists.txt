@@ -36,7 +36,6 @@ endif()
 if(WIN32)
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm)
 else()
-    # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
-    find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+    # Linux: platform layer (Win32 primitives on POSIX) + SDL3 audio + libm
+    target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
 endif()

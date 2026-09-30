@@ -80,7 +80,7 @@ void bind_defaults(BindConfig *c)
 
     memset(c, 0, sizeof *c);
     for (p = 0; p < BIND_PORTS; p++) {
-        c->port[p].device   = BIND_DEV_XINPUT;
+        c->port[p].device   = BIND_DEV_PAD;
         c->port[p].pad      = p;
         c->port[p].deadzone = 7849;          /* XInput's own left-stick value */
         for (i = 0; i < BIND_CONTROLS; i++) {
@@ -200,9 +200,10 @@ static void set_device(BindPort *bp, const char *name)
     if (strcmp(name, "keyboard") == 0) {
         bp->device = BIND_DEV_KEYBOARD;
         bp->pad = -1;
-    } else if (strncmp(name, "xinput:", 7) == 0) {
-        bp->device = BIND_DEV_XINPUT;
-        bp->pad = (int)strtol(name + 7, NULL, 10);
+    } else if (strncmp(name, "gamepad:", 8) == 0 || strncmp(name, "xinput:", 7) == 0) {
+        /* "xinput:N" is what files written before SDL3 say; same slot. */
+        bp->device = BIND_DEV_PAD;
+        bp->pad = (int)strtol(strchr(name, ':') + 1, NULL, 10);
         if (bp->pad < 0 || bp->pad >= BIND_PORTS)
             bp->pad = 0;
     } else {
@@ -372,7 +373,12 @@ int bind_load(const char *path, BindConfig *c)
         p = ws(p);
         if (*p != ':') break;
         p = ws(p + 1);
-        if (strcmp(key, "controllers") == 0 && *p == '[') {
+        if (strcmp(key, "pad_api") == 0 && *p == '"') {
+            char api[16];
+            p = jstring(p, api, sizeof api);
+            if (!p) break;
+            c->pad_api = strcmp(api, "xinput") == 0 ? BIND_PAD_API_XINPUT : BIND_PAD_API_SDL;
+        } else if (strcmp(key, "controllers") == 0 && *p == '[') {
             p = ws(p + 1);
             while (*p && *p != ']') {
                 p = parse_controller(p, c, index++);
@@ -423,7 +429,8 @@ int bind_save(const char *path, const BindConfig *c)
     if (!f)
         return 0;
 
-    fprintf(f, "{\n  \"version\": 1,\n  \"controllers\": [\n");
+    fprintf(f, "{\n  \"version\": 1,\n  \"pad_api\": \"%s\",\n  \"controllers\": [\n",
+            c->pad_api == BIND_PAD_API_XINPUT ? "xinput" : "sdl");
     for (p = 0; p < BIND_PORTS; p++) {
         const BindPort *bp = &c->port[p];
         int first = 1;
@@ -431,8 +438,8 @@ int bind_save(const char *path, const BindConfig *c)
         fprintf(f, "    {\n      \"port\": %d,\n", p + 1);
         if (bp->device == BIND_DEV_KEYBOARD)
             fprintf(f, "      \"device\": \"keyboard\",\n");
-        else if (bp->device == BIND_DEV_XINPUT)
-            fprintf(f, "      \"device\": \"xinput:%d\",\n", bp->pad);
+        else if (bp->device == BIND_DEV_PAD)
+            fprintf(f, "      \"device\": \"gamepad:%d\",\n", bp->pad);
         else
             fprintf(f, "      \"device\": \"none\",\n");
         fprintf(f, "      \"deadzone\": %d,\n      \"bindings\": {\n", bp->deadzone);
