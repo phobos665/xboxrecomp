@@ -348,7 +348,7 @@ BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect)
     return g_scissor_count != 0;
 }
 
-BOOL d3d8_GetScissor(D3D11_RECT *out)
+BOOL d3d8_GetScissor(RhiRect *out)
 {
     if (out) {
         float sx = rt_scale_x(), sy = rt_scale_y();
@@ -356,10 +356,10 @@ BOOL d3d8_GetScissor(D3D11_RECT *out)
         /* Stored as the title gave them, converted here, so the stored
          * rectangle stays comparable with anything else in guest pixels
          * and GetScissors keeps answering in the title's own units. */
-        out->left   = (LONG)(g_scissor.left   * sx);
-        out->top    = (LONG)(g_scissor.top    * sy);
-        out->right  = (LONG)(g_scissor.right  * sx);
-        out->bottom = (LONG)(g_scissor.bottom * sy);
+        out->left   = (int32_t)(LONG)(g_scissor.left   * sx);
+        out->top    = (int32_t)(LONG)(g_scissor.top    * sy);
+        out->right  = (int32_t)(LONG)(g_scissor.right  * sx);
+        out->bottom = (int32_t)(LONG)(g_scissor.bottom * sy);
     }
     return g_scissor_enabled;
 }
