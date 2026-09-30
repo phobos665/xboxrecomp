@@ -326,6 +326,13 @@ int         rhi_swapchain_resize(uint32_t width, uint32_t height);
  * section 4.10). Returns the backend's status, 0 or positive on success
  * (D3D11 passes its HRESULT through). */
 int32_t     rhi_present(uint32_t interval);
+/* The swap chain's back buffer as the next present will show it, as RGBA8
+ * rows at dst_pitch, whatever the swap chain's own format (a BGRA swap
+ * chain is swizzled on the way). dst NULL only reports the size. 0 on
+ * success. Replay's --present and the gate read the display resolve's
+ * output through this. */
+int         rhi_swapchain_readback(void *dst, uint32_t dst_pitch,
+                                   uint32_t *width, uint32_t *height);
 
 /* Buffers */
 RhiBuffer *rhi_buffer_create(const RhiBufferDesc *desc, const void *initial);
