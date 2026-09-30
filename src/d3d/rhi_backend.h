@@ -48,6 +48,7 @@ typedef struct RhiBackend {
     void (*set_render_target)(RhiView *, RhiView *);
     void (*output_save)(RhiOutputState *);
     void (*output_restore)(RhiOutputState *);
+    int  (*output_color_is)(const RhiOutputState *, const RhiView *);
     void (*set_viewports)(uint32_t, const RhiViewport *);
     void (*set_scissor)(const RhiRect *);
     void (*set_topology)(uint32_t);

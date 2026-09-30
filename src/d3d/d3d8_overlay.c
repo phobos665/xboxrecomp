@@ -14,7 +14,6 @@
 #include "d3d8_internal.h"
 #include "d3d8_overlay.h"
 
-#include <d3dcompiler.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -23,22 +22,22 @@
 #define OVERLAY_PAD    8      /* from the top-left corner of the back buffer */
 
 static struct {
-    int                       tried;     /* creation attempted */
-    int                       failed;    /* and gave up: never try again */
-    ID3D11Texture2D          *texture;
-    ID3D11ShaderResourceView *srv;
-    ID3D11Buffer             *cb;
-    ID3D11VertexShader       *vs;
-    ID3D11PixelShader        *ps;
-    ID3D11BlendState         *blend;
-    ID3D11DepthStencilState  *depth;
-    ID3D11RasterizerState    *raster;
-    HDC                       dc;
-    HBITMAP                   bitmap;
-    HFONT                     font;
-    void                     *bits;      /* the DIB's pixels, BGRA top-down */
-    int                       text_w;    /* what the last render measured */
-    char                      text[128];
+    int             tried;     /* creation attempted */
+    int             failed;    /* and gave up: never try again */
+    RhiImage       *texture;
+    RhiView        *srv;
+    RhiBuffer      *cb;
+    RhiShader      *vs;
+    RhiShader      *ps;
+    RhiBlendState  *blend;
+    RhiDepthState  *depth;
+    RhiRasterState *raster;
+    HDC             dc;
+    HBITMAP         bitmap;
+    HFONT           font;
+    void           *bits;      /* the DIB's pixels, BGRA top-down */
+    int             text_w;    /* what the last render measured */
+    char            text[128];
 } g;
 
 /* b7 in both stages: the four texture stages a title can use are b0..b3 and
@@ -71,111 +70,103 @@ static const char kShaderSource[] =
     "    return float4(rgb, max(a, 0.45));\n"
     "}\n";
 
-static void overlay_fail(const char *what, HRESULT hr)
+static void overlay_fail(const char *what)
 {
     g.failed = 1;
-    fprintf(stderr, "D3D8 overlay: %s failed (0x%08lX); the overlay is off for "
-            "this run\n", what, (unsigned long)hr);
+    fprintf(stderr, "D3D8 overlay: %s failed; the overlay is off for "
+            "this run\n", what);
     fflush(stderr);
     d3d8_overlay_shutdown();
 }
 
+static RhiShader *compile_one(uint32_t stage, const char *entry, const char *target)
+{
+    RhiShaderSource src;
+    RhiShader *s;
+    char err[2048];
+
+    memset(&src, 0, sizeof src);
+    src.hlsl = kShaderSource;
+    src.len = sizeof kShaderSource - 1;
+    src.name = "overlay";
+    src.entry = entry;
+    src.target = target;
+    s = rhi_shader_create(stage, &src, err, sizeof err);
+    if (!s && err[0])
+        fprintf(stderr, "D3D8 overlay: %s\n", err);
+    return s;
+}
+
 static int overlay_create(void)
 {
-    ID3D11Device *dev = d3d8_GetD3D11Device();
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_BUFFER_DESC bd;
-    D3D11_BLEND_DESC bl;
-    D3D11_DEPTH_STENCIL_DESC ds;
-    D3D11_RASTERIZER_DESC rd;
+    RhiImageDesc td;
+    RhiBufferDesc bd;
+    RhiBlendDesc bl;
+    RhiDepthDesc ds;
+    RhiRasterDesc rd;
     BITMAPINFO bi;
-    ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr;
 
     if (g.failed) return 0;
     if (g.tried) return g.texture != NULL;
     g.tried = 1;
-    if (!dev) { g.failed = 1; return 0; }
+    if (!d3d8_GetD3D11Device()) { g.failed = 1; return 0; }
 
     memset(&td, 0, sizeof td);
-    td.Width = OVERLAY_W;
-    td.Height = OVERLAY_H;
-    td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DYNAMIC;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    hr = ID3D11Device_CreateTexture2D(dev, &td, NULL, &g.texture);
-    if (FAILED(hr)) { overlay_fail("CreateTexture2D", hr); return 0; }
-    hr = ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g.texture,
-                                               NULL, &g.srv);
-    if (FAILED(hr)) { overlay_fail("CreateShaderResourceView", hr); return 0; }
+    td.type = RHI_IMAGE_2D;
+    td.width = OVERLAY_W;
+    td.height = OVERLAY_H;
+    td.depth = 1;
+    td.mip_levels = 1;
+    td.format = RHI_FORMAT_B8G8R8A8_UNORM;
+    td.samples = 1;
+    td.usage = RHI_USAGE_DYNAMIC;
+    td.bind = RHI_BIND_SAMPLED;
+    td.cpu_access = RHI_CPU_WRITE;
+    if (!(g.texture = rhi_image_create(&td, NULL))) { overlay_fail("CreateTexture2D"); return 0; }
+    if (!(g.srv = rhi_view_create(g.texture, RHI_VIEW_SAMPLED, NULL))) {
+        overlay_fail("CreateShaderResourceView");
+        return 0;
+    }
 
     memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = sizeof(OverlayConstants);
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    hr = ID3D11Device_CreateBuffer(dev, &bd, NULL, &g.cb);
-    if (FAILED(hr)) { overlay_fail("CreateBuffer", hr); return 0; }
+    bd.size = sizeof(OverlayConstants);
+    bd.usage = RHI_USAGE_DYNAMIC;
+    bd.bind = RHI_BIND_UNIFORM;
+    bd.cpu_access = RHI_CPU_WRITE;
+    if (!(g.cb = rhi_buffer_create(&bd, NULL))) { overlay_fail("CreateBuffer"); return 0; }
 
-    hr = d3d8_compile_hlsl(kShaderSource, sizeof kShaderSource - 1, "overlay", NULL,
-                           "vs_main", "vs_4_0", 0, &code, &err);
-    if (FAILED(hr)) {
-        if (err) fprintf(stderr, "D3D8 overlay: %s\n", (const char *)ID3D10Blob_GetBufferPointer(err));
-        if (err) ID3D10Blob_Release(err);
-        overlay_fail("D3DCompile(vs)", hr);
+    if (!(g.vs = compile_one(RHI_STAGE_VERTEX, "vs_main", "vs_4_0"))) {
+        overlay_fail("the vertex shader");
         return 0;
     }
-    hr = ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(code),
-                                         ID3D10Blob_GetBufferSize(code), NULL, &g.vs);
-    ID3D10Blob_Release(code);
-    code = NULL;
-    if (FAILED(hr)) { overlay_fail("CreateVertexShader", hr); return 0; }
-
-    hr = d3d8_compile_hlsl(kShaderSource, sizeof kShaderSource - 1, "overlay", NULL,
-                           "ps_main", "ps_4_0", 0, &code, &err);
-    if (FAILED(hr)) {
-        if (err) fprintf(stderr, "D3D8 overlay: %s\n", (const char *)ID3D10Blob_GetBufferPointer(err));
-        if (err) ID3D10Blob_Release(err);
-        overlay_fail("D3DCompile(ps)", hr);
+    if (!(g.ps = compile_one(RHI_STAGE_PIXEL, "ps_main", "ps_4_0"))) {
+        overlay_fail("the pixel shader");
         return 0;
     }
-    hr = ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code),
-                                        ID3D10Blob_GetBufferSize(code), NULL, &g.ps);
-    ID3D10Blob_Release(code);
-    if (FAILED(hr)) { overlay_fail("CreatePixelShader", hr); return 0; }
-    if (err) ID3D10Blob_Release(err);
 
     memset(&bl, 0, sizeof bl);
-    bl.RenderTarget[0].BlendEnable = TRUE;
-    bl.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-    bl.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    hr = ID3D11Device_CreateBlendState(dev, &bl, &g.blend);
-    if (FAILED(hr)) { overlay_fail("CreateBlendState", hr); return 0; }
+    bl.enable = 1;
+    bl.src = RHI_BLEND_SRC_ALPHA;
+    bl.dst = RHI_BLEND_INV_SRC_ALPHA;
+    bl.op = RHI_BLEND_OP_ADD;
+    bl.src_alpha = RHI_BLEND_ONE;
+    bl.dst_alpha = RHI_BLEND_INV_SRC_ALPHA;
+    bl.op_alpha = RHI_BLEND_OP_ADD;
+    bl.write_mask = RHI_WRITE_ALL;
+    if (!(g.blend = rhi_blend_state_create(&bl))) { overlay_fail("CreateBlendState"); return 0; }
 
     memset(&ds, 0, sizeof ds);
-    ds.DepthEnable = FALSE;
-    ds.StencilEnable = FALSE;
-    hr = ID3D11Device_CreateDepthStencilState(dev, &ds, &g.depth);
-    if (FAILED(hr)) { overlay_fail("CreateDepthStencilState", hr); return 0; }
+    if (!(g.depth = rhi_depth_state_create(&ds))) { overlay_fail("CreateDepthStencilState"); return 0; }
 
     memset(&rd, 0, sizeof rd);
-    rd.FillMode = D3D11_FILL_SOLID;
-    rd.CullMode = D3D11_CULL_NONE;
-    rd.DepthClipEnable = TRUE;
-    hr = ID3D11Device_CreateRasterizerState(dev, &rd, &g.raster);
-    if (FAILED(hr)) { overlay_fail("CreateRasterizerState", hr); return 0; }
+    rd.fill = RHI_FILL_SOLID;
+    rd.cull = RHI_CULL_NONE;
+    rd.depth_clip = 1;
+    if (!(g.raster = rhi_raster_state_create(&rd))) { overlay_fail("CreateRasterizerState"); return 0; }
 
     /* GDI side: a top-down 32-bit DIB the text is drawn into. */
     g.dc = CreateCompatibleDC(NULL);
-    if (!g.dc) { overlay_fail("CreateCompatibleDC", 0); return 0; }
+    if (!g.dc) { overlay_fail("CreateCompatibleDC"); return 0; }
     memset(&bi, 0, sizeof bi);
     bi.bmiHeader.biSize = sizeof bi.bmiHeader;
     bi.bmiHeader.biWidth = OVERLAY_W;
@@ -184,7 +175,7 @@ static int overlay_create(void)
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
     g.bitmap = CreateDIBSection(g.dc, &bi, DIB_RGB_COLORS, &g.bits, NULL, 0);
-    if (!g.bitmap) { overlay_fail("CreateDIBSection", 0); return 0; }
+    if (!g.bitmap) { overlay_fail("CreateDIBSection"); return 0; }
     SelectObject(g.dc, g.bitmap);
     g.font = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -199,8 +190,6 @@ static int overlay_create(void)
 /* Draw the text into the DIB and upload it. Only when it has changed. */
 static int overlay_set_text(const char *text)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    D3D11_MAPPED_SUBRESOURCE mapped;
     wchar_t wide[128];
     RECT rect;
     SIZE extent;
@@ -226,41 +215,28 @@ static int overlay_set_text(const char *text)
     ExtTextOutW(g.dc, 6, 4, ETO_OPAQUE, &rect, wide, (UINT)len, NULL);
     GdiFlush();
 
-    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g.texture, 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-        return 0;
-    for (i = 0; i < OVERLAY_H; i++)
-        memcpy((unsigned char *)mapped.pData + (size_t)i * mapped.RowPitch,
-               (const unsigned char *)g.bits + (size_t)i * OVERLAY_W * 4,
-               (size_t)OVERLAY_W * 4);
-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g.texture, 0);
+    rhi_image_update(g.texture, 0, NULL, g.bits, OVERLAY_W * 4, 0);
     return g.text_w > 0;
 }
 
 void d3d8_overlay_draw(const char *text)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    ID3D11RenderTargetView *saved_rtv = NULL;
-    ID3D11DepthStencilView *saved_dsv = NULL;
-    ID3D11RenderTargetView *rtv = d3d8_GetDefaultRTV();
-    D3D11_VIEWPORT saved_vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-    D3D11_VIEWPORT vp;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    RhiOutputState saved;
+    RhiView *rtv = d3d8_GetDefaultTargetView();
+    RhiViewport vp;
     OverlayConstants c;
-    UINT saved_vps = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     UINT width = d3d8_GetBackBufferWidth(), height = d3d8_GetBackBufferHeight();
     float blend_factor[4] = { 1, 1, 1, 1 };
+    void *mapped;
 
-    if (!text || !*text || !ctx || !rtv || !width || !height)
+    if (!text || !*text || !rtv || !width || !height)
         return;
     if (!overlay_create() || !overlay_set_text(text))
         return;
 
-    ID3D11DeviceContext_OMGetRenderTargets(ctx, 1, &saved_rtv, &saved_dsv);
-    ID3D11DeviceContext_RSGetViewports(ctx, &saved_vps, saved_vp);
+    rhi_output_save(&saved);
 
-    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g.cb, 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    if (!(mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)))
         goto restore;
     c.x = -1.0f + 2.0f * (float)OVERLAY_PAD / (float)width;
     c.y =  1.0f - 2.0f * (float)OVERLAY_PAD / (float)height;
@@ -269,46 +245,42 @@ void d3d8_overlay_draw(const char *text)
     c.tex_w = (float)g.text_w;
     c.tex_h = (float)OVERLAY_H;
     c.pad0 = c.pad1 = 0.0f;
-    memcpy(mapped.pData, &c, sizeof c);
-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g.cb, 0);
+    memcpy(mapped, &c, sizeof c);
+    rhi_buffer_unmap(g.cb);
 
-    vp.TopLeftX = vp.TopLeftY = 0.0f;
-    vp.Width = (float)width;
-    vp.Height = (float)height;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
-    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
-    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
-    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    ID3D11DeviceContext_VSSetShader(ctx, g.vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(ctx, g.ps, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 7, 1, &g.cb);
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 7, 1, &g.cb);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 8, 1, &g.srv);
-    ID3D11DeviceContext_OMSetBlendState(ctx, g.blend, blend_factor, 0xFFFFFFFF);
-    ID3D11DeviceContext_OMSetDepthStencilState(ctx, g.depth, 0);
-    ID3D11DeviceContext_RSSetState(ctx, g.raster);
-    ID3D11DeviceContext_Draw(ctx, 4, 0);
+    vp.x = vp.y = 0.0f;
+    vp.width = (float)width;
+    vp.height = (float)height;
+    vp.min_depth = 0.0f;
+    vp.max_depth = 1.0f;
+    rhi_set_render_target(rtv, NULL);
+    rhi_set_viewports(1, &vp);
+    rhi_set_vertex_layout(NULL);
+    rhi_set_topology(RHI_TOPOLOGY_TRIANGLE_STRIP);
+    rhi_set_shader(RHI_STAGE_VERTEX, g.vs);
+    rhi_set_shader(RHI_STAGE_PIXEL, g.ps);
+    rhi_set_uniform_buffers(RHI_STAGE_VERTEX, 7, 1, &g.cb);
+    rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g.cb);
+    rhi_set_textures(8, 1, &g.srv);
+    rhi_set_blend_state(g.blend, blend_factor, 0xFFFFFFFF);
+    rhi_set_depth_state(g.depth, 0);
+    rhi_set_raster_state(g.raster);
+    rhi_draw(4, 0);
 
 restore:
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &saved_rtv, saved_dsv);
-    if (saved_vps)
-        ID3D11DeviceContext_RSSetViewports(ctx, saved_vps, saved_vp);
-    if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
-    if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
+    rhi_output_restore(&saved);
 }
 
 void d3d8_overlay_shutdown(void)
 {
-    if (g.srv)     { ID3D11ShaderResourceView_Release(g.srv);    g.srv = NULL; }
-    if (g.texture) { ID3D11Texture2D_Release(g.texture);         g.texture = NULL; }
-    if (g.cb)      { ID3D11Buffer_Release(g.cb);                 g.cb = NULL; }
-    if (g.vs)      { ID3D11VertexShader_Release(g.vs);           g.vs = NULL; }
-    if (g.ps)      { ID3D11PixelShader_Release(g.ps);            g.ps = NULL; }
-    if (g.blend)   { ID3D11BlendState_Release(g.blend);          g.blend = NULL; }
-    if (g.depth)   { ID3D11DepthStencilState_Release(g.depth);   g.depth = NULL; }
-    if (g.raster)  { ID3D11RasterizerState_Release(g.raster);    g.raster = NULL; }
+    rhi_view_destroy(g.srv);             g.srv = NULL;
+    rhi_image_destroy(g.texture);        g.texture = NULL;
+    rhi_buffer_destroy(g.cb);            g.cb = NULL;
+    rhi_shader_destroy(g.vs);            g.vs = NULL;
+    rhi_shader_destroy(g.ps);            g.ps = NULL;
+    rhi_blend_state_destroy(g.blend);    g.blend = NULL;
+    rhi_depth_state_destroy(g.depth);    g.depth = NULL;
+    rhi_raster_state_destroy(g.raster);  g.raster = NULL;
     if (g.bitmap)  { DeleteObject(g.bitmap);                     g.bitmap = NULL; }
     if (g.font)    { DeleteObject(g.font);                       g.font = NULL; }
     if (g.dc)      { DeleteDC(g.dc);                             g.dc = NULL; }

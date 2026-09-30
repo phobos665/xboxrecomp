@@ -44,6 +44,11 @@ UINT                 d3d8_GetGuestWidth(void);
  * the host renders larger than the guest, the swap chain's back buffer
  * when it does not. NULL before the device exists. */
 ID3D11ShaderResourceView *d3d8_GetSceneSRV(void);
+/* The scene as rhi.h objects: the image the title draws into, a view to
+ * sample it, and the render-target view "the back buffer" means. */
+RhiImage *d3d8_GetSceneImage(void);
+RhiView  *d3d8_GetSceneView(void);
+RhiView  *d3d8_GetDefaultTargetView(void);
 ID3D11Texture2D *d3d8_GetSceneTexture(void);
 ID3D11RenderTargetView *d3d8_GetCurrentRTV(void);
 /* Tell the device whether the next draw is positioned in screen

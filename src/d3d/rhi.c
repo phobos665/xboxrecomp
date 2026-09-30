@@ -60,6 +60,7 @@ void rhi_sampler_destroy(RhiSampler *s)          { if (s) g_rhi->sampler_destroy
 void rhi_set_render_target(RhiView *c, RhiView *d)            { g_rhi->set_render_target(c, d); }
 void rhi_output_save(RhiOutputState *s)                       { g_rhi->output_save(s); }
 void rhi_output_restore(RhiOutputState *s)                    { g_rhi->output_restore(s); }
+int  rhi_output_color_is(const RhiOutputState *s, const RhiView *v) { return g_rhi->output_color_is(s, v); }
 void rhi_set_viewports(uint32_t n, const RhiViewport *vps)    { g_rhi->set_viewports(n, vps); }
 void rhi_set_scissor(const RhiRect *r)                        { g_rhi->set_scissor(r); }
 void rhi_set_topology(uint32_t t)                             { g_rhi->set_topology(t); }

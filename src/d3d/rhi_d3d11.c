@@ -175,6 +175,51 @@ RhiView *rhi_d3d11_wrap_view(void *native, uint32_t kind)
     return v;
 }
 
+RhiImage *rhi_d3d11_wrap_image(void *native)
+{
+    ID3D11Resource *res = (ID3D11Resource *)native;
+    D3D11_RESOURCE_DIMENSION dim;
+    RhiImage *img;
+
+    if (!res)
+        return NULL;
+    img = calloc(1, sizeof *img);
+    if (!img)
+        return NULL;
+    ID3D11Resource_GetType(res, &dim);
+    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE3D) {
+        D3D11_TEXTURE3D_DESC d;
+        ID3D11Texture3D_GetDesc((ID3D11Texture3D *)res, &d);
+        img->desc.type = RHI_IMAGE_3D;
+        img->desc.width = d.Width;
+        img->desc.height = d.Height;
+        img->desc.depth = d.Depth;
+        img->desc.mip_levels = d.MipLevels;
+        img->desc.format = d.Format;
+        img->desc.usage = d.Usage;
+        img->desc.bind = d.BindFlags;
+        img->desc.cpu_access = d.CPUAccessFlags;
+    } else {
+        D3D11_TEXTURE2D_DESC d;
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)res, &d);
+        img->desc.type = RHI_IMAGE_2D;
+        img->desc.width = d.Width;
+        img->desc.height = d.Height;
+        img->desc.depth = d.ArraySize;
+        img->desc.mip_levels = d.MipLevels;
+        img->desc.format = d.Format;
+        img->desc.samples = d.SampleDesc.Count;
+        img->desc.sample_quality = d.SampleDesc.Quality;
+        img->desc.usage = d.Usage;
+        img->desc.bind = d.BindFlags;
+        img->desc.cpu_access = d.CPUAccessFlags;
+        img->desc.cube = (d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0;
+    }
+    img->res = res;
+    ID3D11Resource_AddRef(res);
+    return img;
+}
+
 /* ---- buffers -------------------------------------------------------------------- */
 
 static RhiBuffer *d_buffer_create(const RhiBufferDesc *d, const void *initial)
@@ -793,6 +838,11 @@ static void d_output_restore(RhiOutputState *s)
     s->color = s->depth = NULL;
 }
 
+static int d_output_color_is(const RhiOutputState *s, const RhiView *v)
+{
+    return v && s->color == (void *)v->v;
+}
+
 static void d_set_scissor(const RhiRect *r)
 {
     D3D11_RECT rc;
@@ -916,7 +966,7 @@ const RhiBackend rhi_d3d11_backend = {
     d_shader_create, d_shader_destroy, d_vertex_layout_create, d_vertex_layout_destroy,
     d_blend_state_create, d_depth_state_create, d_raster_state_create, d_sampler_create,
     d_blend_state_destroy, d_depth_state_destroy, d_raster_state_destroy, d_sampler_destroy,
-    d_set_render_target, d_output_save, d_output_restore, d_set_viewports, d_set_scissor,
+    d_set_render_target, d_output_save, d_output_restore, d_output_color_is, d_set_viewports, d_set_scissor,
     d_set_topology, d_set_vertex_layout, d_set_vertex_buffer, d_set_index_buffer, d_set_shader,
     d_set_uniform_buffers, d_set_textures, d_set_samplers, d_set_blend_state, d_set_depth_state,
     d_set_raster_state, d_draw, d_draw_indexed, d_clear_color, d_clear_depth,
