@@ -15,7 +15,6 @@
 
 #if defined(_WIN32)
 
-#include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -176,151 +175,126 @@ static const char kSource[] =
     "}\n";
 
 static struct {
-    ID3D11VertexShader      *vs;
-    ID3D11PixelShader       *ps;
-    ID3D11Buffer            *cb;
-    ID3D11BlendState        *blend;
-    ID3D11DepthStencilState *depth;
-    ID3D11RasterizerState   *raster;
-    ID3D11SamplerState      *sampler;
-    UINT                     taps;       /* what the shaders were built for */
-    int                      tried, failed;
+    RhiShader      *vs;
+    RhiShader      *ps;
+    RhiBuffer      *cb;
+    RhiBlendState  *blend;
+    RhiDepthState  *depth;
+    RhiRasterState *raster;
+    RhiSampler     *sampler;
+    UINT            taps;                /* what the shaders were built for */
+    int             tried, failed;
 } g;
 
-static void fail(const char *what, HRESULT hr)
+static void fail(const char *what)
 {
     g.failed = 1;
-    fprintf(stderr, "D3D8 display: %s failed (0x%08lX); the scene cannot be "
-            "resolved and the window will stay blank\n", what, (unsigned long)hr);
+    fprintf(stderr, "D3D8 display: %s failed; the scene cannot be "
+            "resolved and the window will stay blank\n", what);
     fflush(stderr);
 }
 
-static int compile_one(ID3D11Device *dev, const char *entry, const char *target,
-                       const D3D_SHADER_MACRO *macros, void **out)
+static RhiShader *compile_one(uint32_t stage, const char *entry, const char *target,
+                              const RhiMacro *macros)
 {
-    ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr;
+    RhiShaderSource src;
+    RhiShader *s;
+    char err[2048];
 
-    hr = D3DCompile(kSource, sizeof kSource - 1, "display_resolve", macros, NULL,
-                    entry, target, 0, 0, &code, &err);
-    if (FAILED(hr)) {
-        if (err) {
-            fprintf(stderr, "D3D8 display: %s\n",
-                    (const char *)ID3D10Blob_GetBufferPointer(err));
-            ID3D10Blob_Release(err);
-        }
-        fail("D3DCompile", hr);
-        return 0;
+    memset(&src, 0, sizeof src);
+    src.hlsl = kSource;
+    src.len = sizeof kSource - 1;
+    src.name = "display_resolve";
+    src.macros = macros;
+    src.entry = entry;
+    src.target = target;
+    s = rhi_shader_create(stage, &src, err, sizeof err);
+    if (!s) {
+        if (err[0])
+            fprintf(stderr, "D3D8 display: %s\n", err);
+        fail("shader creation");
     }
-    if (err) ID3D10Blob_Release(err);
-
-    if (target[0] == 'v')
-        hr = ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(code),
-                                             ID3D10Blob_GetBufferSize(code), NULL,
-                                             (ID3D11VertexShader **)out);
-    else
-        hr = ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code),
-                                            ID3D10Blob_GetBufferSize(code), NULL,
-                                            (ID3D11PixelShader **)out);
-    ID3D10Blob_Release(code);
-    if (FAILED(hr)) { fail("CreateShader", hr); return 0; }
-    return 1;
+    return s;
 }
 
 static int create(UINT taps)
 {
-    ID3D11Device *dev = d3d8_GetD3D11Device();
-    D3D_SHADER_MACRO macros[2];
+    RhiMacro macros[2];
     char taps_text[16];
-    D3D11_BUFFER_DESC bd;
-    D3D11_BLEND_DESC bl;
-    D3D11_DEPTH_STENCIL_DESC ds;
-    D3D11_RASTERIZER_DESC rd;
-    HRESULT hr;
+    RhiBufferDesc bd;
+    RhiBlendDesc bl;
+    RhiDepthDesc ds;
+    RhiRasterDesc rd;
+    RhiSamplerDesc sm;
 
     if (g.failed) return 0;
     if (g.tried && g.taps == taps) return g.ps != NULL;
-    if (!dev) { g.failed = 1; return 0; }
+    if (!rhi_device_ready()) { g.failed = 1; return 0; }
 
     /* The tap count follows the window, not the scale: a window of a
      * different shape from the scene gets a different ratio, and one
      * that is resized gets a new one mid-run. Rebuild the two shaders
      * for it and keep everything else. */
     if (g.tried) {
-        if (g.vs) { ID3D11VertexShader_Release(g.vs); g.vs = NULL; }
-        if (g.ps) { ID3D11PixelShader_Release(g.ps);  g.ps = NULL; }
+        rhi_shader_destroy(g.vs); g.vs = NULL;
+        rhi_shader_destroy(g.ps); g.ps = NULL;
     }
     g.tried = 1;
     g.taps = taps;
 
     snprintf(taps_text, sizeof taps_text, "%u", taps);
-    macros[0].Name = "TAPS";
-    macros[0].Definition = taps_text;
-    macros[1].Name = NULL;
-    macros[1].Definition = NULL;
+    macros[0].name = "TAPS";
+    macros[0].value = taps_text;
+    macros[1].name = NULL;
+    macros[1].value = NULL;
 
-    if (!compile_one(dev, "vs_main", "vs_4_0", macros, (void **)&g.vs)) return 0;
-    if (!compile_one(dev, "ps_main", "ps_4_0", macros, (void **)&g.ps)) return 0;
+    if (!(g.vs = compile_one(RHI_STAGE_VERTEX, "vs_main", "vs_4_0", macros))) return 0;
+    if (!(g.ps = compile_one(RHI_STAGE_PIXEL, "ps_main", "ps_4_0", macros))) return 0;
 
     if (g.cb)
         return 1;                       /* rebuild: the rest already exists */
 
     memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = sizeof(ResolveConstants);
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    hr = ID3D11Device_CreateBuffer(dev, &bd, NULL, &g.cb);
-    if (FAILED(hr)) { fail("CreateBuffer", hr); return 0; }
+    bd.size = sizeof(ResolveConstants);
+    bd.usage = RHI_USAGE_DYNAMIC;
+    bd.bind = RHI_BIND_UNIFORM;
+    bd.cpu_access = RHI_CPU_WRITE;
+    if (!(g.cb = rhi_buffer_create(&bd, NULL))) { fail("CreateBuffer"); return 0; }
 
     /* Opaque, depthless, unculled: this pass replaces the target. */
     memset(&bl, 0, sizeof bl);
-    bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    hr = ID3D11Device_CreateBlendState(dev, &bl, &g.blend);
-    if (FAILED(hr)) { fail("CreateBlendState", hr); return 0; }
+    bl.write_mask = RHI_WRITE_ALL;
+    if (!(g.blend = rhi_blend_state_create(&bl))) { fail("CreateBlendState"); return 0; }
 
     memset(&ds, 0, sizeof ds);
-    hr = ID3D11Device_CreateDepthStencilState(dev, &ds, &g.depth);
-    if (FAILED(hr)) { fail("CreateDepthStencilState", hr); return 0; }
+    if (!(g.depth = rhi_depth_state_create(&ds))) { fail("CreateDepthStencilState"); return 0; }
 
     memset(&rd, 0, sizeof rd);
-    rd.FillMode = D3D11_FILL_SOLID;
-    rd.CullMode = D3D11_CULL_NONE;
-    rd.DepthClipEnable = TRUE;
-    hr = ID3D11Device_CreateRasterizerState(dev, &rd, &g.raster);
-    if (FAILED(hr)) { fail("CreateRasterizerState", hr); return 0; }
+    rd.fill = RHI_FILL_SOLID;
+    rd.cull = RHI_CULL_NONE;
+    rd.depth_clip = 1;
+    if (!(g.raster = rhi_raster_state_create(&rd))) { fail("CreateRasterizerState"); return 0; }
 
-    {
-        D3D11_SAMPLER_DESC sm;
-
-        memset(&sm, 0, sizeof sm);
-        sm.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sm.ComparisonFunc = D3D11_COMPARISON_NEVER;
-        sm.MaxLOD = D3D11_FLOAT32_MAX;
-        hr = ID3D11Device_CreateSamplerState(dev, &sm, &g.sampler);
-        if (FAILED(hr)) { fail("CreateSamplerState", hr); return 0; }
-    }
+    memset(&sm, 0, sizeof sm);
+    sm.filter = RHI_FILTER_LINEAR;
+    sm.address_u = sm.address_v = sm.address_w = RHI_ADDRESS_CLAMP;
+    sm.compare = RHI_CMP_NEVER;
+    sm.max_lod = 3.402823466e+38f;          /* D3D11_FLOAT32_MAX */
+    if (!(g.sampler = rhi_sampler_create(&sm))) { fail("CreateSamplerState"); return 0; }
 
     return 1;
 }
 
-HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
-                             UINT scene_w, UINT scene_h,
-                             ID3D11RenderTargetView *out,
-                             D3D8DisplayFit fit)
+HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
+                             RhiView *out, D3D8DisplayFit fit)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    ID3D11RenderTargetView *saved_rtv = NULL;
-    ID3D11DepthStencilView *saved_dsv = NULL;
-    D3D11_VIEWPORT saved_vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-    UINT saved_vps = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    D3D11_VIEWPORT vp;
+    RhiOutputState saved;
+    RhiViewport vp;
     float blend_factor[4] = { 1, 1, 1, 1 };
     UINT taps;
+    void *mapped;
 
-    if (!ctx || !scene || !out || !fit.w || !fit.h || !scene_h)
+    if (!scene || !out || !fit.w || !fit.h || !scene_h)
         return E_INVALIDARG;
 
     /* Square taps, from the vertical ratio: the horizontal one is the
@@ -333,11 +307,9 @@ HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
     if (taps > 8) taps = 8;
     if (!create(taps)) return E_FAIL;
 
-    ID3D11DeviceContext_RSGetViewports(ctx, &saved_vps, saved_vp);
-    ID3D11DeviceContext_OMGetRenderTargets(ctx, 1, &saved_rtv, &saved_dsv);
+    rhi_output_save(&saved);
 
-    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g.cb, 0,
-                                          D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+    if ((mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)) != NULL) {
         ResolveConstants c;
         c.origin_x = (float)fit.x;
         c.origin_y = (float)fit.y;
@@ -347,59 +319,55 @@ HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
         c.texel_y = 1.0f / (float)scene_h;
         c.inv_taps = 1.0f / (float)(taps * taps);
         c.pad = 0.0f;
-        memcpy(mapped.pData, &c, sizeof c);
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g.cb, 0);
+        memcpy(mapped, &c, sizeof c);
+        rhi_buffer_unmap(g.cb);
     }
 
-    vp.TopLeftX = (float)fit.x;
-    vp.TopLeftY = (float)fit.y;
-    vp.Width = (float)fit.w;
-    vp.Height = (float)fit.h;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &out, NULL);
+    vp.x = (float)fit.x;
+    vp.y = (float)fit.y;
+    vp.width = (float)fit.w;
+    vp.height = (float)fit.h;
+    vp.min_depth = 0.0f;
+    vp.max_depth = 1.0f;
+    rhi_set_render_target(out, NULL);
     /* The bars. Cheaper than tracking whether the window changed shape,
      * and it costs one clear of a buffer that is about to be presented. */
     {
         float black[4] = { 0, 0, 0, 1 };
-        ID3D11DeviceContext_ClearRenderTargetView(ctx, out, black);
+        rhi_clear_color(out, black);
     }
-    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
-    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
-    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(ctx, g.vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(ctx, g.ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 7, 1, &g.cb);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &scene);
-    ID3D11DeviceContext_PSSetSamplers(ctx, 9, 1, &g.sampler);
-    ID3D11DeviceContext_OMSetBlendState(ctx, g.blend, blend_factor, 0xFFFFFFFF);
-    ID3D11DeviceContext_OMSetDepthStencilState(ctx, g.depth, 0);
-    ID3D11DeviceContext_RSSetState(ctx, g.raster);
-    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    rhi_set_viewports(1, &vp);
+    rhi_set_vertex_layout(NULL);
+    rhi_set_topology(RHI_TOPOLOGY_TRIANGLES);
+    rhi_set_shader(RHI_STAGE_VERTEX, g.vs);
+    rhi_set_shader(RHI_STAGE_PIXEL, g.ps);
+    rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g.cb);
+    rhi_set_textures(9, 1, &scene);
+    rhi_set_samplers(9, 1, &g.sampler);
+    rhi_set_blend_state(g.blend, blend_factor, 0xFFFFFFFF);
+    rhi_set_depth_state(g.depth, 0);
+    rhi_set_raster_state(g.raster);
+    rhi_draw(3, 0);
 
     /* The scene must not stay bound as a shader input: it is the render
      * target again as soon as the next frame starts. */
     {
-        ID3D11ShaderResourceView *none = NULL;
-        ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &none);
+        RhiView *none = NULL;
+        rhi_set_textures(9, 1, &none);
     }
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &saved_rtv, saved_dsv);
-    if (saved_vps)
-        ID3D11DeviceContext_RSSetViewports(ctx, saved_vps, saved_vp);
-    if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
-    if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
+    rhi_output_restore(&saved);
     return S_OK;
 }
 
 void d3d8_display_shutdown(void)
 {
-    if (g.vs)     { ID3D11VertexShader_Release(g.vs);           g.vs = NULL; }
-    if (g.ps)     { ID3D11PixelShader_Release(g.ps);            g.ps = NULL; }
-    if (g.cb)     { ID3D11Buffer_Release(g.cb);                 g.cb = NULL; }
-    if (g.blend)  { ID3D11BlendState_Release(g.blend);          g.blend = NULL; }
-    if (g.depth)  { ID3D11DepthStencilState_Release(g.depth);   g.depth = NULL; }
-    if (g.raster) { ID3D11RasterizerState_Release(g.raster);    g.raster = NULL; }
-    if (g.sampler){ ID3D11SamplerState_Release(g.sampler);      g.sampler = NULL; }
+    rhi_shader_destroy(g.vs);            g.vs = NULL;
+    rhi_shader_destroy(g.ps);            g.ps = NULL;
+    rhi_buffer_destroy(g.cb);            g.cb = NULL;
+    rhi_blend_state_destroy(g.blend);    g.blend = NULL;
+    rhi_depth_state_destroy(g.depth);    g.depth = NULL;
+    rhi_raster_state_destroy(g.raster);  g.raster = NULL;
+    rhi_sampler_destroy(g.sampler);      g.sampler = NULL;
     g.tried = 0;
     g.failed = 0;
 }

@@ -27,6 +27,16 @@
  *                    clears after the nth draw are skipped too).
  *   --skip-draw <n>  leave out draw n (0-based).
  *   --list-draws     print every draw with the state it runs under.
+ *   --dump-target    write the render target bound when the frame ends
+ *                    instead of the back buffer: with --draws, the way to see
+ *                    an offscreen pass that is composited to the screen later.
+ *   --present        also write <prefix>NNN_present.bmp: the frame as it
+ *                    reaches the swap chain, after the display resolve, which
+ *                    the scene image (the default) never shows.
+ *   --backend <name> the renderer backend to replay through (d3d11, vulkan);
+ *                    the same as setting RECOMP_D3D8_BACKEND. Replaying one
+ *                    capture through two backends and diffing the images is
+ *                    scripts/replay_ab.py.
  *
  * A player, not an emulator. A capture holds the calls shadow mode
  * made on the host renderer after all of its Xbox conversion (d3d8_capture.h),
@@ -77,6 +87,11 @@ static int g_no_combiners;
 static long g_max_draws = -1;
 static long g_skip_draw = -1;
 static int  g_list_draws;
+static int  g_dump_target;
+/* --dump-target with --draws: the target the first undrawn draw would have
+ * gone to, held from that moment, since later state still runs. */
+static IDirect3DDevice8  *g_replay_dev;
+static IDirect3DSurface8 *g_target_at_limit;
 static long g_draw_index;           /* draws seen in this loop */
 static DWORD g_cur_vs, g_cur_token;
 #define LIST_TEX_IDS 8192
@@ -124,6 +139,8 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
                 (unsigned long)rs[D3DRS_COLORWRITEENABLE], (unsigned long)rs[D3DRS_STENCILENABLE],
                 (unsigned long)rs[D3DRS_FILLMODE], (unsigned long)rs[D3DRS_SHADEMODE]);
     }
+    if (g_dump_target && n == g_max_draws && g_replay_dev && !g_target_at_limit)
+        g_replay_dev->lpVtbl->GetRenderTarget(g_replay_dev, &g_target_at_limit);
     if (g_max_draws >= 0 && n >= g_max_draws)
         return 0;
     return n != g_skip_draw;
@@ -191,22 +208,14 @@ static void pump(void)
 /* -------------------------------------------------------------------- dump */
 
 /* The same 24-bit BMP the shadow path writes (hle_d3d8.c, shadow_dump_frame),
- * so images from the two paths are directly comparable. */
-static void dump_bmp(IDirect3DDevice8 *dev, const char *path, UINT w, UINT h)
+ * so images from the two paths are directly comparable. `rgba` is RGBA8. */
+static void write_bmp(const char *path, const uint8_t *rgba, size_t pitch, UINT w, UINT h)
 {
-    IDirect3DSurface8 *surf = NULL;
-    D3DLOCKED_RECT lr;
     uint8_t hdr[54];
     UINT y, x, pad;
     uint32_t filesz;
     FILE *f;
 
-    if (FAILED(dev->lpVtbl->GetBackBuffer(dev, 0, 0, &surf)) || !surf)
-        return;
-    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
-        surf->lpVtbl->Release(surf);
-        return;
-    }
     pad = (4 - ((w * 3) & 3)) & 3;
     filesz = 54 + (w * 3 + pad) * h;
 
@@ -223,7 +232,7 @@ static void dump_bmp(IDirect3DDevice8 *dev, const char *path, UINT w, UINT h)
         hdr[28] = 24;
         fwrite(hdr, 1, sizeof hdr, f);
         for (y = h; y-- > 0; ) {         /* BMP rows run bottom-up */
-            const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
+            const uint8_t *row = rgba + (size_t)y * pitch;
             for (x = 0; x < w; x++) {
                 const uint8_t *p = row + x * 4;
                 uint8_t bgr[3] = { p[2], p[1], p[0] };
@@ -236,6 +245,34 @@ static void dump_bmp(IDirect3DDevice8 *dev, const char *path, UINT w, UINT h)
     } else {
         fprintf(stderr, "[replay] cannot write %s\n", path);
     }
+}
+
+/* The scene, at the size the surface has. The capture's own width and
+ * height are the guest's; above RECOMP_RES_SCALE 1 the scene is larger, and
+ * writing the guest's size would crop it (hle_d3d8.c learned the same). */
+static void dump_bmp(IDirect3DDevice8 *dev, const char *path)
+{
+    IDirect3DSurface8 *surf = NULL;
+    D3DSURFACE_DESC desc;
+    D3DLOCKED_RECT lr;
+
+    if (g_dump_target && g_target_at_limit) {
+        surf = g_target_at_limit;               /* the reference passes to surf */
+        g_target_at_limit = NULL;
+    } else if (g_dump_target) {
+        dev->lpVtbl->GetRenderTarget(dev, &surf);
+    }
+    /* No target of its own (NULL) is the device's: the back buffer. */
+    if (!surf && FAILED(dev->lpVtbl->GetBackBuffer(dev, 0, 0, &surf)))
+        return;
+    if (!surf)
+        return;
+    if (FAILED(surf->lpVtbl->GetDesc(surf, &desc)) ||
+        FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        surf->lpVtbl->Release(surf);
+        return;
+    }
+    write_bmp(path, (const uint8_t *)lr.pBits, (size_t)lr.Pitch, desc.Width, desc.Height);
     surf->lpVtbl->UnlockRect(surf);
     surf->lpVtbl->Release(surf);
 }
@@ -620,7 +657,7 @@ static void do_vs_declaration(Replay *r, const D3D8CapChunk *c)
     }
     for (k = 0; k < p->count; k++) {
         decl[k].reg    = in[k].reg;
-        decl[k].format = (DXGI_FORMAT)in[k].dxgi_format;
+        decl[k].format = (RhiFormat)in[k].dxgi_format;
         decl[k].offset = in[k].offset;
     }
     if (g_list_draws) {
@@ -1044,14 +1081,15 @@ static void usage(void)
         "usage: d3d8_replay <capture%s> [--out <prefix>] [--loops <n>]\n"
         "                   [--dump-every] [--hold] [--quiet]\n"
         "                   [--no-combiners] [--draws <n>] [--skip-draw <n>]\n"
-        "                   [--list-draws]\n",
+        "                   [--list-draws] [--dump-target] [--present] [--backend <name>]\n",
         D3D8CAP_EXTENSION);
 }
 
 int main(int argc, char **argv)
 {
     const char *path = NULL, *prefix = "replay";
-    int loops = 1, dump_every = 0, hold = 0, i, loop;
+    int loops = 1, dump_every = 0, hold = 0, present = 0, i, loop;
+    const char *backend = NULL;
     char err[128], out[512];
     D3D8CapReader *cap;
     const D3D8CapHeader *h;
@@ -1078,8 +1116,14 @@ int main(int argc, char **argv)
             g_max_draws = atol(argv[++i]);
         else if (!strcmp(argv[i], "--skip-draw") && i + 1 < argc)
             g_skip_draw = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--present"))
+            present = 1;
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc)
+            backend = argv[++i];
         else if (!strcmp(argv[i], "--list-draws"))
             g_list_draws = 1;
+        else if (!strcmp(argv[i], "--dump-target"))
+            g_dump_target = 1;
         else if (argv[i][0] == '-') {
             usage();
             return 2;
@@ -1121,6 +1165,8 @@ int main(int argc, char **argv)
     pp.Windowed = TRUE;
     pp.EnableAutoDepthStencil = TRUE;
 
+    if (backend)
+        _putenv_s("RECOMP_D3D8_BACKEND", backend);
     d3d = xbox_Direct3DCreate8(0);
     hr = d3d ? d3d->lpVtbl->CreateDevice(d3d, 0, 1 /* HAL */, hwnd, 0, &pp, &r.dev)
              : E_FAIL;
@@ -1129,7 +1175,9 @@ int main(int argc, char **argv)
         d3d8cap_close_read(cap);
         return 1;
     }
+    g_replay_dev = r.dev;
     xbox_D3D8SetPresentInterval(0);      /* never wait for vblank: this is a tool */
+    xbox_D3D8KeepPresented(present);
     if (SUCCEEDED(r.dev->lpVtbl->GetDepthStencilSurface(r.dev, &r.device_depth)) &&
         r.device_depth)
         r.device_depth->lpVtbl->Release(r.device_depth);   /* the device keeps it */
@@ -1149,9 +1197,19 @@ int main(int argc, char **argv)
 
         if (dump_every || loop == loops - 1) {
             snprintf(out, sizeof out, "%s%03d.bmp", prefix, loop);
-            dump_bmp(r.dev, out, r.width, r.height);
+            dump_bmp(r.dev, out);
         }
         r.dev->lpVtbl->Swap(r.dev, 0);
+        if (present && (dump_every || loop == loops - 1)) {
+            UINT pw, ph;
+            const uint8_t *px = xbox_D3D8Presented(&pw, &ph);
+            if (px) {
+                snprintf(out, sizeof out, "%s%03d_present.bmp", prefix, loop);
+                write_bmp(out, px, (size_t)pw * 4u, pw, ph);
+            } else {
+                fprintf(stderr, "[replay] loop %d: nothing was presented\n", loop);
+            }
+        }
         pump();
         report_loop(&r, loop);
         end_loop(&r);

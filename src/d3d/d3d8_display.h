@@ -67,10 +67,8 @@ void d3d8_display_output_shape(UINT scene_w, UINT scene_h,
  * target and viewport it found, which is why the caller must not bind the
  * output first: the state this restores is the scene the next frame draws
  * into. */
-HRESULT d3d8_display_resolve(ID3D11ShaderResourceView *scene,
-                             UINT scene_w, UINT scene_h,
-                             ID3D11RenderTargetView *out,
-                             D3D8DisplayFit fit);
+HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
+                             RhiView *out, D3D8DisplayFit fit);
 
 void d3d8_display_shutdown(void);
 

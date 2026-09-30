@@ -4,9 +4,18 @@
 # software conversions can be validated without a D3D11 device.
 
 if(WIN32)
+    # Everything in src/d3d reaches the GPU through rhi.h, so a test that
+    # compiles part of it compiles the interface and its D3D11 backend too.
+    set(D3D8_SMOKE_RHI
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi_d3d11.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_compile.c
+    )
+
     add_executable(d3d8_smoke
         ${CMAKE_CURRENT_SOURCE_DIR}/test_main.c
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_resources.c
+        ${D3D8_SMOKE_RHI}
     )
     target_include_directories(d3d8_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d
@@ -24,15 +33,17 @@ if(WIN32)
         test_states.c
         ../../src/d3d/d3d8_states.c
         ../../src/d3d/d3d8_display.c
+        ${D3D8_SMOKE_RHI}
     )
     target_include_directories(d3d8_states_smoke PRIVATE ../../src/d3d ../../src/config)
-    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11 d3dcompiler xbox_config)
+    target_link_libraries(d3d8_states_smoke PRIVATE platform d3d11 dxgi dxguid d3dcompiler xbox_config)
 
     add_executable(d3d8_a8
         test_a8.c
         ../../src/d3d/d3d8_resources.c
         ../../src/d3d/d3d8_shaders.c
         ../../src/d3d/d3d8_combiners.c
+        ${D3D8_SMOKE_RHI}
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
@@ -47,6 +58,7 @@ if(WIN32)
         ../../src/d3d/d3d8_resources.c
         ../../src/d3d/d3d8_shaders.c
         ../../src/d3d/d3d8_combiners.c
+        ${D3D8_SMOKE_RHI}
     )
     target_include_directories(d3d8_final_default PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_final_default PRIVATE platform d3d11 dxgi dxguid d3dcompiler)

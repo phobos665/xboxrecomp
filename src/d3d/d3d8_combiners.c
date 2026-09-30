@@ -23,7 +23,7 @@
  *
  * 3. SHADER CACHE
  *    We hash the full NV2ACombinerState and maintain a fixed-size cache
- *    (128 entries) of compiled ID3D11PixelShader objects. Most Xbox games
+ *    (128 entries) of compiled pixel shaders (rhi.h).  Most Xbox games
  *    use fewer than 20 unique combiner configurations, so this is ample.
  *
  * 4. DRAW INTEGRATION
@@ -34,13 +34,11 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_combiners.h"
-#include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
 
-#pragma comment(lib, "d3dcompiler.lib")
 
 /* ================================================================
  * Internal State
@@ -56,7 +54,7 @@ static NV2ACombinerState g_combiner_state;
 static BOOL g_dirty = TRUE;
 
 /** PS constant buffer (uploaded to GPU each draw). */
-static ID3D11Buffer *g_combiner_cb = NULL;
+static RhiBuffer *g_combiner_cb = NULL;
 
 /* ================================================================
  * Shader Cache
@@ -73,7 +71,7 @@ typedef struct CombinerCacheEntry {
     BOOL                in_use;
     uint32_t            hash;
     NV2ACombinerState   state;
-    ID3D11PixelShader  *shader;
+    RhiShader          *shader;
     uint32_t            last_used_frame;
 } CombinerCacheEntry;
 
@@ -135,7 +133,7 @@ static int ps_dump_limit(void)
  * profile; the state only changes when a PS render state does, so the
  * result is kept until the next parse. Only this path calls the lookup in
  * the runtime, so the entry cannot be evicted while it is held. */
-static ID3D11PixelShader *g_last_shader;
+static RhiShader *g_last_shader;
 
 /* ================================================================
  * Color Helpers
@@ -950,14 +948,13 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
  * Shader Compilation & Cache
  * ================================================================ */
 
-static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state)
+static RhiShader *compile_combiner_shader(const NV2ACombinerState *state)
 {
     /* 16KB should be more than enough for any combiner shader */
     char hlsl[16384];
-    ID3DBlob *code = NULL;
-    ID3DBlob *errors = NULL;
-    ID3D11PixelShader *ps = NULL;
-    HRESULT hr;
+    char err[4096];
+    RhiShaderSource ss;
+    RhiShader *ps = NULL;
     int len;
 
     len = d3d8_combiners_generate_hlsl(state, hlsl, sizeof(hlsl));
@@ -998,41 +995,30 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
         }
     }
 
+    memset(&ss, 0, sizeof ss);
+    ss.hlsl = hlsl;
+    ss.len = (size_t)len;
+    ss.name = "ps_combiner";
+    ss.entry = "main";
+    ss.target = "ps_5_0";
+    ss.optimize = 1;
     {
         long long started = d3d8_compile_clock();
-        hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
-                        NULL, NULL, "main", "ps_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                        &code, &errors);
+        ps = rhi_shader_create(RHI_STAGE_PIXEL, &ss, err, sizeof err);
         d3d8_compile_note(0, started);
     }
-    if (FAILED(hr)) {
+    if (!ps) {
         fprintf(stderr, "NV2A combiners: HLSL compile failed: %s\n",
-                errors ? (char *)ID3D10Blob_GetBufferPointer(errors)
-                       : "unknown error");
+                err[0] ? err : "unknown error");
         /* Dump the generated source for debugging */
         fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End HLSL ---\n", hlsl);
-        if (errors) ID3D10Blob_Release(errors);
-        return NULL;
-    }
-    if (errors) ID3D10Blob_Release(errors);
-
-    hr = ID3D11Device_CreatePixelShader(
-        d3d8_GetD3D11Device(),
-        ID3D10Blob_GetBufferPointer(code),
-        ID3D10Blob_GetBufferSize(code),
-        NULL, &ps);
-    ID3D10Blob_Release(code);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "NV2A combiners: CreatePixelShader failed: 0x%08lX\n", hr);
         return NULL;
     }
 
     return ps;
 }
 
-ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
+RhiShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 {
     uint32_t hash = combiner_state_hash(state);
     uint32_t idx = hash & (COMBINER_CACHE_SIZE - 1);
@@ -1045,7 +1031,7 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 
         if (!entry->in_use) {
             /* Cache miss - compile and insert */
-            ID3D11PixelShader *ps = compile_combiner_shader(state);
+            RhiShader *ps = compile_combiner_shader(state);
             if (!ps) return NULL;
 
             entry->in_use = TRUE;
@@ -1070,7 +1056,7 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
     {
         uint32_t lru_slot = idx;
         uint32_t lru_frame = UINT32_MAX;
-        ID3D11PixelShader *ps;
+        RhiShader *ps;
         CombinerCacheEntry *entry;
 
         for (probe = 0; probe < COMBINER_CACHE_SIZE; probe++) {
@@ -1082,7 +1068,10 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 
         entry = &g_cache[lru_slot];
         if (entry->shader) {
-            ID3D11PixelShader_Release(entry->shader);
+            if (g_last_shader == entry->shader)
+                g_last_shader = NULL;
+            rhi_shader_destroy(entry->shader);
+            entry->shader = NULL;
         }
 
         ps = compile_combiner_shader(state);
@@ -1100,48 +1089,9 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
  * Initialization / Shutdown
  * ================================================================ */
 
-/* Runtime compile timing (d3d8_internal.h). */
-static volatile LONG     g_compiles[3];
-static volatile LONG64   g_compile_ticks[3];
-static LONG64            g_compile_qpf, g_compile_last_report;
-
-long long d3d8_compile_clock(void)
-{
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return t.QuadPart;
-}
-
-void d3d8_compile_note(int kind, long long started)
-{
-    LARGE_INTEGER now;
-
-    if (kind < 0 || kind > 2)
-        return;
-    QueryPerformanceCounter(&now);
-    if (!g_compile_qpf) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        g_compile_qpf = f.QuadPart;
-        g_compile_last_report = now.QuadPart;
-    }
-    InterlockedIncrement(&g_compiles[kind]);
-    InterlockedAdd64(&g_compile_ticks[kind], now.QuadPart - started);
-    if (now.QuadPart - g_compile_last_report >= 5 * g_compile_qpf) {
-        g_compile_last_report = now.QuadPart;
-        fprintf(stderr, "[D3D8] runtime shader compiles so far: combiner %ld (%.0f ms), "
-                "fixed-function %ld (%.0f ms), vertex program %ld (%.0f ms)\n",
-                g_compiles[0], g_compile_ticks[0] * 1000.0 / g_compile_qpf,
-                g_compiles[1], g_compile_ticks[1] * 1000.0 / g_compile_qpf,
-                g_compiles[2], g_compile_ticks[2] * 1000.0 / g_compile_qpf);
-        fflush(stderr);
-    }
-}
-
 HRESULT d3d8_combiners_init(void)
 {
-    D3D11_BUFFER_DESC cbd;
-    HRESULT hr;
+    RhiBufferDesc cbd;
 
     memset(g_cache, 0, sizeof(g_cache));
     memset(&g_combiner_state, 0, sizeof(g_combiner_state));
@@ -1153,17 +1103,15 @@ HRESULT d3d8_combiners_init(void)
     /* Create the PS constant buffer for combiner shaders.
      * Size must match NV2APSConstants, rounded up to 16-byte alignment. */
     memset(&cbd, 0, sizeof(cbd));
-    cbd.ByteWidth = (sizeof(NV2APSConstants) + 15) & ~15;
-    cbd.Usage = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    cbd.size = (sizeof(NV2APSConstants) + 15) & ~15;
+    cbd.usage = RHI_USAGE_DYNAMIC;
+    cbd.bind = RHI_BIND_UNIFORM;
+    cbd.cpu_access = RHI_CPU_WRITE;
 
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL,
-                                   &g_combiner_cb);
-    if (FAILED(hr)) {
-        fprintf(stderr, "NV2A combiners: Failed to create constant buffer: "
-                "0x%08lX\n", hr);
-        return hr;
+    g_combiner_cb = rhi_buffer_create(&cbd, NULL);
+    if (!g_combiner_cb) {
+        fprintf(stderr, "NV2A combiners: Failed to create constant buffer\n");
+        return E_FAIL;
     }
 
     fprintf(stderr, "NV2A combiners: Initialized (cache size=%d)\n",
@@ -1178,16 +1126,14 @@ void d3d8_combiners_shutdown(void)
     /* Release all cached shaders */
     for (i = 0; i < COMBINER_CACHE_SIZE; i++) {
         if (g_cache[i].in_use && g_cache[i].shader) {
-            ID3D11PixelShader_Release(g_cache[i].shader);
+            rhi_shader_destroy(g_cache[i].shader);
         }
     }
     memset(g_cache, 0, sizeof(g_cache));
     g_last_shader = NULL;
 
-    if (g_combiner_cb) {
-        ID3D11Buffer_Release(g_combiner_cb);
-        g_combiner_cb = NULL;
-    }
+    rhi_buffer_destroy(g_combiner_cb);
+    g_combiner_cb = NULL;
 
     fprintf(stderr, "NV2A combiners: Shut down\n");
 }
@@ -1221,19 +1167,16 @@ void d3d8_combiners_mark_dirty(void)
 
 BOOL d3d8_combiners_prepare_draw(void)
 {
-    ID3D11DeviceContext *ctx;
-    ID3D11PixelShader *ps;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    RhiShader *ps;
+    void *mapped;
     const DWORD *rs;
-    HRESULT hr;
     int i;
 
     /* Not using combiner shaders - fall back to fixed-function */
     if (g_ps_token == 0)
         return FALSE;
 
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx || !g_combiner_cb)
+    if (!rhi_device_ready() || !g_combiner_cb)
         return FALSE;
 
     rs = d3d8_GetRenderStates();
@@ -1279,17 +1222,16 @@ BOOL d3d8_combiners_prepare_draw(void)
     }
 
     /* Bind the combiner pixel shader */
-    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    rhi_set_shader(RHI_STAGE_PIXEL, ps);
 
     /* Update the PS constant buffer with current values.
      *
      * Even though the shader structure doesn't change, the constant
      * values (C0, C1, fog, alpha ref) can change every frame via
      * render state writes. So we always re-upload. */
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_combiner_cb,
-                                0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (SUCCEEDED(hr)) {
-        NV2APSConstants *cb = (NV2APSConstants *)mapped.pData;
+    mapped = rhi_buffer_map(g_combiner_cb, RHI_MAP_WRITE_DISCARD);
+    if (mapped) {
+        NV2APSConstants *cb = (NV2APSConstants *)mapped;
 
         /* Per-stage constants */
         for (i = 0; i < NV2A_MAX_COMBINER_STAGES; i++) {
@@ -1325,11 +1267,11 @@ BOOL d3d8_combiners_prepare_draw(void)
             }
         }
 
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);
+        rhi_buffer_unmap(g_combiner_cb);
     }
 
     /* Bind the constant buffer to PS slot 0 */
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_combiner_cb);
+    rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 0, 1, &g_combiner_cb);
 
     /* Advance frame counter for LRU tracking */
     g_frame_counter++;

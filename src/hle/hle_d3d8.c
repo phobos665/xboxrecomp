@@ -1835,20 +1835,20 @@ static void note_vertex_attributes(uint32_t handle)
  * D3DCOLOR is stored BGRA. Three-component shorts and bytes have no DXGI
  * format, and unnormalised shorts would need an integer shader input, so
  * those return 0. */
-static int xbox_vsdt_to_dxgi(uint32_t format, DXGI_FORMAT *dxgi, UINT *size)
+static int xbox_vsdt_to_dxgi(uint32_t format, RhiFormat *dxgi, UINT *size)
 {
     switch (format) {
-    case 0x12: *dxgi = DXGI_FORMAT_R32_FLOAT;          *size = 4;  return 1; /* FLOAT1 */
-    case 0x22: *dxgi = DXGI_FORMAT_R32G32_FLOAT;       *size = 8;  return 1; /* FLOAT2 */
-    case 0x32: *dxgi = DXGI_FORMAT_R32G32B32_FLOAT;    *size = 12; return 1; /* FLOAT3 */
-    case 0x42: *dxgi = DXGI_FORMAT_R32G32B32A32_FLOAT; *size = 16; return 1; /* FLOAT4 */
-    case 0x40: *dxgi = DXGI_FORMAT_B8G8R8A8_UNORM;     *size = 4;  return 1; /* D3DCOLOR */
-    case 0x11: *dxgi = DXGI_FORMAT_R16_SNORM;          *size = 2;  return 1; /* NORMSHORT1 */
-    case 0x21: *dxgi = DXGI_FORMAT_R16G16_SNORM;       *size = 4;  return 1; /* NORMSHORT2 */
-    case 0x41: *dxgi = DXGI_FORMAT_R16G16B16A16_SNORM; *size = 8;  return 1; /* NORMSHORT4 */
-    case 0x14: *dxgi = DXGI_FORMAT_R8_UNORM;           *size = 1;  return 1; /* PBYTE1 */
-    case 0x24: *dxgi = DXGI_FORMAT_R8G8_UNORM;         *size = 2;  return 1; /* PBYTE2 */
-    case 0x44: *dxgi = DXGI_FORMAT_R8G8B8A8_UNORM;     *size = 4;  return 1; /* PBYTE4 */
+    case 0x12: *dxgi = RHI_FORMAT_R32_FLOAT;          *size = 4;  return 1; /* FLOAT1 */
+    case 0x22: *dxgi = RHI_FORMAT_R32G32_FLOAT;       *size = 8;  return 1; /* FLOAT2 */
+    case 0x32: *dxgi = RHI_FORMAT_R32G32B32_FLOAT;    *size = 12; return 1; /* FLOAT3 */
+    case 0x42: *dxgi = RHI_FORMAT_R32G32B32A32_FLOAT; *size = 16; return 1; /* FLOAT4 */
+    case 0x40: *dxgi = RHI_FORMAT_B8G8R8A8_UNORM;     *size = 4;  return 1; /* D3DCOLOR */
+    case 0x11: *dxgi = RHI_FORMAT_R16_SNORM;          *size = 2;  return 1; /* NORMSHORT1 */
+    case 0x21: *dxgi = RHI_FORMAT_R16G16_SNORM;       *size = 4;  return 1; /* NORMSHORT2 */
+    case 0x41: *dxgi = RHI_FORMAT_R16G16B16A16_SNORM; *size = 8;  return 1; /* NORMSHORT4 */
+    case 0x14: *dxgi = RHI_FORMAT_R8_UNORM;           *size = 1;  return 1; /* PBYTE1 */
+    case 0x24: *dxgi = RHI_FORMAT_R8G8_UNORM;         *size = 2;  return 1; /* PBYTE2 */
+    case 0x44: *dxgi = RHI_FORMAT_R8G8B8A8_UNORM;     *size = 4;  return 1; /* PBYTE4 */
     default:   return 0;
     }
 }
@@ -1872,9 +1872,9 @@ static int xbox_vsdt_expanded(uint32_t format, UINT *size)
     }
 }
 
-static const DXGI_FORMAT FLOATN_FORMAT[5] = {
-    DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
-    DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+static const RhiFormat FLOATN_FORMAT[5] = {
+    RHI_FORMAT_UNKNOWN, RHI_FORMAT_R32_FLOAT, RHI_FORMAT_R32G32_FLOAT,
+    RHI_FORMAT_R32G32B32_FLOAT, RHI_FORMAT_R32G32B32A32_FLOAT,
 };
 
 /* The host program's vertex layout, from the same slots: each register at its
@@ -1915,7 +1915,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     for (i = 0; i < 16u; i++) {
         uint32_t attr = object + 20u + i * 16u;
         uint32_t format = HLE_MEM32(attr + 8u);
-        DXGI_FORMAT dxgi;
+        RhiFormat dxgi;
         UINT size;
         int floats;
 
@@ -1938,7 +1938,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         uint32_t attr = object + 20u + i * 16u;
         uint32_t stream = HLE_MEM32(attr), offset = HLE_MEM32(attr + 4u);
         uint32_t format = HLE_MEM32(attr + 8u);
-        DXGI_FORMAT dxgi;
+        RhiFormat dxgi;
         UINT size;
         int floats;
 
@@ -2358,7 +2358,7 @@ static void inline_draw_program(uint32_t n)
     p = &g_programs[g_shadow_vs_slot];
     for (i = 0; i < 16; i++) {
         in[i].reg = i;
-        in[i].format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        in[i].format = RHI_FORMAT_R32G32B32A32_FLOAT;
         in[i].offset = (UINT)i * 16u;
     }
     if (FAILED(host_vsh_set_declaration(p->host, in, 16))) {

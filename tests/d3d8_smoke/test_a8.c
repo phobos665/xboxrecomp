@@ -1,6 +1,7 @@
 /* Test A8 sampling and transformed-vertex interpolation on D3D11 WARP.
  * No game data, window, or hardware adapter is needed. */
 #include "d3d8_internal.h"
+#include <d3d11.h>   /* this test drives D3D11 itself */
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +83,7 @@ static int check_rhw(ID3D11Texture2D *target, ID3D11Texture2D *readback,
     memcpy((BYTE *)lock.pBits + lock.Pitch, row, sizeof(row));
     REQUIRE(texture->lpVtbl->UnlockRect(texture, 0));
     textures[0] = (IDirect3DBaseTexture8 *)texture;
-    srv = d3d8_base_srv(textures[0]);
+    srv = (ID3D11ShaderResourceView *)rhi_d3d11_native_view(d3d8_base_srv(textures[0]));
     ID3D11DeviceContext_PSSetShaderResources(context, 0, 1, &srv);
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -152,6 +153,8 @@ int main(void)
 
     REQUIRE(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0,
         D3D11_SDK_VERSION, &device, NULL, &context));
+    /* The layers under test create their objects through rhi.h. */
+    rhi_d3d11_adopt(device, context);
     REQUIRE(d3d8_shaders_init());
     REQUIRE(d3d8_combiners_init());
     REQUIRE(D3DCompile(vs_source, sizeof(vs_source), NULL, NULL, NULL, "main",
@@ -209,7 +212,7 @@ int main(void)
                 REQUIRE(d3d8_CreateTextureImpl(2, 2, 2, 0, formats[f], (IDirect3DTexture8 **)&tex));
             }
             textures[stage] = tex;
-            srv = d3d8_base_srv(textures[stage]);
+            srv = (ID3D11ShaderResourceView *)rhi_d3d11_native_view(d3d8_base_srv(textures[stage]));
             ID3D11DeviceContext_PSSetShaderResources(context, stage, 1, &srv);
             ID3D11DeviceContext_PSSetSamplers(context, stage, 1, &sampler);
             for (a = 0; a < sizeof(alphas); a++) {

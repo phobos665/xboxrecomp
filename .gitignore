@@ -59,3 +59,5 @@ d3d8_capture_*.tmp
 
 # FFmpeg shared build for XMV movie playback (fetched, not committed; see docs/technical/video-playback.md)
 third_party/ffmpeg/
+# DXC release build, HLSL -> SPIR-V for the Vulkan backend (fetched, not committed; see docs/technical/vulkan-backend.md)
+third_party/dxc/

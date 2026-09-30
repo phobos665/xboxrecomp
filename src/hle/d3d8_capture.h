@@ -102,6 +102,14 @@ extern "C" {
  * version 4 cube textures and the face a render target names, version 6
  * fixed-function lights and the material. */
 #define D3D8CAP_VERSION      6u
+/* The oldest version the reader still accepts. A bump that only adds chunk
+ * kinds leaves an older file a valid newer one that happens not to contain
+ * them (version 6 added three; version 5 one), so it leaves this alone. A
+ * bump that changes a payload struct or what a chunk means must raise this
+ * to itself -- version 4 changed what a render target names, so nothing
+ * before 5 is readable. Captures stopped being cheap to retake once they
+ * became the regression corpus for a second renderer. */
+#define D3D8CAP_VERSION_MIN_READ 5u
 
 /* The conventional extension. .gitignore has it: a capture contains the
  * title's own textures and vertices, so it is game content and must never be

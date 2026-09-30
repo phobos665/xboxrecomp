@@ -8,7 +8,7 @@
  *   1. Parse: nv2a_vsh_parse(), in src/kernel/nv2a_vsh.c
  *   2. Analyze: determine which input registers (v0-v15) are read
  *   3. Generate HLSL: emit HLSL code mapping NV2A ops to HLSL intrinsics
- *   4. Compile: D3DCompile -> ID3D11VertexShader
+ *   4. Compile: rhi_shader_create -> host vertex shader
  *   5. Cache: hash microcode -> reuse compiled shader on subsequent draws
  *
  * The generated HLSL uses:
@@ -22,14 +22,12 @@
 #include <float.h>
 #include "d3d8_vsh.h"
 #include "recomp_config.h"
-#include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <math.h>
 
-#pragma comment(lib, "d3dcompiler.lib")
 
 /* ================================================================
  * Module State
@@ -48,7 +46,7 @@ typedef struct {
 } VshScreenspace;
 
 static VshScreenspace g_vsh_screen;
-static ID3D11Buffer  *g_vsh_screen_cb;
+static RhiBuffer     *g_vsh_screen_cb;
 static BOOL           g_vsh_screen_dirty;
 
 /* The NV2A's current value of each input register, at register(b3). A
@@ -62,7 +60,7 @@ typedef struct {
 } VshVertexData;
 
 static VshVertexData  g_vsh_vdata;
-static ID3D11Buffer  *g_vsh_vdata_cb;
+static RhiBuffer     *g_vsh_vdata_cb;
 static BOOL           g_vsh_vdata_dirty;
 static uint16_t       g_vsh_vdata_fed;     /* the mask g_vsh_vdata.fed holds */
 
@@ -70,19 +68,18 @@ static uint16_t       g_vsh_vdata_fed;     /* the mask g_vsh_vdata.fed holds */
 static NV2AVSConstants g_vsh_constants;
 static BOOL g_vsh_constants_dirty = TRUE;
 
-/* D3D11 constant buffer for VS constants */
-static ID3D11Buffer *g_vsh_cb = NULL;
+/* Constant buffer for VS constants */
+static RhiBuffer *g_vsh_cb = NULL;
 
 /* Shader cache: maps microcode hash to compiled shader + input layout */
 typedef struct {
     uint32_t            hash;
     int                 in_use;
-    ID3D11VertexShader *vs;
-    ID3DBlob           *vs_blob;      /* Bytecode for input layout creation */
-    ID3D11InputLayout  *layouts[16];  /* Cached layouts per input mask subset */
+    RhiShader          *vs;           /* keeps what input layouts need */
+    RhiVertexLayout    *layouts[16];  /* Cached layouts per input mask subset */
     uint32_t            layout_masks[16];  /* inputs_read | (texcoord-field<<16) */
     int                 layout_count;
-    ID3D11InputLayout  *decl_layouts[16];  /* Cached layouts per declaration */
+    RhiVertexLayout    *decl_layouts[16];  /* Cached layouts per declaration */
     uint32_t            decl_keys[16];     /* NV2AVshSlot.decl_hash */
     int                 decl_layout_count;
     uint16_t            inputs_read;  /* Which v registers are read */
@@ -823,72 +820,69 @@ static UINT vsh_fvf_texcoord_size(DWORD fvf, UINT t)
     return floats[(fvf >> (16 + t * 2)) & 0x3];
 }
 
-static DXGI_FORMAT default_input_format(int vreg, DWORD fvf)
+static RhiFormat default_input_format(int vreg, DWORD fvf)
 {
     switch (vreg) {
-    case 0:  return DXGI_FORMAT_R32G32B32_FLOAT;    /* Position (xyz) */
-    case 1:  return DXGI_FORMAT_R32G32B32A32_FLOAT;  /* Blend weights */
-    case 2:  return DXGI_FORMAT_R32G32B32_FLOAT;     /* Normal */
-    case 3:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Diffuse (D3DCOLOR) */
-    case 4:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Specular (D3DCOLOR) */
-    case 5:  return DXGI_FORMAT_R32_FLOAT;            /* Fog */
-    case 6:  return DXGI_FORMAT_R32_FLOAT;            /* Point size */
-    case 7:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back specular */
-    case 8:  return vsh_fvf_texcoord_size(fvf, 0) == 1 ? DXGI_FORMAT_R32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 0) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 0) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
-                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 0 */
-    case 9:  return vsh_fvf_texcoord_size(fvf, 1) == 1 ? DXGI_FORMAT_R32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 1) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 1) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
-                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 1 */
-    case 10: return vsh_fvf_texcoord_size(fvf, 2) == 1 ? DXGI_FORMAT_R32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 2) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 2) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
-                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 2 */
-    case 11: return vsh_fvf_texcoord_size(fvf, 3) == 1 ? DXGI_FORMAT_R32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 3) == 3 ? DXGI_FORMAT_R32G32B32_FLOAT
-                 : vsh_fvf_texcoord_size(fvf, 3) == 4 ? DXGI_FORMAT_R32G32B32A32_FLOAT
-                 : DXGI_FORMAT_R32G32_FLOAT;          /* Texcoord 3 */
-    default: return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* Generic */
+    case 0:  return RHI_FORMAT_R32G32B32_FLOAT;    /* Position (xyz) */
+    case 1:  return RHI_FORMAT_R32G32B32A32_FLOAT;  /* Blend weights */
+    case 2:  return RHI_FORMAT_R32G32B32_FLOAT;     /* Normal */
+    case 3:  return RHI_FORMAT_R8G8B8A8_UNORM;      /* Diffuse (D3DCOLOR) */
+    case 4:  return RHI_FORMAT_R8G8B8A8_UNORM;      /* Specular (D3DCOLOR) */
+    case 5:  return RHI_FORMAT_R32_FLOAT;            /* Fog */
+    case 6:  return RHI_FORMAT_R32_FLOAT;            /* Point size */
+    case 7:  return RHI_FORMAT_R8G8B8A8_UNORM;      /* Back specular */
+    case 8:  return vsh_fvf_texcoord_size(fvf, 0) == 1 ? RHI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 0) == 3 ? RHI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 0) == 4 ? RHI_FORMAT_R32G32B32A32_FLOAT
+                 : RHI_FORMAT_R32G32_FLOAT;          /* Texcoord 0 */
+    case 9:  return vsh_fvf_texcoord_size(fvf, 1) == 1 ? RHI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 1) == 3 ? RHI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 1) == 4 ? RHI_FORMAT_R32G32B32A32_FLOAT
+                 : RHI_FORMAT_R32G32_FLOAT;          /* Texcoord 1 */
+    case 10: return vsh_fvf_texcoord_size(fvf, 2) == 1 ? RHI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 2) == 3 ? RHI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 2) == 4 ? RHI_FORMAT_R32G32B32A32_FLOAT
+                 : RHI_FORMAT_R32G32_FLOAT;          /* Texcoord 2 */
+    case 11: return vsh_fvf_texcoord_size(fvf, 3) == 1 ? RHI_FORMAT_R32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 3) == 3 ? RHI_FORMAT_R32G32B32_FLOAT
+                 : vsh_fvf_texcoord_size(fvf, 3) == 4 ? RHI_FORMAT_R32G32B32A32_FLOAT
+                 : RHI_FORMAT_R32G32_FLOAT;          /* Texcoord 3 */
+    default: return RHI_FORMAT_R32G32B32A32_FLOAT;   /* Generic */
     }
 }
 
-static UINT input_format_size(DXGI_FORMAT fmt)
+static UINT input_format_size(RhiFormat fmt)
 {
     switch (fmt) {
-    case DXGI_FORMAT_R32_FLOAT:            return 4;
-    case DXGI_FORMAT_R32G32_FLOAT:         return 8;
-    case DXGI_FORMAT_R32G32B32_FLOAT:      return 12;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT:   return 16;
-    case DXGI_FORMAT_R8G8B8A8_UNORM:       return 4;
+    case RHI_FORMAT_R32_FLOAT:            return 4;
+    case RHI_FORMAT_R32G32_FLOAT:         return 8;
+    case RHI_FORMAT_R32G32B32_FLOAT:      return 12;
+    case RHI_FORMAT_R32G32B32A32_FLOAT:   return 16;
+    case RHI_FORMAT_R8G8B8A8_UNORM:       return 4;
     default:                                return 16;
     }
 }
 
-static ID3D11InputLayout *create_vsh_input_layout(
-    uint16_t inputs_read, DWORD fvf, ID3DBlob *vs_blob)
+static RhiVertexLayout *create_vsh_input_layout(
+    uint16_t inputs_read, DWORD fvf, const RhiShader *vs)
 {
-    D3D11_INPUT_ELEMENT_DESC elems[NV2A_VS_MAX_INPUTS];
+    RhiVertexElement elems[NV2A_VS_MAX_INPUTS];
     UINT elem_count = 0;
     UINT offset = 0;
-    ID3D11InputLayout *layout = NULL;
-    HRESULT hr;
+    RhiVertexLayout *layout = NULL;
     int i;
 
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
         if (!(inputs_read & (1u << i)))
             continue;
 
-        DXGI_FORMAT fmt = default_input_format(i, fvf);
+        RhiFormat fmt = default_input_format(i, fvf);
 
-        elems[elem_count].SemanticName      = "ATTR";
-        elems[elem_count].SemanticIndex      = (UINT)i;
-        elems[elem_count].Format             = fmt;
-        elems[elem_count].InputSlot          = 0;
-        elems[elem_count].AlignedByteOffset  = offset;
-        elems[elem_count].InputSlotClass     = D3D11_INPUT_PER_VERTEX_DATA;
-        elems[elem_count].InstanceDataStepRate = 0;
+        elems[elem_count].semantic       = "ATTR";
+        elems[elem_count].semantic_index = (UINT)i;
+        elems[elem_count].format         = fmt;
+        elems[elem_count].slot           = 0;
+        elems[elem_count].offset         = offset;
         elem_count++;
 
         offset += input_format_size(fmt);
@@ -896,15 +890,9 @@ static ID3D11InputLayout *create_vsh_input_layout(
 
     if (elem_count == 0) return NULL;
 
-    hr = ID3D11Device_CreateInputLayout(
-        d3d8_GetD3D11Device(),
-        elems, elem_count,
-        ID3D10Blob_GetBufferPointer(vs_blob),
-        ID3D10Blob_GetBufferSize(vs_blob),
-        &layout);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: CreateInputLayout failed: 0x%08lX\n", hr);
+    layout = rhi_vertex_layout_create(elems, elem_count, vs);
+    if (!layout) {
+        fprintf(stderr, "D3D8 VSH: CreateInputLayout failed\n");
         return NULL;
     }
 
@@ -949,20 +937,13 @@ static VshCacheEntry *cache_insert(uint32_t hash)
         VshCacheEntry *evict = &g_vsh_cache[idx];
         int j;
 
-        if (evict->vs)
-            ID3D11VertexShader_Release(evict->vs);
-        if (evict->vs_blob)
-            ID3D10Blob_Release(evict->vs_blob);
-        for (j = 0; j < evict->layout_count; j++) {
-            if (evict->layouts[j])
-                ID3D11InputLayout_Release(evict->layouts[j]);
-        }
+        rhi_shader_destroy(evict->vs);
+        for (j = 0; j < evict->layout_count; j++)
+            rhi_vertex_layout_destroy(evict->layouts[j]);
         /* The declaration-keyed layouts are a second set, and leak with the
          * entry if they are not released here too. */
-        for (j = 0; j < evict->decl_layout_count; j++) {
-            if (evict->decl_layouts[j])
-                ID3D11InputLayout_Release(evict->decl_layouts[j]);
-        }
+        for (j = 0; j < evict->decl_layout_count; j++)
+            rhi_vertex_layout_destroy(evict->decl_layouts[j]);
         memset(evict, 0, sizeof(*evict));
         evict->hash   = hash;
         evict->in_use = 1;
@@ -985,8 +966,9 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     enum { HLSL_BUF = 65536 };
     char *hlsl_buf = (char *)malloc(HLSL_BUF);
     int hlsl_len;
-    ID3DBlob *code = NULL, *errors = NULL;
-    HRESULT hr;
+    RhiShaderSource ss;
+    RhiShader *vs;
+    char err[4096];
     VshCacheEntry *entry;
 
     /* Parse microcode */
@@ -1017,48 +999,35 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
                     "--- End VS HLSL ---\n", hash, num_insns, hlsl_buf);
     }
 
-    /* Compile HLSL to bytecode */
+    /* Compile HLSL to a host vertex shader */
+    memset(&ss, 0, sizeof ss);
+    ss.hlsl = hlsl_buf;
+    ss.len = (size_t)hlsl_len;
+    ss.name = "nv2a_vsh";
+    ss.entry = "main";
+    ss.target = "vs_5_0";
+    ss.optimize = 1;
     {
         long long started = d3d8_compile_clock();
-        hr = D3DCompile(hlsl_buf, (SIZE_T)hlsl_len, "nv2a_vsh",
-                        NULL, NULL, "main", "vs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                        &code, &errors);
+        vs = rhi_shader_create(RHI_STAGE_VERTEX, &ss, err, sizeof err);
         d3d8_compile_note(2, started);
     }
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: Compile failed: %s\n",
-                errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
+    if (!vs) {
+        fprintf(stderr, "D3D8 VSH: Compile failed: %s\n", err[0] ? err : "unknown");
         fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End ---\n", hlsl_buf);
-        if (errors) ID3D10Blob_Release(errors);
         free(hlsl_buf);
         return NULL;
     }
-    if (errors) ID3D10Blob_Release(errors);
     free(hlsl_buf);
 
     /* Insert into cache */
     entry = cache_insert(hash);
     if (!entry) {
-        ID3D10Blob_Release(code);
+        rhi_shader_destroy(vs);
         return NULL;
     }
 
-    /* Create D3D11 vertex shader */
-    hr = ID3D11Device_CreateVertexShader(
-        d3d8_GetD3D11Device(),
-        ID3D10Blob_GetBufferPointer(code),
-        ID3D10Blob_GetBufferSize(code),
-        NULL, &entry->vs);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: CreateVertexShader failed: 0x%08lX\n", hr);
-        ID3D10Blob_Release(code);
-        entry->in_use = 0;
-        return NULL;
-    }
-
-    entry->vs_blob     = code;
+    entry->vs          = vs;
     entry->inputs_read = program.inputs_read;
     entry->uses_proj   = g_emit_uses_proj;
     entry->pos_input   = g_emit_pos_input;
@@ -1075,13 +1044,12 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
  * reads that the declaration does not feed takes its current value
  * (VSH_VertexData) in the shader; D3D11 still requires every shader input
  * bound, so the layout gives it the vertex's first byte, which is unused. */
-static ID3D11InputLayout *create_vsh_input_layout_decl(
-    uint16_t inputs_read, const NV2AVshSlot *vsh, ID3DBlob *vs_blob)
+static RhiVertexLayout *create_vsh_input_layout_decl(
+    uint16_t inputs_read, const NV2AVshSlot *vsh, const RhiShader *vs)
 {
-    D3D11_INPUT_ELEMENT_DESC elems[NV2A_VS_MAX_INPUTS];
-    ID3D11InputLayout *layout = NULL;
+    RhiVertexElement elems[NV2A_VS_MAX_INPUTS];
+    RhiVertexLayout *layout = NULL;
     UINT elem_count = 0;
-    HRESULT hr;
     int i, j;
 
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
@@ -1098,24 +1066,19 @@ static ID3D11InputLayout *create_vsh_input_layout_decl(
         if (!in)
             fprintf(stderr, "D3D8 VSH: a program reads v%d, which its declaration "
                     "does not feed; it reads the register's current value\n", i);
-        elems[elem_count].SemanticName         = "ATTR";
-        elems[elem_count].SemanticIndex        = (UINT)i;
-        elems[elem_count].Format               = in ? in->format : DXGI_FORMAT_R8_UNORM;
-        elems[elem_count].InputSlot            = 0;
-        elems[elem_count].AlignedByteOffset    = in ? in->offset : 0;
-        elems[elem_count].InputSlotClass       = D3D11_INPUT_PER_VERTEX_DATA;
-        elems[elem_count].InstanceDataStepRate = 0;
+        elems[elem_count].semantic       = "ATTR";
+        elems[elem_count].semantic_index = (UINT)i;
+        elems[elem_count].format         = in ? in->format : RHI_FORMAT_R8_UNORM;
+        elems[elem_count].slot           = 0;
+        elems[elem_count].offset         = in ? in->offset : 0;
         elem_count++;
     }
     if (elem_count == 0)
         return NULL;
 
-    hr = ID3D11Device_CreateInputLayout(
-        d3d8_GetD3D11Device(), elems, elem_count,
-        ID3D10Blob_GetBufferPointer(vs_blob), ID3D10Blob_GetBufferSize(vs_blob),
-        &layout);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: CreateInputLayout from declaration failed: 0x%08lX\n", hr);
+    layout = rhi_vertex_layout_create(elems, elem_count, vs);
+    if (!layout) {
+        fprintf(stderr, "D3D8 VSH: CreateInputLayout from declaration failed\n");
         return NULL;
     }
     return layout;
@@ -1125,7 +1088,7 @@ static ID3D11InputLayout *create_vsh_input_layout_decl(
  * Get the input layout for a cache entry.
  * Creates and caches the layout on first request per (input mask, texcoord sizes).
  */
-static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
+static RhiVertexLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
 {
     uint16_t mask = entry->inputs_read;
     uint32_t key = (uint32_t)mask | (((uint32_t)(fvf >> 16) & 0xFFFF) << 16);
@@ -1141,7 +1104,7 @@ static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
     if (entry->layout_count >= 16)
         return entry->layouts[0]; /* Fallback to first */
 
-    ID3D11InputLayout *layout = create_vsh_input_layout(mask, fvf, entry->vs_blob);
+    RhiVertexLayout *layout = create_vsh_input_layout(mask, fvf, entry->vs);
     entry->layouts[entry->layout_count]      = layout;
     entry->layout_masks[entry->layout_count] = key;
     entry->layout_count++;
@@ -1151,7 +1114,7 @@ static ID3D11InputLayout *get_cached_layout(VshCacheEntry *entry, DWORD fvf)
 
 /* The same per declaration. Kept apart from the mask-keyed layouts so a
  * declaration hash can never collide with an FVF key. */
-static ID3D11InputLayout *get_cached_layout_decl(VshCacheEntry *entry, const NV2AVshSlot *vsh)
+static RhiVertexLayout *get_cached_layout_decl(VshCacheEntry *entry, const NV2AVshSlot *vsh)
 {
     int i;
 
@@ -1163,7 +1126,7 @@ static ID3D11InputLayout *get_cached_layout_decl(VshCacheEntry *entry, const NV2
         return entry->decl_layouts[0];
 
     entry->decl_layouts[entry->decl_layout_count] =
-        create_vsh_input_layout_decl(entry->inputs_read, vsh, entry->vs_blob);
+        create_vsh_input_layout_decl(entry->inputs_read, vsh, entry->vs);
     entry->decl_keys[entry->decl_layout_count] = vsh->decl_hash;
     return entry->decl_layouts[entry->decl_layout_count++];
 }
@@ -1174,8 +1137,7 @@ static ID3D11InputLayout *get_cached_layout_decl(VshCacheEntry *entry, const NV2
 
 HRESULT d3d8_vsh_init(void)
 {
-    D3D11_BUFFER_DESC cbd;
-    HRESULT hr;
+    RhiBufferDesc cbd;
 
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
     memset(g_vsh_cache, 0, sizeof(g_vsh_cache));
@@ -1185,31 +1147,23 @@ HRESULT d3d8_vsh_init(void)
 
     /* Create the constant buffer for VS constants (192 * float4 = 3072 bytes) */
     memset(&cbd, 0, sizeof(cbd));
-    cbd.ByteWidth      = sizeof(NV2AVSConstants);
-    cbd.Usage           = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags       = D3D11_BIND_CONSTANT_BUFFER;
-    cbd.CPUAccessFlags  = D3D11_CPU_ACCESS_WRITE;
+    cbd.size       = sizeof(NV2AVSConstants);
+    cbd.usage      = RHI_USAGE_DYNAMIC;
+    cbd.bind       = RHI_BIND_UNIFORM;
+    cbd.cpu_access = RHI_CPU_WRITE;
 
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vsh_cb);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: Failed to create constant buffer: 0x%08lX\n", hr);
-        return hr;
+    g_vsh_cb = rhi_buffer_create(&cbd, NULL);
+    if (!g_vsh_cb) {
+        fprintf(stderr, "D3D8 VSH: Failed to create constant buffer\n");
+        return E_FAIL;
     }
 
     /* The screen-space undo starts disabled: every enable component is 0. */
     memset(&g_vsh_screen, 0, sizeof(g_vsh_screen));
-    cbd.ByteWidth = sizeof(VshScreenspace);
-    {
-        D3D11_SUBRESOURCE_DATA init;
-        init.pSysMem = &g_vsh_screen;
-        init.SysMemPitch = 0;
-        init.SysMemSlicePitch = 0;
-        hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, &init, &g_vsh_screen_cb);
-    }
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8 VSH: Failed to create screen-space buffer: 0x%08lX\n", hr);
-        g_vsh_screen_cb = NULL;
-    }
+    cbd.size = sizeof(VshScreenspace);
+    g_vsh_screen_cb = rhi_buffer_create(&cbd, &g_vsh_screen);
+    if (!g_vsh_screen_cb)
+        fprintf(stderr, "D3D8 VSH: Failed to create screen-space buffer\n");
     g_vsh_screen_dirty = FALSE;
 
     /* Current values start as the D3D defaults: diffuse white, everything
@@ -1220,14 +1174,13 @@ HRESULT d3d8_vsh_init(void)
     for (int k = 0; k < 3; k++)
         g_vsh_vdata.value[3][k] = 1.0f;
     g_vsh_vdata_fed = 0;
-    cbd.ByteWidth = sizeof(VshVertexData);
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_vsh_vdata_cb);
-    if (FAILED(hr)) {
+    cbd.size = sizeof(VshVertexData);
+    g_vsh_vdata_cb = rhi_buffer_create(&cbd, NULL);
+    if (!g_vsh_vdata_cb) {
         /* Without it every program would read every input as zero, so
          * prepare_draw refuses programs instead. */
-        fprintf(stderr, "D3D8 VSH: Failed to create vertex data buffer: 0x%08lX\n", hr);
-        g_vsh_vdata_cb = NULL;
-        return hr;
+        fprintf(stderr, "D3D8 VSH: Failed to create vertex data buffer\n");
+        return E_FAIL;
     }
     g_vsh_vdata_dirty = TRUE;
 
@@ -1243,31 +1196,17 @@ void d3d8_vsh_shutdown(void)
     for (i = 0; i < NV2A_VS_CACHE_SIZE; i++) {
         VshCacheEntry *e = &g_vsh_cache[i];
         if (!e->in_use) continue;
-        if (e->vs)      ID3D11VertexShader_Release(e->vs);
-        if (e->vs_blob) ID3D10Blob_Release(e->vs_blob);
-        for (j = 0; j < e->layout_count; j++) {
-            if (e->layouts[j])
-                ID3D11InputLayout_Release(e->layouts[j]);
-        }
-        for (j = 0; j < e->decl_layout_count; j++) {
-            if (e->decl_layouts[j])
-                ID3D11InputLayout_Release(e->decl_layouts[j]);
-        }
+        rhi_shader_destroy(e->vs);
+        for (j = 0; j < e->layout_count; j++)
+            rhi_vertex_layout_destroy(e->layouts[j]);
+        for (j = 0; j < e->decl_layout_count; j++)
+            rhi_vertex_layout_destroy(e->decl_layouts[j]);
     }
     memset(g_vsh_cache, 0, sizeof(g_vsh_cache));
 
-    if (g_vsh_cb) {
-        ID3D11Buffer_Release(g_vsh_cb);
-        g_vsh_cb = NULL;
-    }
-    if (g_vsh_screen_cb) {
-        ID3D11Buffer_Release(g_vsh_screen_cb);
-        g_vsh_screen_cb = NULL;
-    }
-    if (g_vsh_vdata_cb) {
-        ID3D11Buffer_Release(g_vsh_vdata_cb);
-        g_vsh_vdata_cb = NULL;
-    }
+    rhi_buffer_destroy(g_vsh_cb);        g_vsh_cb = NULL;
+    rhi_buffer_destroy(g_vsh_screen_cb); g_vsh_screen_cb = NULL;
+    rhi_buffer_destroy(g_vsh_vdata_cb);  g_vsh_vdata_cb = NULL;
 
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
     g_vsh_slot_count = 0;
@@ -1544,21 +1483,18 @@ BOOL d3d8_vsh_is_programmable(DWORD handle)
 
 BOOL d3d8_vsh_prepare_draw(DWORD handle)
 {
-    ID3D11DeviceContext *ctx;
     int slot;
     NV2AVshSlot *vsh;
     uint32_t hash;
     VshCacheEntry *entry;
-    ID3D11InputLayout *layout;
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr;
+    RhiVertexLayout *layout;
+    void *mapped;
     uint16_t fed;
 
     if (!d3d8_vsh_is_programmable(handle) || !g_vsh_cb || !g_vsh_vdata_cb)
         return FALSE;
 
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx) return FALSE;
+    if (!rhi_device_ready()) return FALSE;
 
     /* Resolve handle to shader slot */
     slot = (int)(handle - 0x10000);
@@ -1582,7 +1518,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     }
 
     /* Bind the vertex shader */
-    ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
+    rhi_set_shader(RHI_STAGE_VERTEX, entry->vs);
     g_bound_uses_proj = entry->uses_proj;
     g_bound_pos_input = entry->pos_input;
     g_bound_decl = vsh->decl_count ? vsh->decl : NULL;
@@ -1595,7 +1531,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
          * this vertex at another program's offsets, where no layout draws
          * nothing. */
         layout = get_cached_layout_decl(entry, vsh);
-        ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+        rhi_set_vertex_layout(layout);
         fed = 0;
         for (int j = 0; j < vsh->decl_count; j++)
             if (vsh->decl[j].reg >= 0 && vsh->decl[j].reg < NV2A_VS_MAX_INPUTS)
@@ -1605,7 +1541,7 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
          * vertex, so all count as fed, as before current values existed. */
         layout = get_cached_layout(entry, d3d8_GetCurrentFVF());
         if (layout)
-            ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+            rhi_set_vertex_layout(layout);
         fed = 0xFFFF;
     }
     if (fed != g_vsh_vdata_fed) {
@@ -1617,44 +1553,41 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
 
     /* Update constant buffer if dirty */
     if (g_vsh_constants_dirty) {
-        hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_cb,
-                                     0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr)) {
-            memcpy(mapped.pData, &g_vsh_constants, sizeof(g_vsh_constants));
-            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_cb, 0);
+        mapped = rhi_buffer_map(g_vsh_cb, RHI_MAP_WRITE_DISCARD);
+        if (mapped) {
+            memcpy(mapped, &g_vsh_constants, sizeof(g_vsh_constants));
+            rhi_buffer_unmap(g_vsh_cb);
         }
         g_vsh_constants_dirty = FALSE;
     }
 
     /* Bind constant buffer to slot b1 */
-    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 1, 1, &g_vsh_cb);
+    rhi_set_uniform_buffers(RHI_STAGE_VERTEX, 1, 1, &g_vsh_cb);
 
     /* And the screen-space undo to b2 */
     if (g_vsh_screen_cb) {
         if (g_vsh_screen_dirty) {
-            hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_screen_cb,
-                                         0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-            if (SUCCEEDED(hr)) {
-                memcpy(mapped.pData, &g_vsh_screen, sizeof(g_vsh_screen));
-                ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_screen_cb, 0);
+            mapped = rhi_buffer_map(g_vsh_screen_cb, RHI_MAP_WRITE_DISCARD);
+            if (mapped) {
+                memcpy(mapped, &g_vsh_screen, sizeof(g_vsh_screen));
+                rhi_buffer_unmap(g_vsh_screen_cb);
                 g_vsh_screen_dirty = FALSE;
             }
         }
-        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 2, 1, &g_vsh_screen_cb);
+        rhi_set_uniform_buffers(RHI_STAGE_VERTEX, 2, 1, &g_vsh_screen_cb);
     }
 
     /* And the current input values to b3 */
     if (g_vsh_vdata_cb) {
         if (g_vsh_vdata_dirty) {
-            hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_vdata_cb,
-                                         0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-            if (SUCCEEDED(hr)) {
-                memcpy(mapped.pData, &g_vsh_vdata, sizeof(g_vsh_vdata));
-                ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_vdata_cb, 0);
+            mapped = rhi_buffer_map(g_vsh_vdata_cb, RHI_MAP_WRITE_DISCARD);
+            if (mapped) {
+                memcpy(mapped, &g_vsh_vdata, sizeof(g_vsh_vdata));
+                rhi_buffer_unmap(g_vsh_vdata_cb);
                 g_vsh_vdata_dirty = FALSE;
             }
         }
-        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 3, 1, &g_vsh_vdata_cb);
+        rhi_set_uniform_buffers(RHI_STAGE_VERTEX, 3, 1, &g_vsh_vdata_cb);
     }
 
     return TRUE;
