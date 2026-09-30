@@ -15,6 +15,7 @@
 #include "kernel.h"
 #include "xbox_watchpoint.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -282,6 +283,21 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
     }
 
+    /* RECOMP_SAVE_DIR moves T:, U:, Z: and the partition images out of the
+     * per-user default. The default is shared by every title and by the
+     * player's own games, so a scripted or test run that does not set this
+     * reads and writes the player's real saves -- which is what happened on
+     * 30 Sep 2026, and what also made those runs depend on each other. A
+     * caller that passes a save_dir of its own still wins. */
+    const char *save_source = save_dir ? "caller" : "default";
+    if (!save_dir) {
+        const char *env = getenv("RECOMP_SAVE_DIR");
+        if (env && env[0]) {
+            save_dir = env;
+            save_source = "RECOMP_SAVE_DIR";
+        }
+    }
+
     if (save_dir) {
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {
@@ -360,6 +376,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
+    fprintf(stderr, "[PATH] saves in %ls (%s)\n", s_save_dir, save_source);
+    fflush(stderr);
 }
 
 /* The host path the last translation produced.
@@ -519,6 +537,21 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         snprintf(s_game_dir, sizeof(s_game_dir), "%s/game", cwd);
     }
 
+    /* RECOMP_SAVE_DIR moves T:, U:, Z: and the partition images out of the
+     * per-user default. The default is shared by every title and by the
+     * player's own games, so a scripted or test run that does not set this
+     * reads and writes the player's real saves -- which is what happened on
+     * 30 Sep 2026, and what also made those runs depend on each other. A
+     * caller that passes a save_dir of its own still wins. */
+    const char *save_source = save_dir ? "caller" : "default";
+    if (!save_dir) {
+        const char *env = getenv("RECOMP_SAVE_DIR");
+        if (env && env[0]) {
+            save_dir = env;
+            save_source = "RECOMP_SAVE_DIR";
+        }
+    }
+
     if (save_dir) {
         snprintf(s_save_dir, sizeof(s_save_dir), "%s", save_dir);
     } else {
@@ -539,6 +572,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
+    fprintf(stderr, "[PATH] saves in %s (%s)\n", s_save_dir, save_source);
+    fflush(stderr);
 }
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
