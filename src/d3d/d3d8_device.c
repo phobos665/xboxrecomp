@@ -68,6 +68,8 @@ typedef struct D3D8DeviceState {
     ID3D11RenderTargetView   *present_rtv;    /* the back buffer; NULL unscaled */
     RhiView                  *rhi_scene_srv;  /* the same two, as rhi.h views */
     RhiView                  *rhi_present_rtv;
+    RhiImage                 *rhi_scene_image;
+    RhiView                  *rhi_default_rtv;
     D3DFORMAT               backbuffer_format;
 
     /* State tracking */
@@ -203,6 +205,9 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.present_width; }
 
 ID3D11ShaderResourceView *d3d8_GetSceneSRV(void) { return g_device_state.scene_srv; }
+RhiImage *d3d8_GetSceneImage(void)      { return g_device_state.rhi_scene_image; }
+RhiView  *d3d8_GetSceneView(void)       { return g_device_state.rhi_scene_srv; }
+RhiView  *d3d8_GetDefaultTargetView(void) { return g_device_state.rhi_default_rtv; }
 ID3D11Texture2D *d3d8_GetSceneTexture(void) { return g_device_state.scene_texture; }
 /* The render target drawing goes to right now: a title's own surface, or the
  * scene target when none is set. For the screen copy's probe. */
@@ -515,6 +520,8 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
         if (SUCCEEDED(hr)) {
             state->rhi_scene_srv = rhi_d3d11_wrap_view(state->scene_srv, RHI_VIEW_SAMPLED);
             state->rhi_present_rtv = rhi_d3d11_wrap_view(state->present_rtv, RHI_VIEW_RENDER_TARGET);
+            state->rhi_scene_image = rhi_d3d11_wrap_image(state->scene_texture);
+            state->rhi_default_rtv = rhi_d3d11_wrap_view(state->default_rtv, RHI_VIEW_RENDER_TARGET);
         }
         if (FAILED(hr))
             fprintf(stderr, "D3D8 display: the %ux%u scene target could not be "
@@ -656,6 +663,8 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
         rhi_view_destroy(s->rhi_scene_srv); s->rhi_scene_srv = NULL;
         rhi_view_destroy(s->rhi_present_rtv); s->rhi_present_rtv = NULL;
+        rhi_view_destroy(s->rhi_default_rtv); s->rhi_default_rtv = NULL;
+        rhi_image_destroy(s->rhi_scene_image); s->rhi_scene_image = NULL;
         if (s->scene_srv) { ID3D11ShaderResourceView_Release(s->scene_srv); s->scene_srv = NULL; }
         if (s->scene_texture) { ID3D11Texture2D_Release(s->scene_texture); s->scene_texture = NULL; }
         if (s->present_rtv) { ID3D11RenderTargetView_Release(s->present_rtv); s->present_rtv = NULL; }

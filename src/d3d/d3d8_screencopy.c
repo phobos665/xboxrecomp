@@ -23,20 +23,20 @@
 #include "d3d8_internal.h"
 #include "d3d8_xbox.h"
 
-#include <d3dcompiler.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static struct {
-    int                       tried, failed;
-    ID3D11ShaderResourceView *back_srv;      /* the swap chain's back buffer */
-    ID3D11VertexShader       *vs;
-    ID3D11PixelShader        *ps;
-    ID3D11Buffer             *cb;
-    ID3D11BlendState         *blend;
-    ID3D11DepthStencilState  *depth;
-    ID3D11RasterizerState    *raster;
-    unsigned long             copies;
+    int             tried, failed;
+    RhiView        *back_srv;       /* the scene, which the device owns */
+    RhiShader      *vs;
+    RhiShader      *ps;
+    RhiBuffer      *cb;
+    RhiBlendState  *blend;
+    RhiDepthState  *depth;
+    RhiRasterState *raster;
+    unsigned long   copies;
 } g;
 
 /* Source pixel = destination pixel * scale. One when the sizes agree, which
@@ -58,230 +58,204 @@ static const char kSource[] =
     "    return screen.Load(int3(p, 0));\n"
     "}\n";
 
-static void fail(const char *what, HRESULT hr)
+static void fail(const char *what)
 {
     g.failed = 1;
-    fprintf(stderr, "D3D8 screen copy: %s failed (0x%08lX); a title that reads its "
-            "own screen back will see black\n", what, (unsigned long)hr);
+    fprintf(stderr, "D3D8 screen copy: %s failed; a title that reads its "
+            "own screen back will see black\n", what);
     fflush(stderr);
+}
+
+static RhiShader *compile_one(uint32_t stage, const char *entry, const char *target)
+{
+    RhiShaderSource src;
+    RhiShader *s;
+    char err[2048];
+
+    memset(&src, 0, sizeof src);
+    src.hlsl = kSource;
+    src.len = sizeof kSource - 1;
+    src.name = "screencopy";
+    src.entry = entry;
+    src.target = target;
+    s = rhi_shader_create(stage, &src, err, sizeof err);
+    if (!s) {
+        if (err[0])
+            fprintf(stderr, "D3D8 screen copy: %s\n", err);
+        fail(stage == RHI_STAGE_VERTEX ? "the vertex shader" : "the pixel shader");
+    }
+    return s;
 }
 
 static int create(void)
 {
-    ID3D11Device *dev = d3d8_GetD3D11Device();
-    IDXGISwapChain *swap = d3d8_GetSwapChain();
-    ID3D11Texture2D *back = NULL;
-    D3D11_BUFFER_DESC bd;
-    D3D11_BLEND_DESC bl;
-    D3D11_DEPTH_STENCIL_DESC ds;
-    D3D11_RASTERIZER_DESC rd;
-    ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr;
+    RhiBufferDesc bd;
+    RhiBlendDesc bl;
+    RhiDepthDesc ds;
+    RhiRasterDesc rd;
 
     if (g.failed) return 0;
     if (g.tried) return g.back_srv != NULL;
     g.tried = 1;
-    if (!dev || !swap) { g.failed = 1; return 0; }
+    if (!d3d8_GetD3D11Device() || !d3d8_GetSwapChain()) { g.failed = 1; return 0; }
 
     /* The scene the title has been drawing into, which is the swap chain's
      * own back buffer only while nothing is scaled. Reading the back
      * buffer directly would be wrong above scale 1: the resolve that fills
      * it has not run yet this frame, so it still holds the last one. */
-    g.back_srv = d3d8_GetSceneSRV();
-    if (!g.back_srv) { fail("GetSceneSRV", E_FAIL); return 0; }
-    ID3D11ShaderResourceView_AddRef(g.back_srv);
-    (void)back;
+    g.back_srv = d3d8_GetSceneView();
+    if (!g.back_srv) { fail("GetSceneView"); return 0; }
 
-    hr = d3d8_compile_hlsl(kSource, sizeof kSource - 1, "screencopy", NULL,
-                           "vs_main", "vs_4_0", 0, &code, &err);
-    if (FAILED(hr)) {
-        if (err) { fprintf(stderr, "D3D8 screen copy: %s\n",
-                           (const char *)ID3D10Blob_GetBufferPointer(err));
-                   ID3D10Blob_Release(err); }
-        fail("D3DCompile(vs)", hr);
-        return 0;
-    }
-    hr = ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(code),
-                                         ID3D10Blob_GetBufferSize(code), NULL, &g.vs);
-    ID3D10Blob_Release(code);
-    code = NULL;
-    if (FAILED(hr)) { fail("CreateVertexShader", hr); return 0; }
-
-    hr = d3d8_compile_hlsl(kSource, sizeof kSource - 1, "screencopy", NULL,
-                           "ps_main", "ps_4_0", 0, &code, &err);
-    if (FAILED(hr)) {
-        if (err) { fprintf(stderr, "D3D8 screen copy: %s\n",
-                           (const char *)ID3D10Blob_GetBufferPointer(err));
-                   ID3D10Blob_Release(err); }
-        fail("D3DCompile(ps)", hr);
-        return 0;
-    }
-    hr = ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code),
-                                        ID3D10Blob_GetBufferSize(code), NULL, &g.ps);
-    ID3D10Blob_Release(code);
-    if (err) ID3D10Blob_Release(err);
-    if (FAILED(hr)) { fail("CreatePixelShader", hr); return 0; }
+    if (!(g.vs = compile_one(RHI_STAGE_VERTEX, "vs_main", "vs_4_0"))) return 0;
+    if (!(g.ps = compile_one(RHI_STAGE_PIXEL, "ps_main", "ps_4_0"))) return 0;
 
     memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = sizeof(ScreenCopyConstants);
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    hr = ID3D11Device_CreateBuffer(dev, &bd, NULL, &g.cb);
-    if (FAILED(hr)) { fail("CreateBuffer", hr); return 0; }
+    bd.size = sizeof(ScreenCopyConstants);
+    bd.usage = RHI_USAGE_DYNAMIC;
+    bd.bind = RHI_BIND_UNIFORM;
+    bd.cpu_access = RHI_CPU_WRITE;
+    if (!(g.cb = rhi_buffer_create(&bd, NULL))) { fail("CreateBuffer"); return 0; }
 
     memset(&bl, 0, sizeof bl);
-    bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    hr = ID3D11Device_CreateBlendState(dev, &bl, &g.blend);
-    if (FAILED(hr)) { fail("CreateBlendState", hr); return 0; }
+    bl.write_mask = RHI_WRITE_ALL;
+    if (!(g.blend = rhi_blend_state_create(&bl))) { fail("CreateBlendState"); return 0; }
 
     memset(&ds, 0, sizeof ds);
-    hr = ID3D11Device_CreateDepthStencilState(dev, &ds, &g.depth);
-    if (FAILED(hr)) { fail("CreateDepthStencilState", hr); return 0; }
+    if (!(g.depth = rhi_depth_state_create(&ds))) { fail("CreateDepthStencilState"); return 0; }
 
     memset(&rd, 0, sizeof rd);
-    rd.FillMode = D3D11_FILL_SOLID;
-    rd.CullMode = D3D11_CULL_NONE;
-    rd.DepthClipEnable = TRUE;
-    hr = ID3D11Device_CreateRasterizerState(dev, &rd, &g.raster);
-    if (FAILED(hr)) { fail("CreateRasterizerState", hr); return 0; }
+    rd.fill = RHI_FILL_SOLID;
+    rd.cull = RHI_CULL_NONE;
+    rd.depth_clip = 1;
+    if (!(g.raster = rhi_raster_state_create(&rd))) { fail("CreateRasterizerState"); return 0; }
     return 1;
+}
+
+/* RECOMP_D3D8_SCREENCOPY_PROBE=n: what the source holds at the moment of the
+ * first n copies, and whether drawing was going to the scene target at all.
+ * The texture layer's own probe reads the destination; when that says "not
+ * arriving" this says which side is empty. It reads the scene through
+ * rhi_image_readback, so it reports the same under either backend. */
+static void probe_source(const RhiOutputState *saved, const D3D8Texture *tex,
+                         UINT back_w, UINT back_h)
+{
+    static int probe = -1;
+    static unsigned long said;
+    RhiImage *scene;
+    RhiImageDesc sd;
+    unsigned long long sum = 0;
+    unsigned nonzero = 0, samples = 0;
+    uint8_t *pixels;
+
+    if (probe < 0) {
+        const char *v = getenv("RECOMP_D3D8_SCREENCOPY_PROBE");
+        probe = (v && atoi(v) > 0) ? atoi(v) : 0;   /* how many copies to report */
+    }
+    if (!probe || said++ >= (unsigned long)probe)
+        return;
+
+    memset(&sd, 0, sizeof sd);
+    scene = d3d8_GetSceneImage();
+    if (scene) {
+        rhi_image_get_desc(scene, &sd);
+        pixels = malloc((size_t)sd.width * sd.height * 4u);
+        if (pixels && rhi_image_readback(scene, 0, pixels, sd.width * 4u) == 0) {
+            UINT x, y;
+            for (y = 0; y < sd.height; y += 16) {
+                const uint8_t *row = pixels + (size_t)y * sd.width * 4u;
+                for (x = 0; x < sd.width; x += 16) {
+                    const uint8_t *p = row + (size_t)x * 4u;
+                    sum += (unsigned)p[0] + p[1] + p[2];
+                    samples += 3;
+                    if (p[0] || p[1] || p[2]) nonzero++;
+                }
+            }
+        }
+        free(pixels);
+    }
+    fprintf(stderr, "D3D8 screen copy probe: scene %ux%u holds mean %.1f/255, %u of %u "
+            "non-zero; current target %s the scene; dst %ux%u scale %g x %g\n",
+            sd.width, sd.height,
+            samples ? (double)sum / samples : 0.0, nonzero, samples / 3u,
+            rhi_output_color_is(saved, d3d8_GetDefaultTargetView()) ? "is" : "is NOT",
+            tex->width, tex->height,
+            tex->width ? (double)back_w / tex->width : 0.0,
+            tex->height ? (double)back_h / tex->height : 0.0);
+    fflush(stderr);
 }
 
 HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 {
-    ID3D11Device *dev = d3d8_GetD3D11Device();
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     D3D8Texture *tex = (D3D8Texture *)dst;
-    ID3D11RenderTargetView *rtv = NULL, *saved_rtv = NULL;
-    ID3D11DepthStencilView *saved_dsv = NULL;
-    D3D11_VIEWPORT saved_vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-    UINT saved_vps = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-    D3D11_RENDER_TARGET_VIEW_DESC rtvd;
-    D3D11_MAPPED_SUBRESOURCE mapped;
+    RhiImage *dst_image;
+    RhiView *rtv;
+    RhiViewDesc rtvd;
+    RhiOutputState saved;
     ScreenCopyConstants c;
-    D3D11_VIEWPORT vp;
+    RhiViewport vp;
     float blend_factor[4] = { 1, 1, 1, 1 };
     UINT back_w = d3d8_GetBackBufferWidth(), back_h = d3d8_GetBackBufferHeight();
-    HRESULT hr;
+    void *mapped;
 
-    if (!dev || !ctx || !tex || !tex->d3d11_texture || !back_w || !back_h)
+    if (!d3d8_GetD3D11Device() || !tex || !tex->d3d11_texture || !back_w || !back_h)
         return E_INVALIDARG;
     if (!create())
         return E_FAIL;
 
+    /* The destination texture is a native D3D11 object until the resource
+     * layer moves behind rhi.h; wrap it for the length of the copy. */
+    dst_image = rhi_d3d11_wrap_image(tex->d3d11_texture);
     memset(&rtvd, 0, sizeof rtvd);
-    rtvd.Format = tex->dxgi_format;
-    rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-    hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tex->d3d11_texture,
-                                             &rtvd, &rtv);
-    if (FAILED(hr)) {
+    rtvd.format = tex->dxgi_format;
+    rtvd.dim = RHI_VIEW_DIM_2D;
+    rtv = dst_image ? rhi_view_create(dst_image, RHI_VIEW_RENDER_TARGET, &rtvd) : NULL;
+    if (!rtv) {
         static int said;
         if (!said++)
             fprintf(stderr, "D3D8 screen copy: the destination texture is not a render "
-                    "target (0x%08lX); nothing copied\n", (unsigned long)hr);
-        return hr;
+                    "target; nothing copied\n");
+        rhi_image_destroy(dst_image);
+        return E_FAIL;
     }
 
-    ID3D11DeviceContext_OMGetRenderTargets(ctx, 1, &saved_rtv, &saved_dsv);
-    ID3D11DeviceContext_RSGetViewports(ctx, &saved_vps, saved_vp);
-    /* RECOMP_D3D8_SCREENCOPY_PROBE=1: what the source holds at the moment of
-     * the copy, read back through a staging texture, and whether drawing was
-     * going to the scene target at all. The texture layer's own probe reads
-     * the destination; when that says "not arriving" this says which side
-     * is empty. */
-    {
-        static int probe = -1;
-        static unsigned long said;
-        if (probe < 0) {
-            const char *v = getenv("RECOMP_D3D8_SCREENCOPY_PROBE");
-            probe = (v && atoi(v) > 0) ? atoi(v) : 0;   /* how many copies to report */
-        }
-        if (probe && said++ < (unsigned long)probe) {
-            ID3D11Texture2D *scene = d3d8_GetSceneTexture();
-            ID3D11Texture2D *staging = NULL;
-            D3D11_TEXTURE2D_DESC sd;
-            D3D11_MAPPED_SUBRESOURCE m;
-            unsigned long long sum = 0;
-            unsigned nonzero = 0, samples = 0;
+    rhi_output_save(&saved);
+    probe_source(&saved, tex, back_w, back_h);
 
-            if (scene) {
-                ID3D11Texture2D_GetDesc(scene, &sd);
-                sd.Usage = D3D11_USAGE_STAGING;
-                sd.BindFlags = 0;
-                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                sd.MiscFlags = 0;
-                if (SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &staging))) {
-                    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging,
-                                                     (ID3D11Resource *)scene);
-                    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0,
-                                                          D3D11_MAP_READ, 0, &m))) {
-                        UINT x, y;
-                        for (y = 0; y < sd.Height; y += 16) {
-                            const uint8_t *row = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
-                            for (x = 0; x < sd.Width; x += 16) {
-                                const uint8_t *p = row + (size_t)x * 4u;
-                                sum += (unsigned)p[0] + p[1] + p[2];
-                                samples += 3;
-                                if (p[0] || p[1] || p[2]) nonzero++;
-                            }
-                        }
-                        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
-                    }
-                    ID3D11Texture2D_Release(staging);
-                }
-            }
-            fprintf(stderr, "D3D8 screen copy probe: scene %ux%u holds mean %.1f/255, %u of %u "
-                    "non-zero; current target %s the scene; dst %ux%u scale %g x %g\n",
-                    scene ? sd.Width : 0, scene ? sd.Height : 0,
-                    samples ? (double)sum / samples : 0.0, nonzero, samples / 3u,
-                    saved_rtv == d3d8_GetDefaultRTV() ? "is" : "is NOT",
-                    tex->width, tex->height,
-                    tex->width ? (double)back_w / tex->width : 0.0,
-                    tex->height ? (double)back_h / tex->height : 0.0);
-            fflush(stderr);
-        }
-    }
-
-    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g.cb, 0,
-                                          D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+    if ((mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)) != NULL) {
         c.scale_x = tex->width ? (float)back_w / (float)tex->width : 1.0f;
         c.scale_y = tex->height ? (float)back_h / (float)tex->height : 1.0f;
         c.pad0 = c.pad1 = 0.0f;
-        memcpy(mapped.pData, &c, sizeof c);
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g.cb, 0);
+        memcpy(mapped, &c, sizeof c);
+        rhi_buffer_unmap(g.cb);
     }
 
-    vp.TopLeftX = vp.TopLeftY = 0.0f;
-    vp.Width = (float)tex->width;
-    vp.Height = (float)tex->height;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
-    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
-    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
-    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(ctx, g.vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(ctx, g.ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 7, 1, &g.cb);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &g.back_srv);
-    ID3D11DeviceContext_OMSetBlendState(ctx, g.blend, blend_factor, 0xFFFFFFFF);
-    ID3D11DeviceContext_OMSetDepthStencilState(ctx, g.depth, 0);
-    ID3D11DeviceContext_RSSetState(ctx, g.raster);
-    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    vp.x = vp.y = 0.0f;
+    vp.width = (float)tex->width;
+    vp.height = (float)tex->height;
+    vp.min_depth = 0.0f;
+    vp.max_depth = 1.0f;
+    rhi_set_render_target(rtv, NULL);
+    rhi_set_viewports(1, &vp);
+    rhi_set_vertex_layout(NULL);
+    rhi_set_topology(RHI_TOPOLOGY_TRIANGLES);
+    rhi_set_shader(RHI_STAGE_VERTEX, g.vs);
+    rhi_set_shader(RHI_STAGE_PIXEL, g.ps);
+    rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g.cb);
+    rhi_set_textures(9, 1, &g.back_srv);
+    rhi_set_blend_state(g.blend, blend_factor, 0xFFFFFFFF);
+    rhi_set_depth_state(g.depth, 0);
+    rhi_set_raster_state(g.raster);
+    rhi_draw(3, 0);
 
     /* The back buffer must not stay bound as a shader input while it is the
      * render target again. */
     {
-        ID3D11ShaderResourceView *none = NULL;
-        ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &none);
+        RhiView *none = NULL;
+        rhi_set_textures(9, 1, &none);
     }
-    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &saved_rtv, saved_dsv);
-    if (saved_vps)
-        ID3D11DeviceContext_RSSetViewports(ctx, saved_vps, saved_vp);
-    if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
-    if (saved_dsv) ID3D11DepthStencilView_Release(saved_dsv);
-    ID3D11RenderTargetView_Release(rtv);
+    rhi_output_restore(&saved);
+    rhi_view_destroy(rtv);
+    rhi_image_destroy(dst_image);
     g.copies++;
     return S_OK;
 }
@@ -290,12 +264,12 @@ unsigned long xbox_D3D8ScreenCopyCount(void) { return g.copies; }
 
 void xbox_D3D8ScreenCopyShutdown(void)
 {
-    if (g.back_srv) { ID3D11ShaderResourceView_Release(g.back_srv); g.back_srv = NULL; }
-    if (g.vs)       { ID3D11VertexShader_Release(g.vs);             g.vs = NULL; }
-    if (g.ps)       { ID3D11PixelShader_Release(g.ps);              g.ps = NULL; }
-    if (g.cb)       { ID3D11Buffer_Release(g.cb);                   g.cb = NULL; }
-    if (g.blend)    { ID3D11BlendState_Release(g.blend);            g.blend = NULL; }
-    if (g.depth)    { ID3D11DepthStencilState_Release(g.depth);     g.depth = NULL; }
-    if (g.raster)   { ID3D11RasterizerState_Release(g.raster);      g.raster = NULL; }
+    g.back_srv = NULL;
+    rhi_shader_destroy(g.vs);            g.vs = NULL;
+    rhi_shader_destroy(g.ps);            g.ps = NULL;
+    rhi_buffer_destroy(g.cb);            g.cb = NULL;
+    rhi_blend_state_destroy(g.blend);    g.blend = NULL;
+    rhi_depth_state_destroy(g.depth);    g.depth = NULL;
+    rhi_raster_state_destroy(g.raster);  g.raster = NULL;
     g.tried = 0;
 }

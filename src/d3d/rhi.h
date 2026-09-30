@@ -352,6 +352,9 @@ void rhi_sampler_destroy(RhiSampler *s);
 void rhi_set_render_target(RhiView *color, RhiView *depth);
 void rhi_output_save(RhiOutputState *s);
 void rhi_output_restore(RhiOutputState *s);   /* also releases what save held */
+/* Whether the colour target a save recorded is this view: how a pass asks
+ * "was drawing going to the scene?" without knowing the backend. */
+int  rhi_output_color_is(const RhiOutputState *s, const RhiView *v);
 void rhi_set_viewports(uint32_t count, const RhiViewport *vps);
 void rhi_set_scissor(const RhiRect *rect);
 void rhi_set_topology(uint32_t topology);
@@ -381,6 +384,7 @@ void *rhi_d3d11_native_buffer(const RhiBuffer *b);
 void *rhi_d3d11_native_image(const RhiImage *img);
 void *rhi_d3d11_native_view(const RhiView *v);
 RhiView *rhi_d3d11_wrap_view(void *id3d11_view, uint32_t kind);  /* AddRefs it */
+RhiImage *rhi_d3d11_wrap_image(void *id3d11_resource);           /* AddRefs it */
 
 #ifdef __cplusplus
 }
