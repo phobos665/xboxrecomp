@@ -1,7 +1,8 @@
 """Replay every capture through two renderers and compare the images.
 
     py -3 scripts/replay_ab.py --a <replay.exe> --b <replay.exe>
-    py -3 scripts/replay_ab.py --a <replay.exe> --b-env RECOMP_D3D8_BACKEND=vulkan
+    py -3 scripts/replay_ab.py --a <replay.exe> --b-arg=--backend --b-arg=vulkan
+    py -3 scripts/replay_ab.py --a <replay.exe> --b-env RECOMP_D3D8_BACKEND=vulkan --arg=--present
 
 This is the acceptance test the Vulkan work runs on
 (docs/technical/vulkan-backend.md, section 5): a capture is deterministic, so
@@ -20,6 +21,13 @@ backend which is merely rounding differently can be told from one that drew
 the wrong thing. --diff-dir writes an amplified difference image for each.
 Exit status is 0 only when every image is identical, or, with --tolerance,
 when every image is within it.
+
+--arg (both sides), --a-arg and --b-arg pass arguments on to d3d8_replay; give
+each as --arg=--present, since argparse takes a bare leading "--" for one of
+its own options. --present compares the frame as it reaches the swap chain as
+well as the scene, which is the only way the display resolve is covered. An
+older replay build that does not know an argument fails every capture, so pass
+it to both sides only when both builds have it.
 """
 import argparse
 import glob
@@ -101,10 +109,10 @@ def write_diff(pa, pb, out):
     Path(out).write_bytes(hdr + info + bytes(body))
 
 
-def replay(exe, env_over, capture, prefix):
+def replay(exe, env_over, extra, capture, prefix):
     env = dict(os.environ)
     env.update(env_over)
-    r = subprocess.run([exe, capture, "--out", prefix, "--quiet"], env=env,
+    r = subprocess.run([exe, capture, "--out", prefix, "--quiet"] + extra, env=env,
                        capture_output=True, text=True, errors="replace", timeout=180)
     out = sorted(glob.glob(prefix + "*.bmp"))
     return r.returncode, out, (r.stderr or r.stdout).strip().splitlines()[-1:]
@@ -125,6 +133,10 @@ def main():
     ap.add_argument("--b", help="side B replay executable (default: side A's)")
     ap.add_argument("--a-env", action="append", metavar="KEY=VALUE")
     ap.add_argument("--b-env", action="append", metavar="KEY=VALUE")
+    ap.add_argument("--arg", action="append", default=[], metavar="ARG",
+                    help="pass ARG to both sides' d3d8_replay (write it as --arg=--present)")
+    ap.add_argument("--a-arg", action="append", default=[], metavar="ARG")
+    ap.add_argument("--b-arg", action="append", default=[], metavar="ARG")
     ap.add_argument("--captures", nargs="*", help="capture files (default: games/_pipeline/**)")
     ap.add_argument("--diff-dir", help="write amplified difference images here")
     ap.add_argument("--tolerance", type=float, default=None,
@@ -156,8 +168,10 @@ def main():
     rows = []
     for i, cap in enumerate(caps):
         tag = f"{i:03d}_" + Path(cap).stem
-        rc_a, imgs_a, tail_a = replay(exe_a, env_a, cap, str(work / ("a_" + tag)))
-        rc_b, imgs_b, tail_b = replay(exe_b, env_b, cap, str(work / ("b_" + tag)))
+        rc_a, imgs_a, tail_a = replay(exe_a, env_a, args.arg + args.a_arg, cap,
+                                      str(work / ("a_" + tag)))
+        rc_b, imgs_b, tail_b = replay(exe_b, env_b, args.arg + args.b_arg, cap,
+                                      str(work / ("b_" + tag)))
         rel = os.path.relpath(cap, ROOT)
         if rc_a or rc_b or not imgs_a or len(imgs_a) != len(imgs_b):
             failed += 1

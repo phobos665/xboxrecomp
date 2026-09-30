@@ -1160,6 +1160,12 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  * 0 presents without waiting, for a device that is not the title's display.
  */
 void xbox_D3D8SetPresentInterval(UINT interval);
+/* Keep a copy of every frame as it is about to be presented -- after the
+ * display resolve, in the swap chain -- as RGBA8, for a tool that checks
+ * what reaches the screen rather than the scene (d3d8_replay --present).
+ * Presented returns the last copy and its size, or NULL. */
+void           xbox_D3D8KeepPresented(BOOL on);
+const uint8_t *xbox_D3D8Presented(UINT *width, UINT *height);
 /* The size the guest presents at, for its screen-space geometry; the HLE
  * sets it from the title's present parameters (d3d8_GetGuestWidth). */
 void xbox_D3D8SetGuestSize(UINT width, UINT height);

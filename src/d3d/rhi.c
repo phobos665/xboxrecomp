@@ -54,6 +54,10 @@ int      rhi_device_ready(void)                        { return g_rhi && g_rhi->
 RhiView *rhi_swapchain_view(void)                      { return g_rhi ? g_rhi->swapchain_view() : NULL; }
 int      rhi_swapchain_resize(uint32_t w, uint32_t h)  { return g_rhi ? g_rhi->swapchain_resize(w, h) : -1; }
 int32_t  rhi_present(uint32_t interval)                { return g_rhi ? g_rhi->present(interval) : -1; }
+int      rhi_swapchain_readback(void *dst, uint32_t pitch, uint32_t *w, uint32_t *h)
+{
+    return g_rhi ? g_rhi->swapchain_readback(dst, pitch, w, h) : -1;
+}
 
 RhiBuffer *rhi_buffer_create(const RhiBufferDesc *d, const void *init) { return g_rhi->buffer_create(d, init); }
 void  rhi_buffer_destroy(RhiBuffer *b)                  { if (b) g_rhi->buffer_destroy(b); }

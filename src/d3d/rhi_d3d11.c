@@ -354,6 +354,28 @@ static int32_t d_present(uint32_t interval)
     return g_swap ? (int32_t)IDXGISwapChain_Present(g_swap, interval, 0) : -1;
 }
 
+static int d_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitch);
+
+/* The swap chain here is R8G8B8A8, so its rows are already RGBA8. */
+static int d_swapchain_readback(void *dst, uint32_t pitch, uint32_t *w, uint32_t *h)
+{
+    ID3D11Texture2D *bb = NULL;
+    RhiImage *img;
+    int rc = -1;
+
+    if (!g_swap || FAILED(IDXGISwapChain_GetBuffer(g_swap, 0, &IID_ID3D11Texture2D, (void **)&bb)))
+        return -1;
+    img = rhi_d3d11_wrap_image(bb);
+    ID3D11Texture2D_Release(bb);
+    if (!img)
+        return -1;
+    if (w) *w = img->desc.width;
+    if (h) *h = img->desc.height;
+    rc = dst ? d_image_readback(img, 0, dst, pitch) : 0;
+    rhi_image_destroy(img);                 /* drops the wrapper's reference */
+    return rc;
+}
+
 /* ---- buffers -------------------------------------------------------------------- */
 
 static RhiBuffer *d_buffer_create(const RhiBufferDesc *d, const void *initial)
@@ -1118,7 +1140,7 @@ static void d_clear_depth(RhiView *v, uint32_t flags, float z, uint8_t s)
 const RhiBackend rhi_d3d11_backend = {
     "d3d11",
     d_device_create, d_device_destroy, d_device_ready, d_swapchain_view, d_swapchain_resize,
-    d_present,
+    d_present, d_swapchain_readback,
     d_buffer_create, d_buffer_destroy, d_buffer_map, d_buffer_unmap, d_buffer_update,
     d_image_create, d_image_retain, d_image_destroy, d_image_get_desc, d_image_update, d_image_readback,
     d_view_create, d_view_destroy, d_view_image,

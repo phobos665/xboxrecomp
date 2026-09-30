@@ -217,6 +217,37 @@ static float rt_scale_y(void)
     return (float)g_device_state.height / (float)g_device_state.present_height;
 }
 
+/* xbox_D3D8KeepPresented: the frame as it reaches the swap chain. */
+static BOOL     g_keep_presented;
+static uint8_t *g_presented;
+static UINT     g_presented_w, g_presented_h;
+
+void xbox_D3D8KeepPresented(BOOL on) { g_keep_presented = on; }
+
+const uint8_t *xbox_D3D8Presented(UINT *width, UINT *height)
+{
+    if (width) *width = g_presented_w;
+    if (height) *height = g_presented_h;
+    return g_presented;
+}
+
+static void keep_presented(void)
+{
+    uint32_t w = 0, h = 0;
+    uint8_t *buf;
+
+    if (!g_keep_presented || rhi_swapchain_readback(NULL, 0, &w, &h) != 0 || !w || !h)
+        return;
+    buf = (uint8_t *)realloc(g_presented, (size_t)w * h * 4u);
+    if (!buf)
+        return;
+    g_presented = buf;
+    if (rhi_swapchain_readback(g_presented, w * 4u, &w, &h) == 0) {
+        g_presented_w = w;
+        g_presented_h = h;
+    }
+}
+
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
@@ -254,6 +285,7 @@ static void present_resolve(void)
         fit = d3d8_display_fit(shape_w, shape_h, s->swap_width, s->swap_height);
     }
     d3d8_display_resolve(s->rhi_scene_srv, s->width, s->height, rhi_swapchain_view(), fit);
+    keep_presented();
 }
 
 /* The scissor rectangle, from the Xbox's D3DDevice_SetScissors. The host
