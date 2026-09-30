@@ -620,7 +620,7 @@ static void do_vs_declaration(Replay *r, const D3D8CapChunk *c)
     }
     for (k = 0; k < p->count; k++) {
         decl[k].reg    = in[k].reg;
-        decl[k].format = (DXGI_FORMAT)in[k].dxgi_format;
+        decl[k].format = (RhiFormat)in[k].dxgi_format;
         decl[k].offset = in[k].offset;
     }
     if (g_list_draws) {
