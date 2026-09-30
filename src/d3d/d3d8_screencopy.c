@@ -197,24 +197,21 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     UINT back_w = d3d8_GetBackBufferWidth(), back_h = d3d8_GetBackBufferHeight();
     void *mapped;
 
-    if (!d3d8_GetD3D11Device() || !tex || !tex->d3d11_texture || !back_w || !back_h)
+    if (!d3d8_GetD3D11Device() || !tex || !tex->image || !back_w || !back_h)
         return E_INVALIDARG;
     if (!create())
         return E_FAIL;
 
-    /* The destination texture is a native D3D11 object until the resource
-     * layer moves behind rhi.h; wrap it for the length of the copy. */
-    dst_image = rhi_d3d11_wrap_image(tex->d3d11_texture);
+    dst_image = tex->image;
     memset(&rtvd, 0, sizeof rtvd);
-    rtvd.format = tex->dxgi_format;
+    rtvd.format = tex->host_format;
     rtvd.dim = RHI_VIEW_DIM_2D;
-    rtv = dst_image ? rhi_view_create(dst_image, RHI_VIEW_RENDER_TARGET, &rtvd) : NULL;
+    rtv = rhi_view_create(dst_image, RHI_VIEW_RENDER_TARGET, &rtvd);
     if (!rtv) {
         static int said;
         if (!said++)
             fprintf(stderr, "D3D8 screen copy: the destination texture is not a render "
                     "target; nothing copied\n");
-        rhi_image_destroy(dst_image);
         return E_FAIL;
     }
 
@@ -255,7 +252,6 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     }
     rhi_output_restore(&saved);
     rhi_view_destroy(rtv);
-    rhi_image_destroy(dst_image);
     g.copies++;
     return S_OK;
 }

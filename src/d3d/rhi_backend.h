@@ -22,6 +22,7 @@ typedef struct RhiBackend {
     void  (*buffer_update)(RhiBuffer *, const void *);
 
     RhiImage *(*image_create)(const RhiImageDesc *, const RhiSubresourceData *);
+    RhiImage *(*image_retain)(RhiImage *);
     void  (*image_destroy)(RhiImage *);
     void  (*image_get_desc)(const RhiImage *, RhiImageDesc *);
     void  (*image_update)(RhiImage *, uint32_t, const RhiBox *, const void *, uint32_t, uint32_t);
@@ -30,6 +31,8 @@ typedef struct RhiBackend {
     RhiView  *(*view_create)(RhiImage *, uint32_t, const RhiViewDesc *);
     void      (*view_destroy)(RhiView *);
     RhiImage *(*view_image)(const RhiView *);
+
+    int   (*sample_count_supported)(RhiFormat, uint32_t);
 
     RhiShader *(*shader_create)(uint32_t, const RhiShaderSource *, char *, size_t);
     void       (*shader_destroy)(RhiShader *);
