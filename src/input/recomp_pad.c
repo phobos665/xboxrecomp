@@ -129,6 +129,11 @@ static void sdl_scan(uint64_t now)
     g_scan_at = now + SCAN_MS;
 }
 
+static int16_t flip_y(Sint16 v)
+{
+    return v == -32768 ? (int16_t)32767 : (int16_t)-v;
+}
+
 static int sdl_read(int slot, RecompPadState *out)
 {
     SDL_Gamepad *p;
@@ -178,12 +183,13 @@ static int sdl_read(int slot, RecompPadState *out)
     /* Triggers are 0..32767 in SDL, 0..255 in XInput. */
     out->left_trigger  = (uint8_t)(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7);
     out->right_trigger = (uint8_t)(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7);
-    /* SDL's Y axes point down and XInput's up; -1 - v maps the whole range
-     * across without overflowing at -32768. */
+    /* SDL's Y axes point down and XInput's up. Negated, with -32768 (full
+     * down in SDL) clamped to 32767 so it does not overflow, and 0 staying 0
+     * at rest. */
     out->lx = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFTX);
-    out->ly = (int16_t)(-1 - SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFTY));
+    out->ly = flip_y(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFTY));
     out->rx = SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTX);
-    out->ry = (int16_t)(-1 - SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTY));
+    out->ry = flip_y(SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHTY));
     return 1;
 }
 
