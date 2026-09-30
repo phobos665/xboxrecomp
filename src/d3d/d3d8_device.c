@@ -270,6 +270,9 @@ static BOOL g_2d_screen_space;
  * (xbox_D3D8SetTwoDPlacement), and which of its call sites they come from. */
 static int      g_2d_placement = XBOX_D3D8_2D_AUTO;
 static uint32_t g_2d_tag;
+/* The edge a squeezed draw is anchored to: LEFT, RIGHT or CENTRE. The
+ * title's placement for LEFT and RIGHT; chosen per draw for SIDE. */
+static int      g_2d_anchor = XBOX_D3D8_2D_CENTRE;
 
 /* The widescreen 2D squeeze (see apply_host_viewport) as a horizontal
  * factor about an anchor, both in host pixels of the scene. FALSE when no
@@ -293,9 +296,9 @@ static BOOL two_d_squeeze(float *k_out, float *cx_out)
     if (!(k > 0.0f && k < 1.0f))
         return FALSE;
     *k_out = k;
-    if (g_2d_placement == XBOX_D3D8_2D_LEFT)
+    if (g_2d_anchor == XBOX_D3D8_2D_LEFT)
         *cx_out = 0.0f;
-    else if (g_2d_placement == XBOX_D3D8_2D_RIGHT)
+    else if (g_2d_anchor == XBOX_D3D8_2D_RIGHT)
         *cx_out = (float)g_device_state.width;
     else
         *cx_out = (float)g_device_state.width * 0.5f;
@@ -1838,7 +1841,7 @@ static void two_d_tag_note(const void *vertices, UINT stride, UINT count)
 
 static void two_d_tag_frame(void)
 {
-    static const char *names[] = { "auto", "stretch", "centre", "left", "right" };
+    static const char *names[] = { "auto", "stretch", "centre", "left", "right", "side" };
     UINT guest_w = d3d8_GetGuestWidth();
     int i;
 
@@ -1847,7 +1850,7 @@ static void two_d_tag_frame(void)
     fprintf(stderr, "[2D-TAGS] frame %lu: %d tag(s)\n", g_tag_frames, g_tag_count);
     for (i = 0; i < g_tag_count; i++) {
         const TwoDTagStat *t = &g_tag_stats[i];
-        int pl = t->placement >= 0 && t->placement <= XBOX_D3D8_2D_RIGHT ? t->placement : 0;
+        int pl = t->placement >= 0 && t->placement <= XBOX_D3D8_2D_SIDE ? t->placement : 0;
 
         fprintf(stderr, "[2D-TAGS]   tag %08X %-7s draws %6lu  x %7.1f..%7.1f (%5.1f%%) "
                 "widest %5.1f%%\n", t->tag, names[pl], t->draws, t->lo, t->hi,
@@ -1860,16 +1863,42 @@ static void two_d_tag_frame(void)
 
 void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag)
 {
-    if (placement < XBOX_D3D8_2D_AUTO || placement > XBOX_D3D8_2D_RIGHT)
+    int anchor;
+
+    if (placement < XBOX_D3D8_2D_AUTO || placement > XBOX_D3D8_2D_SIDE)
         placement = XBOX_D3D8_2D_AUTO;
     g_2d_tag = tag;
     if (placement == g_2d_placement)
         return;
     g_2d_placement = placement;
+    anchor = placement == XBOX_D3D8_2D_LEFT || placement == XBOX_D3D8_2D_RIGHT
+             ? placement : XBOX_D3D8_2D_CENTRE;
+    if (anchor == g_2d_anchor)
+        return;
+    g_2d_anchor = anchor;
     /* The anchor moved: a squeezed viewport already in place has to follow.
      * The scissor is recomputed at the next draw's state apply. */
     if (g_2d_squeeze)
         apply_host_viewport();
+}
+
+/* SIDE: the edge this draw is nearer, from where it sits in the title's
+ * own pixels (clipped by the scissor). Thirds rather than halves, so that
+ * a piece spanning the middle -- a message, a centred counter -- stays in
+ * the middle. */
+static int two_d_side_anchor(const void *vertices, UINT stride, UINT count)
+{
+    UINT guest_w = d3d8_GetGuestWidth();
+    float lo, hi, mid;
+
+    if (!guest_w || !draw_extent(vertices, stride, count, &lo, &hi))
+        return XBOX_D3D8_2D_CENTRE;
+    mid = (lo + hi) * 0.5f;
+    if (mid < (float)guest_w / 3.0f)
+        return XBOX_D3D8_2D_LEFT;
+    if (mid > (float)guest_w * 2.0f / 3.0f)
+        return XBOX_D3D8_2D_RIGHT;
+    return XBOX_D3D8_2D_CENTRE;
 }
 
 int xbox_D3D8GetTwoDPlacement(uint32_t *tag)
@@ -1898,6 +1927,15 @@ void d3d8_place_2d_draw(const void *vertices, UINT stride, UINT count)
     case XBOX_D3D8_2D_LEFT:
     case XBOX_D3D8_2D_RIGHT:
         break;
+    case XBOX_D3D8_2D_SIDE: {
+        int anchor = two_d_side_anchor(vertices, stride, count);
+
+        if (anchor != g_2d_anchor) {
+            g_2d_anchor = anchor;
+            apply_host_viewport();
+        }
+        break;
+    }
     default:
         if (d3d8_draw_escapes_squeeze(vertices, stride, count))
             d3d8_SetTwoDSqueeze(FALSE);
