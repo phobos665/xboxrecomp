@@ -22,14 +22,12 @@
 #include <float.h>
 #include "d3d8_vsh.h"
 #include "recomp_config.h"
-#include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <math.h>
 
-#pragma comment(lib, "d3dcompiler.lib")
 
 /* ================================================================
  * Module State

@@ -1,6 +1,7 @@
 /* Test A8 sampling and transformed-vertex interpolation on D3D11 WARP.
  * No game data, window, or hardware adapter is needed. */
 #include "d3d8_internal.h"
+#include <d3d11.h>   /* this test drives D3D11 itself */
 #include <d3dcompiler.h>
 #include <stdio.h>
 #include <stdlib.h>

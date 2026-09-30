@@ -1,18 +1,18 @@
 /**
- * D3D8→D3D11 Compatibility Device Implementation
+ * D3D8 Compatibility Device Implementation
  *
- * Implements the Xbox D3D8 IDirect3DDevice8 interface using D3D11.
- * The game's translated RenderWare code calls D3D8 methods through
- * COM vtables; this layer translates those calls to D3D11 equivalents.
+ * Implements the Xbox D3D8 IDirect3DDevice8 interface on the host GPU
+ * through rhi.h. The game's translated code calls D3D8 methods through COM
+ * vtables; this layer keeps the D3D8 state, owns the scene target, the
+ * device depth buffer and the UP rings, and draws through whichever rhi.h
+ * backend is in use (D3D11 on Windows; Vulkan is the portable one).
  *
  * Architecture:
- * - D3D11 device and swap chain created during initialization
- * - Render state tracking: D3D8 states mapped to D3D11 state objects
- * - Texture/buffer management: D3D8 resource handles wrap D3D11 resources
- * - Fixed-function pipeline: emulated via D3D11 shaders (the Xbox D3D8
- *   pipeline is configurable but not fully programmable)
- *
- * Build: Requires Windows SDK with d3d11.h and dxgi.h
+ * - The backend creates the device and swap chain (rhi_device_create)
+ * - Render state tracking: D3D8 states mapped to rhi.h state objects
+ * - Texture/buffer management: D3D8 resource handles wrap rhi.h objects
+ * - Fixed-function pipeline: emulated with generated HLSL shaders (the
+ *   Xbox D3D8 pipeline is configurable but not fully programmable)
  */
 
 #include "d3d8_internal.h"

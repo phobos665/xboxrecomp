@@ -44,101 +44,101 @@ RhiFormat d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_LIN_A8R8G8B8:
     case D3DFMT_B8G8R8A8:
     case D3DFMT_LIN_B8G8R8A8:
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
+        return RHI_FORMAT_B8G8R8A8_UNORM;
     case D3DFMT_X8R8G8B8:
     case D3DFMT_LIN_X8R8G8B8:
-        return DXGI_FORMAT_B8G8R8X8_UNORM;
+        return RHI_FORMAT_B8G8R8X8_UNORM;
     case D3DFMT_R8G8B8A8:
     case D3DFMT_LIN_R8G8B8A8:
     case D3DFMT_A8B8G8R8:
     case D3DFMT_LIN_A8B8G8R8:
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
+        return RHI_FORMAT_R8G8B8A8_UNORM;
 
     /* Signed bump-map (SNORM) formats */
     case D3DFMT_Q8W8V8U8:
-        return DXGI_FORMAT_R8G8B8A8_SNORM;
+        return RHI_FORMAT_R8G8B8A8_SNORM;
     case D3DFMT_X8L8V8U8:
-        return DXGI_FORMAT_R8G8B8A8_SNORM;
+        return RHI_FORMAT_R8G8B8A8_SNORM;
     case D3DFMT_V8U8:
     case D3DFMT_LIN_V8U8:
-        return DXGI_FORMAT_R8G8_SNORM;
+        return RHI_FORMAT_R8G8_SNORM;
     case D3DFMT_L6V5U5:
     case D3DFMT_LIN_L6V5U5:
-        return DXGI_FORMAT_R8G8_SNORM;   /* L6V5U5 sign-extended to R8G8_SNORM at upload */
+        return RHI_FORMAT_R8G8_SNORM;   /* L6V5U5 sign-extended to R8G8_SNORM at upload */
     case D3DFMT_V16U16:
     case D3DFMT_LIN_V16U16:
-        return DXGI_FORMAT_R16G16_SNORM;
+        return RHI_FORMAT_R16G16_SNORM;
 
     /* 16-bit RGB */
     case D3DFMT_R5G6B5:
     case D3DFMT_LIN_R5G6B5:
     case D3DFMT_R6G5B5:
     case D3DFMT_LIN_R6G5B5:
-        return DXGI_FORMAT_B5G6R5_UNORM;
+        return RHI_FORMAT_B5G6R5_UNORM;
     case D3DFMT_A1R5G5B5:
     case D3DFMT_X1R5G5B5:
     case D3DFMT_LIN_A1R5G5B5:
     case D3DFMT_LIN_X1R5G5B5:
-        return DXGI_FORMAT_B5G5R5A1_UNORM;
+        return RHI_FORMAT_B5G5R5A1_UNORM;
     case D3DFMT_A4R4G4B4:
     case D3DFMT_LIN_A4R4G4B4:
-        return DXGI_FORMAT_B4G4R4A4_UNORM;
+        return RHI_FORMAT_B4G4R4A4_UNORM;
     case D3DFMT_R5G5B5A1:       /* bit-reordered to B5G5R5A1 at upload */
     case D3DFMT_LIN_R5G5B5A1:
-        return DXGI_FORMAT_B5G5R5A1_UNORM;
+        return RHI_FORMAT_B5G5R5A1_UNORM;
     case D3DFMT_R4G4B4A4:       /* bit-reordered to B4G4R4A4 at upload */
     case D3DFMT_LIN_R4G4B4A4:
-        return DXGI_FORMAT_B4G4R4A4_UNORM;
+        return RHI_FORMAT_B4G4R4A4_UNORM;
 
     /* Compressed */
     case D3DFMT_DXT1:
     case D3DFMT_CTX1:           /* no real D3D11 equiv; approximate as BC1 */
     case D3DFMT_LIN_CTX1:
-        return DXGI_FORMAT_BC1_UNORM;
+        return RHI_FORMAT_BC1_UNORM;
     case D3DFMT_DXT3:
     case D3DFMT_DXT3A:          /* explicit-alpha DXT3 variant */
     case D3DFMT_LIN_DXT3A:
-        return DXGI_FORMAT_BC2_UNORM;
+        return RHI_FORMAT_BC2_UNORM;
     case D3DFMT_DXT5:
     case D3DFMT_DXT5A:          /* alpha-only DXT5 variant */
     case D3DFMT_LIN_DXT5A:
-        return DXGI_FORMAT_BC3_UNORM;
+        return RHI_FORMAT_BC3_UNORM;
     case D3DFMT_DXN:            /* 2-channel normal compression */
     case D3DFMT_LIN_DXN:
-        return DXGI_FORMAT_BC5_UNORM;
+        return RHI_FORMAT_BC5_UNORM;
 
     /* Alpha / luminance */
     case D3DFMT_A8:
     case D3DFMT_LIN_A8:
-        return DXGI_FORMAT_A8_UNORM;
+        return RHI_FORMAT_A8_UNORM;
     case D3DFMT_L8:
     case D3DFMT_LIN_L8:
-        return DXGI_FORMAT_R8_UNORM;
+        return RHI_FORMAT_R8_UNORM;
     case D3DFMT_L16:
     case D3DFMT_LIN_L16:
-        return DXGI_FORMAT_R16_UNORM;
+        return RHI_FORMAT_R16_UNORM;
     case D3DFMT_A8L8:
     case D3DFMT_LIN_A8L8:
-        return DXGI_FORMAT_R8G8_UNORM;
+        return RHI_FORMAT_R8G8_UNORM;
     case D3DFMT_AL8:            /* expanded to 16-bit at upload */
     case D3DFMT_LIN_AL8:
-        return DXGI_FORMAT_R8G8_UNORM;
+        return RHI_FORMAT_R8G8_UNORM;
 
     /* 16-bit color channel pairs */
     case D3DFMT_G8B8:
     case D3DFMT_LIN_G8B8:
     case D3DFMT_R8B8:
     case D3DFMT_LIN_R8B8:
-        return DXGI_FORMAT_R8G8_UNORM;
+        return RHI_FORMAT_R8G8_UNORM;
 
     /* Palette */
     case D3DFMT_P8:             /* expanded to BGRA through the palette */
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
+        return RHI_FORMAT_B8G8R8A8_UNORM;
 
     /* YUV (converted to BGRA at upload) */
     case D3DFMT_YUY2:
     case D3DFMT_UYVY:
-        return DXGI_FORMAT_B8G8R8A8_UNORM;
+        return RHI_FORMAT_B8G8R8A8_UNORM;
 
     /* Depth/stencil */
     case D3DFMT_D24S8:
@@ -149,58 +149,58 @@ RhiFormat d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_LIN_F24S8:
     case D3DFMT_LIN_D24X8:
     case D3DFMT_LIN_D24FS8:
-        return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        return RHI_FORMAT_D24_UNORM_S8_UINT;
     case D3DFMT_D16:
     case D3DFMT_LIN_D16:
-        return DXGI_FORMAT_D16_UNORM;
+        return RHI_FORMAT_D16_UNORM;
     case D3DFMT_F16:            /* no float depth in D3D11; sample as R16 */
     case D3DFMT_LIN_F16:
-        return DXGI_FORMAT_R16_FLOAT;
+        return RHI_FORMAT_R16_FLOAT;
     case D3DFMT_D32:
     case D3DFMT_LIN_D32:        /* 32-bit fixed depth; approximated as float D32 */
-        return DXGI_FORMAT_D32_FLOAT;
+        return RHI_FORMAT_D32_FLOAT;
 
     /* 16/32-bit uncompressed pairs & luminance */
     case D3DFMT_G16R16:
     case D3DFMT_LIN_G16R16:
     case D3DFMT_A16L16:          /* luma+alpha -> R,G */
     case D3DFMT_LIN_A16L16:
-        return DXGI_FORMAT_R16G16_UNORM;
+        return RHI_FORMAT_R16G16_UNORM;
     case D3DFMT_A16B16G16R16:   /* BGRA layout -> R16G16B16A16 (swizzled byte order at upload) */
     case D3DFMT_LIN_A16B16G16R16:
-        return DXGI_FORMAT_R16G16B16A16_UNORM;
+        return RHI_FORMAT_R16G16B16A16_UNORM;
     case D3DFMT_A32B32G32R32:
     case D3DFMT_LIN_A32B32G32R32:
-        return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* no 128-bit UNORM in DXGI */
+        return RHI_FORMAT_R32G32B32A32_FLOAT;   /* no 128-bit UNORM in DXGI */
     case D3DFMT_G32R32:
     case D3DFMT_LIN_G32R32:
-        return DXGI_FORMAT_R32G32_FLOAT;   /* no R32G32_UNORM in DXGI */
+        return RHI_FORMAT_R32G32_FLOAT;   /* no R32G32_UNORM in DXGI */
     case D3DFMT_L32:
     case D3DFMT_LIN_L32:        /* 32-bit luminance */
-        return DXGI_FORMAT_R32_FLOAT;
+        return RHI_FORMAT_R32_FLOAT;
     case D3DFMT_A32L32:
     case D3DFMT_LIN_A32L32:
-        return DXGI_FORMAT_R32G32_FLOAT;
+        return RHI_FORMAT_R32G32_FLOAT;
 
     /* Floating-point formats */
     case D3DFMT_R16F:
     case D3DFMT_LIN_R16F:
-        return DXGI_FORMAT_R16_FLOAT;
+        return RHI_FORMAT_R16_FLOAT;
     case D3DFMT_R32F:
     case D3DFMT_LIN_R32F:
-        return DXGI_FORMAT_R32_FLOAT;
+        return RHI_FORMAT_R32_FLOAT;
     case D3DFMT_G16R16F:
     case D3DFMT_LIN_G16R16F:
-        return DXGI_FORMAT_R16G16_FLOAT;
+        return RHI_FORMAT_R16G16_FLOAT;
     case D3DFMT_G32R32F:
     case D3DFMT_LIN_G32R32F:
-        return DXGI_FORMAT_R32G32_FLOAT;
+        return RHI_FORMAT_R32G32_FLOAT;
     case D3DFMT_A16B16G16R16F:
     case D3DFMT_LIN_A16B16G16R16F:
-        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        return RHI_FORMAT_R16G16B16A16_FLOAT;
     case D3DFMT_A32B32G32R32F:
     case D3DFMT_LIN_A32B32G32R32F:
-        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        return RHI_FORMAT_R32G32B32A32_FLOAT;
 
     /* 10-bit formats */
     case D3DFMT_A2R10G10B10:
@@ -211,32 +211,32 @@ RhiFormat d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_LIN_X2R10G10B10:
     case D3DFMT_LIN_A2B10G10R10:
     case D3DFMT_LIN_A2W10V10U10:
-        return DXGI_FORMAT_R10G10B10A2_UNORM;
+        return RHI_FORMAT_R10G10B10A2_UNORM;
     case D3DFMT_R11G11B10:
     case D3DFMT_LIN_R11G11B10:
-        return DXGI_FORMAT_R11G11B10_FLOAT;
+        return RHI_FORMAT_R11G11B10_FLOAT;
     case D3DFMT_R10G11B11:
     case D3DFMT_LIN_R10G11B11:
-        return DXGI_FORMAT_R11G11B10_FLOAT;   /* no exact DXGI; approximate */
+        return RHI_FORMAT_R11G11B10_FLOAT;   /* no exact DXGI; approximate */
 
     /* Signed bump (16/32/64-bit) */
     case D3DFMT_V32U32:
     case D3DFMT_LIN_V32U32:
-        return DXGI_FORMAT_R32G32_FLOAT;   /* 32-bit signed ints sampled as float */
+        return RHI_FORMAT_R32G32_FLOAT;   /* 32-bit signed ints sampled as float */
     case D3DFMT_Q16W16V16U16:
     case D3DFMT_LIN_Q16W16V16U16:
-        return DXGI_FORMAT_R16G16B16A16_SNORM;
+        return RHI_FORMAT_R16G16B16A16_SNORM;
     case D3DFMT_Q32W32V32U32:
     case D3DFMT_LIN_Q32W32V32U32:
-        return DXGI_FORMAT_R32G32B32A32_SINT;   /* no 128-bit SNORM in DXGI */
+        return RHI_FORMAT_R32G32B32A32_SINT;   /* no 128-bit SNORM in DXGI */
 
     /* Index buffers */
-    case D3DFMT_INDEX16:        return DXGI_FORMAT_R16_UINT;
-    case D3DFMT_INDEX32:        return DXGI_FORMAT_R32_UINT;
+    case D3DFMT_INDEX16:        return RHI_FORMAT_R16_UINT;
+    case D3DFMT_INDEX32:        return RHI_FORMAT_R32_UINT;
 
     default:
         fprintf(stderr, "D3D8: Unknown format 0x%X, using R8G8B8A8\n", fmt);
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
+        return RHI_FORMAT_R8G8B8A8_UNORM;
     }
 }
 

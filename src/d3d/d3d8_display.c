@@ -15,7 +15,6 @@
 
 #if defined(_WIN32)
 
-#include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

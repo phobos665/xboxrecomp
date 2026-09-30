@@ -733,10 +733,11 @@ static RhiShader *d_shader_create(uint32_t stage, const RhiShaderSource *src, ch
         macros[n].Name = NULL;
         macros[n].Definition = NULL;
     }
-    hr = d3d8_compile_hlsl(src->hlsl, src->len, src->name, src->macros ? macros : NULL,
-                           src->entry, src->target,
-                           src->optimize ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : 0,
-                           &code, &errors);
+    d3d8_hlsl_note(src->hlsl, src->len, src->name, src->macros, src->entry, src->target);
+    hr = D3DCompile(src->hlsl, (SIZE_T)src->len, src->name, src->macros ? macros : NULL, NULL,
+                    src->entry, src->target,
+                    src->optimize ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : 0, 0,
+                    &code, &errors);
     if (err && err_len)
         err[0] = 0;
     if (errors) {

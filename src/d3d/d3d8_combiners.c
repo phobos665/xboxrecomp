@@ -34,13 +34,11 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_combiners.h"
-#include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
 
-#pragma comment(lib, "d3dcompiler.lib")
 
 /* ================================================================
  * Internal State
