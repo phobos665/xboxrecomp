@@ -288,10 +288,25 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
     r.bottom = (LONG)req->height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     req->hwnd = CreateWindowA(wc.lpszClassName, "xboxrecomp - D3D8 replacement (shadow)",
-                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                              WS_OVERLAPPEDWINDOW,
                               CW_USEDEFAULT, CW_USEDEFAULT,
                               r.right - r.left, r.bottom - r.top,
                               NULL, NULL, wc.hInstance, NULL);
+    /* RECOMP_WINDOW_BACKGROUND=1: open behind the other windows and without
+     * the focus, for a run a script drives while someone works at the same
+     * desk. The game neither needs nor notices the focus: a script is its
+     * only input, and the frame is drawn and dumped the same either way. */
+    if (req->hwnd) {
+        const char *bg = getenv("RECOMP_WINDOW_BACKGROUND");
+
+        if (bg && *bg && strcmp(bg, "0") != 0) {
+            ShowWindow(req->hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(req->hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                         SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+        } else {
+            ShowWindow(req->hwnd, SW_SHOW);
+        }
+    }
 
     /* Say what is being played, not what is playing it. The name is the
      * title's own, out of its XBE certificate, and it is set through the

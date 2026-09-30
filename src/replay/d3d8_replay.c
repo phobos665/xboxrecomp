@@ -48,6 +48,12 @@
  *                    to <prefix>_<tag>.bmp. One capture then shows every
  *                    call site in a frame, which is how a title project
  *                    finds which of its sites is which piece of the HUD.
+ *   --hide-tag <tag> draw everything but this tag's draws.
+ *   --each-tag-hidden  as --each-tag, but each image leaves one tag out.
+ *                    For a layer that only shows blended over the others
+ *                    (a multiplied or added backdrop), which solo draws
+ *                    over black and so draws as nothing: its difference
+ *                    from the full frame is what it contributes.
  *
  * A player, not an emulator. A capture holds the calls shadow mode
  * made on the host renderer after all of its Xbox conversion (d3d8_capture.h),
@@ -107,8 +113,9 @@ static IDirect3DSurface8 *g_target_at_limit;
 typedef struct { uint32_t tag; int all; int placement; } PlaceOverride;
 static PlaceOverride g_place[256];
 static int           g_place_count;
-/* --solo-tag / --each-tag: the tag the next draws were placed under, and
- * the tags this capture uses. */
+/* --solo-tag / --hide-tag / --each-tag: the tag the next draws were placed
+ * under, and the tags this capture uses. g_solo_on is 1 to draw only
+ * g_solo_tag's 2D, 2 to draw everything but it. */
 static int      g_solo_on;
 static uint32_t g_solo_tag, g_cur_tag;
 static uint32_t g_seen_tags[512];
@@ -164,7 +171,9 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
         g_replay_dev->lpVtbl->GetRenderTarget(g_replay_dev, &g_target_at_limit);
     if (g_max_draws >= 0 && n >= g_max_draws)
         return 0;
-    if (g_solo_on && g_cur_tag && g_cur_tag != g_solo_tag)
+    if (g_solo_on == 1 && g_cur_tag && g_cur_tag != g_solo_tag)
+        return 0;
+    if (g_solo_on == 2 && g_cur_tag == g_solo_tag)
         return 0;
     return n != g_skip_draw;
 }
@@ -212,10 +221,24 @@ static HWND replay_window(UINT width, UINT height)
     r.bottom = (LONG)height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     return CreateWindowA(wc.lpszClassName, "xboxrecomp - D3D8 frame replay",
-                         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                         WS_OVERLAPPEDWINDOW,
                          CW_USEDEFAULT, CW_USEDEFAULT,
                          r.right - r.left, r.bottom - r.top,
                          NULL, NULL, wc.hInstance, NULL);
+}
+
+/* A replay is usually one of dozens a script runs, so its window opens
+ * behind the others and leaves the focus alone -- unless --hold asked to
+ * look at it. */
+static void replay_show(HWND hwnd, int hold)
+{
+    if (hold) {
+        ShowWindow(hwnd, SW_SHOW);
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                 SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
 }
 
 static void pump(void)
@@ -1168,7 +1191,8 @@ static void usage(void)
         "                   [--no-combiners] [--draws <n>] [--skip-draw <n>]\n"
         "                   [--list-draws] [--dump-target] [--present] [--backend <name>]\n"
         "                   [--place <tag|all>=<placement>]...\n"
-        "                   [--solo-tag <tag>] [--each-tag]\n",
+        "                   [--solo-tag <tag>] [--each-tag]\n"
+        "                   [--hide-tag <tag>] [--each-tag-hidden]\n",
         D3D8CAP_EXTENSION);
 }
 
@@ -1215,8 +1239,14 @@ int main(int argc, char **argv)
             g_solo_on = 1;
             g_solo_tag = (uint32_t)strtoul(argv[++i], NULL, 16);
         }
+        else if (!strcmp(argv[i], "--hide-tag") && i + 1 < argc) {
+            g_solo_on = 2;
+            g_solo_tag = (uint32_t)strtoul(argv[++i], NULL, 16);
+        }
         else if (!strcmp(argv[i], "--each-tag"))
             each_tag = 1;
+        else if (!strcmp(argv[i], "--each-tag-hidden"))
+            each_tag = 2;
         else if (!strcmp(argv[i], "--place") && i + 1 < argc) {
             const char *a = argv[++i], *eq = strchr(a, '=');
             static const char *names[] = { "auto", "stretch", "centre", "left", "right" };
@@ -1270,6 +1300,7 @@ int main(int argc, char **argv)
         d3d8cap_close_read(cap);
         return 1;
     }
+    replay_show(hwnd, hold);
 
     /* As hle_d3d8.c's shadow_create. */
     memset(&pp, 0, sizeof pp);
@@ -1314,8 +1345,9 @@ int main(int argc, char **argv)
     if (each_tag) {
         int n = g_seen_count, t;
 
-        note("[replay] %d tag(s) in this frame; one image each, solo\n", n);
-        g_solo_on = 1;
+        note("[replay] %d tag(s) in this frame; one image each, %s\n", n,
+             each_tag == 2 ? "without it" : "solo");
+        g_solo_on = each_tag;
         for (t = 0; t < n; t++) {
             g_solo_tag = g_seen_tags[t];
             replay_pass(&r, cap, loops + t);
