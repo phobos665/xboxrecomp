@@ -11,8 +11,9 @@ The file is JSON:
 
     {
       "version": 1,
+      "pad_api": "sdl",
       "controllers": [
-        {"port": 1, "device": "xinput:0", "deadzone": 7849,
+        {"port": 1, "device": "gamepad:0", "deadzone": 7849,
          "bindings": {"a": ["pad:a", "key:Z"], "start": "key:RETURN", ...}},
         ...
       ]
@@ -22,6 +23,11 @@ Ports are 1-4, as they are written on the console. A binding is one source or
 a list of them, and any of them pressing the control presses it -- that is how
 the default port 1 answers to both a pad and the keyboard. A control the file
 does not mention keeps its default; "none" or [] unbinds it.
+
+"pad_api" is which API reads the pads, for every port: "sdl" (SDL3, every kind
+of controller; the default) or "xinput" (Xbox controllers only). A device is
+"gamepad:N", the N-th pad through that API; "xinput:N" is what files written
+before SDL3 say, and means the same slot.
 """
 
 import json
@@ -29,6 +35,7 @@ import os
 
 VERSION = 1
 PORTS = 4
+PAD_APIS = ("sdl", "xinput")
 DEADZONE_DEFAULT = 7849
 
 # Every Xbox input, as (name in the file, label in the UI, group).
@@ -199,16 +206,23 @@ def device_label(device):
         return "Keyboard"
     if device in (None, "", "none"):
         return "Nothing"
-    if device.startswith("xinput:"):
-        return "XInput pad %s" % device[7:]
+    if device.startswith(("gamepad:", "xinput:")):
+        return "Gamepad %d" % (int(device.split(":", 1)[1]) + 1)
     return device
+
+
+def pad_index(device):
+    """The pad slot a device names, or None for the keyboard or nothing."""
+    if isinstance(device, str) and device.startswith(("gamepad:", "xinput:")):
+        return int(device.split(":", 1)[1])
+    return None
 
 
 def is_valid_device(device):
     if device in ("keyboard", "none"):
         return True
-    if isinstance(device, str) and device.startswith("xinput:"):
-        index = device[7:]
+    if isinstance(device, str) and device.startswith(("gamepad:", "xinput:")):
+        index = device.split(":", 1)[1]
         return index.isdigit() and 0 <= int(index) < PORTS
     return False
 
@@ -229,7 +243,7 @@ def default_controller(port):
         bindings[control] = sources
     return {
         "port": port,
-        "device": "xinput:%d" % (port - 1),
+        "device": "gamepad:%d" % (port - 1),
         "deadzone": DEADZONE_DEFAULT,
         "bindings": bindings,
     }
@@ -238,6 +252,7 @@ def default_controller(port):
 def default_config():
     return {
         "version": VERSION,
+        "pad_api": "sdl",
         "controllers": [default_controller(p) for p in range(1, PORTS + 1)],
     }
 
@@ -252,6 +267,8 @@ def normalise(data):
     config = default_config()
     if not isinstance(data, dict):
         return config
+    if data.get("pad_api") in PAD_APIS:
+        config["pad_api"] = data["pad_api"]
     listed = data.get("controllers")
     if not isinstance(listed, list):
         return config
@@ -266,7 +283,7 @@ def normalise(data):
         if is_valid_device(entry.get("device")):
             target["device"] = entry["device"]
         elif port != index + 1:
-            target["device"] = "xinput:%d" % (port - 1)
+            target["device"] = "gamepad:%d" % (port - 1)
         deadzone = entry.get("deadzone")
         if isinstance(deadzone, int) and 0 <= deadzone < 32767:
             target["deadzone"] = deadzone

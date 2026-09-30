@@ -48,11 +48,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # SDL3 is built from its submodule; the others are not needed here.
+      - name: Fetch SDL3
+        run: git submodule update --init --depth 1 third_party/SDL
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config libsdl2-dev libepoxy-dev libssl-dev
+            ninja-build pkg-config libepoxy-dev libssl-dev
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -68,6 +72,9 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch SDL3
+        run: git submodule update --init --depth 1 third_party/SDL
 
       - name: Configure
         run: cmake -S . -B build -A x64

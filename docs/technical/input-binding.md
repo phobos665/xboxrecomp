@@ -26,10 +26,11 @@ JSON, one entry per controller:
 ```json
 {
   "version": 1,
+  "pad_api": "sdl",
   "controllers": [
     {
       "port": 1,
-      "device": "xinput:0",
+      "device": "gamepad:0",
       "deadzone": 7849,
       "bindings": {
         "a": ["pad:a", "key:Z"],
@@ -47,10 +48,23 @@ does not mention keeps its defaults, and so does a control the file does not
 mention -- a file with one binding in it is a config with one binding changed.
 That is deliberate: it makes the file hand-editable and a diff readable.
 
-**`device`** is `keyboard`, `xinput:0` .. `xinput:3`, or `none`. It says where
+**`device`** is `keyboard`, `gamepad:0` .. `gamepad:3`, or `none`. It says where
 `pad:` sources are read from. `key:` sources are always read, whatever the
 device is, which is why the default port 1 answers to both a pad and the
-keyboard at once.
+keyboard at once. `xinput:0` .. `xinput:3` is what files written before SDL3
+say, and names the same slot.
+
+**`pad_api`** (Sep 2026) is which API reads every pad: `"sdl"`, the default, or
+`"xinput"`. SDL3 reads Xbox pads and everything else -- DualSense and
+DualShock 4, Switch Pro, 8BitDo, the Steam Deck, generic pads through SDL's
+mapping database -- with hotplug and rumble; a pad takes the first free slot
+when it is connected and keeps it until unplugged. XInput reads Xbox
+controllers only, by XInput's user index, and is kept for a pad or machine
+where SDL3 misbehaves. `RECOMP_PAD_API=sdl|xinput` overrides the file, and
+the launcher's Input tab has it as "Controllers". Both go through
+`src/input/recomp_pad.h`, which returns XInput's layout whichever API read
+the pad; `recomp_pad_probe [seconds] [xinput]` (built on request, target
+`recomp_pad_probe`) prints what it sees, live.
 
 **A binding** is one source string or a list of up to four. Any of them
 pressing the control presses it, and the strongest wins for anything analog,

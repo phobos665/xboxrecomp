@@ -17,7 +17,6 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <xinput.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +25,7 @@
 #include "launcher_theme.h"
 #include "launcher_bindings.h"
 #include "recomp_config.h"
+#include "recomp_pad.h"
 
 #ifndef LAUNCHER_GAME_EXE
 #define LAUNCHER_GAME_EXE "game.exe"
@@ -85,10 +85,11 @@ static int        g_sel;
  * They live in the list rather than off to one side so they are reached
  * the same way as everything else -- one way to move, one way to
  * change, and no second idea to learn. */
-#define BIND_HEAD_ROWS 3
+#define BIND_HEAD_ROWS 4
 #define BIND_ROW_PORT   0
 #define BIND_ROW_DEVICE 1
-#define BIND_ROW_RESET  2
+#define BIND_ROW_API    2       /* SDL3 or XInput, for every controller */
+#define BIND_ROW_RESET  3
 #define BIND_TOTAL_ROWS (BIND_HEAD_ROWS + BIND_CONTROLS)
 
 static const char *frame_cap_label(int i)
@@ -291,44 +292,43 @@ static void read_title(void)
 static const char *capture_pad(int pad_index)
 {
     static char out[BIND_SOURCE_LEN];
-    XINPUT_STATE st;
+    RecompPadState st;
     static const struct { WORD mask; const char *name; } k_buttons[] = {
-        { XINPUT_GAMEPAD_A, "a" }, { XINPUT_GAMEPAD_B, "b" },
-        { XINPUT_GAMEPAD_X, "x" }, { XINPUT_GAMEPAD_Y, "y" },
-        { XINPUT_GAMEPAD_LEFT_SHOULDER, "lshoulder" },
-        { XINPUT_GAMEPAD_RIGHT_SHOULDER, "rshoulder" },
-        { XINPUT_GAMEPAD_START, "start" }, { XINPUT_GAMEPAD_BACK, "back" },
-        { XINPUT_GAMEPAD_LEFT_THUMB, "lthumb" },
-        { XINPUT_GAMEPAD_RIGHT_THUMB, "rthumb" },
-        { XINPUT_GAMEPAD_DPAD_UP, "dpad_up" },
-        { XINPUT_GAMEPAD_DPAD_DOWN, "dpad_down" },
-        { XINPUT_GAMEPAD_DPAD_LEFT, "dpad_left" },
-        { XINPUT_GAMEPAD_DPAD_RIGHT, "dpad_right" },
+        { RECOMP_PAD_A, "a" }, { RECOMP_PAD_B, "b" },
+        { RECOMP_PAD_X, "x" }, { RECOMP_PAD_Y, "y" },
+        { RECOMP_PAD_LEFT_SHOULDER, "lshoulder" },
+        { RECOMP_PAD_RIGHT_SHOULDER, "rshoulder" },
+        { RECOMP_PAD_START, "start" }, { RECOMP_PAD_BACK, "back" },
+        { RECOMP_PAD_LEFT_THUMB, "lthumb" },
+        { RECOMP_PAD_RIGHT_THUMB, "rthumb" },
+        { RECOMP_PAD_DPAD_UP, "dpad_up" },
+        { RECOMP_PAD_DPAD_DOWN, "dpad_down" },
+        { RECOMP_PAD_DPAD_LEFT, "dpad_left" },
+        { RECOMP_PAD_DPAD_RIGHT, "dpad_right" },
         { 0, NULL }
     };
     const SHORT push = 22000;             /* well past any resting stick */
     int i;
 
-    memset(&st, 0, sizeof st);
-    if (XInputGetState((DWORD)pad_index, &st) != ERROR_SUCCESS)
+    if (!recomp_pad_read(pad_index, &st))
         return NULL;
 
     for (i = 0; k_buttons[i].name; i++)
-        if (st.Gamepad.wButtons & k_buttons[i].mask) {
+        if (st.buttons & k_buttons[i].mask) {
             snprintf(out, sizeof out, "pad:%s", k_buttons[i].name);
             return out;
         }
-    if (st.Gamepad.bLeftTrigger > 160)  { snprintf(out, sizeof out, "pad:lt"); return out; }
-    if (st.Gamepad.bRightTrigger > 160) { snprintf(out, sizeof out, "pad:rt"); return out; }
+    if (st.left_trigger > 160)  { snprintf(out, sizeof out, "pad:lt"); return out; }
+    if (st.right_trigger > 160) { snprintf(out, sizeof out, "pad:rt"); return out; }
 
-    if (st.Gamepad.sThumbLX >  push) { snprintf(out, sizeof out, "pad:lx+"); return out; }
-    if (st.Gamepad.sThumbLX < -push) { snprintf(out, sizeof out, "pad:lx-"); return out; }
-    if (st.Gamepad.sThumbLY >  push) { snprintf(out, sizeof out, "pad:ly+"); return out; }
-    if (st.Gamepad.sThumbLY < -push) { snprintf(out, sizeof out, "pad:ly-"); return out; }
-    if (st.Gamepad.sThumbRX >  push) { snprintf(out, sizeof out, "pad:rx+"); return out; }
-    if (st.Gamepad.sThumbRX < -push) { snprintf(out, sizeof out, "pad:rx-"); return out; }
-    if (st.Gamepad.sThumbRY >  push) { snprintf(out, sizeof out, "pad:ry+"); return out; }
-    if (st.Gamepad.sThumbRY < -push) { snprintf(out, sizeof out, "pad:ry-"); return out; }
+    if (st.lx >  push) { snprintf(out, sizeof out, "pad:lx+"); return out; }
+    if (st.lx < -push) { snprintf(out, sizeof out, "pad:lx-"); return out; }
+    if (st.ly >  push) { snprintf(out, sizeof out, "pad:ly+"); return out; }
+    if (st.ly < -push) { snprintf(out, sizeof out, "pad:ly-"); return out; }
+    if (st.rx >  push) { snprintf(out, sizeof out, "pad:rx+"); return out; }
+    if (st.rx < -push) { snprintf(out, sizeof out, "pad:rx-"); return out; }
+    if (st.ry >  push) { snprintf(out, sizeof out, "pad:ry+"); return out; }
+    if (st.ry < -push) { snprintf(out, sizeof out, "pad:ry-"); return out; }
     return NULL;
 }
 
@@ -378,7 +378,7 @@ static int everything_released(int pad_index)
 static void capture_tick(void)
 {
     const BindPort *bp = &g_bind.port[g_bind_port];
-    int pad = bp->device == BIND_DEV_XINPUT ? bp->pad : 0;
+    int pad = bp->device == BIND_DEV_PAD ? bp->pad : 0;
     const char *got;
 
     if (!g_capture_armed) {
@@ -435,6 +435,8 @@ static void bindings_load(void)
     bind_defaults(&g_bind);
     if (bind_config_path(path, sizeof path))
         bind_load(path, &g_bind);
+    recomp_pad_set_api(g_bind.pad_api == BIND_PAD_API_XINPUT
+                       ? RECOMP_PAD_API_XINPUT : RECOMP_PAD_API_SDL);
     g_bind_dirty = 0;
 }
 
@@ -526,7 +528,7 @@ static int pad_axis(SHORT v)
  * frame per press, or repeatedly while a direction is held. */
 static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
 {
-    XINPUT_STATE st;
+    RecompPadState st;
     DWORD now = GetTickCount();
     WORD b;
     int x, y, i, connected = 0;
@@ -534,20 +536,20 @@ static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
     *dx = *dy = *accept = *cancel = *tab = 0;
 
     memset(&st, 0, sizeof st);
-    for (i = 0; i < 4; i++)
-        if (XInputGetState((DWORD)i, &st) == ERROR_SUCCESS) { connected = 1; break; }
+    for (i = 0; i < RECOMP_PAD_SLOTS; i++)
+        if (recomp_pad_read(i, &st)) { connected = 1; break; }
     if (!connected) {
         g_pad.last = 0;
         return 0;
     }
 
-    b = st.Gamepad.wButtons;
-    x = pad_axis(st.Gamepad.sThumbLX);
-    y = -pad_axis(st.Gamepad.sThumbLY);            /* screen y grows downward */
-    if (b & XINPUT_GAMEPAD_DPAD_LEFT)  x = -1;
-    if (b & XINPUT_GAMEPAD_DPAD_RIGHT) x = 1;
-    if (b & XINPUT_GAMEPAD_DPAD_UP)    y = -1;
-    if (b & XINPUT_GAMEPAD_DPAD_DOWN)  y = 1;
+    b = st.buttons;
+    x = pad_axis(st.lx);
+    y = -pad_axis(st.ly);                          /* screen y grows downward */
+    if (b & RECOMP_PAD_DPAD_LEFT)  x = -1;
+    if (b & RECOMP_PAD_DPAD_RIGHT) x = 1;
+    if (b & RECOMP_PAD_DPAD_UP)    y = -1;
+    if (b & RECOMP_PAD_DPAD_DOWN)  y = 1;
 
     if (x != g_pad.last_dir_x || y != g_pad.last_dir_y) {
         g_pad.last_dir_x = x;
@@ -564,13 +566,13 @@ static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
     }
 
     /* Buttons on the press, not the release. */
-    if ((b & XINPUT_GAMEPAD_A) && !(g_pad.last & XINPUT_GAMEPAD_A)) *accept = 1;
-    if ((b & XINPUT_GAMEPAD_B) && !(g_pad.last & XINPUT_GAMEPAD_B)) *cancel = 1;
-    if ((b & XINPUT_GAMEPAD_RIGHT_SHOULDER) &&
-        !(g_pad.last & XINPUT_GAMEPAD_RIGHT_SHOULDER)) *tab = 1;
-    if ((b & XINPUT_GAMEPAD_LEFT_SHOULDER) &&
-        !(g_pad.last & XINPUT_GAMEPAD_LEFT_SHOULDER)) *tab = -1;
-    if ((b & XINPUT_GAMEPAD_START) && !(g_pad.last & XINPUT_GAMEPAD_START)) *accept = 1;
+    if ((b & RECOMP_PAD_A) && !(g_pad.last & RECOMP_PAD_A)) *accept = 1;
+    if ((b & RECOMP_PAD_B) && !(g_pad.last & RECOMP_PAD_B)) *cancel = 1;
+    if ((b & RECOMP_PAD_RIGHT_SHOULDER) &&
+        !(g_pad.last & RECOMP_PAD_RIGHT_SHOULDER)) *tab = 1;
+    if ((b & RECOMP_PAD_LEFT_SHOULDER) &&
+        !(g_pad.last & RECOMP_PAD_LEFT_SHOULDER)) *tab = -1;
+    if ((b & RECOMP_PAD_START) && !(g_pad.last & RECOMP_PAD_START)) *accept = 1;
 
     g_pad.last = b;
     return 1;
@@ -681,13 +683,13 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
                 /* One list, in the order a person would try them:
                  * the four pads, then the keyboard, then nothing. */
                 BindPort *bp = &g_bind.port[g_bind_port];
-                int cur = (bp->device == BIND_DEV_XINPUT) ? bp->pad
+                int cur = (bp->device == BIND_DEV_PAD) ? bp->pad
                         : (bp->device == BIND_DEV_KEYBOARD) ? BIND_PORTS
                         : BIND_PORTS + 1;
 
                 cur = (cur + dx + BIND_PORTS + 2) % (BIND_PORTS + 2);
                 if (cur < BIND_PORTS) {
-                    bp->device = BIND_DEV_XINPUT;
+                    bp->device = BIND_DEV_PAD;
                     bp->pad = cur;
                 } else if (cur == BIND_PORTS) {
                     bp->device = BIND_DEV_KEYBOARD;
@@ -696,6 +698,14 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
                     bp->device = BIND_DEV_NONE;
                     bp->pad = -1;
                 }
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_API) {
+            if (dx || accept) {
+                g_bind.pad_api = g_bind.pad_api == BIND_PAD_API_XINPUT
+                                 ? BIND_PAD_API_SDL : BIND_PAD_API_XINPUT;
+                recomp_pad_set_api(g_bind.pad_api == BIND_PAD_API_XINPUT
+                                   ? RECOMP_PAD_API_XINPUT : RECOMP_PAD_API_SDL);
                 g_bind_dirty = 1;
             }
         } else if (k == BIND_ROW_RESET) {
@@ -825,13 +835,14 @@ static void draw(void)
                 theme_text(cv, line, 12, 400,
                            lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_DEVICE) {
-                if (bp->device == BIND_DEV_XINPUT) {
-                    XINPUT_STATE st;
+                if (bp->device == BIND_DEV_PAD) {
+                    char name[64];
 
-                    memset(&st, 0, sizeof st);
-                    snprintf(line, sizeof line, "Gamepad %d%s", bp->pad + 1,
-                             XInputGetState((DWORD)bp->pad, &st) == ERROR_SUCCESS
-                                 ? "  (connected)" : "  (not plugged in)");
+                    recomp_pad_name(bp->pad, name, sizeof name);
+                    if (name[0])
+                        snprintf(line, sizeof line, "Gamepad %d  (%s)", bp->pad + 1, name);
+                    else
+                        snprintf(line, sizeof line, "Gamepad %d  (not plugged in)", bp->pad + 1);
                 } else if (bp->device == BIND_DEV_KEYBOARD) {
                     snprintf(line, sizeof line, "Keyboard");
                 } else {
@@ -841,6 +852,13 @@ static void draw(void)
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
                 theme_text(cv, line, 12, 400,
                            lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_API) {
+                theme_text(lr, "Controllers", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, g_bind.pad_api == BIND_PAD_API_XINPUT
+                                   ? "Xbox controllers only (XInput)"
+                                   : "All controllers (SDL3)",
+                           12, 400, lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_RESET) {
                 theme_text(lr, "Reset this controller", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
@@ -869,7 +887,7 @@ static void draw(void)
                            THEME_LEFT);
             }
 
-            if (lit > 0.5 && k <= BIND_ROW_DEVICE) {
+            if (lit > 0.5 && k <= BIND_ROW_API) {
                 ThemeRect ar = rr;
 
                 ar.x = rr.x + rr.w - 46; ar.w = 30;
@@ -899,6 +917,9 @@ static void draw(void)
                 g_capturing ? "Press what you want this to be. Escape cancels."
                 : k == BIND_ROW_PORT   ? "Which of the four controllers these bindings are for."
                 : k == BIND_ROW_DEVICE ? "What this controller reads: a gamepad, the keyboard, or nothing."
+                : k == BIND_ROW_API    ? "All controllers reads Xbox, PlayStation, Switch and most other pads. "
+                                         "Xbox controllers only is the older XInput path, for a pad that misbehaves. "
+                                         "Every game uses this."
                 : k == BIND_ROW_RESET  ? "Put this controller back to the built-in mapping."
                 : "Left and right choose the controller or the keyboard column. "
                   "A or Enter rebinds. Bindings are shared by every game.",

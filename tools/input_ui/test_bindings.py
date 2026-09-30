@@ -21,7 +21,7 @@ class Defaults(unittest.TestCase):
         self.assertEqual(len(config["controllers"]), 4)
         for index, controller in enumerate(config["controllers"]):
             self.assertEqual(controller["port"], index + 1)
-            self.assertEqual(controller["device"], "xinput:%d" % index)
+            self.assertEqual(controller["device"], "gamepad:%d" % index)
 
     def test_every_control_is_bound_by_default(self):
         for controller in bindings.default_config()["controllers"]:
@@ -115,13 +115,19 @@ class Normalising(unittest.TestCase):
         config = bindings.normalise({
             "controllers": [{"port": 1, "device": "joystick"}],
         })
-        self.assertEqual(config["controllers"][0]["device"], "xinput:0")
+        self.assertEqual(config["controllers"][0]["device"], "gamepad:0")
 
     def test_devices_that_are_allowed(self):
-        for device in ("keyboard", "none", "xinput:0", "xinput:3"):
+        for device in ("keyboard", "none", "gamepad:0", "gamepad:3",
+                       "xinput:0", "xinput:3"):
             config = bindings.normalise({
                 "controllers": [{"port": 3, "device": device}]})
             self.assertEqual(config["controllers"][2]["device"], device)
+
+    def test_pad_api_survives_and_defaults_to_sdl(self):
+        self.assertEqual(bindings.default_config()["pad_api"], "sdl")
+        self.assertEqual(bindings.normalise({"pad_api": "xinput"})["pad_api"], "xinput")
+        self.assertEqual(bindings.normalise({"pad_api": "joystick"})["pad_api"], "sdl")
 
     def test_rubbish_gives_the_defaults(self):
         for data in (None, [], {}, {"controllers": "no"},
