@@ -944,17 +944,17 @@ static HRESULT __stdcall dev_GetIndices(IDirect3DDevice8 *self, IDirect3DIndexBu
     return S_OK;
 }
 
-static D3D11_PRIMITIVE_TOPOLOGY map_primitive_type(D3DPRIMITIVETYPE pt, UINT count, UINT *out_count)
+static uint32_t map_primitive_type(D3DPRIMITIVETYPE pt, UINT count, UINT *out_count)
 {
     switch (pt) {
-    case D3DPT_TRIANGLELIST:  *out_count = count * 3; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    case D3DPT_TRIANGLESTRIP: *out_count = count + 2; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-    case D3DPT_TRIANGLEFAN:   *out_count = count * 3; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    case D3DPT_LINELIST:      *out_count = count * 2; return D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-    case D3DPT_LINESTRIP:     *out_count = count + 1; return D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
-    case D3DPT_POINTLIST:     *out_count = count;     return D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
-    case D3DPT_QUADLIST:      *out_count = count * 6; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    default:                  *out_count = 0;          return D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    case D3DPT_TRIANGLELIST:  *out_count = count * 3; return RHI_TOPOLOGY_TRIANGLES;
+    case D3DPT_TRIANGLESTRIP: *out_count = count + 2; return RHI_TOPOLOGY_TRIANGLE_STRIP;
+    case D3DPT_TRIANGLEFAN:   *out_count = count * 3; return RHI_TOPOLOGY_TRIANGLES;
+    case D3DPT_LINELIST:      *out_count = count * 2; return RHI_TOPOLOGY_LINES;
+    case D3DPT_LINESTRIP:     *out_count = count + 1; return RHI_TOPOLOGY_LINE_STRIP;
+    case D3DPT_POINTLIST:     *out_count = count;     return RHI_TOPOLOGY_POINTS;
+    case D3DPT_QUADLIST:      *out_count = count * 6; return RHI_TOPOLOGY_TRIANGLES;
+    default:                  *out_count = 0;          return RHI_TOPOLOGY_UNDEFINED;
     }
 }
 
@@ -1026,32 +1026,31 @@ static void *convert_fan_or_quad(D3DPRIMITIVETYPE pt, const void *src,
 #define UP_RING_BUFFER_SIZE (4 * 1024 * 1024)  /* 4MB per ring */
 
 typedef struct UpRing {
-    ID3D11Buffer *buffer;
-    UINT          offset;
-    UINT          bind;      /* D3D11_BIND_VERTEX_BUFFER or D3D11_BIND_INDEX_BUFFER */
-    UINT          wraps;     /* how often the ring started over */
+    RhiBuffer *buffer;
+    UINT       offset;
+    UINT       bind;      /* RHI_BIND_VERTEX or RHI_BIND_INDEX */
+    UINT       wraps;     /* how often the ring started over */
 } UpRing;
 
-static UpRing g_up_vertex_ring = { NULL, 0, D3D11_BIND_VERTEX_BUFFER, 0 };
-static UpRing g_up_index_ring  = { NULL, 0, D3D11_BIND_INDEX_BUFFER, 0 };
+static UpRing g_up_vertex_ring = { NULL, 0, RHI_BIND_VERTEX, 0 };
+static UpRing g_up_index_ring  = { NULL, 0, RHI_BIND_INDEX, 0 };
 
 static HRESULT up_ring_init(UpRing *ring)
 {
-    D3D11_BUFFER_DESC bd;
+    RhiBufferDesc bd;
     memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = UP_RING_BUFFER_SIZE;
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = ring->bind;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &ring->buffer);
+    bd.size = UP_RING_BUFFER_SIZE;
+    bd.usage = RHI_USAGE_DYNAMIC;
+    bd.bind = ring->bind;
+    bd.cpu_access = RHI_CPU_WRITE;
+    ring->buffer = rhi_buffer_create(&bd, NULL);
+    return ring->buffer ? S_OK : E_FAIL;
 }
 
 static void up_ring_release(UpRing *ring)
 {
-    if (ring->buffer) {
-        ID3D11Buffer_Release(ring->buffer);
-        ring->buffer = NULL;
-    }
+    rhi_buffer_destroy(ring->buffer);
+    ring->buffer = NULL;
     ring->offset = 0;
 }
 
@@ -1064,9 +1063,8 @@ static void up_ring_shutdown(void)
 /* Append data to a ring, returns its byte offset. Returns (UINT)-1 on failure. */
 static UINT up_ring_upload(UpRing *ring, const void *data, UINT size)
 {
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    D3D11_MAP map_type;
-    HRESULT hr;
+    void *mapped;
+    uint32_t map_type;
     UINT offset;
 
     if (!ring->buffer) {
@@ -1079,20 +1077,18 @@ static UINT up_ring_upload(UpRing *ring, const void *data, UINT size)
     if (ring->offset + size > UP_RING_BUFFER_SIZE) {
         ring->offset = 0;
         ring->wraps++;
-        map_type = D3D11_MAP_WRITE_DISCARD;
+        map_type = RHI_MAP_WRITE_DISCARD;
     } else {
-        map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
+        map_type = RHI_MAP_WRITE_NO_OVERWRITE;
     }
 
-    hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
-        (ID3D11Resource *)ring->buffer, 0, map_type, 0, &mapped);
-    if (FAILED(hr)) return (UINT)-1;
+    mapped = rhi_buffer_map(ring->buffer, map_type);
+    if (!mapped) return (UINT)-1;
 
     offset = ring->offset;
-    memcpy((BYTE *)mapped.pData + offset, data, size);
+    memcpy((BYTE *)mapped + offset, data, size);
 
-    ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
-        (ID3D11Resource *)ring->buffer, 0);
+    rhi_buffer_unmap(ring->buffer);
 
     ring->offset = (offset + size + 15) & ~15;  /* 16-byte align */
     return offset;
@@ -1102,7 +1098,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
 {
     (void)self;
     g_d3d_draw_count++;
-    D3D11_PRIMITIVE_TOPOLOGY topology;
+    uint32_t topology;
     UINT vertex_count;
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count);
@@ -1112,8 +1108,8 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
-    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
-    ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, StartVertex);
+    rhi_set_topology(topology);
+    rhi_draw(vertex_count, StartVertex);
     return S_OK;
 }
 
@@ -1121,7 +1117,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
 {
     (void)self; (void)MinVertexIndex; (void)NumVertices;
     g_d3d_draw_count++;
-    D3D11_PRIMITIVE_TOPOLOGY topology;
+    uint32_t topology;
     UINT index_count;
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
@@ -1131,8 +1127,8 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
 
-    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
-    ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, StartIndex, (INT)g_cur_ib_base_vertex);
+    rhi_set_topology(topology);
+    rhi_draw_indexed(index_count, StartIndex, (int32_t)g_cur_ib_base_vertex);
     return S_OK;
 }
 
@@ -1165,7 +1161,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 {
     (void)self;
     g_d3d_draw_count++;
-    D3D11_PRIMITIVE_TOPOLOGY topology;
+    uint32_t topology;
     UINT vertex_count, vb_size, ring_offset;
     const void *draw_data = pVertexData;
     void *converted = NULL;
@@ -1195,8 +1191,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     if (ring_offset == (UINT)-1) return E_OUTOFMEMORY;
 
     /* Bind ring buffer at the right offset */
-    ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-        0, 1, &g_up_vertex_ring.buffer, &VertexStreamZeroStride, &ring_offset);
+    rhi_set_vertex_buffer(0, g_up_vertex_ring.buffer, VertexStreamZeroStride, ring_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
@@ -1210,8 +1205,8 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
-    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
-    ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, 0);
+    rhi_set_topology(topology);
+    rhi_draw(vertex_count, 0);
 
     /* Restore previous VB binding if any */
     if (g_cur_vb) {
@@ -1225,11 +1220,10 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
 {
     (void)self; (void)MinVertexIndex;
     g_d3d_draw_count++;
-    D3D11_PRIMITIVE_TOPOLOGY topology;
-    UINT index_count, vb_size, ib_size, offset = 0;
+    uint32_t topology;
+    UINT index_count, vb_size, ib_size;
     UINT vb_offset, ib_offset;
     UINT idx_bytes;
-    DXGI_FORMAT ib_fmt;
 
     if (!pVertexData || !pIndexData || !VertexStreamZeroStride) return E_INVALIDARG;
 
@@ -1238,7 +1232,6 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
 
 
     idx_bytes = (IndexDataFormat == D3DFMT_INDEX32) ? 4 : 2;
-    ib_fmt = (IndexDataFormat == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     vb_size = NumVertices * VertexStreamZeroStride;
     ib_size = index_count * idx_bytes;
 
@@ -1250,10 +1243,8 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     if (ib_offset == (UINT)-1) return E_OUTOFMEMORY;
 
     /* Bind, prepare, draw */
-    ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-        0, 1, &g_up_vertex_ring.buffer, &VertexStreamZeroStride, &vb_offset);
-    ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
-        g_up_index_ring.buffer, ib_fmt, ib_offset);
+    rhi_set_vertex_buffer(0, g_up_vertex_ring.buffer, VertexStreamZeroStride, vb_offset);
+    rhi_set_index_buffer(g_up_index_ring.buffer, idx_bytes * 8, ib_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
@@ -1267,8 +1258,8 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
         d3d8_SetTwoDSqueeze(FALSE);
     d3d8_states_apply();
 
-    ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
-    ID3D11DeviceContext_DrawIndexed(g_device_state.d3d11_context, index_count, 0, 0);
+    rhi_set_topology(topology);
+    rhi_draw_indexed(index_count, 0, 0);
 
     /* Restore previous bindings */
     if (g_cur_vb) {
@@ -1544,17 +1535,17 @@ static void apply_host_viewport(void)
 {
     const D3DVIEWPORT8 *vp = &g_device_state.viewport;
     float sx = rt_scale_x(), sy = rt_scale_y();
-    D3D11_VIEWPORT hv;
+    RhiViewport hv;
 
     if (!g_device_state.d3d11_context)
         return;
 
-    hv.TopLeftX = (FLOAT)vp->X * sx;
-    hv.TopLeftY = (FLOAT)vp->Y * sy;
-    hv.Width    = (FLOAT)vp->Width * sx;
-    hv.Height   = (FLOAT)vp->Height * sy;
-    hv.MinDepth = vp->MinZ;
-    hv.MaxDepth = vp->MaxZ;
+    hv.x         = (FLOAT)vp->X * sx;
+    hv.y         = (FLOAT)vp->Y * sy;
+    hv.width     = (FLOAT)vp->Width * sx;
+    hv.height    = (FLOAT)vp->Height * sy;
+    hv.min_depth = vp->MinZ;
+    hv.max_depth = vp->MaxZ;
 
     /* In widescreen the whole scene is stretched horizontally at present,
      * which is right for geometry that went through a widened projection
@@ -1570,12 +1561,12 @@ static void apply_host_viewport(void)
         if (k > 0.0f && k < 1.0f) {
             float cx = (float)g_device_state.width * 0.5f;
 
-            hv.TopLeftX = cx + (hv.TopLeftX - cx) * k;
-            hv.Width   *= k;
+            hv.x = cx + (hv.x - cx) * k;
+            hv.width *= k;
         }
     }
 
-    ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &hv);
+    rhi_set_viewports(1, &hv);
 }
 
 /* Called once per draw, from the shader path that knows which kind of
@@ -1989,16 +1980,16 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
 
     d3d8_init_default_states(&g_device_state);
 
-    /* Set initial viewport (D3D11 requires explicit viewport) */
+    /* Set the initial viewport (no backend guesses one) */
     {
-        D3D11_VIEWPORT vp;
-        vp.TopLeftX = 0.0f;
-        vp.TopLeftY = 0.0f;
-        vp.Width    = (FLOAT)g_device_state.width;
-        vp.Height   = (FLOAT)g_device_state.height;
-        vp.MinDepth = 0.0f;
-        vp.MaxDepth = 1.0f;
-        ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &vp);
+        RhiViewport vp;
+        vp.x = 0.0f;
+        vp.y = 0.0f;
+        vp.width = (float)g_device_state.width;
+        vp.height = (float)g_device_state.height;
+        vp.min_depth = 0.0f;
+        vp.max_depth = 1.0f;
+        rhi_set_viewports(1, &vp);
     }
 
     /* Initialize shader and state subsystems */
