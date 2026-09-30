@@ -138,7 +138,7 @@ SAME(RHI_APPEND, D3D11_APPEND_ALIGNED_ELEMENT);
 /* ---- the objects --------------------------------------------------------------- */
 
 struct RhiBuffer       { ID3D11Buffer *b; RhiBufferDesc desc; };
-struct RhiImage        { ID3D11Resource *res; RhiImageDesc desc; };
+struct RhiImage        { ID3D11Resource *res; RhiImageDesc desc; LONG refs; };
 struct RhiView         { ID3D11View *v; uint32_t kind; RhiImage *image; };
 struct RhiShader       { uint32_t stage; ID3D11DeviceChild *sh; ID3DBlob *blob; };
 struct RhiVertexLayout { ID3D11InputLayout *il; };
@@ -216,6 +216,7 @@ RhiImage *rhi_d3d11_wrap_image(void *native)
         img->desc.cube = (d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0;
     }
     img->res = res;
+    img->refs = 1;
     ID3D11Resource_AddRef(res);
     return img;
 }
@@ -331,13 +332,29 @@ static RhiImage *d_image_create(const RhiImageDesc *d, const RhiSubresourceData 
         return NULL;
     }
     img->desc = *d;
+    img->refs = 1;
+    return img;
+}
+
+static RhiImage *d_image_retain(RhiImage *img)
+{
+    InterlockedIncrement(&img->refs);
     return img;
 }
 
 static void d_image_destroy(RhiImage *img)
 {
+    if (InterlockedDecrement(&img->refs) > 0)
+        return;
     if (img->res) ID3D11Resource_Release(img->res);
     free(img);
+}
+
+static int d_sample_count_supported(RhiFormat f, uint32_t samples)
+{
+    UINT levels = 0;
+    return SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(g_dev, (DXGI_FORMAT)f,
+                                                                samples, &levels)) && levels > 0;
 }
 
 static void d_image_get_desc(const RhiImage *img, RhiImageDesc *out)
@@ -961,8 +978,9 @@ static void d_clear_depth(RhiView *v, uint32_t flags, float z, uint8_t s)
 const RhiBackend rhi_d3d11_backend = {
     "d3d11",
     d_buffer_create, d_buffer_destroy, d_buffer_map, d_buffer_unmap, d_buffer_update,
-    d_image_create, d_image_destroy, d_image_get_desc, d_image_update, d_image_readback,
+    d_image_create, d_image_retain, d_image_destroy, d_image_get_desc, d_image_update, d_image_readback,
     d_view_create, d_view_destroy, d_view_image,
+    d_sample_count_supported,
     d_shader_create, d_shader_destroy, d_vertex_layout_create, d_vertex_layout_destroy,
     d_blend_state_create, d_depth_state_create, d_raster_state_create, d_sampler_create,
     d_blend_state_destroy, d_depth_state_destroy, d_raster_state_destroy, d_sampler_destroy,

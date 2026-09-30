@@ -21,6 +21,7 @@ void  rhi_buffer_unmap(RhiBuffer *b)                    { g_rhi->buffer_unmap(b)
 void  rhi_buffer_update(RhiBuffer *b, const void *data) { g_rhi->buffer_update(b, data); }
 
 RhiImage *rhi_image_create(const RhiImageDesc *d, const RhiSubresourceData *init) { return g_rhi->image_create(d, init); }
+RhiImage *rhi_image_retain(RhiImage *img)                        { return img ? g_rhi->image_retain(img) : NULL; }
 void rhi_image_destroy(RhiImage *img)                            { if (img) g_rhi->image_destroy(img); }
 void rhi_image_get_desc(const RhiImage *img, RhiImageDesc *out)  { g_rhi->image_get_desc(img, out); }
 void rhi_image_update(RhiImage *img, uint32_t sub, const RhiBox *box,
@@ -36,6 +37,59 @@ int rhi_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitc
 RhiView  *rhi_view_create(RhiImage *img, uint32_t kind, const RhiViewDesc *d) { return g_rhi->view_create(img, kind, d); }
 void      rhi_view_destroy(RhiView *v)       { if (v) g_rhi->view_destroy(v); }
 RhiImage *rhi_view_image(const RhiView *v)   { return v ? g_rhi->view_image(v) : NULL; }
+
+int rhi_sample_count_supported(RhiFormat f, uint32_t samples)   { return g_rhi->sample_count_supported(f, samples); }
+
+/* Bytes per texel, or per 4x4 block for the BC formats. */
+static uint32_t format_block_bytes(RhiFormat f, int *block)
+{
+    *block = 0;
+    switch (f) {
+    case RHI_FORMAT_R32G32B32A32_FLOAT: case RHI_FORMAT_R32G32B32A32_SINT:
+        return 16;
+    case RHI_FORMAT_R32G32B32_FLOAT:
+        return 12;
+    case RHI_FORMAT_R16G16B16A16_FLOAT: case RHI_FORMAT_R16G16B16A16_UNORM:
+    case RHI_FORMAT_R16G16B16A16_SNORM: case RHI_FORMAT_R32G32_FLOAT:
+        return 8;
+    case RHI_FORMAT_R10G10B10A2_UNORM: case RHI_FORMAT_R11G11B10_FLOAT:
+    case RHI_FORMAT_R8G8B8A8_UNORM: case RHI_FORMAT_R8G8B8A8_SNORM:
+    case RHI_FORMAT_R16G16_FLOAT: case RHI_FORMAT_R16G16_UNORM: case RHI_FORMAT_R16G16_SNORM:
+    case RHI_FORMAT_D32_FLOAT: case RHI_FORMAT_R32_FLOAT: case RHI_FORMAT_R32_UINT:
+    case RHI_FORMAT_D24_UNORM_S8_UINT:
+    case RHI_FORMAT_B8G8R8A8_UNORM: case RHI_FORMAT_B8G8R8X8_UNORM:
+        return 4;
+    case RHI_FORMAT_R8G8_UNORM: case RHI_FORMAT_R8G8_SNORM: case RHI_FORMAT_R16_FLOAT:
+    case RHI_FORMAT_D16_UNORM: case RHI_FORMAT_R16_UNORM: case RHI_FORMAT_R16_UINT:
+    case RHI_FORMAT_R16_SNORM: case RHI_FORMAT_B5G6R5_UNORM: case RHI_FORMAT_B5G5R5A1_UNORM:
+    case RHI_FORMAT_B4G4R4A4_UNORM:
+        return 2;
+    case RHI_FORMAT_R8_UNORM: case RHI_FORMAT_A8_UNORM:
+        return 1;
+    case RHI_FORMAT_BC1_UNORM:
+        *block = 1;
+        return 8;
+    case RHI_FORMAT_BC2_UNORM: case RHI_FORMAT_BC3_UNORM: case RHI_FORMAT_BC5_UNORM:
+        *block = 1;
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+uint32_t rhi_format_row_pitch(RhiFormat f, uint32_t width)
+{
+    int block;
+    uint32_t bytes = format_block_bytes(f, &block);
+    return block ? ((width + 3) / 4) * bytes : width * bytes;
+}
+
+uint32_t rhi_format_rows(RhiFormat f, uint32_t height)
+{
+    int block;
+    (void)format_block_bytes(f, &block);
+    return block ? (height + 3) / 4 : height;
+}
 
 RhiShader *rhi_shader_create(uint32_t stage, const RhiShaderSource *src, char *err, size_t err_len)
 {

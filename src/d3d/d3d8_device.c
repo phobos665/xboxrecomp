@@ -39,10 +39,9 @@ typedef struct D3D8DeviceState {
     ID3D11DeviceContext     *d3d11_context;
     IDXGISwapChain          *swap_chain;
 
-    /* Default render targets */
-    ID3D11RenderTargetView  *default_rtv;
-    ID3D11DepthStencilView  *default_dsv;
-    ID3D11Texture2D         *default_depth;
+    /* The device's own depth buffer and a view of it */
+    RhiImage               *depth_image;
+    RhiView                *depth_view;
 
     /* Window */
     HWND                    hwnd;
@@ -63,13 +62,11 @@ typedef struct D3D8DeviceState {
      * rendered for a 640x480 guest, and only where it lands changes. */
     UINT                    swap_width;
     UINT                    swap_height;
-    ID3D11Texture2D          *scene_texture;  /* NULL while unscaled */
-    ID3D11ShaderResourceView *scene_srv;      /* the finished frame, to read */
-    ID3D11RenderTargetView   *present_rtv;    /* the back buffer; NULL unscaled */
-    RhiView                  *rhi_scene_srv;  /* the same two, as rhi.h views */
-    RhiView                  *rhi_present_rtv;
-    RhiImage                 *rhi_scene_image;
-    RhiView                  *rhi_default_rtv;
+    ID3D11RenderTargetView   *present_rtv;    /* the swap chain's back buffer */
+    RhiView                  *rhi_present_rtv;  /* the same, as an rhi.h view */
+    RhiImage                 *rhi_scene_image;  /* what every draw goes to */
+    RhiView                  *rhi_scene_srv;    /* the finished frame, to read */
+    RhiView                  *rhi_default_rtv;  /* "the back buffer" to a title */
     D3DFORMAT               backbuffer_format;
 
     /* State tracking */
@@ -179,7 +176,6 @@ IDirect3DDevice8    *d3d8_GetDevice(void) { return &g_device; }
 ID3D11Device        *d3d8_GetD3D11Device(void) { return g_device_state.d3d11_device; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_context; }
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
-ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
 UINT d3d8_GetBackBufferWidth(void)  { return g_device_state.width; }
 UINT d3d8_GetBackBufferHeight(void) { return g_device_state.height; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
@@ -204,17 +200,9 @@ void xbox_D3D8SetGuestSize(UINT width, UINT height)
  * screen-space quad by the scene size would shrink it. */
 UINT d3d8_GetGuestWidth(void)  { return g_guest_width  ? g_guest_width  : g_device_state.present_width; }
 
-ID3D11ShaderResourceView *d3d8_GetSceneSRV(void) { return g_device_state.scene_srv; }
 RhiImage *d3d8_GetSceneImage(void)      { return g_device_state.rhi_scene_image; }
 RhiView  *d3d8_GetSceneView(void)       { return g_device_state.rhi_scene_srv; }
 RhiView  *d3d8_GetDefaultTargetView(void) { return g_device_state.rhi_default_rtv; }
-ID3D11Texture2D *d3d8_GetSceneTexture(void) { return g_device_state.scene_texture; }
-/* The render target drawing goes to right now: a title's own surface, or the
- * scene target when none is set. For the screen copy's probe. */
-ID3D11RenderTargetView *d3d8_GetCurrentRTV(void)
-{
-    return g_cur_rt ? g_cur_rt->rtv : g_device_state.default_rtv;
-}
 
 /* Guest render-target pixels to host pixels, for the viewport and the
  * scissor rectangle -- the two pieces of state a title hands us measured
@@ -247,7 +235,7 @@ static void present_resolve(void)
     D3D8DisplayFit fit;
     RECT rc;
 
-    if (!s->present_rtv || !s->scene_srv)
+    if (!s->present_rtv || !s->rhi_scene_srv)
         return;
 
     /* Follow the window. DXGI stretches the back buffer to the client
@@ -471,7 +459,7 @@ static HRESULT d3d11_create_device_and_swap_chain(
 static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
 {
     ID3D11Texture2D *back_buffer = NULL;
-    D3D11_TEXTURE2D_DESC depth_desc;
+    RhiImageDesc depth_desc;
     HRESULT hr;
 
     hr = IDXGISwapChain_GetBuffer(state->swap_chain, 0,
@@ -480,7 +468,7 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
     if (FAILED(hr)) return hr;
 
     {
-        D3D11_TEXTURE2D_DESC sd;
+        RhiImageDesc sd;
 
         /* An offscreen colour target the size of the scene, always, even
          * when that is the size the guest asked for. The swap chain
@@ -494,35 +482,30 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
          * SHADER_RESOURCE because both the resolve and a title reading
          * back its own screen sample it. */
         memset(&sd, 0, sizeof sd);
-        sd.Width = state->width;
-        sd.Height = state->height;
-        sd.MipLevels = 1;
-        sd.ArraySize = 1;
-        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.SampleDesc.Count = 1;
-        sd.Usage = D3D11_USAGE_DEFAULT;
-        sd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        sd.type = RHI_IMAGE_2D;
+        sd.width = state->width;
+        sd.height = state->height;
+        sd.depth = 1;
+        sd.mip_levels = 1;
+        sd.format = RHI_FORMAT_R8G8B8A8_UNORM;
+        sd.samples = 1;
+        sd.usage = RHI_USAGE_DEFAULT;
+        sd.bind = RHI_BIND_RENDER_TARGET | RHI_BIND_SAMPLED;
 
-        hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &sd, NULL,
-                                          &state->scene_texture);
-        if (SUCCEEDED(hr))
-            hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
-                                                      (ID3D11Resource *)state->scene_texture,
-                                                      NULL, &state->default_rtv);
-        if (SUCCEEDED(hr))
-            hr = ID3D11Device_CreateShaderResourceView(state->d3d11_device,
-                                                        (ID3D11Resource *)state->scene_texture,
-                                                        NULL, &state->scene_srv);
-        if (SUCCEEDED(hr))
+        hr = E_FAIL;
+        state->rhi_scene_image = rhi_image_create(&sd, NULL);
+        if (state->rhi_scene_image)
+            state->rhi_default_rtv = rhi_view_create(state->rhi_scene_image,
+                                                     RHI_VIEW_RENDER_TARGET, NULL);
+        if (state->rhi_default_rtv)
+            state->rhi_scene_srv = rhi_view_create(state->rhi_scene_image,
+                                                   RHI_VIEW_SAMPLED, NULL);
+        if (state->rhi_scene_srv)
             hr = ID3D11Device_CreateRenderTargetView(state->d3d11_device,
                                                       (ID3D11Resource *)back_buffer,
                                                       NULL, &state->present_rtv);
-        if (SUCCEEDED(hr)) {
-            state->rhi_scene_srv = rhi_d3d11_wrap_view(state->scene_srv, RHI_VIEW_SAMPLED);
+        if (SUCCEEDED(hr))
             state->rhi_present_rtv = rhi_d3d11_wrap_view(state->present_rtv, RHI_VIEW_RENDER_TARGET);
-            state->rhi_scene_image = rhi_d3d11_wrap_image(state->scene_texture);
-            state->rhi_default_rtv = rhi_d3d11_wrap_view(state->default_rtv, RHI_VIEW_RENDER_TARGET);
-        }
         if (FAILED(hr))
             fprintf(stderr, "D3D8 display: the %ux%u scene target could not be "
                     "made (0x%08lX); nothing will be drawn\n",
@@ -533,29 +516,24 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
 
     /* Create depth stencil */
     memset(&depth_desc, 0, sizeof(depth_desc));
-    depth_desc.Width = state->width;
-    depth_desc.Height = state->height;
-    depth_desc.MipLevels = 1;
-    depth_desc.ArraySize = 1;
-    depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    depth_desc.SampleDesc.Count = 1;
-    depth_desc.SampleDesc.Quality = 0;
-    depth_desc.Usage = D3D11_USAGE_DEFAULT;
-    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    depth_desc.type = RHI_IMAGE_2D;
+    depth_desc.width = state->width;
+    depth_desc.height = state->height;
+    depth_desc.depth = 1;
+    depth_desc.mip_levels = 1;
+    depth_desc.format = RHI_FORMAT_D24_UNORM_S8_UINT;
+    depth_desc.samples = 1;
+    depth_desc.usage = RHI_USAGE_DEFAULT;
+    depth_desc.bind = RHI_BIND_DEPTH;
 
-    hr = ID3D11Device_CreateTexture2D(state->d3d11_device, &depth_desc,
-                                       NULL, &state->default_depth);
-    if (FAILED(hr)) return hr;
+    state->depth_image = rhi_image_create(&depth_desc, NULL);
+    if (!state->depth_image) return E_FAIL;
 
-    hr = ID3D11Device_CreateDepthStencilView(state->d3d11_device,
-                                              (ID3D11Resource *)state->default_depth,
-                                              NULL, &state->default_dsv);
-    if (FAILED(hr)) return hr;
+    state->depth_view = rhi_view_create(state->depth_image, RHI_VIEW_DEPTH, NULL);
+    if (!state->depth_view) return E_FAIL;
 
     /* Bind default render targets */
-    ID3D11DeviceContext_OMSetRenderTargets(state->d3d11_context, 1,
-                                            &state->default_rtv,
-                                            state->default_dsv);
+    rhi_set_render_target(state->rhi_default_rtv, state->depth_view);
 
     return S_OK;
 }
@@ -658,15 +636,12 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
         if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
         if (g_auto_ds) { IDirect3DSurface8_Release(&g_auto_ds->iface); g_auto_ds = NULL; }
-        if (s->default_dsv) { ID3D11DepthStencilView_Release(s->default_dsv); s->default_dsv = NULL; }
-        if (s->default_depth) { ID3D11Texture2D_Release(s->default_depth); s->default_depth = NULL; }
-        if (s->default_rtv) { ID3D11RenderTargetView_Release(s->default_rtv); s->default_rtv = NULL; }
+        rhi_view_destroy(s->depth_view); s->depth_view = NULL;
+        rhi_image_destroy(s->depth_image); s->depth_image = NULL;
         rhi_view_destroy(s->rhi_scene_srv); s->rhi_scene_srv = NULL;
         rhi_view_destroy(s->rhi_present_rtv); s->rhi_present_rtv = NULL;
         rhi_view_destroy(s->rhi_default_rtv); s->rhi_default_rtv = NULL;
         rhi_image_destroy(s->rhi_scene_image); s->rhi_scene_image = NULL;
-        if (s->scene_srv) { ID3D11ShaderResourceView_Release(s->scene_srv); s->scene_srv = NULL; }
-        if (s->scene_texture) { ID3D11Texture2D_Release(s->scene_texture); s->scene_texture = NULL; }
         if (s->present_rtv) { ID3D11RenderTargetView_Release(s->present_rtv); s->present_rtv = NULL; }
         if (s->swap_chain) { IDXGISwapChain_Release(s->swap_chain); s->swap_chain = NULL; }
         if (s->d3d11_context) { ID3D11DeviceContext_Release(s->d3d11_context); s->d3d11_context = NULL; }
@@ -763,31 +738,19 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *self, const RECT *src, co
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *self, INT iBackBuffer, DWORD Type, IDirect3DSurface8 **ppSurface)
 {
     (void)self; (void)iBackBuffer; (void)Type;
-    ID3D11Texture2D *back_buffer = NULL;
-    HRESULT hr;
 
     if (!ppSurface) return E_INVALIDARG;
 
     /* The scene target, not the swap chain: that is what every draw went
-     * to, and its size is the one the rest of the device reports. They are
-     * the same object while unscaled. */
-    if (g_device_state.scene_texture) {
-        back_buffer = g_device_state.scene_texture;
-        ID3D11Texture2D_AddRef(back_buffer);
-    } else {
-        hr = IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
-                                       &IID_ID3D11Texture2D,
-                                       (void **)&back_buffer);
-        if (FAILED(hr)) return hr;
-    }
+     * to, and its size is the one the rest of the device reports. */
+    if (!g_device_state.rhi_scene_image) return E_FAIL;
 
-    *ppSurface = d3d8_surface_create(back_buffer, 0, 0,
+    *ppSurface = d3d8_surface_create(g_device_state.rhi_scene_image, 0, 0,
                                      g_device_state.width,
                                      g_device_state.height,
                                      D3DFMT_X8R8G8B8,
                                      D3DPOOL_DEFAULT, 0,
                                      D3DMULTISAMPLE_NONE, NULL, 0);
-    ID3D11Texture2D_Release(back_buffer);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
@@ -814,8 +777,8 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
 
     /* Clear the currently bound targets. With no depth surface bound there
      * is no depth to clear (SetRenderTarget). */
-    ID3D11RenderTargetView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.default_rtv;
-    ID3D11DepthStencilView *dsv = g_cur_ds ? g_cur_ds->dsv : NULL;
+    RhiView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.rhi_default_rtv;
+    RhiView *dsv = g_cur_ds ? g_cur_ds->dsv : NULL;
 
     if ((Flags & D3DCLEAR_TARGET) && rtv) {
         float clear_color[4] = {
@@ -824,19 +787,15 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
             ((Color >>  0) & 0xFF) / 255.0f,  /* B */
             ((Color >> 24) & 0xFF) / 255.0f,  /* A */
         };
-        ID3D11DeviceContext_ClearRenderTargetView(g_device_state.d3d11_context,
-                                                   rtv,
-                                                   clear_color);
+        rhi_clear_color(rtv, clear_color);
     }
 
     if ((Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) && dsv) {
-        UINT clear_flags = 0;
-        if (Flags & D3DCLEAR_ZBUFFER) clear_flags |= D3D11_CLEAR_DEPTH;
-        if (Flags & D3DCLEAR_STENCIL) clear_flags |= D3D11_CLEAR_STENCIL;
+        uint32_t clear_flags = 0;
+        if (Flags & D3DCLEAR_ZBUFFER) clear_flags |= RHI_CLEAR_DEPTH;
+        if (Flags & D3DCLEAR_STENCIL) clear_flags |= RHI_CLEAR_STENCIL;
 
-        ID3D11DeviceContext_ClearDepthStencilView(g_device_state.d3d11_context,
-                                                    dsv,
-                                                    clear_flags, Z, (UINT8)Stencil);
+        rhi_clear_depth(dsv, clear_flags, Z, (uint8_t)Stencil);
     }
 
     return S_OK;
@@ -911,22 +870,19 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
 
     /* Bind SRV to pixel shader */
     if (pTexture) {
-        ID3D11ShaderResourceView *srv = d3d8_base_srv(pTexture);
+        RhiView *srv = d3d8_base_srv(pTexture);
         /* P8 textures bake a palette; record which stage palette they use
          * so SetPalette can re-bake them later. */
         if (d3d8_format_is_palettized(d3d8_base_format(pTexture)))
             d3d8_base_set_palette(pTexture, Stage);
-        if (srv) {
-            ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context,
-                Stage, 1, &srv);
-        }
+        if (srv)
+            rhi_set_textures(Stage, 1, &srv);
         /* Mark texture stage as active */
         if (g_device_state.tss[Stage][D3DTSS_COLOROP] == D3DTOP_DISABLE)
             g_device_state.tss[Stage][D3DTSS_COLOROP] = D3DTOP_MODULATE;
     } else {
-        ID3D11ShaderResourceView *null_srv = NULL;
-        ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context,
-            Stage, 1, &null_srv);
+        RhiView *null_srv = NULL;
+        rhi_set_textures(Stage, 1, &null_srv);
         g_device_state.tss[Stage][D3DTSS_COLOROP] = D3DTOP_DISABLE;
     }
     return S_OK;
@@ -950,9 +906,7 @@ static HRESULT __stdcall dev_SetStreamSource(IDirect3DDevice8 *self, UINT Stream
 
     if (pStreamData) {
         D3D8VertexBuffer *vb = (D3D8VertexBuffer *)pStreamData;
-        UINT offset = 0;
-        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-            0, 1, &vb->d3d11_buffer, &Stride, &offset);
+        rhi_set_vertex_buffer(0, vb->buffer, Stride, 0);
     }
     return S_OK;
 }
@@ -975,10 +929,7 @@ static HRESULT __stdcall dev_SetIndices(IDirect3DDevice8 *self, IDirect3DIndexBu
 
     if (pIndexData) {
         D3D8IndexBuffer *ib = (D3D8IndexBuffer *)pIndexData;
-        DXGI_FORMAT fmt = (ib->format == D3DFMT_INDEX32)
-            ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-        ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
-            ib->d3d11_buffer, fmt, 0);
+        rhi_set_index_buffer(ib->buffer, ib->format == D3DFMT_INDEX32 ? 32 : 16, 0);
     }
     return S_OK;
 }
@@ -1265,9 +1216,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     /* Restore previous VB binding if any */
     if (g_cur_vb) {
         D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
-        UINT restore_offset = 0;
-        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-            0, 1, &vb->d3d11_buffer, &g_cur_vb_stride, &restore_offset);
+        rhi_set_vertex_buffer(0, vb->buffer, g_cur_vb_stride, 0);
     }
     return S_OK;
 }
@@ -1324,15 +1273,11 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     /* Restore previous bindings */
     if (g_cur_vb) {
         D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
-        offset = 0;
-        ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-            0, 1, &vb->d3d11_buffer, &g_cur_vb_stride, &offset);
+        rhi_set_vertex_buffer(0, vb->buffer, g_cur_vb_stride, 0);
     }
     if (g_cur_ib) {
         D3D8IndexBuffer *ib = (D3D8IndexBuffer *)g_cur_ib;
-        DXGI_FORMAT fmt = (ib->format == D3DFMT_INDEX32) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-        ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
-            ib->d3d11_buffer, fmt, 0);
+        rhi_set_index_buffer(ib->buffer, ib->format == D3DFMT_INDEX32 ? 32 : 16, 0);
     }
     return S_OK;
 }
@@ -1376,28 +1321,22 @@ static HRESULT __stdcall dev_CreateIndexBuffer(IDirect3DDevice8 *self, UINT Leng
 static HRESULT __stdcall dev_CreateRenderTarget(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, BOOL Lockable, IDirect3DSurface8 **ppSurface)
 {
     (void)self; (void)Lockable;
-    D3D11_TEXTURE2D_DESC td;
-    ID3D11Texture2D *tex = NULL;
-    HRESULT hr;
+    RhiImageDesc td;
+    RhiImage *img;
     UINT sample_count;
 
     if (!ppSurface || !Width || !Height) return E_INVALIDARG;
 
     sample_count = d3d8_msaa_sample_count(MultiSample);
     if (sample_count > 1) {
-        UINT levels = 0;
-        UINT maxq = 0;
-        DXGI_FORMAT fmt = d3d8_to_dxgi_format(Format);
-        /* Validate against D3D11 hardware limits; fall back gracefully. */
-        hr = ID3D11Device_CheckMultisampleQualityLevels(d3d8_GetD3D11Device(),
-                fmt, sample_count, &maxq);
-        if (FAILED(hr) || maxq == 0) {
+        RhiFormat fmt = d3d8_to_dxgi_format(Format);
+        /* Validate against the host's limits; fall back gracefully. */
+        if (!rhi_sample_count_supported(fmt, sample_count)) {
             UINT counts[] = { 9, 8, 4, 2, 1 };
             UINT i;
             for (i = 0; i < 5; i++) {
                 if (counts[i] >= sample_count) continue;
-                if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(
-                        d3d8_GetD3D11Device(), fmt, counts[i], &levels)) && levels > 0) {
+                if (rhi_sample_count_supported(fmt, counts[i])) {
                     sample_count = counts[i];
                     break;
                 }
@@ -1413,61 +1352,57 @@ static HRESULT __stdcall dev_CreateRenderTarget(IDirect3DDevice8 *self, UINT Wid
     }
 
     memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = d3d8_to_dxgi_format(Format);
-    td.SampleDesc.Count = sample_count;
-    td.SampleDesc.Quality = 0;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.type = RHI_IMAGE_2D;
+    td.width = Width;
+    td.height = Height;
+    td.depth = 1;
+    td.mip_levels = 1;
+    td.format = d3d8_to_dxgi_format(Format);
+    td.samples = sample_count;
+    td.sample_quality = 0;
+    td.usage = RHI_USAGE_DEFAULT;
+    td.bind = RHI_BIND_RENDER_TARGET | RHI_BIND_SAMPLED;
 
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateRenderTarget failed: 0x%08lX (fmt=0x%X %ux%u)\n", hr, Format, Width, Height);
-        return hr;
+    img = rhi_image_create(&td, NULL);
+    if (!img) {
+        fprintf(stderr, "D3D8: CreateRenderTarget failed (fmt=0x%X %ux%u)\n", Format, Width, Height);
+        return E_FAIL;
     }
 
-    *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, Format,
+    *ppSurface = d3d8_surface_create(img, 0, 0, Width, Height, Format,
                                      D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET,
                                      MultiSample, NULL, 0);
-    ID3D11Texture2D_Release(tex);
+    rhi_image_destroy(img);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
 static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, IDirect3DSurface8 **ppSurface)
 {
     (void)self;
-    D3D11_TEXTURE2D_DESC td;
-    ID3D11Texture2D *tex = NULL;
-    DXGI_FORMAT dxgi;
+    RhiImageDesc td;
+    RhiImage *img;
+    RhiFormat host;
     D3DFORMAT surface_format = Format;
-    HRESULT hr;
     UINT sample_count;
 
     if (!ppSurface || !Width || !Height) return E_INVALIDARG;
 
-    dxgi = d3d8_to_dxgi_format(Format);
-    if (dxgi == DXGI_FORMAT_R16_FLOAT) {
-        /* F16 has no D3D11 depth equivalent; fall back to D16. */
+    host = d3d8_to_dxgi_format(Format);
+    if (host == RHI_FORMAT_R16_FLOAT) {
+        /* F16 has no host depth equivalent; fall back to D16. */
         fprintf(stderr, "D3D8: F16 depth surface falling back to D16\n");
-        dxgi = DXGI_FORMAT_D16_UNORM;
+        host = RHI_FORMAT_D16_UNORM;
         surface_format = D3DFMT_D16;
     }
 
     sample_count = d3d8_msaa_sample_count(MultiSample);
     if (sample_count > 1) {
-        UINT levels = 0;
-        hr = ID3D11Device_CheckMultisampleQualityLevels(d3d8_GetD3D11Device(),
-                dxgi, sample_count, &levels);
-        if (FAILED(hr) || levels == 0) {
+        if (!rhi_sample_count_supported(host, sample_count)) {
             UINT counts[] = { 9, 8, 4, 2, 1 };
             UINT i;
             for (i = 0; i < 5; i++) {
                 if (counts[i] >= sample_count) continue;
-                if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(
-                        d3d8_GetD3D11Device(), dxgi, counts[i], &levels)) && levels > 0) {
+                if (rhi_sample_count_supported(host, counts[i])) {
                     sample_count = counts[i];
                     break;
                 }
@@ -1482,26 +1417,27 @@ static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, U
     }
 
     memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = dxgi;
-    td.SampleDesc.Count = sample_count;
-    td.SampleDesc.Quality = 0;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    td.type = RHI_IMAGE_2D;
+    td.width = Width;
+    td.height = Height;
+    td.depth = 1;
+    td.mip_levels = 1;
+    td.format = host;
+    td.samples = sample_count;
+    td.sample_quality = 0;
+    td.usage = RHI_USAGE_DEFAULT;
+    td.bind = RHI_BIND_DEPTH;
 
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateDepthStencilSurface failed: 0x%08lX (fmt=0x%X)\n", hr, Format);
-        return hr;
+    img = rhi_image_create(&td, NULL);
+    if (!img) {
+        fprintf(stderr, "D3D8: CreateDepthStencilSurface failed (fmt=0x%X)\n", Format);
+        return E_FAIL;
     }
 
-    *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, surface_format,
+    *ppSurface = d3d8_surface_create(img, 0, 0, Width, Height, surface_format,
                                      D3DPOOL_DEFAULT, D3DUSAGE_DEPTHSTENCIL,
                                      MultiSample, NULL, 0);
-    ID3D11Texture2D_Release(tex);
+    rhi_image_destroy(img);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
 
@@ -1515,26 +1451,25 @@ static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, U
  *
  * SetTexture is the only other place that binds these, so nothing else
  * reinstates them per draw. */
-static void rebind_stage_srvs(ID3D11Resource *target)
+static void rebind_stage_srvs(RhiImage *target)
 {
     DWORD stage;
 
     for (stage = 0; stage < MAX_TEXTURE_STAGES; stage++) {
-        ID3D11ShaderResourceView *srv = NULL;
+        RhiView *srv = NULL;
 
         if (g_cur_textures[stage] &&
             d3d8_base_resource(g_cur_textures[stage]) != target)
             srv = d3d8_base_srv(g_cur_textures[stage]);
-        ID3D11DeviceContext_PSSetShaderResources(g_device_state.d3d11_context,
-                                                 stage, 1, &srv);
+        rhi_set_textures(stage, 1, &srv);
     }
 }
 
 static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSurface8 *pRenderTarget, IDirect3DSurface8 *pZStencilSurface)
 {
     (void)self;
-    ID3D11RenderTargetView *rtv;
-    ID3D11DepthStencilView *dsv = NULL;
+    RhiView *rtv;
+    RhiView *dsv = NULL;
     D3D8Surface *rt = (D3D8Surface *)pRenderTarget;
     D3D8Surface *ds = (D3D8Surface *)pZStencilSurface;
 
@@ -1567,11 +1502,10 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
     g_cur_rt = rt;
     g_cur_ds = ds;
 
-    rtv = rt ? rt->rtv : g_device_state.default_rtv;
+    rtv = rt ? rt->rtv : g_device_state.rhi_default_rtv;
     dsv = ds ? ds->dsv : NULL;
-    ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1,
-                                            &rtv, dsv);
-    rebind_stage_srvs(rt ? (ID3D11Resource *)rt->d3d11_texture : NULL);
+    rhi_set_render_target(rtv, dsv);
+    rebind_stage_srvs(rt ? rt->image : NULL);
     return S_OK;
 }
 
@@ -2038,7 +1972,7 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
     if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
     if (g_auto_ds) { IDirect3DSurface8_Release(&g_auto_ds->iface); g_auto_ds = NULL; }
-    g_auto_ds = (D3D8Surface *)d3d8_surface_create(g_device_state.default_depth, 0, 0,
+    g_auto_ds = (D3D8Surface *)d3d8_surface_create(g_device_state.depth_image, 0, 0,
                                                    g_device_state.width,
                                                    g_device_state.height,
                                                    D3DFMT_D24S8, D3DPOOL_DEFAULT,
@@ -2051,8 +1985,7 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     }
     g_cur_ds = g_auto_ds;
     IDirect3DSurface8_AddRef(&g_auto_ds->iface);
-    ID3D11DeviceContext_OMSetRenderTargets(g_device_state.d3d11_context, 1,
-                                            &g_device_state.default_rtv, g_auto_ds->dsv);
+    rhi_set_render_target(g_device_state.rhi_default_rtv, g_auto_ds->dsv);
 
     d3d8_init_default_states(&g_device_state);
 

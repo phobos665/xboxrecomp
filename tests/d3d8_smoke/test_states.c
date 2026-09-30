@@ -13,7 +13,7 @@ ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return context; }
 const DWORD *d3d8_GetRenderStates(void) { return rs; }
 const DWORD *d3d8_GetTSS(DWORD stage) { (void)stage; return NULL; }
 /* No scissor: these tests set render states, not the Xbox's SetScissors. */
-BOOL d3d8_GetScissor(D3D11_RECT *out) { (void)out; return FALSE; }
+BOOL d3d8_GetScissor(RhiRect *out) { (void)out; return FALSE; }
 
 #define CHECK(name, cond) \
     do { if (!(cond)) { printf("FAIL: %s\n", name); failures++; } } while (0)
@@ -82,6 +82,8 @@ int main(void)
         fprintf(stderr, "D3D11CreateDevice(WARP) failed: 0x%08lX\n", hr);
         return 1;
     }
+    /* The state cache creates its objects through rhi.h. */
+    rhi_d3d11_adopt(device, context);
 
     rs[D3DRS_ZENABLE] = TRUE;
     rs[D3DRS_ZWRITEENABLE] = TRUE;

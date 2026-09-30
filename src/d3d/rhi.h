@@ -310,6 +310,10 @@ void       rhi_buffer_update(RhiBuffer *b, const void *data);
 
 /* Images and views */
 RhiImage  *rhi_image_create(const RhiImageDesc *desc, const RhiSubresourceData *initial);
+/* Images are reference counted: a surface aliasing a level of a texture
+ * holds the texture's image. create returns one reference; destroy drops
+ * one, and the image goes with the last. */
+RhiImage  *rhi_image_retain(RhiImage *img);
 void       rhi_image_destroy(RhiImage *img);
 void       rhi_image_get_desc(const RhiImage *img, RhiImageDesc *out);
 /* New texels for one subresource (mip + layer * mip_levels), or a box of
@@ -329,6 +333,16 @@ int        rhi_image_readback(RhiImage *img, uint32_t subresource,
 RhiView   *rhi_view_create(RhiImage *img, uint32_t kind, const RhiViewDesc *desc);
 void       rhi_view_destroy(RhiView *v);
 RhiImage  *rhi_view_image(const RhiView *v);
+
+/* Whether a render target or depth image of this format can have this
+ * many samples. */
+int        rhi_sample_count_supported(RhiFormat format, uint32_t samples);
+
+/* Sizes of a format's storage, backend-independent: bytes in one row of
+ * `width` texels (a row of 4x4 blocks for BC formats), and how many such
+ * rows `height` texels take. 0 for a format this table does not know. */
+uint32_t   rhi_format_row_pitch(RhiFormat format, uint32_t width);
+uint32_t   rhi_format_rows(RhiFormat format, uint32_t height);
 
 /* Shaders and vertex layouts. err may be NULL. */
 RhiShader *rhi_shader_create(uint32_t stage, const RhiShaderSource *src,

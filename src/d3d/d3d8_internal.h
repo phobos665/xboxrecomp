@@ -32,7 +32,6 @@ IDirect3DDevice8    *d3d8_GetDevice(void);
 ID3D11Device        *d3d8_GetD3D11Device(void);
 ID3D11DeviceContext *d3d8_GetD3D11Context(void);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
-ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 /* The host back buffer's size, which is what clip space maps onto. */
 UINT                 d3d8_GetBackBufferWidth(void);
 UINT                 d3d8_GetBackBufferHeight(void);
@@ -43,21 +42,18 @@ UINT                 d3d8_GetGuestWidth(void);
 /* The finished frame as a shader input: the offscreen scene target when
  * the host renders larger than the guest, the swap chain's back buffer
  * when it does not. NULL before the device exists. */
-ID3D11ShaderResourceView *d3d8_GetSceneSRV(void);
 /* The scene as rhi.h objects: the image the title draws into, a view to
  * sample it, and the render-target view "the back buffer" means. */
 RhiImage *d3d8_GetSceneImage(void);
 RhiView  *d3d8_GetSceneView(void);
 RhiView  *d3d8_GetDefaultTargetView(void);
-ID3D11Texture2D *d3d8_GetSceneTexture(void);
-ID3D11RenderTargetView *d3d8_GetCurrentRTV(void);
 /* Tell the device whether the next draw is positioned in screen
  * coordinates of the title's own making rather than through its
  * projection. Only matters in widescreen, where the two need different
  * horizontal treatment. */
 void d3d8_SetTwoDSqueeze(BOOL on);
 
-/* Runtime shader compiles, timed (d3d8_combiners.c). kind: 0 combiner pixel
+/* Runtime shader compiles, timed (d3d8_compile.c). kind: 0 combiner pixel
  * shader, 1 fixed-function pixel shader, 2 vertex program. Reported every
  * few seconds with the count and the milliseconds they took, because a
  * compile inside a frame is a stall the frame rate shows and the profile
@@ -135,7 +131,7 @@ BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
 typedef struct D3D8VertexBuffer {
     IDirect3DVertexBuffer8  iface;      /* COM interface (must be first) */
     LONG                    ref_count;
-    ID3D11Buffer           *d3d11_buffer;
+    RhiBuffer              *buffer;
     UINT                    size;
     DWORD                   fvf;
     DWORD                   usage;
@@ -147,7 +143,7 @@ typedef struct D3D8VertexBuffer {
 typedef struct D3D8IndexBuffer {
     IDirect3DIndexBuffer8   iface;
     LONG                    ref_count;
-    ID3D11Buffer           *d3d11_buffer;
+    RhiBuffer              *buffer;
     UINT                    size;
     D3DFORMAT               format;     /* INDEX16 or INDEX32 */
     DWORD                   usage;
@@ -159,13 +155,13 @@ typedef struct D3D8IndexBuffer {
 typedef struct D3D8Texture {
     IDirect3DTexture8       iface;
     LONG                    ref_count;
-    ID3D11Texture2D        *d3d11_texture;
-    ID3D11ShaderResourceView *srv;
+    RhiImage               *image;
+    RhiView                *srv;
     UINT                    width;
     UINT                    height;
     UINT                    levels;
     D3DFORMAT               d3d8_format;
-    DXGI_FORMAT             dxgi_format;
+    RhiFormat               host_format;
     DWORD                   usage;
     BYTE                   *sys_mem;    /* All mip levels, back to back (level 0 first) */
     UINT                    pitch;      /* Row pitch of level 0 */
@@ -177,42 +173,44 @@ typedef struct D3D8Texture {
 typedef struct D3D8Surface {
     IDirect3DSurface8       iface;
     LONG                    ref_count;
-    ID3D11Texture2D        *d3d11_texture;
-    ID3D11RenderTargetView *rtv;
-    ID3D11DepthStencilView *dsv;
+    RhiImage               *image;      /* held; often a parent texture's */
+    RhiView                *rtv;
+    RhiView                *dsv;
     UINT                    width;
     UINT                    height;
     D3DFORMAT               format;
     D3DPOOL                 pool;
     DWORD                   usage;
 
-    /* D3D11 subresource this surface aliases (array*MipLevels+mip).
+    /* Subresource of `image` this surface aliases (array*MipLevels+mip).
      * 0 for a standalone offscreen surface. */
     UINT                    subresource;
 
-    /* Multisample state (requested Xbox type + resolved D3D11 count). */
+    /* Multisample state (requested Xbox type + resolved host count). */
     D3DMULTISAMPLE_TYPE     multsample_type;
     UINT                    sample_count;
 
-    /* Surface LockRect readback (staging round-trip). */
-    ID3D11Texture2D        *staging;
+    /* Surface LockRect: the locked region, read back into CPU memory
+     * (rhi_image_readback) and written back on unlock unless read-only. */
     BYTE                   *locked_bits;
     INT                     locked_pitch;
     UINT                    lock_x;
     UINT                    lock_y;
+    UINT                    lock_w;
+    UINT                    lock_h;
     BOOL                    locked;
     BOOL                    lock_readonly;
 
     /* P8 (palettized) surfaces: raw index data lives in the parent
      * texture's sys_mem. LockRect returns the indices directly instead
-     * of the palette-expanded BGRA that the D3D11 texture holds. */
+     * of the palette-expanded BGRA that the host image holds. */
     BOOL                    palettized;
     const BYTE             *palette_sys;  /* raw level data (1 byte/texel) */
     UINT                    palette_pitch;
     UINT                    palette_index; /* stage palette baked into it */
 } D3D8Surface;
 
-/* 2D texture (D3D11 Texture2D). See tex_* implementation.
+/* 2D texture. See tex_* implementation.
  *
  * D3D8CubeTexture/D3D8VolumeTexture intentionally mirror the field
  * layout of D3D8Texture up to and including the `srv` member (a
@@ -221,13 +219,13 @@ typedef struct D3D8Surface {
 typedef struct D3D8CubeTexture {
     IDirect3DCubeTexture8   iface;
     LONG                    ref_count;
-    ID3D11Texture2D        *d3d11_texture;
-    ID3D11ShaderResourceView *srv;
+    RhiImage               *image;
+    RhiView                *srv;
     UINT                    width;      /* edge length */
     UINT                    height;     /* == width (cube faces are square) */
     UINT                    levels;
     D3DFORMAT               d3d8_format;
-    DXGI_FORMAT             dxgi_format;
+    RhiFormat               host_format;
     DWORD                   usage;
     BYTE                   *sys_mem;    /* 6 faces * mip chain per face */
     UINT                    pitch;      /* row pitch of face level 0 */
@@ -236,21 +234,21 @@ typedef struct D3D8CubeTexture {
     UINT                    palette;    /* Palette index (texture stage) this P8 texture bakes */
 } D3D8CubeTexture;
 
-/* 3D texture (D3D11 Texture3D). The leading fields mirror D3D8CubeTexture
+/* 3D texture. The leading fields mirror D3D8CubeTexture
  * up to `srv` (layout overlay) when read through the D3D8Texture prefix.
  * Note `depth` is placed AFTER `levels` so width/height/levels stay at the
  * same offsets as the 2D types. */
 typedef struct D3D8VolumeTexture {
     IDirect3DVolumeTexture8 iface;
     LONG                    ref_count;
-    ID3D11Texture3D        *d3d11_texture;
-    ID3D11ShaderResourceView *srv;
+    RhiImage               *image;
+    RhiView                *srv;
     UINT                    width;
     UINT                    height;
     UINT                    levels;
     UINT                    depth;
     D3DFORMAT               d3d8_format;
-    DXGI_FORMAT             dxgi_format;
+    RhiFormat               host_format;
     DWORD                   usage;
     BYTE                   *sys_mem;    /* all levels, back to back */
     UINT                    pitch;      /* row pitch of level 0 */
@@ -271,7 +269,9 @@ typedef struct D3D8Volume {
  * Format conversion (d3d8_resources.c)
  * ================================================================ */
 
-DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt);
+/* The host format an Xbox format is held in: an RhiFormat, which is the
+ * DXGI number (so the name is historical). */
+RhiFormat   d3d8_to_dxgi_format(D3DFORMAT fmt);
 UINT        d3d8_format_bpp(D3DFORMAT fmt);
 BOOL        d3d8_format_is_compressed(D3DFORMAT fmt);
 UINT        d3d8_row_pitch(D3DFORMAT fmt, UINT width);
@@ -296,8 +296,9 @@ BOOL d3d8_format_is_palettized(D3DFORMAT fmt);
 void d3d8_convert_linear_pixels(D3DFORMAT fmt, UINT width, UINT height,
                                 const BYTE *src, BYTE *dst, UINT palette);
 
-/* Surface implementation (d3d8_resources.c) */
-IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
+/* Surface implementation (d3d8_resources.c). The surface takes its own
+ * reference to `image`. */
+IDirect3DSurface8 *d3d8_surface_create(RhiImage *image,
                                        UINT mip_slice,
                                        UINT array_slice,
                                        UINT width, UINT height,
@@ -307,19 +308,14 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
                                        const BYTE *raw_level_data,
                                        UINT palette_index);
 
-/* Wrap a raw D3D11 texture (back buffer, etc.) as a surface. */
-IDirect3DSurface8 *xbox_d3d8_surface_wrap(ID3D11Texture2D *texture,
-                                          UINT width, UINT height,
-                                          D3DFORMAT fmt);
-
 HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format,
                                     IDirect3DSurface8 **ppSurface);
 
-/* Fetch the pixel-shader SRV of any bound base texture (2D, cube or
- * volume). All three implementations keep the SRV at the same offset
- * as D3D8Texture. */
-ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
-ID3D11Resource *d3d8_base_resource(IDirect3DBaseTexture8 *texture);
+/* Fetch the sampled view of any bound base texture (2D, cube or
+ * volume). All three implementations keep it at the same offset as
+ * D3D8Texture, and the image likewise. */
+RhiView  *d3d8_base_srv(IDirect3DBaseTexture8 *texture);
+RhiImage *d3d8_base_resource(IDirect3DBaseTexture8 *texture);
 
 /* Read the D3DFORMAT of any base texture. */
 D3DFORMAT d3d8_base_format(IDirect3DBaseTexture8 *texture);

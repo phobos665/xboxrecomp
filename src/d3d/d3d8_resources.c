@@ -23,7 +23,7 @@ static UINT vol_level_depth(const struct D3D8VolumeTexture *vol, UINT level);
 static UINT vol_level_pitch(const struct D3D8VolumeTexture *vol, UINT level);
 static UINT vol_level_rows(const struct D3D8VolumeTexture *vol, UINT level);
 static UINT vol_level_offset(const struct D3D8VolumeTexture *vol, UINT level);
-static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
+static void d3d8_upload_mip_level(RhiImage *image, D3DFORMAT fmt,
                                   UINT w, UINT h, UINT subresource,
                                   const BYTE *src_data, UINT src_row_pitch,
                                   UINT palette);
@@ -36,7 +36,7 @@ static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
  * converted in software during LockRect upload.
  * ================================================================ */
 
-DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt)
+RhiFormat d3d8_to_dxgi_format(D3DFORMAT fmt)
 {
     switch (fmt) {
     /* 32-bit ARGB / RGB */
@@ -734,7 +734,7 @@ static ULONG __stdcall vb_Release(IDirect3DVertexBuffer8 *self)
     D3D8VertexBuffer *vb = vb_from_iface(self);
     LONG ref = InterlockedDecrement(&vb->ref_count);
     if (ref <= 0) {
-        if (vb->d3d11_buffer) ID3D11Buffer_Release(vb->d3d11_buffer);
+        rhi_buffer_destroy(vb->buffer);
         free(vb->sys_mem);
         free(vb);
     }
@@ -793,11 +793,8 @@ static HRESULT __stdcall vb_Unlock(IDirect3DVertexBuffer8 *self)
     vb->dirty = TRUE;
 
     /* Upload to GPU */
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    if (ctx && vb->d3d11_buffer) {
-        ID3D11DeviceContext_UpdateSubresource(ctx,
-            (ID3D11Resource *)vb->d3d11_buffer,
-            0, NULL, vb->sys_mem, vb->size, 0);
+    if (d3d8_GetD3D11Context() && vb->buffer) {
+        rhi_buffer_update(vb->buffer, vb->sys_mem);
         vb->dirty = FALSE;
     }
     return S_OK;
@@ -826,8 +823,7 @@ static const IDirect3DVertexBuffer8Vtbl g_vb_vtbl = {
 HRESULT d3d8_CreateVertexBufferImpl(UINT Length, DWORD Usage, DWORD FVF, IDirect3DVertexBuffer8 **ppVB)
 {
     D3D8VertexBuffer *vb;
-    D3D11_BUFFER_DESC bd;
-    HRESULT hr;
+    RhiBufferDesc bd;
 
     if (!ppVB) return E_INVALIDARG;
 
@@ -837,17 +833,17 @@ HRESULT d3d8_CreateVertexBufferImpl(UINT Length, DWORD Usage, DWORD FVF, IDirect
     vb->sys_mem = (BYTE *)calloc(1, Length);
     if (!vb->sys_mem) { free(vb); return E_OUTOFMEMORY; }
 
-    /* Create D3D11 buffer */
+    /* Create the host buffer */
     memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = Length;
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.size = Length;
+    bd.usage = RHI_USAGE_DEFAULT;
+    bd.bind = RHI_BIND_VERTEX;
 
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, &vb->d3d11_buffer);
-    if (FAILED(hr)) {
+    vb->buffer = rhi_buffer_create(&bd, NULL);
+    if (!vb->buffer) {
         free(vb->sys_mem);
         free(vb);
-        return hr;
+        return E_FAIL;
     }
 
     vb->iface.lpVtbl = &g_vb_vtbl;
@@ -885,7 +881,7 @@ static ULONG __stdcall ib_Release(IDirect3DIndexBuffer8 *self)
     D3D8IndexBuffer *ib = ib_from_iface(self);
     LONG ref = InterlockedDecrement(&ib->ref_count);
     if (ref <= 0) {
-        if (ib->d3d11_buffer) ID3D11Buffer_Release(ib->d3d11_buffer);
+        rhi_buffer_destroy(ib->buffer);
         free(ib->sys_mem);
         free(ib);
     }
@@ -922,11 +918,8 @@ static HRESULT __stdcall ib_Unlock(IDirect3DIndexBuffer8 *self)
     ib->locked = FALSE;
     ib->dirty = TRUE;
 
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-    if (ctx && ib->d3d11_buffer) {
-        ID3D11DeviceContext_UpdateSubresource(ctx,
-            (ID3D11Resource *)ib->d3d11_buffer,
-            0, NULL, ib->sys_mem, ib->size, 0);
+    if (d3d8_GetD3D11Context() && ib->buffer) {
+        rhi_buffer_update(ib->buffer, ib->sys_mem);
         ib->dirty = FALSE;
     }
     return S_OK;
@@ -947,8 +940,7 @@ static const IDirect3DIndexBuffer8Vtbl g_ib_vtbl = {
 HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, IDirect3DIndexBuffer8 **ppIB)
 {
     D3D8IndexBuffer *ib;
-    D3D11_BUFFER_DESC bd;
-    HRESULT hr;
+    RhiBufferDesc bd;
 
     if (!ppIB) return E_INVALIDARG;
 
@@ -959,12 +951,12 @@ HRESULT d3d8_CreateIndexBufferImpl(UINT Length, DWORD Usage, D3DFORMAT Format, I
     if (!ib->sys_mem) { free(ib); return E_OUTOFMEMORY; }
 
     memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = Length;
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    bd.size = Length;
+    bd.usage = RHI_USAGE_DEFAULT;
+    bd.bind = RHI_BIND_INDEX;
 
-    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &bd, NULL, &ib->d3d11_buffer);
-    if (FAILED(hr)) { free(ib->sys_mem); free(ib); return hr; }
+    ib->buffer = rhi_buffer_create(&bd, NULL);
+    if (!ib->buffer) { free(ib->sys_mem); free(ib); return E_FAIL; }
 
     ib->iface.lpVtbl = &g_ib_vtbl;
     ib->ref_count = 1;
@@ -1050,8 +1042,8 @@ static ULONG __stdcall tex_Release(IDirect3DTexture8 *self)
     D3D8Texture *tex = tex_from_iface(self);
     LONG ref = InterlockedDecrement(&tex->ref_count);
     if (ref <= 0) {
-        if (tex->srv) ID3D11ShaderResourceView_Release(tex->srv);
-        if (tex->d3d11_texture) ID3D11Texture2D_Release(tex->d3d11_texture);
+        rhi_view_destroy(tex->srv);
+        rhi_image_destroy(tex->image);
         free(tex->sys_mem);
         free(tex);
     }
@@ -1113,17 +1105,12 @@ static ULONG __stdcall sf_Release(IDirect3DSurface8 *self)
     D3D8Surface *sf = sf_from_iface(self);
     LONG ref = InterlockedDecrement(&sf->ref_count);
     if (ref <= 0) {
-        if (sf->locked) {
-            if (sf->staging && d3d8_GetD3D11Context()) {
-                ID3D11DeviceContext_Unmap(d3d8_GetD3D11Context(),
-                    (ID3D11Resource *)sf->staging, 0);
-            }
-            sf->locked = FALSE;
-        }
-        if (sf->staging) ID3D11Texture2D_Release(sf->staging);
-        if (sf->rtv) ID3D11RenderTargetView_Release(sf->rtv);
-        if (sf->dsv) ID3D11DepthStencilView_Release(sf->dsv);
-        if (sf->d3d11_texture) ID3D11Texture2D_Release(sf->d3d11_texture);
+        if (sf->locked && !sf->palettized)
+            free(sf->locked_bits);
+        sf->locked = FALSE;
+        rhi_view_destroy(sf->rtv);
+        rhi_view_destroy(sf->dsv);
+        rhi_image_destroy(sf->image);
         free(sf);
     }
     return (ULONG)ref;
@@ -1153,24 +1140,26 @@ static HRESULT __stdcall sf_GetDesc(IDirect3DSurface8 *self, D3DSURFACE_DESC *pD
     return S_OK;
 }
 
-/* CPU readback of a surface region. Copies the requested sub-rect of the
- * D3D11 texture into a staging texture, maps it, and returns the mapped
- * pointer. UnlockRect unmaps and writes the region back (unless the lock
- * was read-only). Supports MSAA sources via ResolveSubresource. */
+/* CPU readback of a surface region. The surface's level is read back
+ * (rhi_image_readback, which resolves a multisampled image first) and the
+ * requested sub-rect is handed out from a CPU copy; UnlockRect writes the
+ * region back unless the lock was read-only. The same under any backend,
+ * which is what every probe that looks at pixels relies on: frame dumps, F11,
+ * the brightness and frame-buffer probes and replay's images all read the
+ * screen through here. */
 static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags)
 {
     D3D8Surface *sf = sf_from_iface(self);
-    ID3D11DeviceContext *ctx;
-    D3D11_TEXTURE2D_DESC tdesc, sdesc;
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr;
-    UINT rx, ry, rw, rh;
+    RhiImageDesc id;
+    UINT rx, ry, rw, rh, mip, level_w, level_h, full_pitch, full_rows;
+    UINT x_off, row0, row_bytes, rows, y;
+    BYTE *full, *region;
 
     if (!pLockedRect) return E_INVALIDARG;
     if (sf->locked) return E_FAIL;
 
     /* P8 surfaces: the palette indices live in the parent texture's
-     * sys_mem, not in the D3D11 texture. Expose them directly (
+     * sys_mem, not in the host image. Expose them directly (
      * only the full level is addressable this way). */
     if (sf->palettized) {
         if (pRect &&
@@ -1186,7 +1175,7 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
         return S_OK;
     }
 
-    if (!sf->d3d11_texture) return E_FAIL;
+    if (!sf->image) return E_FAIL;
 
     /* The lock rectangle defaults to the whole surface. */
     if (pRect) {
@@ -1201,60 +1190,57 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
     if (rx + rw > sf->width || ry + rh > sf->height) return E_INVALIDARG;
     if (!rw || !rh) return E_INVALIDARG;
 
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx) return E_FAIL;
+    if (!d3d8_GetD3D11Context()) return E_FAIL;
 
-    ID3D11Texture2D_GetDesc(sf->d3d11_texture, &tdesc);
-
-    if (tdesc.SampleDesc.Count > 1) {
+    rhi_image_get_desc(sf->image, &id);
+    if (id.samples > 1) {
         /* MSAA sub-rects cannot be resolved individually; ignore the
          * sub-rect and expose the whole (resolved) surface. */
         rx = 0; ry = 0;
         rw = sf->width; rh = sf->height;
     }
 
-    memset(&sdesc, 0, sizeof(sdesc));
-    sdesc.Width = rw;
-    sdesc.Height = rh;
-    sdesc.MipLevels = 1;
-    sdesc.ArraySize = 1;
-    sdesc.Format = tdesc.Format;
-    sdesc.SampleDesc.Count = 1;   /* staging is never multisampled */
-    sdesc.Usage = D3D11_USAGE_STAGING;
-    sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+    mip = sf->subresource % (id.mip_levels ? id.mip_levels : 1);
+    level_w = id.width >> mip ? id.width >> mip : 1;
+    level_h = id.height >> mip ? id.height >> mip : 1;
+    full_pitch = rhi_format_row_pitch(id.format, level_w);
+    full_rows = rhi_format_rows(id.format, level_h);
+    if (!full_pitch) return E_FAIL;
 
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &sdesc, NULL, &sf->staging);
-    if (FAILED(hr)) return hr;
-
-    if (tdesc.SampleDesc.Count > 1) {
-        /* MSAA: resolve into the staging copy (full surface). */
-        ID3D11DeviceContext_ResolveSubresource(ctx,
-            (ID3D11Resource *)sf->staging, 0,
-            (ID3D11Resource *)sf->d3d11_texture, sf->subresource, tdesc.Format);
-    } else {
-        D3D11_BOX box;
-        box.left = rx; box.top = ry; box.front = 0;
-        box.right = rx + rw; box.bottom = ry + rh; box.back = 1;
-        ID3D11DeviceContext_CopySubresourceRegion(ctx,
-            (ID3D11Resource *)sf->staging, 0, 0, 0, 0,
-            (ID3D11Resource *)sf->d3d11_texture, sf->subresource, &box);
+    full = (BYTE *)malloc((size_t)full_pitch * full_rows);
+    if (!full) return E_OUTOFMEMORY;
+    if (rhi_image_readback(sf->image, sf->subresource, full, full_pitch) != 0) {
+        free(full);
+        return E_FAIL;
     }
 
-    hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)sf->staging, 0,
-             (Flags & D3DLOCK_READONLY) ? D3D11_MAP_READ : D3D11_MAP_READ_WRITE,
-             0, &mapped);
-    if (FAILED(hr)) {
-        ID3D11Texture2D_Release(sf->staging);
-        sf->staging = NULL;
-        return hr;
+    if (rx == 0 && ry == 0 && rw == level_w && rh == level_h) {
+        region = full;
+        row_bytes = full_pitch;
+    } else {
+        x_off = rhi_format_row_pitch(id.format, rx);
+        row0 = rhi_format_rows(id.format, ry);
+        row_bytes = rhi_format_row_pitch(id.format, rw);
+        rows = rhi_format_rows(id.format, rh);
+        region = (BYTE *)malloc((size_t)row_bytes * rows);
+        if (!region) {
+            free(full);
+            return E_OUTOFMEMORY;
+        }
+        for (y = 0; y < rows; y++)
+            memcpy(region + (size_t)y * row_bytes,
+                   full + (size_t)(row0 + y) * full_pitch + x_off, row_bytes);
+        free(full);
     }
 
     sf->locked = TRUE;
     sf->lock_readonly = (Flags & D3DLOCK_READONLY) != 0;
     sf->lock_x = rx;
     sf->lock_y = ry;
-    sf->locked_pitch = (INT)mapped.RowPitch;
-    sf->locked_bits = (BYTE *)mapped.pData;
+    sf->lock_w = rw;
+    sf->lock_h = rh;
+    sf->locked_pitch = (INT)row_bytes;
+    sf->locked_bits = region;
 
     pLockedRect->Pitch = sf->locked_pitch;
     pLockedRect->pBits = sf->locked_bits;
@@ -1264,16 +1250,13 @@ static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *self, D3DLOCKED_RECT *pL
 static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *self)
 {
     D3D8Surface *sf = sf_from_iface(self);
-    ID3D11DeviceContext *ctx;
 
     if (!sf->locked) return E_FAIL;
 
     /* P8 surface: re-upload the raw indices through the surface's palette. */
     if (sf->palettized) {
-        if (!sf->lock_readonly && sf->d3d11_texture && sf->palette_sys) {
-            D3D11_TEXTURE2D_DESC td;
-            ID3D11Texture2D_GetDesc(sf->d3d11_texture, &td);
-            d3d8_upload_mip_level(sf->d3d11_texture, sf->format,
+        if (!sf->lock_readonly && sf->image && sf->palette_sys) {
+            d3d8_upload_mip_level(sf->image, sf->format,
                 sf->width, sf->height, sf->subresource,
                 sf->palette_sys, sf->palette_pitch, sf->palette_index);
         }
@@ -1281,36 +1264,30 @@ static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *self)
         return S_OK;
     }
 
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx) { sf->locked = FALSE; return E_FAIL; }
-
-    if (sf->staging) {
-        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)sf->staging, 0);
-
-        /* Write the (possibly modified) locked region back to the GPU
-         * texture unless the lock was read-only. */
-        if (!sf->lock_readonly && sf->d3d11_texture) {
-            D3D11_TEXTURE2D_DESC tdesc;
-            ID3D11Texture2D_GetDesc(sf->d3d11_texture, &tdesc);
-            if (tdesc.SampleDesc.Count > 1) {
-                /* MSAA: resolve the staging copy back into the RT. */
-                DXGI_FORMAT fmt = tdesc.Format;
-                ID3D11DeviceContext_ResolveSubresource(ctx,
-                    (ID3D11Resource *)sf->d3d11_texture, sf->subresource,
-                    (ID3D11Resource *)sf->staging, 0, fmt);
-            } else {
-                /* Copy the whole staging texture back at the lock origin
-                 * (a NULL src box means "entire resource"). */
-                ID3D11DeviceContext_CopySubresourceRegion(ctx,
-                    (ID3D11Resource *)sf->d3d11_texture, sf->subresource,
-                    sf->lock_x, sf->lock_y, 0,
-                    (ID3D11Resource *)sf->staging, 0, NULL);
-            }
-        }
-        ID3D11Texture2D_Release(sf->staging);
-        sf->staging = NULL;
+    if (!d3d8_GetD3D11Context()) {
+        free(sf->locked_bits);
+        sf->locked_bits = NULL;
+        sf->locked = FALSE;
+        return E_FAIL;
     }
 
+    /* Write the (possibly modified) locked region back unless the lock was
+     * read-only. A multisampled image cannot be written from the CPU at all;
+     * the D3D11 code this replaced tried to resolve into it, which D3D11
+     * refuses, so it was never written there either. */
+    if (!sf->lock_readonly && sf->image && sf->sample_count <= 1) {
+        RhiBox box;
+        box.left = sf->lock_x;
+        box.top = sf->lock_y;
+        box.front = 0;
+        box.right = sf->lock_x + sf->lock_w;
+        box.bottom = sf->lock_y + sf->lock_h;
+        box.back = 1;
+        rhi_image_update(sf->image, sf->subresource, &box,
+                         sf->locked_bits, (uint32_t)sf->locked_pitch, 0);
+    }
+
+    free(sf->locked_bits);
     sf->locked = FALSE;
     sf->locked_bits = NULL;
     return S_OK;
@@ -1321,10 +1298,10 @@ static const IDirect3DSurface8Vtbl g_sf_vtbl = {
     sf_GetDevice, sf_GetDesc, sf_LockRect, sf_UnlockRect,
 };
 
-/* Create a surface wrapping an existing D3D11 texture (a texture mip level,
- * cube face, or a dedicated offscreen render target). Adds a render target
- * view or depth stencil view when the caller requests it. */
-IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
+/* Create a surface over one level of an image (a texture mip level, cube
+ * face, or a dedicated offscreen render target). Adds a render target view
+ * or depth view when the caller requests it. */
+IDirect3DSurface8 *d3d8_surface_create(RhiImage *image,
                                        UINT mip_slice,
                                        UINT array_slice,
                                        UINT width, UINT height,
@@ -1335,75 +1312,53 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
                                        UINT palette_index)
 {
     D3D8Surface *sf;
-    DXGI_FORMAT dxgi;
-    D3D11_TEXTURE2D_DESC td;
+    RhiFormat host;
+    RhiImageDesc id;
+    RhiViewDesc vd;
     BOOL is_depth;
     BOOL is_array;
 
-    if (!texture) return NULL;
+    if (!image) return NULL;
 
     sf = (D3D8Surface *)calloc(1, sizeof(*sf));
     if (!sf) return NULL;
 
     sf->iface.lpVtbl = &g_sf_vtbl;
     sf->ref_count = 1;
-    sf->d3d11_texture = texture;
-    ID3D11Texture2D_AddRef(texture);
+    sf->image = rhi_image_retain(image);
     sf->width = width;
     sf->height = height;
     sf->format = fmt;
     sf->pool = pool;
     sf->usage = usage;
 
-    ID3D11Texture2D_GetDesc(texture, &td);
-    is_array = (td.ArraySize > 1);
-    sf->subresource = array_slice * td.MipLevels + mip_slice;
-    sf->sample_count = td.SampleDesc.Count ? td.SampleDesc.Count : 1;
+    rhi_image_get_desc(image, &id);
+    is_array = (id.type == RHI_IMAGE_2D && id.depth > 1);
+    sf->subresource = array_slice * id.mip_levels + mip_slice;
+    sf->sample_count = id.samples ? id.samples : 1;
     sf->multsample_type = multsample_type;
 
-    dxgi = d3d8_to_dxgi_format(fmt);
+    host = d3d8_to_dxgi_format(fmt);
     is_depth = d3d8_format_is_depth(fmt);
 
+    memset(&vd, 0, sizeof(vd));
+    vd.format = host;
+    vd.dim = is_array ? RHI_VIEW_DIM_2D_ARRAY : RHI_VIEW_DIM_2D;
+    vd.base_mip = mip_slice;
+    vd.base_layer = array_slice;
+    vd.layer_count = 1;
+
     if (is_depth) {
-        /* F16 has no D3D11 depth equivalent; skip the DSV. */
-        if (dxgi == DXGI_FORMAT_D16_UNORM ||
-            dxgi == DXGI_FORMAT_D24_UNORM_S8_UINT) {
-            D3D11_DEPTH_STENCIL_VIEW_DESC dsvd;
-            memset(&dsvd, 0, sizeof(dsvd));
-            dsvd.Format = dxgi;
-            dsvd.ViewDimension = is_array
-                ? D3D11_DSV_DIMENSION_TEXTURE2DARRAY
-                : D3D11_DSV_DIMENSION_TEXTURE2D;
-            if (is_array) {
-                dsvd.Texture2DArray.MipSlice = mip_slice;
-                dsvd.Texture2DArray.FirstArraySlice = array_slice;
-                dsvd.Texture2DArray.ArraySize = 1;
-            } else {
-                dsvd.Texture2D.MipSlice = mip_slice;
-            }
-            ID3D11Device_CreateDepthStencilView(d3d8_GetD3D11Device(),
-                (ID3D11Resource *)texture, &dsvd, &sf->dsv);
-        }
+        /* F16 has no host depth equivalent; skip the depth view. */
+        if (host == RHI_FORMAT_D16_UNORM ||
+            host == RHI_FORMAT_D24_UNORM_S8_UINT)
+            sf->dsv = rhi_view_create(image, RHI_VIEW_DEPTH, &vd);
     } else if (usage & D3DUSAGE_RENDERTARGET) {
-        D3D11_RENDER_TARGET_VIEW_DESC rtvd;
-        memset(&rtvd, 0, sizeof(rtvd));
-        rtvd.Format = dxgi;
-        rtvd.ViewDimension = is_array
-            ? D3D11_RTV_DIMENSION_TEXTURE2DARRAY
-            : D3D11_RTV_DIMENSION_TEXTURE2D;
-        if (is_array) {
-            rtvd.Texture2DArray.MipSlice = mip_slice;
-            rtvd.Texture2DArray.FirstArraySlice = array_slice;
-            rtvd.Texture2DArray.ArraySize = 1;
-        } else {
-            rtvd.Texture2D.MipSlice = mip_slice;
-        }
-        ID3D11Device_CreateRenderTargetView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)texture, &rtvd, &sf->rtv);
+        sf->rtv = rhi_view_create(image, RHI_VIEW_RENDER_TARGET, &vd);
     }
 
     /* P8 surfaces expose the raw palette indices through LockRect. The
-     * index data is not in the D3D11 texture (it was palette-expanded to
+     * index data is not in the host image (it was palette-expanded to
      * BGRA at upload), so attach a pointer to the parent's raw sys_mem
      * region. Only the texture/cube/volume creators pass raw_level_data. */
     if (d3d8_format_is_palettized(fmt) && raw_level_data) {
@@ -1416,23 +1371,12 @@ IDirect3DSurface8 *d3d8_surface_create(ID3D11Texture2D *texture,
     return &sf->iface;
 }
 
-/* Wrap a raw D3D11 texture (e.g. a back buffer) as a surface. Borrowed from
- * upstream's "ponytail" fix so a surface can alias a GPU texture that is not
- * owned by a D3D8Texture. The surface adds a reference to the D3D11 texture. */
-IDirect3DSurface8 *xbox_d3d8_surface_wrap(ID3D11Texture2D *tex, UINT w, UINT h,
-                                          D3DFORMAT fmt)
-{
-    return d3d8_surface_create(tex, 0, 0, w, h, fmt,
-                               D3DPOOL_DEFAULT, 0,
-                               D3DMULTISAMPLE_NONE, NULL, 0);
-}
-
 static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *self, UINT Level, IDirect3DSurface8 **ppSurface)
 {
     D3D8Texture *tex = tex_from_iface(self);
     if (!ppSurface || Level >= tex->levels) return E_INVALIDARG;
 
-    *ppSurface = d3d8_surface_create(tex->d3d11_texture, Level, 0,
+    *ppSurface = d3d8_surface_create(tex->image, Level, 0,
                                      tex_level_width(tex, Level),
                                      tex_level_height(tex, Level),
                                      tex->d3d8_format,
@@ -1463,12 +1407,11 @@ static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT Level, D3DLO
  * D3D11 texture subresource: unswizzle (swizzled formats), convert to the
  * D3D11 layout (YUV/P8/AL8/reordered 16-bit), then UpdateSubresource.
  * Shared by 2D textures, cube faces and volume slices. */
-static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
+static void d3d8_upload_mip_level(RhiImage *image, D3DFORMAT fmt,
                                   UINT w, UINT h, UINT subresource,
                                   const BYTE *src_data, UINT src_row_pitch,
                                   UINT palette)
 {
-    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     UINT bpp = d3d8_format_bpp(fmt) / 8;
     UINT rows = d3d8_format_is_compressed(fmt) ? (h + 3) / 4 : h;
     BYTE *linear = NULL;
@@ -1476,7 +1419,7 @@ static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
     const BYTE *upload_data = src_data;
     UINT upload_pitch = src_row_pitch;
 
-    if (!ctx || !d3d11_texture) return;
+    if (!d3d8_GetD3D11Context() || !image) return;
 
     /* Step 1: unswizzle swizzled formats into linear storage. */
     if (!d3d8_format_is_compressed(fmt) && d3d8_format_is_swizzled(fmt)) {
@@ -1501,8 +1444,7 @@ static void d3d8_upload_mip_level(ID3D11Texture2D *d3d11_texture, D3DFORMAT fmt,
         }
     }
 
-    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)d3d11_texture,
-        subresource, NULL, upload_data, upload_pitch, upload_pitch * rows);
+    rhi_image_update(image, subresource, NULL, upload_data, upload_pitch, upload_pitch * rows);
 
     if (linear) free(linear);
     if (converted) free(converted);
@@ -1516,7 +1458,7 @@ static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *self, UINT Level)
     tex->locked = FALSE;
     tex->dirty = FALSE;
 
-    d3d8_upload_mip_level(tex->d3d11_texture, tex->d3d8_format,
+    d3d8_upload_mip_level(tex->image, tex->d3d8_format,
                           tex_level_width(tex, Level),
                           tex_level_height(tex, Level), Level,
                           tex->sys_mem + tex_level_offset(tex, Level),
@@ -1568,9 +1510,8 @@ BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
 HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DTexture8 **ppTex)
 {
     D3D8Texture *tex;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
-    HRESULT hr;
+    RhiImageDesc td;
+    RhiViewDesc srvd;
     UINT max_dim;
     BOOL want_srv;
 
@@ -1580,7 +1521,7 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
     if (!tex) return E_OUTOFMEMORY;
 
     tex->d3d8_format = Format;
-    tex->dxgi_format = d3d8_to_dxgi_format(Format);
+    tex->host_format = d3d8_to_dxgi_format(Format);
     tex->width = Width;
     tex->height = Height;
     tex->usage = Usage;
@@ -1599,15 +1540,16 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
     tex->sys_mem = (BYTE *)calloc(1, tex_total_size(tex));
     if (!tex->sys_mem) { free(tex); return E_OUTOFMEMORY; }
 
-    /* Create D3D11 texture */
+    /* Create the host image */
     memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.MipLevels = tex->levels;
-    td.ArraySize = 1;
-    td.Format = tex->dxgi_format;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
+    td.type = RHI_IMAGE_2D;
+    td.width = Width;
+    td.height = Height;
+    td.depth = 1;
+    td.mip_levels = tex->levels;
+    td.format = tex->host_format;
+    td.samples = 1;
+    td.usage = RHI_USAGE_DEFAULT;
     /* Depth textures are not sampled directly in D3D11, and a
      * D24_UNORM_S8_UINT texture that asks for SHADER_RESOURCE is refused
      * outright with E_INVALIDARG -- Outrun 2's 512x512 LIN_D24S8 shadow
@@ -1615,35 +1557,34 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
      * the title's usage says: that is the only way D3D11 can hold one. */
     want_srv = !d3d8_format_is_depth(Format);
     if (want_srv) {
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (Usage & D3DUSAGE_RENDERTARGET) td.BindFlags |= D3D11_BIND_RENDER_TARGET;
-        if (Usage & D3DUSAGE_DEPTHSTENCIL) td.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+        td.bind = RHI_BIND_SAMPLED;
+        if (Usage & D3DUSAGE_RENDERTARGET) td.bind |= RHI_BIND_RENDER_TARGET;
+        if (Usage & D3DUSAGE_DEPTHSTENCIL) td.bind |= RHI_BIND_DEPTH;
     } else {
-        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        td.bind = RHI_BIND_DEPTH;
     }
 
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex->d3d11_texture);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateTexture2D failed: 0x%08lX (fmt=%d %ux%u)\n", hr, Format, Width, Height);
+    tex->image = rhi_image_create(&td, NULL);
+    if (!tex->image) {
+        fprintf(stderr, "D3D8: CreateTexture2D failed (fmt=%d %ux%u)\n", Format, Width, Height);
         free(tex->sys_mem);
         free(tex);
-        return hr;
+        return E_FAIL;
     }
 
-    /* Create shader resource view */
+    /* Create the sampled view */
     if (want_srv) {
         memset(&srvd, 0, sizeof(srvd));
-        srvd.Format = tex->dxgi_format;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvd.Texture2D.MipLevels = tex->levels;
+        srvd.format = tex->host_format;
+        srvd.dim = RHI_VIEW_DIM_2D;
+        srvd.mip_count = tex->levels;
 
-        hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)tex->d3d11_texture, &srvd, &tex->srv);
-        if (FAILED(hr)) {
-            ID3D11Texture2D_Release(tex->d3d11_texture);
+        tex->srv = rhi_view_create(tex->image, RHI_VIEW_SAMPLED, &srvd);
+        if (!tex->srv) {
+            rhi_image_destroy(tex->image);
             free(tex->sys_mem);
             free(tex);
-            return hr;
+            return E_FAIL;
         }
     }
 
@@ -1670,28 +1611,28 @@ static void d3d8_check_overlay(void)
     checked = TRUE;
     if (offsetof(D3D8CubeTexture, srv)   != offsetof(D3D8Texture, srv)   ||
         offsetof(D3D8VolumeTexture, srv) != offsetof(D3D8Texture, srv)   ||
+        offsetof(D3D8CubeTexture, image)   != offsetof(D3D8Texture, image) ||
+        offsetof(D3D8VolumeTexture, image) != offsetof(D3D8Texture, image) ||
         offsetof(D3D8CubeTexture, width) != offsetof(D3D8Texture, width) ||
         offsetof(D3D8VolumeTexture, levels) != offsetof(D3D8Texture, levels))
         fprintf(stderr, "D3D8: internal base-texture layout mismatch\n");
 }
 
-ID3D11ShaderResourceView *d3d8_base_srv(IDirect3DBaseTexture8 *texture)
+RhiView *d3d8_base_srv(IDirect3DBaseTexture8 *texture)
 {
     if (!texture) return NULL;
     d3d8_check_overlay();
-    return *(ID3D11ShaderResourceView **)((BYTE *)texture +
-        offsetof(D3D8Texture, srv));
+    return *(RhiView **)((BYTE *)texture + offsetof(D3D8Texture, srv));
 }
 
-/* The D3D11 resource behind any base texture, through the same overlay as
+/* The host image behind any base texture, through the same overlay as
  * d3d8_base_srv. Used to tell whether a texture is the one currently being
  * rendered into. */
-ID3D11Resource *d3d8_base_resource(IDirect3DBaseTexture8 *texture)
+RhiImage *d3d8_base_resource(IDirect3DBaseTexture8 *texture)
 {
     if (!texture) return NULL;
     d3d8_check_overlay();
-    return *(ID3D11Resource **)((BYTE *)texture +
-        offsetof(D3D8Texture, d3d11_texture));
+    return *(RhiImage **)((BYTE *)texture + offsetof(D3D8Texture, image));
 }
 
 /* Look up the palette index a base texture bakes. All wrapper types keep
@@ -1771,7 +1712,7 @@ void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
         for (UINT face = 0; face < 6; face++) {
             for (UINT lvl = 0; lvl < cube->levels; lvl++) {
                 UINT w = cube_level_width(cube, lvl);
-                d3d8_upload_mip_level(cube->d3d11_texture, cube->d3d8_format,
+                d3d8_upload_mip_level(cube->image, cube->d3d8_format,
                     w, w, face * cube->levels + lvl,
                     cube_level_ptr(cube, face, lvl),
                     d3d8_row_pitch(cube->d3d8_format, w), palette);
@@ -1826,9 +1767,7 @@ void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
                     ud = up * h;
                 }
             }
-            ID3D11DeviceContext_UpdateSubresource(ctx,
-                (ID3D11Resource *)vol->d3d11_texture, lvl, NULL,
-                upload_data, up, ud);
+            rhi_image_update(vol->image, lvl, NULL, upload_data, up, ud);
             if (linear) free(linear);
             if (converted) free(converted);
         }
@@ -1841,7 +1780,7 @@ void d3d8_refresh_palette(IDirect3DBaseTexture8 *texture)
         if (!d3d8_format_is_palettized(tex->d3d8_format)) return;
         palette = tex->palette;
         for (UINT lvl = 0; lvl < tex->levels; lvl++) {
-            d3d8_upload_mip_level(tex->d3d11_texture, tex->d3d8_format,
+            d3d8_upload_mip_level(tex->image, tex->d3d8_format,
                 tex_level_width(tex, lvl), tex_level_height(tex, lvl), lvl,
                 tex->sys_mem + tex_level_offset(tex, lvl),
                 tex_level_pitch(tex, lvl), palette);
@@ -1896,8 +1835,8 @@ static ULONG __stdcall cube_Release(IDirect3DCubeTexture8 *self)
     D3D8CubeTexture *cube = cube_from_iface(self);
     LONG ref = InterlockedDecrement(&cube->ref_count);
     if (ref <= 0) {
-        if (cube->srv) ID3D11ShaderResourceView_Release(cube->srv);
-        if (cube->d3d11_texture) ID3D11Texture2D_Release(cube->d3d11_texture);
+        rhi_view_destroy(cube->srv);
+        rhi_image_destroy(cube->image);
         free(cube->sys_mem);
         free(cube);
     }
@@ -1946,7 +1885,7 @@ static HRESULT __stdcall cube_GetCubeMapSurface(IDirect3DCubeTexture8 *self, D3D
     if (!ppSurface || face >= 6 || Level >= cube->levels) return E_INVALIDARG;
 
     w = h = cube_level_width(cube, Level);
-    *ppSurface = d3d8_surface_create(cube->d3d11_texture, Level, face, w, h,
+    *ppSurface = d3d8_surface_create(cube->image, Level, face, w, h,
                                      cube->d3d8_format, D3DPOOL_DEFAULT,
                                      cube->usage,                                      D3DMULTISAMPLE_NONE,
                                      d3d8_format_is_palettized(cube->d3d8_format)
@@ -1983,7 +1922,7 @@ static HRESULT __stdcall cube_UnlockRect(IDirect3DCubeTexture8 *self, D3DCUBEMAP
     if (face >= 6 || Level >= cube->levels || !cube->locked) return E_FAIL;
 
     w = cube_level_width(cube, Level);
-    d3d8_upload_mip_level(cube->d3d11_texture, cube->d3d8_format, w, w,
+    d3d8_upload_mip_level(cube->image, cube->d3d8_format, w, w,
         face * cube->levels + Level, cube_level_ptr(cube, face, Level),
         d3d8_row_pitch(cube->d3d8_format, w), cube->palette);
 
@@ -2018,9 +1957,8 @@ BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info)
 HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DCubeTexture8 **ppTex)
 {
     D3D8CubeTexture *cube;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
-    HRESULT hr;
+    RhiImageDesc td;
+    RhiViewDesc srvd;
     UINT max_dim;
     UINT face_size;
 
@@ -2030,7 +1968,7 @@ HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3
     if (!cube) return E_OUTOFMEMORY;
 
     cube->d3d8_format = Format;
-    cube->dxgi_format = d3d8_to_dxgi_format(Format);
+    cube->host_format = d3d8_to_dxgi_format(Format);
     cube->width = EdgeLength;
     cube->height = EdgeLength;
     cube->usage = Usage;
@@ -2049,37 +1987,37 @@ HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3
     if (!cube->sys_mem) { free(cube); return E_OUTOFMEMORY; }
 
     memset(&td, 0, sizeof(td));
-    td.Width = EdgeLength;
-    td.Height = EdgeLength;
-    td.MipLevels = cube->levels;
-    td.ArraySize = 6;
-    td.Format = cube->dxgi_format;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (Usage & D3DUSAGE_RENDERTARGET) td.BindFlags |= D3D11_BIND_RENDER_TARGET;
-    td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+    td.type = RHI_IMAGE_2D;
+    td.width = EdgeLength;
+    td.height = EdgeLength;
+    td.depth = 6;
+    td.mip_levels = cube->levels;
+    td.format = cube->host_format;
+    td.samples = 1;
+    td.usage = RHI_USAGE_DEFAULT;
+    td.bind = RHI_BIND_SAMPLED;
+    if (Usage & D3DUSAGE_RENDERTARGET) td.bind |= RHI_BIND_RENDER_TARGET;
+    td.cube = 1;
 
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &cube->d3d11_texture);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateCubeTexture2D failed: 0x%08lX (fmt=%d edge=%u)\n", hr, Format, EdgeLength);
+    cube->image = rhi_image_create(&td, NULL);
+    if (!cube->image) {
+        fprintf(stderr, "D3D8: CreateCubeTexture2D failed (fmt=%d edge=%u)\n", Format, EdgeLength);
         free(cube->sys_mem);
         free(cube);
-        return hr;
+        return E_FAIL;
     }
 
-    if (!d3d8_format_is_depth(Format) && cube->dxgi_format != DXGI_FORMAT_UNKNOWN) {
+    if (!d3d8_format_is_depth(Format) && cube->host_format != RHI_FORMAT_UNKNOWN) {
         memset(&srvd, 0, sizeof(srvd));
-        srvd.Format = cube->dxgi_format;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
-        srvd.TextureCube.MipLevels = cube->levels;
-        hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)cube->d3d11_texture, &srvd, &cube->srv);
-        if (FAILED(hr)) {
-            ID3D11Texture2D_Release(cube->d3d11_texture);
+        srvd.format = cube->host_format;
+        srvd.dim = RHI_VIEW_DIM_CUBE;
+        srvd.mip_count = cube->levels;
+        cube->srv = rhi_view_create(cube->image, RHI_VIEW_SAMPLED, &srvd);
+        if (!cube->srv) {
+            rhi_image_destroy(cube->image);
             free(cube->sys_mem);
             free(cube);
-            return hr;
+            return E_FAIL;
         }
     }
 
@@ -2174,8 +2112,8 @@ static ULONG __stdcall voltex_Release(IDirect3DVolumeTexture8 *self)
     D3D8VolumeTexture *vol = (D3D8VolumeTexture *)self;
     LONG ref = InterlockedDecrement(&vol->ref_count);
     if (ref <= 0) {
-        if (vol->srv) ID3D11ShaderResourceView_Release(vol->srv);
-        if (vol->d3d11_texture) ID3D11Texture3D_Release(vol->d3d11_texture);
+        rhi_view_destroy(vol->srv);
+        rhi_image_destroy(vol->image);
         free(vol->sys_mem);
         free(vol);
     }
@@ -2240,7 +2178,7 @@ static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Le
     if (Level >= vol->levels || !vol->locked) return E_FAIL;
 
     ctx = d3d8_GetD3D11Context();
-    if (!ctx || !vol->d3d11_texture) { vol->locked = FALSE; return E_FAIL; }
+    if (!ctx || !vol->image) { vol->locked = FALSE; return E_FAIL; }
 
     w = vol_level_width(vol, Level);
     h = vol_level_height(vol, Level);
@@ -2284,8 +2222,7 @@ static HRESULT __stdcall voltex_UnlockBox(IDirect3DVolumeTexture8 *self, UINT Le
         }
     }
 
-    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)vol->d3d11_texture,
-        Level, NULL, upload_data, upload_pitch, upload_depth);
+    rhi_image_update(vol->image, Level, NULL, upload_data, upload_pitch, upload_depth);
 
     if (linear) free(linear);
     if (converted) free(converted);
@@ -2326,9 +2263,8 @@ static const IDirect3DVolumeTexture8Vtbl g_voltex_vtbl = {
 HRESULT d3d8_CreateVolumeTextureImpl(UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DVolumeTexture8 **ppTex)
 {
     D3D8VolumeTexture *vol;
-    D3D11_TEXTURE3D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
-    HRESULT hr;
+    RhiImageDesc td;
+    RhiViewDesc srvd;
     UINT max_dim;
 
     if (!ppTex || !Width || !Height || !Depth) return E_INVALIDARG;
@@ -2337,7 +2273,7 @@ HRESULT d3d8_CreateVolumeTextureImpl(UINT Width, UINT Height, UINT Depth, UINT L
     if (!vol) return E_OUTOFMEMORY;
 
     vol->d3d8_format = Format;
-    vol->dxgi_format = d3d8_to_dxgi_format(Format);
+    vol->host_format = d3d8_to_dxgi_format(Format);
     vol->width = Width;
     vol->height = Height;
     vol->depth = Depth;
@@ -2358,35 +2294,35 @@ HRESULT d3d8_CreateVolumeTextureImpl(UINT Width, UINT Height, UINT Depth, UINT L
     if (!vol->sys_mem) { free(vol); return E_OUTOFMEMORY; }
 
     memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.Depth = Depth;
-    td.MipLevels = vol->levels;
-    td.Format = vol->dxgi_format;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.type = RHI_IMAGE_3D;
+    td.width = Width;
+    td.height = Height;
+    td.depth = Depth;
+    td.mip_levels = vol->levels;
+    td.format = vol->host_format;
+    td.usage = RHI_USAGE_DEFAULT;
+    td.bind = RHI_BIND_SAMPLED;
 
-    hr = ID3D11Device_CreateTexture3D(d3d8_GetD3D11Device(), &td, NULL, &vol->d3d11_texture);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateVolumeTexture3D failed: 0x%08lX (fmt=%d %ux%ux%u)\n",
-                hr, Format, Width, Height, Depth);
+    vol->image = rhi_image_create(&td, NULL);
+    if (!vol->image) {
+        fprintf(stderr, "D3D8: CreateVolumeTexture3D failed (fmt=%d %ux%ux%u)\n",
+                Format, Width, Height, Depth);
         free(vol->sys_mem);
         free(vol);
-        return hr;
+        return E_FAIL;
     }
 
-    if (!d3d8_format_is_depth(Format) && vol->dxgi_format != DXGI_FORMAT_UNKNOWN) {
+    if (!d3d8_format_is_depth(Format) && vol->host_format != RHI_FORMAT_UNKNOWN) {
         memset(&srvd, 0, sizeof(srvd));
-        srvd.Format = vol->dxgi_format;
-        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
-        srvd.Texture3D.MipLevels = vol->levels;
-        hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
-            (ID3D11Resource *)vol->d3d11_texture, &srvd, &vol->srv);
-        if (FAILED(hr)) {
-            ID3D11Texture3D_Release(vol->d3d11_texture);
+        srvd.format = vol->host_format;
+        srvd.dim = RHI_VIEW_DIM_3D;
+        srvd.mip_count = vol->levels;
+        vol->srv = rhi_view_create(vol->image, RHI_VIEW_SAMPLED, &srvd);
+        if (!vol->srv) {
+            rhi_image_destroy(vol->image);
             free(vol->sys_mem);
             free(vol);
-            return hr;
+            return E_FAIL;
         }
     }
 
@@ -2478,36 +2414,36 @@ const IDirect3DVolume8Vtbl g_vol_vtbl = {
 
 HRESULT d3d8_CreateImageSurfaceImpl(UINT Width, UINT Height, D3DFORMAT Format, IDirect3DSurface8 **ppSurface)
 {
-    D3D11_TEXTURE2D_DESC td;
-    ID3D11Texture2D *tex = NULL;
-    HRESULT hr;
+    RhiImageDesc td;
+    RhiImage *img;
 
     if (!ppSurface || !Width || !Height) return E_INVALIDARG;
-    if (d3d8_to_dxgi_format(Format) == DXGI_FORMAT_UNKNOWN) {
+    if (d3d8_to_dxgi_format(Format) == RHI_FORMAT_UNKNOWN) {
         fprintf(stderr, "D3D8: CreateImageSurface: unsupported format 0x%X\n", Format);
         return E_INVALIDARG;
     }
 
     memset(&td, 0, sizeof(td));
-    td.Width = Width;
-    td.Height = Height;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = d3d8_to_dxgi_format(Format);
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.type = RHI_IMAGE_2D;
+    td.width = Width;
+    td.height = Height;
+    td.depth = 1;
+    td.mip_levels = 1;
+    td.format = d3d8_to_dxgi_format(Format);
+    td.samples = 1;
+    td.usage = RHI_USAGE_DEFAULT;
+    td.bind = RHI_BIND_RENDER_TARGET | RHI_BIND_SAMPLED;
 
-    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &tex);
-    if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: CreateImageSurface failed: 0x%08lX (fmt=0x%X %ux%u)\n",
-                hr, Format, Width, Height);
-        return hr;
+    img = rhi_image_create(&td, NULL);
+    if (!img) {
+        fprintf(stderr, "D3D8: CreateImageSurface failed (fmt=0x%X %ux%u)\n",
+                Format, Width, Height);
+        return E_FAIL;
     }
 
-    *ppSurface = d3d8_surface_create(tex, 0, 0, Width, Height, Format,
+    *ppSurface = d3d8_surface_create(img, 0, 0, Width, Height, Format,
                                      D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET,
                                      D3DMULTISAMPLE_NONE, NULL, 0);
-    ID3D11Texture2D_Release(tex);
+    rhi_image_destroy(img);
     return *ppSurface ? S_OK : E_OUTOFMEMORY;
 }
