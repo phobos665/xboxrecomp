@@ -643,6 +643,21 @@ static VkPresentModeKHR choose_mode(uint32_t interval)
     if (interval)
         return VK_PRESENT_MODE_FIFO_KHR;
     vkGetPhysicalDeviceSurfacePresentModesKHR(V.pd, V.surface, &n, modes);
+    /* RECOMP_VK_PRESENT=immediate|mailbox|fifo_relaxed|fifo puts that mode
+     * first. On Windows a windowed MAILBOX swap chain is paced by the
+     * compositor at the display's refresh rate, so measuring what a frame
+     * costs, rather than what the screen shows, wants IMMEDIATE. */
+    {
+        const char *want = getenv("RECOMP_VK_PRESENT");
+        VkPresentModeKHR m = VK_PRESENT_MODE_MAX_ENUM_KHR;
+        if (want && !strcmp(want, "immediate"))    m = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        if (want && !strcmp(want, "mailbox"))      m = VK_PRESENT_MODE_MAILBOX_KHR;
+        if (want && !strcmp(want, "fifo_relaxed")) m = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+        if (want && !strcmp(want, "fifo"))         m = VK_PRESENT_MODE_FIFO_KHR;
+        for (i = 0; i < n; i++)
+            if (modes[i] == m)
+                return m;
+    }
     for (k = 0; k < sizeof order / sizeof order[0]; k++)
         for (i = 0; i < n; i++)
             if (modes[i] == order[k])
