@@ -1,5 +1,6 @@
 /* Verify the real state cache through D3D11 WARP, without a window or game. */
 #include "d3d8_internal.h"
+#include <d3d11.h>   /* this test drives D3D11 itself */
 #include <stdio.h>
 #include <string.h>
 

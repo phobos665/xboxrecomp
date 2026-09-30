@@ -1,7 +1,8 @@
 /**
  * D3D8 Compatibility Layer - Internal Header
  *
- * Shared types and declarations for the D3D8→D3D11 implementation.
+ * Shared types and declarations for the D3D8 implementation. The host GPU
+ * is reached only through rhi.h; nothing here names a graphics API.
  * Not part of the public API - only included by d3d8_*.c files.
  */
 
@@ -16,16 +17,14 @@
 IDirect3DDevice8 *d3d8_GetDevice(void);
 
 #if defined(_WIN32)
-/* === Everything below is the D3D11 backend. The POSIX d3d8_compat
+/* === Everything below is the rhi.h renderer. The POSIX d3d8_compat
  * library (d3d8_gl.c) implements its own internal state and does not
  * need any of these declarations. === */
 
-#include <d3d11.h>
-#include <dxgi.h>
 #include "rhi.h"
 
 /* ================================================================
- * D3D11 device accessors (implemented in d3d8_device.c)
+ * Device accessors (implemented in d3d8_device.c)
  * ================================================================ */
 
 IDirect3DDevice8    *d3d8_GetDevice(void);
@@ -57,13 +56,10 @@ void d3d8_SetTwoDSqueeze(BOOL on);
  * attributes to D3DCOMPILER_47. */
 long long d3d8_compile_clock(void);
 void      d3d8_compile_note(int kind, long long started);
-/* Every HLSL compile in the renderer goes through here (d3d8_compile.c):
- * D3DCompile's arguments less the include handler and effect flags, which
- * no caller uses. RECOMP_D3D8_HLSL_DIR=<dir> writes each distinct source. */
-HRESULT   d3d8_compile_hlsl(const char *src, size_t len, const char *name,
-                            const D3D_SHADER_MACRO *macros,
-                            const char *entry, const char *target, UINT flags,
-                            ID3DBlob **code, ID3DBlob **errors);
+/* Every backend calls this with each HLSL source before compiling it
+ * (d3d8_compile.c): RECOMP_D3D8_HLSL_DIR=<dir> writes each distinct one. */
+void      d3d8_hlsl_note(const char *src, size_t len, const char *name,
+                         const RhiMacro *macros, const char *entry, const char *target);
 BOOL d3d8_GetTwoDSqueeze(void);
 /* Whether a draw's own vertices span the guest's full width, which is
  * what separates a backdrop or a fade from a HUD element. */
