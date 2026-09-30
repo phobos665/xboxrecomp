@@ -703,6 +703,41 @@ static void rejects_version_1(void)
     remove(path);
 }
 
+/* The round-trip capture relabelled as another version: does it open? */
+static int opens_as_version(uint32_t version)
+{
+    const char *path = "d3d8_capture_vN.tmp";
+    unsigned char *bytes;
+    long size = file_bytes(CAP_PATH, &bytes);
+    char err[128];
+    D3D8CapReader *r;
+
+    if (size < (long)sizeof(D3D8CapHeader)) {
+        free(bytes);
+        return -1;
+    }
+    memcpy(bytes + offsetof(D3D8CapHeader, version), &version, sizeof version);
+    write_bytes(path, bytes, (size_t)size);
+    free(bytes);
+    r = d3d8cap_open(path, err, sizeof err);
+    if (r)
+        d3d8cap_close_read(r);
+    remove(path);
+    return r != NULL;
+}
+
+/* Version 6 only added chunk kinds, so a version 5 file is a version 6 file
+ * without lights and must still open: the saved captures are the second
+ * renderer's regression corpus. Version 4 changed a payload, and a build
+ * cannot read a version newer than itself. */
+static void version_range(void)
+{
+    check(D3D8CAP_VERSION_MIN_READ == 5, "the oldest readable version is 5");
+    check(opens_as_version(5) == 1, "a version 5 capture opens");
+    check(opens_as_version(4) == 0, "a version 4 capture is refused");
+    check(opens_as_version(D3D8CAP_VERSION + 1) == 0, "a newer version is refused");
+}
+
 static void rejects_junk(void)
 {
     const char *path = "d3d8_capture_junk.tmp";
@@ -742,6 +777,7 @@ int main(int argc, char **argv)
         read_capture();
         truncated_capture();
         rejects_version_1();
+        version_range();
     } else {
         check(0, "the synthetic capture is written");
     }

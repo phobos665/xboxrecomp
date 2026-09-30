@@ -81,8 +81,8 @@ static void movie_fail(const char *what, HRESULT hr)
 static int compile(const char *entry, const char *profile, ID3DBlob **code)
 {
     ID3DBlob *err = NULL;
-    HRESULT hr = D3DCompile(kShaderSource, sizeof kShaderSource - 1, "movie", NULL, NULL,
-                            entry, profile, 0, 0, code, &err);
+    HRESULT hr = d3d8_compile_hlsl(kShaderSource, sizeof kShaderSource - 1, "movie", NULL,
+                                   entry, profile, 0, code, &err);
     if (FAILED(hr)) {
         if (err)
             fprintf(stderr, "D3D8 movie: %s\n", (const char *)ID3D10Blob_GetBufferPointer(err));

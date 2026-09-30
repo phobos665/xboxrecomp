@@ -201,8 +201,8 @@ static int compile_one(ID3D11Device *dev, const char *entry, const char *target,
     ID3DBlob *code = NULL, *err = NULL;
     HRESULT hr;
 
-    hr = D3DCompile(kSource, sizeof kSource - 1, "display_resolve", macros, NULL,
-                    entry, target, 0, 0, &code, &err);
+    hr = d3d8_compile_hlsl(kSource, sizeof kSource - 1, "display_resolve", macros,
+                           entry, target, 0, &code, &err);
     if (FAILED(hr)) {
         if (err) {
             fprintf(stderr, "D3D8 display: %s\n",

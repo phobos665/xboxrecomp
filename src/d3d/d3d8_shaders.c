@@ -516,8 +516,8 @@ static ID3D11PixelShader *ff_ps_get_shader(UINT sig)
 
     {
         long long started = d3d8_compile_clock();
-        hr = D3DCompile(src, strlen(src), "ps_ffp", NULL, NULL,
-                        "main", "ps_5_0", 0, 0, &blob, &errors);
+        hr = d3d8_compile_hlsl(src, strlen(src), "ps_ffp", NULL,
+                               "main", "ps_5_0", 0, &blob, &errors);
         d3d8_compile_note(1, started);
     }
     free(src);
@@ -839,8 +839,8 @@ HRESULT d3d8_shaders_init(void)
     HRESULT hr;
 
     /* Compile vertex shader */
-    hr = D3DCompile(g_vs_source, strlen(g_vs_source), "vs_ffp",
-                    NULL, NULL, "main", "vs_5_0", 0, 0, &g_vs_blob, &errors);
+    hr = d3d8_compile_hlsl(g_vs_source, strlen(g_vs_source), "vs_ffp",
+                           NULL, "main", "vs_5_0", 0, &g_vs_blob, &errors);
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: VS compile failed: %s\n",
                 errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
