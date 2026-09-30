@@ -1206,6 +1206,12 @@ void xbox_D3D8SetWideFrames(BOOL wide);
  *   CENTRE   keep at 4:3, centred
  *   LEFT     keep at 4:3, pinned to the left edge of the picture
  *   RIGHT    keep at 4:3, pinned to the right edge
+ *   SIDE     keep at 4:3, each draw pinned to the edge it is nearer: left
+ *            if it sits in the left third of the screen, right if in the
+ *            right third, centred otherwise. For one piece of code that
+ *            draws at both edges (a HUD showing each hand's ammo), where
+ *            a single LEFT or RIGHT is wrong for half of what it draws;
+ *            each piece has to reach the renderer as its own draw.
  *
  * Holds until changed; 3D draws ignore it; without widescreen nothing is
  * squeezed and it has no effect. `tag` names the title's call site for
@@ -1215,7 +1221,8 @@ enum {
     XBOX_D3D8_2D_STRETCH,
     XBOX_D3D8_2D_CENTRE,
     XBOX_D3D8_2D_LEFT,
-    XBOX_D3D8_2D_RIGHT
+    XBOX_D3D8_2D_RIGHT,
+    XBOX_D3D8_2D_SIDE
 };
 void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag);
 int  xbox_D3D8GetTwoDPlacement(uint32_t *tag);

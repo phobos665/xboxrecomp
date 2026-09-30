@@ -38,8 +38,8 @@
  *                    capture through two backends and diffing the images is
  *                    scripts/replay_ab.py.
  *   --place <tag>=<p>  replay the title's widescreen 2D placement for tag
- *                    (hex, or "all") as p: auto, stretch, centre, left or
- *                    right. Repeatable. Needs RECOMP_WIDESCREEN=1 to show,
+ *                    (hex, or "all") as p: auto, stretch, centre, left,
+ *                    right or side. Repeatable. Needs RECOMP_WIDESCREEN=1 to show,
  *                    and is how a title project tries its placement table
  *                    on a captured frame instead of a run.
  *   --solo-tag <tag> draw the untagged draws (the 3D) and only this tag's
@@ -1249,18 +1249,19 @@ int main(int argc, char **argv)
             each_tag = 2;
         else if (!strcmp(argv[i], "--place") && i + 1 < argc) {
             const char *a = argv[++i], *eq = strchr(a, '=');
-            static const char *names[] = { "auto", "stretch", "centre", "left", "right" };
+            static const char *names[] = { "auto", "stretch", "centre", "left", "right", "side" };
+            const int n = (int)(sizeof names / sizeof names[0]);
             int p;
 
             if (!eq || g_place_count == (int)(sizeof g_place / sizeof g_place[0])) {
                 usage();
                 return 2;
             }
-            for (p = 0; p < 5 && strcmp(eq + 1, names[p]) != 0; p++)
+            for (p = 0; p < n && strcmp(eq + 1, names[p]) != 0; p++)
                 ;
-            if (p == 5 && !strcmp(eq + 1, "center"))
+            if (p == n && !strcmp(eq + 1, "center"))
                 p = XBOX_D3D8_2D_CENTRE;
-            if (p == 5) {
+            if (p == n) {
                 usage();
                 return 2;
             }
