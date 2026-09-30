@@ -611,6 +611,36 @@ static ThemeRect row_rect(int i)
     return r;
 }
 
+/* Where a row's arrows are drawn: theme_arrows puts the left one at this
+ * box's left edge and the right one at its right edge. Drawing and clicking
+ * both come from here -- the click test once kept its own numbers, which
+ * put the drawn left arrow inside its "right" zone, so clicking it moved a
+ * setting the wrong way. */
+static ThemeRect arrows_rect(ThemeRect row)
+{
+    ThemeRect a = row;
+
+    a.x = row.x + row.w - 46;
+    a.w = 30;
+    return a;
+}
+
+/* Which arrow a click at mx on this row means: -1 the left, +1 the right,
+ * 0 neither. Each target is half the arrows' box, stretched outward -- the
+ * left back to where the value column ends, the right out to the row's
+ * edge -- so a 7-pixel triangle is not all there is to hit. */
+static int hit_arrow(ThemeRect row, int mx)
+{
+    ThemeRect a = arrows_rect(row);
+    int mid = a.x + a.w / 2;
+
+    if (mx >= row.x + row.w - 60 && mx < mid)
+        return -1;
+    if (mx >= mid && mx < row.x + row.w)
+        return 1;
+    return 0;
+}
+
 static void set_tab(Tab t)
 {
     if (t == g_tab)
@@ -785,7 +815,7 @@ static void draw(void)
             theme_text(vr, value, 13, 400,
                        lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
 
-            ar = rr; ar.x = rr.x + rr.w - 46; ar.w = 30;
+            ar = arrows_rect(rr);
             theme_arrows(ar, row_can(row, -1), row_can(row, 1), lit);
         }
 
@@ -887,12 +917,8 @@ static void draw(void)
                            THEME_LEFT);
             }
 
-            if (lit > 0.5 && k <= BIND_ROW_API) {
-                ThemeRect ar = rr;
-
-                ar.x = rr.x + rr.w - 46; ar.w = 30;
-                theme_arrows(ar, 1, 1, lit);
-            }
+            if (lit > 0.5 && k <= BIND_ROW_API)
+                theme_arrows(arrows_rect(rr), 1, 1, lit);
         }
 
         /* Where we are in a list longer than the screen. */
@@ -1004,6 +1030,24 @@ static int hit_row(int mx, int my)
     return -1;
 }
 
+/* The Input tab's visible row under the mouse, or -1. Its rows are shorter
+ * than the Video tab's (46, not 52) and the list scrolls. */
+static int hit_bind_row(int mx, int my)
+{
+    int j;
+
+    if (g_tab != TAB_INPUT)
+        return -1;
+    for (j = 0; j < BIND_ROWS_VISIBLE && g_bind_top + j < BIND_TOTAL_ROWS; j++) {
+        ThemeRect r = row_rect(j);
+
+        r.h = 46;
+        if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
+            return j;
+    }
+    return -1;
+}
+
 static int hit_play(int mx, int my)
 {
     return mx >= g_cw - 60 - 150 && mx < g_cw - 60 &&
@@ -1059,10 +1103,13 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 
                     g_sel = j;
                     if (k < BIND_HEAD_ROWS) {
-                        /* The head rows change on a click, right half
-                         * forward and left half back, as the arrows say. */
-                        nav(mx > rr.x + rr.w / 2 ? 1 : -1, 0,
-                            k == BIND_ROW_RESET, 0, 0);
+                        /* The head rows change on a click: back or forward
+                         * on the arrows, forward anywhere else on the row.
+                         * (Splitting the whole row in half put both drawn
+                         * arrows in the forward half.) */
+                        int dir = hit_arrow(rr, mx);
+
+                        nav(dir ? dir : 1, 0, k == BIND_ROW_RESET, 0, 0);
                     } else {
                         g_bind_col = (mx >= rr.x + 510) ? 1 : 0;
                         g_capturing = 1;
@@ -1077,16 +1124,12 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         i = hit_row(mx, my);
         if (i >= 0) {
-            ThemeRect r = row_rect(i);
+            int dir = hit_arrow(row_rect(i), mx);
 
             g_sel = i;
-            /* The right-hand third of a row is its arrows. */
-            if (mx > r.x + r.w - 60)
-                row_move(&g_video_rows[i], 1);
-            else if (mx > r.x + r.w - 110)
-                row_move(&g_video_rows[i], -1);
-            else
-                row_move(&g_video_rows[i], 1);
+            /* Back or forward on the arrows; anywhere else on the row steps
+             * it forward, which is how a toggle is clicked. */
+            row_move(&g_video_rows[i], dir ? dir : 1);
         }
         if (hit_play(mx, my))
             do_play();
@@ -1096,6 +1139,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEMOVE: {
         int i = hit_row(LOWORD(lp), HIWORD(lp));
 
+        /* The highlight follows the mouse on both lists -- but not away from
+         * a row waiting for the key to bind to it. */
+        if (i < 0 && !g_capturing)
+            i = hit_bind_row(LOWORD(lp), HIWORD(lp));
         if (i >= 0 && i != g_sel) {
             g_sel = i;
             InvalidateRect(h, NULL, FALSE);
