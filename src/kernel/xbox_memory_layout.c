@@ -799,8 +799,65 @@ static void park_enter(void)
  * finishing between "is it still running?" and "here is your semaphore".
  * Host threads (the renderer, audio, the window) are left free.
  *
- * 1 picks the highest core this process may run on; a number above 1 is
- * taken as a core index + 1 (2 = core 1, ...). Off when unset or 0. */
+ * 1 picks a core for the guest: the highest-numbered core of the fastest
+ * class the process may run on. A number above 1 is taken as a core index
+ * + 1 (2 = core 1, ...). Off when unset or 0.
+ *
+ * "The fastest class" matters on a hybrid CPU. Windows numbers the
+ * efficiency cores last, so "the highest core" on an i7-12700H was CPU 19,
+ * an E-core, and the whole title -- lifted code, HLE, renderer submission --
+ * ran on it: Outrun 2's race measured 12-15 fps there and 35-40 fps on a
+ * P-core, the same build, the same drive (1 Oct 2026). CPU sets report each
+ * logical processor's EfficiencyClass (higher is faster); the pick is the
+ * highest-numbered processor of the highest class, which also keeps the
+ * guest off CPU 0. */
+typedef BOOL (WINAPI *GetSystemCpuSetInformation_t)(PVOID, ULONG, PULONG, HANDLE, ULONG);
+
+static DWORD_PTR fastest_core_mask(DWORD_PTR proc)
+{
+    GetSystemCpuSetInformation_t get_sets =
+        (GetSystemCpuSetInformation_t)(void *)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation");
+    ULONG len = 0;
+    BYTE *buf, *p;
+    DWORD_PTR best = 0;
+    int best_class = -1;
+
+    if (!get_sets)
+        return 0;
+    get_sets(NULL, 0, &len, GetCurrentProcess(), 0);
+    if (!len || !(buf = (BYTE *)malloc(len)))
+        return 0;
+    if (!get_sets(buf, len, &len, GetCurrentProcess(), 0)) {
+        free(buf);
+        return 0;
+    }
+    /* SYSTEM_CPU_SET_INFORMATION: Size at +0, Type at +4 (0 = CpuSet), then
+     * the CpuSet record at +8: Id (ULONG), Group (USHORT, +12),
+     * LogicalProcessorIndex (BYTE, +14), CoreIndex (+15),
+     * LastLevelCacheIndex (+16), NumaNodeIndex (+17), EfficiencyClass (+18).
+     * Spelt out so this builds against older SDK headers. */
+    for (p = buf; p + 24 <= buf + len; p += *(ULONG *)p) {
+        ULONG size = *(ULONG *)p;
+        BYTE lp = p[14], cls = p[18];
+
+        if (size < 24)
+            break;
+        if (*(ULONG *)(p + 4) != 0 || lp >= sizeof(DWORD_PTR) * 8)
+            continue;
+        if (!(proc & ((DWORD_PTR)1 << lp)))
+            continue;
+        if ((int)cls > best_class || ((int)cls == best_class && lp > 0)) {
+            if ((int)cls > best_class)
+                best = 0;
+            best_class = cls;
+            best = (DWORD_PTR)1 << lp;      /* highest index wins: ascending order */
+        }
+    }
+    free(buf);
+    return best;
+}
+
 static DWORD_PTR guest_cpu_mask(void)
 {
     static DWORD_PTR mask = (DWORD_PTR)-1;
@@ -811,9 +868,12 @@ static DWORD_PTR guest_cpu_mask(void)
         mask = 0;
         if (n > 0 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && proc) {
             if (n == 1) {
-                /* the highest core the process is allowed */
-                for (mask = (DWORD_PTR)1 << (sizeof mask * 8 - 1); !(mask & proc); mask >>= 1)
-                    ;
+                mask = fastest_core_mask(proc);
+                if (!mask) {
+                    /* No CPU-set information: the highest core allowed. */
+                    for (mask = (DWORD_PTR)1 << (sizeof mask * 8 - 1); !(mask & proc); mask >>= 1)
+                        ;
+                }
             } else {
                 mask = ((DWORD_PTR)1 << (n - 2)) & proc;
             }
