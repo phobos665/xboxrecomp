@@ -207,6 +207,25 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
         tex_desc(t2, sizeof t2, g_stage_tex[2]);
         tex_desc(t3, sizeof t3, g_stage_tex[3]);
         fprintf(stderr, "[draw %4ld] tex %s %s %s %s\n", n, t0, t1, t2, t3);
+        /* The viewport, and the projection as uploaded (the register named by
+         * hor_plus_register, four rows): what the widescreen 2D rule judges a
+         * program draw by. A HUD drawn through the 3D programs shows up here
+         * as the draws whose matrix is not the camera's. */
+        if (g_replay_dev) {
+            D3DVIEWPORT8 vp;
+            const float *c = d3d8_vsh_constants();
+            int reg = d3d8_vsh_hor_plus_reg();
+            if (SUCCEEDED(g_replay_dev->lpVtbl->GetViewport(g_replay_dev, &vp)) && c &&
+                reg + 3 < NV2A_VS_MAX_CONSTANTS) {
+                const float *r0 = c + reg * 4, *r1 = r0 + 4, *r2 = r0 + 8, *r3 = r0 + 12;
+                fprintf(stderr, "[draw %4ld] vp %lu,%lu %lux%lu  c[%d..%d] x(%.3g %.3g %.3g %.3g) "
+                        "y(%.3g %.3g %.3g %.3g) z(%.3g %.3g %.3g %.3g) w(%.3g %.3g %.3g %.3g)\n",
+                        n, (unsigned long)vp.X, (unsigned long)vp.Y, (unsigned long)vp.Width,
+                        (unsigned long)vp.Height, reg, reg + 3,
+                        r0[0], r0[1], r0[2], r0[3], r1[0], r1[1], r1[2], r1[3],
+                        r2[0], r2[1], r2[2], r2[3], r3[0], r3[1], r3[2], r3[3]);
+            }
+        }
         fprintf(stderr, "[draw %4ld] %-8s prim %u x%-5u stride %2u  vs 0x%05lX  ps %lu  "
                 "blend %lu %lu>%lu  atest %lu ref %lu  z %lu/%lu  fog %lu  cull %lu%s%s\n",
                 n, kind, prim, count, stride, (unsigned long)g_cur_vs,
