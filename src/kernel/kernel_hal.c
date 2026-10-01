@@ -823,8 +823,21 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * NTSC-M here while the EEPROM said PAL for a PAL-only disc, and XGRA
          * asked for the 640x576 PAL mode it read from one and D3D rejected it
          * against the other: CreateDevice returned E_FAIL and the title ran
-         * with no device. */
-        *Result = AV_PACK_HDTV | xbox_kernel_console_av_standard();
+         * with no device.
+         *
+         * Widescreen lives in this word too, at 0x00010000, and nowhere
+         * else that D3D reads. A title with a 16:9 mode of its own asks for
+         * it with D3DPRESENTFLAG_WIDESCREEN (0x10), and D3D's mode scan then
+         * requires that bit here (Outrun 2's D3D8, 0x0019BAA6: `test
+         * [flags], 0x10; test caps, 0x10000`) before it accepts a row. With
+         * the bit missing every row was refused and CreateDevice returned
+         * E_FAIL, so a title that honoured the widescreen setting ran with
+         * no device while one that ignored it was fine. The AV_FLAGS_*
+         * values below are the XC_VIDEO (EEPROM) layout the two capability
+         * queries use, not this word's, so the bit is spelt out here. */
+        *Result = AV_PACK_HDTV | xbox_kernel_console_av_standard()
+                | (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0)
+                   ? 0x00010000u /* AV_FLAGS_WIDESCREEN, AV pack word layout */ : 0);
         break;
 
     case AV_OPTION_QUERY_MODE:

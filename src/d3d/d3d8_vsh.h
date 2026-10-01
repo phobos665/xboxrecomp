@@ -250,6 +250,9 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle);
  * the projection's first column. False means it draws in screen
  * coordinates of its own -- the HUD, a menu, a full-screen quad. */
 int  d3d8_vsh_bound_uses_projection(void);
+/* ... and whether that projection, as uploaded right now, is orthographic:
+ * a constant w row. A HUD drawn through the 3D programs looks like this. */
+int  d3d8_vsh_bound_projection_is_ortho(void);
 
 /* Of the 4-register groups from c[first] (count registers), which the
  * bound program reads: bit g for c[first+4g..first+4g+3]. A program that

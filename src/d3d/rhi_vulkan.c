@@ -264,6 +264,29 @@ static struct {
     uint32_t         stencil_ref;
     RhiRasterState  *raster;
     VkPipeline       cur_pipe;
+    /* The dynamic state the command buffer currently holds, so a draw sets
+     * only what changed. Dynamic state lives in the command buffer and
+     * persists across pipeline binds (every pipeline here declares the
+     * same dynamic states), so this is valid from the first draw of a
+     * recording until submit; begin_recording clears it. Setting all of
+     * it on every draw was some twenty driver calls a draw, measured at a
+     * few percent of Outrun 2's guest thread in a race. */
+    struct {
+        int                  valid;
+        VkViewport           vp;
+        VkRect2D             sc;
+        VkCullModeFlags      cull;
+        VkFrontFace          front_face;
+        VkPrimitiveTopology  topo;
+        VkBool32             bias_enable;
+        float                bias[3];
+        VkBool32             depth_test, depth_write;
+        VkCompareOp          depth_cmp;
+        VkBool32             stencil_test;
+        struct { VkStencilOp fail, pass, depth_fail; VkCompareOp cmp; } front, back;
+        uint32_t             read_mask, write_mask, ref;
+        float                blend_const[4];
+    } dyn;
 } V;
 
 static struct {
@@ -513,6 +536,7 @@ static void begin_recording(void)
     V.recording = 1;
     V.rendering = 0;
     V.cur_pipe = VK_NULL_HANDLE;
+    V.dyn.valid = 0;                    /* a new command buffer holds no dynamic state */
 }
 
 static VkCommandBuffer cmd(void)
@@ -3197,7 +3221,6 @@ static void apply_dynamic_state(VkCommandBuffer cb)
     v.height = -vp->height;
     v.minDepth = vp->min_depth;
     v.maxDepth = vp->max_depth;
-    vkCmdSetViewportWithCount(cb, 1, &v);
 
     if (r->scissor) {
         x0 = V.scissor.left; y0 = V.scissor.top; x1 = V.scissor.right; y1 = V.scissor.bottom;
@@ -3212,29 +3235,63 @@ static void apply_dynamic_state(VkCommandBuffer cb)
     sc.offset.y = y0;
     sc.extent.width = (uint32_t)(x1 - x0);
     sc.extent.height = (uint32_t)(y1 - y0);
-    vkCmdSetScissorWithCount(cb, 1, &sc);
 
-    vkCmdSetCullMode(cb, r->cull == RHI_CULL_FRONT ? VK_CULL_MODE_FRONT_BIT
-                       : r->cull == RHI_CULL_BACK  ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE);
-    vkCmdSetFrontFace(cb, raster_front_face(r));
-    vkCmdSetPrimitiveTopology(cb, vk_topology(V.topology));
-    vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
-    vkCmdSetDepthBiasEnable(cb, (r->depth_bias || r->slope_scaled_depth_bias) ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthBias(cb, (float)r->depth_bias, V.feat_bias_clamp ? r->depth_bias_clamp : 0.0f,
-                      r->slope_scaled_depth_bias);
+    /* Each piece of state is set only when it differs from what the command
+     * buffer already holds (V.dyn, cleared at begin_recording). The first
+     * draw of a recording sets everything. */
+#define DYN_CHANGED(field, value) \
+    ((!V.dyn.valid || memcmp(&V.dyn.field, &(value), sizeof(value)) != 0) \
+        ? (memcpy(&V.dyn.field, &(value), sizeof(value)), 1) : 0)
+#define DYN_SET(field, value, ...) \
+    do { if (DYN_CHANGED(field, value)) { __VA_ARGS__; } } while (0)
+    {
+        VkCullModeFlags cull = r->cull == RHI_CULL_FRONT ? VK_CULL_MODE_FRONT_BIT
+                             : r->cull == RHI_CULL_BACK  ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+        VkFrontFace ff = raster_front_face(r);
+        VkPrimitiveTopology topo = vk_topology(V.topology);
+        VkBool32 bias_enable = (r->depth_bias || r->slope_scaled_depth_bias) ? VK_TRUE : VK_FALSE;
+        float bias[3];
+        VkBool32 depth_test = d->depth_enable ? VK_TRUE : VK_FALSE;
+        VkBool32 depth_write = (d->depth_enable && d->depth_write) ? VK_TRUE : VK_FALSE;
+        VkCompareOp depth_cmp = vk_cmp(d->depth_func);
+        VkBool32 stencil_test = d->stencil_enable ? VK_TRUE : VK_FALSE;
+        struct { VkStencilOp fail, pass, depth_fail; VkCompareOp cmp; } front, back;
+        uint32_t read_mask = d->stencil_read_mask, write_mask = d->stencil_write_mask;
+        uint32_t ref = V.stencil_ref;
 
-    vkCmdSetDepthTestEnable(cb, d->depth_enable ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthWriteEnable(cb, (d->depth_enable && d->depth_write) ? VK_TRUE : VK_FALSE);
-    vkCmdSetDepthCompareOp(cb, vk_cmp(d->depth_func));
-    vkCmdSetStencilTestEnable(cb, d->stencil_enable ? VK_TRUE : VK_FALSE);
-    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, vk_stencil(d->front.fail), vk_stencil(d->front.pass),
-                      vk_stencil(d->front.depth_fail), vk_cmp(d->front.func));
-    vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, vk_stencil(d->back.fail), vk_stencil(d->back.pass),
-                      vk_stencil(d->back.depth_fail), vk_cmp(d->back.func));
-    vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, d->stencil_read_mask);
-    vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, d->stencil_write_mask);
-    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, V.stencil_ref);
-    vkCmdSetBlendConstants(cb, V.blend_factor);
+        bias[0] = (float)r->depth_bias;
+        bias[1] = V.feat_bias_clamp ? r->depth_bias_clamp : 0.0f;
+        bias[2] = r->slope_scaled_depth_bias;
+        front.fail = vk_stencil(d->front.fail); front.pass = vk_stencil(d->front.pass);
+        front.depth_fail = vk_stencil(d->front.depth_fail); front.cmp = vk_cmp(d->front.func);
+        back.fail = vk_stencil(d->back.fail); back.pass = vk_stencil(d->back.pass);
+        back.depth_fail = vk_stencil(d->back.depth_fail); back.cmp = vk_cmp(d->back.func);
+
+        DYN_SET(vp, v, vkCmdSetViewportWithCount(cb, 1, &v));
+        DYN_SET(sc, sc, vkCmdSetScissorWithCount(cb, 1, &sc));
+        DYN_SET(cull, cull, vkCmdSetCullMode(cb, cull));
+        DYN_SET(front_face, ff, vkCmdSetFrontFace(cb, ff));
+        DYN_SET(topo, topo, vkCmdSetPrimitiveTopology(cb, topo));
+        if (!V.dyn.valid)
+            vkCmdSetPrimitiveRestartEnable(cb, VK_FALSE);
+        DYN_SET(bias_enable, bias_enable, vkCmdSetDepthBiasEnable(cb, bias_enable));
+        DYN_SET(bias, bias, vkCmdSetDepthBias(cb, bias[0], bias[1], bias[2]));
+        DYN_SET(depth_test, depth_test, vkCmdSetDepthTestEnable(cb, depth_test));
+        DYN_SET(depth_write, depth_write, vkCmdSetDepthWriteEnable(cb, depth_write));
+        DYN_SET(depth_cmp, depth_cmp, vkCmdSetDepthCompareOp(cb, depth_cmp));
+        DYN_SET(stencil_test, stencil_test, vkCmdSetStencilTestEnable(cb, stencil_test));
+        DYN_SET(front, front, vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, front.fail, front.pass,
+                                                front.depth_fail, front.cmp));
+        DYN_SET(back, back, vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, back.fail, back.pass,
+                                              back.depth_fail, back.cmp));
+        DYN_SET(read_mask, read_mask, vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, read_mask));
+        DYN_SET(write_mask, write_mask, vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, write_mask));
+        DYN_SET(ref, ref, vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, ref));
+        DYN_SET(blend_const, V.blend_factor, vkCmdSetBlendConstants(cb, V.blend_factor));
+        V.dyn.valid = 1;
+    }
+#undef DYN_SET
+#undef DYN_CHANGED
 }
 
 static int prepare_draw(void)
