@@ -140,6 +140,7 @@ const DWORD *d3d8_GetPalette(DWORD stage)
 static const IDirect3DDevice8Vtbl g_device_vtbl;
 static void up_ring_shutdown(void);
 static void present_resolve(void);
+static void interp_target_destroy(void);
 #include "d3d8_overlay.h"
 #include "d3d8_movie.h"
 
@@ -256,9 +257,12 @@ static void present_scene(void);
  * note the frame done. */
 static void follow_vrr(void);
 
+static void two_d_tag_frame(void);
+
 static void present_resolve(void)
 {
     follow_vrr();
+    two_d_tag_frame();
     present_scene();
     d3d8_display_frame_done();
 }
@@ -336,8 +340,6 @@ static BOOL two_d_squeeze(float *k_out, float *cx_out)
     return TRUE;
 }
 
-static void two_d_tag_frame(void);
-
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
@@ -347,7 +349,6 @@ static void present_scene(void)
     D3D8DisplayFit fit;
     RECT rc;
 
-    two_d_tag_frame();
     if (!rhi_swapchain_view() || !s->rhi_scene_srv)
         return;
 
@@ -678,6 +679,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         if (g_cur_rt) { IDirect3DSurface8_Release(&g_cur_rt->iface); g_cur_rt = NULL; }
         if (g_cur_ds) { IDirect3DSurface8_Release(&g_cur_ds->iface); g_cur_ds = NULL; }
         if (g_auto_ds) { IDirect3DSurface8_Release(&g_auto_ds->iface); g_auto_ds = NULL; }
+        interp_target_destroy();
         rhi_view_destroy(s->depth_view); s->depth_view = NULL;
         rhi_image_destroy(s->depth_image); s->depth_image = NULL;
         rhi_view_destroy(s->rhi_scene_srv); s->rhi_scene_srv = NULL;
@@ -2150,6 +2152,105 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
 
     present_resolve();
     return (HRESULT)rhi_present(g_present_interval);
+}
+
+/* ================================================================
+ * Frame interpolation's target (src/hle/hle_d3d8_interp.c)
+ *
+ * An in-between frame is drawn while the title's finished frame waits for
+ * its vblank, so it cannot go to the scene target: that still holds the
+ * frame about to be shown. Between Begin and End, "the back buffer" to
+ * everything here -- SetRenderTarget(NULL), a screen copy, the resolve --
+ * is a second image of the same size. The device depth buffer is shared:
+ * the title's frame is finished with it, and the in-between frame starts
+ * with the same clears that frame did.
+ * ================================================================ */
+
+static RhiImage *g_interp_image;
+static RhiView  *g_interp_rtv, *g_interp_srv;
+static UINT      g_interp_w, g_interp_h;
+static BOOL      g_interp_on;
+
+static void interp_target_destroy(void)
+{
+    rhi_view_destroy(g_interp_srv); g_interp_srv = NULL;
+    rhi_view_destroy(g_interp_rtv); g_interp_rtv = NULL;
+    rhi_image_destroy(g_interp_image); g_interp_image = NULL;
+}
+
+/* Trade the scene target for the other image, and rebind it if the back
+ * buffer is what is bound. */
+static void interp_target_swap(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+    RhiImage *image = s->rhi_scene_image;
+    RhiView *rtv = s->rhi_default_rtv, *srv = s->rhi_scene_srv;
+
+    s->rhi_scene_image = g_interp_image;
+    s->rhi_default_rtv = g_interp_rtv;
+    s->rhi_scene_srv = g_interp_srv;
+    g_interp_image = image;
+    g_interp_rtv = rtv;
+    g_interp_srv = srv;
+    if (!g_cur_rt)
+        rhi_set_render_target(s->rhi_default_rtv, g_cur_ds ? g_cur_ds->dsv : NULL);
+}
+
+BOOL xbox_D3D8InterpBegin(void)
+{
+    D3D8DeviceState *s = &g_device_state;
+
+    if (g_interp_on || !rhi_device_ready() || !s->rhi_scene_image)
+        return FALSE;
+    if (g_interp_image && (g_interp_w != s->width || g_interp_h != s->height))
+        interp_target_destroy();
+    if (!g_interp_image) {
+        RhiImageDesc sd;
+
+        memset(&sd, 0, sizeof sd);
+        sd.type = RHI_IMAGE_2D;
+        sd.width = s->width;
+        sd.height = s->height;
+        sd.depth = 1;
+        sd.mip_levels = 1;
+        sd.format = RHI_FORMAT_R8G8B8A8_UNORM;
+        sd.samples = 1;
+        sd.usage = RHI_USAGE_DEFAULT;
+        sd.bind = RHI_BIND_RENDER_TARGET | RHI_BIND_SAMPLED;
+        g_interp_image = rhi_image_create(&sd, NULL);
+        if (g_interp_image)
+            g_interp_rtv = rhi_view_create(g_interp_image, RHI_VIEW_RENDER_TARGET, NULL);
+        if (g_interp_rtv)
+            g_interp_srv = rhi_view_create(g_interp_image, RHI_VIEW_SAMPLED, NULL);
+        if (!g_interp_srv) {
+            interp_target_destroy();
+            return FALSE;
+        }
+        g_interp_w = s->width;
+        g_interp_h = s->height;
+    }
+    interp_target_swap();
+    g_interp_on = TRUE;
+    return TRUE;
+}
+
+/* The resolve and the present, without counting a frame: the title drew
+ * none. */
+void xbox_D3D8InterpPresent(void)
+{
+    if (!g_interp_on)
+        return;
+    follow_vrr();
+    present_scene();
+    rhi_present(g_present_interval);
+}
+
+void xbox_D3D8InterpEnd(void)
+{
+    if (!g_interp_on)
+        return;
+    interp_target_swap();
+    g_interp_on = FALSE;
 }
 
 /* ================================================================

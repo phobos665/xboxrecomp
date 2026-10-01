@@ -85,6 +85,8 @@ typedef struct {
     uint16_t            inputs_read;  /* Which v registers are read */
     int                 uses_proj;    /* reads the projection's first column */
     int                 pos_input;    /* v# oPos is copied from, or -1 */
+    uint64_t            const_read[3];/* constant registers read by index, a bit each */
+    int                 const_indexed;/* reads through a0: any register, as far as known */
 } VshCacheEntry;
 
 static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
@@ -100,6 +102,28 @@ static int g_emit_uses_proj;
 static int g_bound_uses_proj;
 
 int d3d8_vsh_bound_uses_projection(void) { return g_bound_uses_proj; }
+
+/* Which constants a program reads, for frame interpolation: a matrix the
+ * program never reads may hold anything, and is not the draw's. */
+static uint64_t g_emit_const_read[3], g_bound_const_read[3];
+static int      g_emit_const_indexed, g_bound_const_indexed;
+
+uint32_t d3d8_vsh_bound_reads(int first, int count)
+{
+    uint32_t mask = 0;
+    int g, r;
+
+    for (g = 0; g * 4 < count && g < 32; g++) {
+        int hit = g_bound_const_indexed;
+        for (r = first + g * 4; !hit && r < first + g * 4 + 4; r++)
+            if (r >= 0 && r < NV2A_VS_MAX_CONSTANTS &&
+                (g_bound_const_read[r >> 6] >> (r & 63)) & 1)
+                hit = 1;
+        if (hit)
+            mask |= 1u << g;
+    }
+    return mask;
+}
 
 /* For a program that writes oPos straight from an input register -- the
  * shape every screen-space program has -- the register that input came
@@ -228,10 +252,13 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
         sb_append(sb, "v%d", src->reg_index);
         break;
     case NV2A_VSH_REG_CONST:
-        if (src->rel_addr)
+        if (src->rel_addr) {
             sb_append(sb, "c[a0 + %d]", src->reg_index);
-        else {
+            g_emit_const_indexed = 1;
+        } else {
             sb_append(sb, "c[%d]", src->reg_index);
+            if (src->reg_index >= 0 && src->reg_index < NV2A_VS_MAX_CONSTANTS)
+                g_emit_const_read[src->reg_index >> 6] |= 1ull << (src->reg_index & 63);
             /* A program that reads the register holding the first column of
              * the title's projection is transforming geometry through it,
              * which is what makes it 3D. One that never does is drawing in
@@ -979,6 +1006,8 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
         return NULL;
     g_emit_uses_proj = 0;
     g_emit_pos_input = -1;
+    memset(g_emit_const_read, 0, sizeof g_emit_const_read);
+    g_emit_const_indexed = 0;
     hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, HLSL_BUF);
     if (hlsl_len <= 0 || hlsl_len >= HLSL_BUF - 1) {
         fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d bytes)\n", hlsl_len);
@@ -1031,6 +1060,8 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     entry->inputs_read = program.inputs_read;
     entry->uses_proj   = g_emit_uses_proj;
     entry->pos_input   = g_emit_pos_input;
+    memcpy(entry->const_read, g_emit_const_read, sizeof entry->const_read);
+    entry->const_indexed = g_emit_const_indexed;
     entry->layout_count = 0;
 
     fprintf(stderr, "D3D8 VSH: Compiled shader (hash 0x%08X, %d insns, inputs 0x%04X)\n",
@@ -1360,6 +1391,58 @@ int d3d8_vsh_hor_plus_reg(void)
     return reg;
 }
 
+/* Frame interpolation's registers: what the title said
+ * (xbox_D3D8SetInterpRegisters), under what the settings say. */
+static int g_interp_title_said;
+static int g_interp_title_proj = -1, g_interp_title_first = -1, g_interp_title_count;
+
+void xbox_D3D8SetInterpRegisters(int projection, int affine_first, int affine_count)
+{
+    g_interp_title_proj = projection;
+    g_interp_title_first = affine_first;
+    g_interp_title_count = affine_count;
+    g_interp_title_said = 1;
+}
+
+void d3d8_vsh_interp_registers(int *projection, int *affine_first, int *affine_count)
+{
+    static int read;
+    static const char *proj_v, *affine_v;
+    int proj, first, count;
+
+    if (!read) {
+        read = 1;
+        proj_v = recomp_config_lookup("RECOMP_INTERP_PROJECTION", "interp_projection");
+        affine_v = recomp_config_lookup("RECOMP_INTERP_AFFINE", "interp_affine");
+    }
+    proj = g_interp_title_said ? g_interp_title_proj : d3d8_vsh_hor_plus_reg();
+    first = g_interp_title_said ? g_interp_title_first : -1;
+    count = g_interp_title_said ? g_interp_title_count : 0;
+    if (proj_v && *proj_v)
+        proj = (strcmp(proj_v, "none") == 0) ? -1 : atoi(proj_v);
+    if (affine_v && *affine_v) {
+        /* "64-75", or "none" */
+        int lo = -1, hi = -1;
+        if (strcmp(affine_v, "none") != 0 && sscanf(affine_v, "%d-%d", &lo, &hi) == 2 &&
+            hi >= lo) {
+            first = lo;
+            count = hi - lo + 1;
+        } else {
+            first = -1;
+            count = 0;
+        }
+    }
+    if (proj < 0 || proj + 4 > NV2A_VS_MAX_CONSTANTS)
+        proj = -1;
+    if (first < 0 || count < 4 || first + count > NV2A_VS_MAX_CONSTANTS) {
+        first = -1;
+        count = 0;
+    }
+    *projection = proj;
+    *affine_first = first;
+    *affine_count = count & ~3;
+}
+
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
 {
     int end_reg;
@@ -1520,6 +1603,8 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     /* Bind the vertex shader */
     rhi_set_shader(RHI_STAGE_VERTEX, entry->vs);
     g_bound_uses_proj = entry->uses_proj;
+    memcpy(g_bound_const_read, entry->const_read, sizeof g_bound_const_read);
+    g_bound_const_indexed = entry->const_indexed;
     g_bound_pos_input = entry->pos_input;
     g_bound_decl = vsh->decl_count ? vsh->decl : NULL;
     g_bound_decl_count = vsh->decl_count;

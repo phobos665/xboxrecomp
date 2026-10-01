@@ -808,6 +808,89 @@ static void defer_call(void (*fn)(const void *), const void *fixed, size_t fixed
 #define DEFER_PART_B(arg, fixed_type, a_size) \
     (DEFER_PART_A(arg, fixed_type) + DEFER_ALIGN(a_size))
 
+/* ------------------------------------------------- frame interpolation
+ *
+ * The same ops, kept for hle_d3d8_interp.c while the call also runs (see
+ * hle_d3d8_record.h). retain_call lays a payload out as defer_call does. */
+int hle_d3d8_interp_rec;
+
+/* The vertex constants as src/hle gave them, which is before Hor+ scales
+ * its register: an op that sets them again goes through the same scaling,
+ * so it has to start from the same values. And what a draw is drawn with,
+ * for its key. */
+static float                  g_constants[NV2A_VS_MAX_CONSTANTS * 4];
+static DWORD                  g_bound_vs;
+static IDirect3DBaseTexture8 *g_bound_tex[CAPTURE_STAGES];
+
+const float *hle_d3d8_interp_constants(void)
+{
+    return g_constants;
+}
+
+static void retain_call(void (*fn)(const void *), const void *fixed, size_t fixed_size,
+                        const void *a, size_t a_size, const void *b, size_t b_size,
+                        const HleInterpDrawKey *key)
+{
+    uint8_t stack[256], *p = stack;
+    size_t total = DEFER_ALIGN(fixed_size) + DEFER_ALIGN(a_size) + b_size;
+
+    if (total > sizeof stack) {
+        p = (uint8_t *)malloc(total);
+        if (!p)
+            return;
+    }
+    memcpy(p, fixed, fixed_size);
+    if (a_size)
+        memcpy(p + DEFER_ALIGN(fixed_size), a, a_size);
+    if (b_size)
+        memcpy(p + DEFER_ALIGN(fixed_size) + DEFER_ALIGN(a_size), b, b_size);
+    if (key)
+        hle_d3d8_interp_draw(fn, p, total, key);
+    else
+        hle_d3d8_interp_op(fn, p, total);
+    if (p != stack)
+        free(p);
+}
+
+/* A draw's identity across frames: the bytes it draws, hashed. Eight bytes
+ * a step, so a frame's megabyte of vertices costs a fraction of a
+ * millisecond. */
+static uint64_t hash_bytes(uint64_t h, const void *data, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)data;
+
+    while (n >= 8) {
+        uint64_t v;
+        memcpy(&v, b, 8);
+        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+        b += 8;
+        n -= 8;
+    }
+    while (n--)
+        h = (h ^ *b++) * 0x100000001B3ull;
+    return h;
+}
+
+static void draw_key(HleInterpDrawKey *k, DWORD type, UINT prims, UINT stride,
+                     DWORD index_format)
+{
+    int s;
+
+    k->vs = g_bound_vs;
+    k->stride = stride;
+    k->prims = prims;
+    k->prim_type = type;
+    k->index_format = index_format;
+    for (s = 0; s < CAPTURE_STAGES; s++)
+        k->tex[s] = g_bound_tex[s];
+    k->target = g_target_lost ? NULL : g_target_texture;
+    /* Read after the draw: the program's verdict is made when it is bound
+     * for it. A fixed-function draw is not blended. */
+    k->uses_proj = d3d8_vsh_is_programmable(g_bound_vs) &&
+                   d3d8_vsh_bound_uses_projection();
+}
+
 /* ------------------------------------------------------------ device calls */
 
 typedef struct { DWORD count, flags; D3DCOLOR color; float z; DWORD stencil; } dq_clear;
@@ -832,6 +915,16 @@ HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,
         c.stencil = stencil;
         defer_call(op_clear, &c, sizeof c, rects, (size_t)c.count * sizeof *rects, NULL, 0);
         return S_OK;
+    }
+    if (hle_d3d8_interp_rec) {
+        dq_clear c;
+        c.count = rects ? count : 0;
+        c.flags = flags;
+        c.color = color;
+        c.z = z;
+        c.stencil = stencil;
+        retain_call(op_clear, &c, sizeof c, rects, (size_t)c.count * sizeof *rects,
+                    NULL, 0, NULL);
     }
     if (g_cap) {
         D3D8CapClear c;
@@ -877,6 +970,10 @@ HRESULT host_SetRenderState(IDirect3DDevice8 *dev, D3DRENDERSTATETYPE state, DWO
         hle_d3d8_defer_op(op_render_state, &p, sizeof p);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec) {
+        dq_3 p = { (DWORD)state, value, 0 };
+        hle_d3d8_interp_op(op_render_state, &p, sizeof p);
+    }
     if (g_cap)
         rec_render_state((DWORD)state, value);
     return dev->lpVtbl->SetRenderState(dev, state, value);
@@ -896,6 +993,10 @@ HRESULT host_SetTextureStageState(IDirect3DDevice8 *dev, DWORD stage,
         dq_3 p = { stage, (DWORD)type, value };
         hle_d3d8_defer_op(op_stage_state, &p, sizeof p);
         return S_OK;
+    }
+    if (hle_d3d8_interp_rec) {
+        dq_3 p = { stage, (DWORD)type, value };
+        hle_d3d8_interp_op(op_stage_state, &p, sizeof p);
     }
     if (g_cap)
         rec_stage_state(stage, (DWORD)type, value);
@@ -920,6 +1021,12 @@ HRESULT host_SetTransform(IDirect3DDevice8 *dev, D3DTRANSFORMSTATETYPE state,
         hle_d3d8_defer_op(op_transform, &p, sizeof p);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec && matrix) {
+        dq_transform p;
+        p.state = (DWORD)state;
+        p.m = *matrix;
+        hle_d3d8_interp_op(op_transform, &p, sizeof p);
+    }
     if (g_cap && matrix)
         rec_transform((DWORD)state, matrix);
     return dev->lpVtbl->SetTransform(dev, state, matrix);
@@ -938,6 +1045,8 @@ HRESULT host_SetMaterial(IDirect3DDevice8 *dev, const D3DMATERIAL8 *material)
         hle_d3d8_defer_op(op_material, material, sizeof *material);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec)
+        hle_d3d8_interp_op(op_material, material, sizeof *material);
     if (g_cap)
         rec_material(material);
     return dev->lpVtbl->SetMaterial(dev, material);
@@ -962,6 +1071,12 @@ HRESULT host_SetLight(IDirect3DDevice8 *dev, DWORD index, const D3DLIGHT8 *light
         hle_d3d8_defer_op(op_light, &p, sizeof p);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec) {
+        dq_light p;
+        p.index = index;
+        p.light = *light;
+        hle_d3d8_interp_op(op_light, &p, sizeof p);
+    }
     if (g_cap)
         rec_light(index, light);
     return dev->lpVtbl->SetLight(dev, index, light);
@@ -983,6 +1098,12 @@ HRESULT host_LightEnable(IDirect3DDevice8 *dev, DWORD index, BOOL enable)
         p.enable = enable;
         hle_d3d8_defer_op(op_light_enable, &p, sizeof p);
         return S_OK;
+    }
+    if (hle_d3d8_interp_rec) {
+        dq_light_enable p;
+        p.index = index;
+        p.enable = enable;
+        hle_d3d8_interp_op(op_light_enable, &p, sizeof p);
     }
     if (g_cap)
         rec_light_enable(index, enable);
@@ -1008,6 +1129,13 @@ void host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects)
                    NULL, 0);
         return;
     }
+    if (hle_d3d8_interp_rec) {
+        dq_scissors p;
+        p.count = rects ? count : 0;
+        p.exclusive = exclusive;
+        retain_call(op_scissors, &p, sizeof p, rects, (size_t)p.count * sizeof *rects,
+                    NULL, 0, NULL);
+    }
     if (g_cap)
         rec_scissors(count, exclusive, count && rects ? &rects[0] : NULL);
     xbox_D3D8SetScissors(count, exclusive, rects);
@@ -1030,6 +1158,12 @@ void host_SetTwoDPlacement(int placement, uint32_t tag)
         hle_d3d8_defer_op(op_two_d_placement, &p, sizeof p);
         return;
     }
+    if (hle_d3d8_interp_rec) {
+        dq_two_d_placement p;
+        p.placement = placement;
+        p.tag = tag;
+        hle_d3d8_interp_op(op_two_d_placement, &p, sizeof p);
+    }
     if (g_cap)
         rec_two_d_placement(placement, tag);
     xbox_D3D8SetTwoDPlacement(placement, tag);
@@ -1046,6 +1180,8 @@ HRESULT host_SetViewport(IDirect3DDevice8 *dev, const D3DVIEWPORT8 *viewport)
         hle_d3d8_defer_op(op_viewport, viewport, sizeof *viewport);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec && viewport)
+        hle_d3d8_interp_op(op_viewport, viewport, sizeof *viewport);
     if (g_cap && viewport)
         rec_viewport(viewport);
     return dev->lpVtbl->SetViewport(dev, viewport);
@@ -1068,6 +1204,14 @@ HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage, IDirect3DBaseTexture
         hle_d3d8_defer_op(op_host_set_texture, &p, sizeof p);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec) {
+        dq_set_texture p;
+        p.stage = stage;
+        p.texture = texture;
+        hle_d3d8_interp_op(op_host_set_texture, &p, sizeof p);
+    }
+    if (stage < CAPTURE_STAGES)
+        g_bound_tex[stage] = texture;
     if (g_cap)
         rec_set_texture(stage, texture);
     return dev->lpVtbl->SetTexture(dev, stage, texture);
@@ -1084,6 +1228,9 @@ HRESULT host_SetVertexShader(IDirect3DDevice8 *dev, DWORD handle)
         hle_d3d8_defer_op(op_vertex_shader, &handle, sizeof handle);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec)
+        hle_d3d8_interp_op(op_vertex_shader, &handle, sizeof handle);
+    g_bound_vs = handle;
     if (g_cap)
         rec_set_vertex_shader(handle);
     return dev->lpVtbl->SetVertexShader(dev, handle);
@@ -1143,7 +1290,23 @@ HRESULT host_DrawPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,
             g_draws++;
         }
     }
-    return dev->lpVtbl->DrawPrimitiveUP(dev, type, prims, vertices, stride);
+    {
+        HRESULT hr = dev->lpVtbl->DrawPrimitiveUP(dev, type, prims, vertices, stride);
+        uint64_t bytes = (uint64_t)d3d8_up_vertices_read(type, prims) * stride;
+
+        if (hle_d3d8_interp_rec && vertices && stride && bytes <= DEFER_LIMIT) {
+            dq_draw_up p;
+            HleInterpDrawKey k;
+
+            draw_key(&k, (DWORD)type, prims, stride, 0);
+            k.content = hash_bytes(0xCBF29CE484222325ull, vertices, (size_t)bytes);
+            p.type = (DWORD)type;
+            p.prims = prims;
+            p.stride = stride;
+            retain_call(op_draw_up, &p, sizeof p, vertices, (size_t)bytes, NULL, 0, &k);
+        }
+        return hr;
+    }
 }
 
 HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type,
@@ -1190,9 +1353,34 @@ HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type
             g_draws++;
         }
     }
-    return dev->lpVtbl->DrawIndexedPrimitiveUP(dev, type, min_index, num_vertices,
-                                               prims, indices, index_format,
-                                               vertices, stride);
+    {
+        HRESULT hr = dev->lpVtbl->DrawIndexedPrimitiveUP(dev, type, min_index, num_vertices,
+                                                         prims, indices, index_format,
+                                                         vertices, stride);
+        UINT index_size = index_format == D3DFMT_INDEX32 ? 4u : 2u;
+        uint64_t ibytes = (uint64_t)d3d8_up_indices_read(type, prims) * index_size;
+        uint64_t vbytes = (uint64_t)(min_index + num_vertices) * stride;
+
+        if (hle_d3d8_interp_rec && indices && vertices && stride &&
+            ibytes <= DEFER_LIMIT && vbytes <= DEFER_LIMIT) {
+            dq_draw_indexed_up p;
+            HleInterpDrawKey k;
+
+            draw_key(&k, (DWORD)type, prims, stride, (DWORD)index_format);
+            k.content = hash_bytes(hash_bytes(0xCBF29CE484222325ull, indices, (size_t)ibytes),
+                                   vertices, (size_t)vbytes);
+            p.type = (DWORD)type;
+            p.min_index = min_index;
+            p.num_vertices = num_vertices;
+            p.prims = prims;
+            p.stride = stride;
+            p.index_format = (DWORD)index_format;
+            p.index_bytes = (uint32_t)ibytes;
+            retain_call(op_draw_indexed_up, &p, sizeof p, indices, (size_t)ibytes,
+                        vertices, (size_t)vbytes, &k);
+        }
+        return hr;
+    }
 }
 
 HRESULT host_CreateTexture(IDirect3DDevice8 *dev, UINT width, UINT height,
@@ -1256,6 +1444,12 @@ ULONG host_ReleaseTexture(IDirect3DTexture8 *texture)
     /* Queued draws may still name it: released where the queue reaches. */
     if (hle_d3d8_defer_recording()) {
         hle_d3d8_defer_op(op_release_texture, &texture, sizeof texture);
+        return 0;
+    }
+    /* Likewise the frame frame interpolation keeps: released once it will
+     * not be drawn again. */
+    if (hle_d3d8_interp_rec) {
+        hle_d3d8_interp_retire(op_release_texture, &texture, sizeof texture);
         return 0;
     }
     ULONG left = texture->lpVtbl->Release(texture);
@@ -1341,6 +1535,14 @@ HRESULT host_SetRenderTarget(IDirect3DDevice8 *dev, IDirect3DBaseTexture8 *textu
     g_target_face    = face;
     g_target_depth   = depth;
     g_target_lost    = FAILED(hr);
+    if (hle_d3d8_interp_rec) {
+        dq_render_target p;
+        p.texture = texture;
+        p.level = level;
+        p.face = face;
+        p.depth = depth;
+        hle_d3d8_interp_op(op_render_target, &p, sizeof p);
+    }
     if (g_cap)
         rec_set_render_target(texture, level, face, depth, 0);
     return hr;
@@ -1405,6 +1607,10 @@ HRESULT host_vsh_delete_shader(DWORD handle)
         hle_d3d8_defer_op(op_vsh_delete, &handle, sizeof handle);
         return S_OK;
     }
+    if (hle_d3d8_interp_rec) {
+        hle_d3d8_interp_retire(op_vsh_delete, &handle, sizeof handle);
+        return S_OK;
+    }
     if (g_cap) {
         D3D8CapVsHandle c;
 
@@ -1454,6 +1660,19 @@ void host_vsh_set_constant(int first_reg, const float *data, int count)
                    (size_t)count * 4 * sizeof(float), NULL, 0);
         return;
     }
+    if (data && first_reg >= 0 && first_reg < NV2A_VS_MAX_CONSTANTS && count > 0) {
+        int n = count > NV2A_VS_MAX_CONSTANTS - first_reg
+                    ? NV2A_VS_MAX_CONSTANTS - first_reg : count;
+
+        memcpy(&g_constants[first_reg * 4], data, (size_t)n * 4 * sizeof(float));
+        if (hle_d3d8_interp_rec) {
+            dq_constants p;
+            p.first = first_reg;
+            p.count = n;
+            retain_call(op_vsh_constants, &p, sizeof p, data,
+                        (size_t)n * 4 * sizeof(float), NULL, 0, NULL);
+        }
+    }
     if (g_cap)
         rec_vs_constants(first_reg, data, count);
     d3d8_vsh_set_constant(first_reg, data, count);
@@ -1479,6 +1698,16 @@ void host_vsh_set_screenspace(const float scale[4], const float offset[4])
         hle_d3d8_defer_op(op_vsh_screenspace, &p, sizeof p);
         return;
     }
+    if (hle_d3d8_interp_rec) {
+        dq_screenspace p;
+        memset(&p, 0, sizeof p);
+        p.enabled = scale && offset;
+        if (p.enabled) {
+            memcpy(p.scale, scale, sizeof p.scale);
+            memcpy(p.offset, offset, sizeof p.offset);
+        }
+        hle_d3d8_interp_op(op_vsh_screenspace, &p, sizeof p);
+    }
     if (g_cap && scale && offset)
         rec_vs_screenspace(1, scale, offset);
     d3d8_vsh_set_screenspace(scale, offset);
@@ -1493,6 +1722,12 @@ void host_vsh_set_vertex_data(int reg, const float value[4])
         hle_d3d8_defer_op(op_vsh_vertex_data, &p, sizeof p);
         return;
     }
+    if (hle_d3d8_interp_rec && value) {
+        dq_vertex_data p;
+        p.reg = reg;
+        memcpy(p.v, value, sizeof p.v);
+        hle_d3d8_interp_op(op_vsh_vertex_data, &p, sizeof p);
+    }
     if (g_cap && value)
         rec_vs_vertex_data(reg, value);
     d3d8_vsh_set_vertex_data(reg, value);
@@ -1504,9 +1739,173 @@ void host_combiners_set_pixel_shader(DWORD token)
         hle_d3d8_defer_op(op_ps_token, &token, sizeof token);
         return;
     }
+    if (hle_d3d8_interp_rec)
+        hle_d3d8_interp_op(op_ps_token, &token, sizeof token);
     if (g_cap)
         rec_ps_token(token);
     d3d8_combiners_set_pixel_shader(token);
+}
+
+/* ----------------------------------------------------------- screen copies */
+
+typedef struct { IDirect3DTexture8 *dst; int has_rect; RECT src; POINT at; } dq_screen_copy;
+
+static void op_screen_copy(const void *arg)
+{
+    const dq_screen_copy *p = (const dq_screen_copy *)arg;
+
+    if (p->has_rect)
+        host_CopyBackBufferRectToTexture(p->dst, &p->src, &p->at);
+    else
+        host_CopyBackBufferToTexture(p->dst);
+}
+
+HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst)
+{
+    if (hle_d3d8_interp_rec) {
+        dq_screen_copy p;
+        memset(&p, 0, sizeof p);
+        p.dst = dst;
+        hle_d3d8_interp_op(op_screen_copy, &p, sizeof p);
+    }
+    return xbox_D3D8CopyBackBufferToTexture(dst);
+}
+
+HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
+                                         const POINT *at)
+{
+    if (hle_d3d8_interp_rec && src) {
+        dq_screen_copy p;
+        memset(&p, 0, sizeof p);
+        p.dst = dst;
+        p.has_rect = 1;
+        p.src = *src;
+        if (at) {
+            p.at = *at;
+        } else {
+            p.at.x = 0;
+            p.at.y = 0;
+        }
+        hle_d3d8_interp_op(op_screen_copy, &p, sizeof p);
+    }
+    return xbox_D3D8CopyBackBufferRectToTexture(dst, src, at);
+}
+
+/* --------------------------------------------- the frame-start state, kept
+ *
+ * capture_snapshot's list, as ops, in the same order and for the same
+ * reason (SetTexture rewrites COLOROP, so the stage states come after the
+ * textures). The constants are the ones src/hle gave, not the host's
+ * scaled copy: these go through the setter again. */
+void hle_d3d8_interp_snapshot(void)
+{
+    static const DWORD transforms[] = {
+        D3DTS_VIEW, D3DTS_PROJECTION,
+        D3DTS_TEXTURE0, D3DTS_TEXTURE0 + 1, D3DTS_TEXTURE0 + 2, D3DTS_TEXTURE0 + 3,
+        D3DTS_WORLD, D3DTS_WORLD + 1, D3DTS_WORLD + 2, D3DTS_WORLD + 3
+    };
+    IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
+    const DWORD *rs = d3d8_GetRenderStates();
+    D3DVIEWPORT8 vp;
+    DWORD s, t;
+    int i;
+
+    if (!dev || !hle_d3d8_interp_rec)
+        return;
+    {
+        dq_constants p;
+        p.first = 0;
+        p.count = NV2A_VS_MAX_CONSTANTS;
+        retain_call(op_vsh_constants, &p, sizeof p, g_constants, sizeof g_constants,
+                    NULL, 0, NULL);
+    }
+    {
+        dq_screenspace p;
+        memset(&p, 0, sizeof p);
+        d3d8_vsh_get_screenspace(p.scale, p.offset, &p.enabled);
+        hle_d3d8_interp_op(op_vsh_screenspace, &p, sizeof p);
+    }
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
+        dq_vertex_data p;
+        p.reg = i;
+        d3d8_vsh_get_vertex_data(i, p.v);
+        hle_d3d8_interp_op(op_vsh_vertex_data, &p, sizeof p);
+    }
+    {
+        DWORD token = d3d8_combiners_get_pixel_shader();
+        hle_d3d8_interp_op(op_ps_token, &token, sizeof token);
+    }
+    {
+        DWORD vs = 0;
+        dev->lpVtbl->GetVertexShader(dev, &vs);
+        hle_d3d8_interp_op(op_vertex_shader, &vs, sizeof vs);
+    }
+    for (s = 0; s < CAPTURE_STAGES; s++) {
+        dq_set_texture p;
+        p.stage = s;
+        p.texture = d3d8_GetStageTexture(s);
+        hle_d3d8_interp_op(op_host_set_texture, &p, sizeof p);
+    }
+    {
+        dq_render_target p;
+        p.texture = g_target_lost ? NULL : g_target_texture;
+        p.level = g_target_lost ? 0 : g_target_level;
+        p.face = g_target_lost ? 0 : g_target_face;
+        p.depth = g_target_depth;
+        hle_d3d8_interp_op(op_render_target, &p, sizeof p);
+    }
+    for (i = 0; i < (int)(sizeof transforms / sizeof transforms[0]); i++) {
+        const D3DMATRIX *m = d3d8_GetTransform((D3DTRANSFORMSTATETYPE)transforms[i]);
+        if (m) {
+            dq_transform p;
+            p.state = transforms[i];
+            p.m = *m;
+            hle_d3d8_interp_op(op_transform, &p, sizeof p);
+        }
+    }
+    hle_d3d8_interp_op(op_material, d3d8_GetMaterial(), sizeof(D3DMATERIAL8));
+    for (i = 0; i < (int)d3d8_GetNumLights(); i++) {
+        const D3DLIGHT8 *l = d3d8_GetLight((DWORD)i);
+        dq_light_enable e;
+        if (l) {
+            dq_light p;
+            p.index = (DWORD)i;
+            p.light = *l;
+            hle_d3d8_interp_op(op_light, &p, sizeof p);
+        }
+        e.index = (DWORD)i;
+        e.enable = d3d8_GetLightEnable((DWORD)i);
+        hle_d3d8_interp_op(op_light_enable, &e, sizeof e);
+    }
+    dev->lpVtbl->GetViewport(dev, &vp);
+    hle_d3d8_interp_op(op_viewport, &vp, sizeof vp);
+    {
+        UINT count; BOOL exclusive; D3DRECT rect;
+        dq_scissors p;
+        xbox_D3D8GetScissors(&count, &exclusive, &rect);
+        /* The host keeps one rectangle; more than one it applies as none,
+         * which is what no rectangle says. */
+        p.count = count == 1 ? 1 : 0;
+        p.exclusive = exclusive;
+        retain_call(op_scissors, &p, sizeof p, &rect, p.count * sizeof rect,
+                    NULL, 0, NULL);
+    }
+    {
+        dq_two_d_placement p;
+        p.placement = xbox_D3D8GetTwoDPlacement(&p.tag);
+        hle_d3d8_interp_op(op_two_d_placement, &p, sizeof p);
+    }
+    for (s = 0; rs && s < CAPTURE_RENDER_STATES; s++) {
+        dq_3 p = { s, rs[s], 0 };
+        hle_d3d8_interp_op(op_render_state, &p, sizeof p);
+    }
+    for (s = 0; s < CAPTURE_STAGES; s++) {
+        const DWORD *tss = d3d8_GetTSS(s);
+        for (t = 0; tss && t < CAPTURE_STAGE_STATES; t++) {
+            dq_3 p = { s, t, tss[t] };
+            hle_d3d8_interp_op(op_stage_state, &p, sizeof p);
+        }
+    }
 }
 
 #endif /* _WIN32 */
