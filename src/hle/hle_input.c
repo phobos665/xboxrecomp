@@ -151,6 +151,38 @@ static int is_gamepad(uint32_t type)
            type == hle_var_g_DeviceType_Gamepad;
 }
 
+/* VOID XInitDevices(DWORD dwPreallocTypeCount, PXDEVICE_PREALLOC_TYPE types)
+ *
+ * Every other XAPI input entry is replaced here, so the XDK body has nothing
+ * left to set up; what this one does is fix the baseline. On the console the
+ * devices connected when XInitDevices runs are learned through XGetDevices,
+ * and XGetDeviceChanges reports only what is plugged in or pulled out after
+ * that. This model used to report the boot-time pad as an insertion on the
+ * first XGetDeviceChanges, and Jet Set Radio Future (4134) reads a TRUE from
+ * its first call as "the device list is still changing", fails its
+ * controller detection with E_FAIL, and skips the rest of its graphics
+ * start-up -- the first model it loads then dereferenced an object that was
+ * never created. */
+HLE_EXPORT(XInitDevices)
+{
+    static int said;
+    unsigned pads = 0u, m;
+
+    lock();
+    refresh_connected();
+    g_model.reported_mask = g_model.connected_mask;
+    for (m = g_model.connected_mask; m; m &= m - 1u)
+        pads++;
+    unlock();
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[INPUT] XInitDevices: %u pad(s) present at start-up, reported through "
+                        "XGetDevices, not as insertions\n", pads);
+        fflush(stderr);
+    }
+    HLE_RETURN(0);
+}
+
 /* DWORD XGetDevices(PXPP_DEVICE_TYPE type) -- bitmask of connected ports. */
 HLE_EXPORT(XGetDevices)
 {
@@ -251,6 +283,35 @@ HLE_EXPORT(XInputGetCapabilities)
         fflush(stderr);
     }
     HLE_RETURN(result);
+}
+
+/* DWORD XInputPoll(HANDLE)
+ *
+ * The older XDKs' "poll, then read" API: the title asks for the device to be
+ * polled and then calls XInputGetState. Jet Set Radio Future (4134) wraps the
+ * result in HRESULT_FROM_WIN32 and treats anything but ERROR_SUCCESS as "no
+ * controller" -- and with this function left to the title's own XAPI body,
+ * which talks to a USB stack that is not there, its graphics start-up bailed
+ * at that check every time, silently, before any model could load. The poll
+ * here is the sample XInputGetState would take anyway. */
+HLE_EXPORT(XInputPoll)
+{
+    uint32_t handle = HLE_ARG(0), port;
+    RecompInputGamepad sampled;
+    static int said;
+
+    if (!recomp_input_port_for_handle(handle, &port))
+        HLE_RETURN(ERR_DEVICE_NOT_CONNECTED);
+    recomp_input_host_sample_port(port, &sampled);
+    lock();
+    recomp_input_set_gamepad(&g_model, handle, &sampled);
+    unlock();
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[INPUT] XInputPoll(handle 0x%08X) -> polled port %u\n", handle, port + 1u);
+        fflush(stderr);
+    }
+    HLE_RETURN(ERR_SUCCESS);
 }
 
 /* DWORD XInputGetState(HANDLE, PXINPUT_STATE) */
