@@ -18,7 +18,7 @@ tells the mechanism something only the game knows.
 
 | # | Enhancement | Today | Toolkit | Title project |
 |---|---|---|---|---|
-| 1 | Higher frame rates | Frame cap exists (adaptive 60 / 60 / 30 / off); above 60 is unsafe | Pacing, cap settings, interpolation hooks | Making the game's logic correct at a higher rate: the bulk of the work |
+| 1 | Higher frame rates | Frame cap exists (adaptive 60 / 60 / 30 / off); above 60 is unsafe; frame interpolation shows 2-4x with logic at 60 (`frame_interp`) | Pacing, cap settings, frame interpolation | Which registers hold its matrices; or making the game's logic correct at a higher rate: the bulk of the work |
 | 2 | Native widescreen | Console flag and 16:9 presentation exist; Hor+ is experimental | The flag, 16:9 presentation, Hor+ mechanisms | Which register holds the projection, which draws are HUD, 4:3-authored 2D |
 | 3 | Internal resolution scaling | `RECOMP_RES_SCALE=1..8` exists | All of it | Fixes for passes that break at scale (post effects, read-backs) |
 | 4 | MSAA / supersampling | Supersampling exists (item 3); MSAA only when the title asks for it | Forced MSAA, resolve, SSAA via item 3 | Passes that must not be multisampled |
@@ -52,8 +52,10 @@ toolkit bug; each is the game meeting timing it was never tested against.
 - Caps other than 60: 120 and 144 are the gate with a different release rate, if the
   vblank the game sees is decoupled from presentation.
 - A presentation-only mode: keep the game's logic at its own rate and present
-  interpolated or repeated frames above it. The hook is at Swap; interpolation needs
-  transforms from two frames, which the shadow renderer already sees.
+  interpolated frames above it. **Done (Oct 2026)** for titles drawn through the shadow
+  renderer with vertex programs: `RECOMP_FRAME_INTERP` / `frame_interp`, see
+  `frame-interpolation.md`. The title project's part is naming the registers that hold
+  its projection and matrices (`xbox_D3D8SetInterpRegisters`).
 
 **Title project part.** Finding every fixed-step assumption (physics steps, animation
 per frame, timers counted in vblanks) and making each one time-based, or accepting logic
