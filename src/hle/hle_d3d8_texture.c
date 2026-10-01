@@ -76,6 +76,10 @@ typedef struct {
     IDirect3DTexture8 *host;
     uint32_t           checksum;
     unsigned long      checked_swap, used_swap;
+    /* The cheap check (texel_sample) and the frame of the last full one;
+     * see texels_changed. */
+    uint32_t           quick;
+    unsigned long      full_swap;
     /* The title renders into this texture (hle_d3d8_render_texture): the
      * host texture is a render target, and what shadow mode drew into it is
      * the content -- the guest's bytes are not, since nothing on the guest
@@ -283,6 +287,57 @@ static uint32_t level0_checksum(const texture_layout *t)
             h = (h ^ p[i]) * 0x100000001B3ull;
         return (uint32_t)(h ^ (h >> 32));
     }
+}
+
+/* A cheap look at level 0: 4,096 bytes spread across it. */
+static uint32_t texel_sample(const texture_layout *t)
+{
+    const uint8_t *p = (const uint8_t *)HLE_PTR(CONTIG_BASE + t->phys);
+    uint32_t n = t->linear
+        ? t->guest_pitch * level_rows(t->fmt, t->height)
+        : d3d8_row_pitch((D3DFORMAT)t->fmt, t->width) * level_rows(t->fmt, t->height);
+    uint32_t h = 2166136261u, i, step = n > 4096 ? n / 4096 : 1;
+
+    for (i = 0; i < n; i += step) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Have this texture's texels changed since the host copy was made?
+ *
+ * Every first bind of a frame used to hash the whole texture, every mip of
+ * it: Outrun 2 binds about 380 a frame in a race, many of them 512x512, and
+ * the hashing was a quarter of the main thread -- 5 ms of a 20 ms frame
+ * that had to fit in 16.7 to make 60.
+ *
+ * So the check is tiered. A sample of level 0 is taken at every check, and
+ * the full hash only when the sample moved or the last full one is
+ * RECOMP_HLE_D3D8_TEX_FULL_EVERY frames old (8; 1 = every check, as before).
+ * A texture rewritten wholesale -- a streamed sprite frame, a decoded movie,
+ * a reused slot -- changes the sample and uploads the same frame. A small
+ * edit the sample misses uploads within that many frames instead of the
+ * next. Updates e->checksum, e->quick and e->full_swap. */
+static int texels_changed(texture_entry *e, const texture_layout *t,
+                          unsigned long now)
+{
+    static int full_every = -1;
+    uint32_t quick = texel_sample(t), sum;
+
+    if (full_every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_FULL_EVERY");
+        full_every = v && atoi(v) > 0 ? atoi(v) : 8;
+    }
+    if (quick == e->quick && now - e->full_swap < (unsigned long)full_every)
+        return 0;
+    e->quick = quick;
+    e->full_swap = now;
+    sum = level0_checksum(t);
+    if (sum == e->checksum)
+        return 0;
+    e->checksum = sum;
+    return 1;
 }
 
 static void upload(IDirect3DTexture8 *host, const texture_layout *t)
@@ -531,11 +586,10 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
                 refresh = getenv("RECOMP_HLE_D3D8_TEX_REFRESH") ? 1 : 0;
             e->checked_swap = now;
             if (read_layout(va, &t)) {
-                uint32_t sum = level0_checksum(&t);
-                if (sum != e->checksum || (refresh && !same_frame)) {
-                    if (same_frame && sum != e->checksum)
+                int changed = texels_changed(e, &t, now);
+                if (changed || (refresh && !same_frame)) {
+                    if (same_frame && changed)
                         g_midframe_changes++;
-                    e->checksum = sum;
                     upload(e->host, &t);
                     e->pal_sum = 0;     /* baked through whichever palette */
                     g_reuploads++;
@@ -571,6 +625,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e->format = format;
     e->size = size;
     e->checksum = level0_checksum(&t);
+    e->quick = texel_sample(&t);
+    e->full_swap = now;
     e->checked_swap = e->used_swap = now;
     e->p8 = t.fmt == XFMT_P8;
     e->pal_sum = 0;
@@ -724,7 +780,15 @@ void hle_d3d8_texture_frame_end(void)
     unsigned long now = hle_d3d8_shadow_swaps();
     texture_layout t;
     int i, any = 0;
+    static int on = -1;
 
+    /* RECOMP_HLE_D3D8_TEX_AFTER_DRAW=1. It hashes every texture the frame
+     * used a second time, for a count, and was a fifth of Outrun 2's main
+     * thread in a race; so it is asked for, not paid for by default. */
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_AFTER_DRAW", 0);
+    if (!on)
+        return;
     for (i = 0; i < g_texture_count; i++) {
         texture_entry *e = &g_textures[i];
         if (!e->host || e->rendered || e->framebuffer || e->used_swap != now)
