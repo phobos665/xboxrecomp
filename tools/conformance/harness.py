@@ -264,7 +264,10 @@ def harness_source(prepared, why_of, tol_of):
         "@FPMACROS@", chr(10).join(FP_STACK_MACROS))
     _LIFTED_EPILOGUE["fpu"] = _LIFTED_EPILOGUE["fpu"].replace(
         "@FPUNDEFS@", chr(10).join(FP_STACK_UNDEFS))
-    out = [_PREAMBLE]
+    from tools.recomp import perf_opts
+    from tools.recomp.translator import perf_defines
+    out = [_PREAMBLE.replace("#define RECOMP_GENERATED_CODE 1\n", "#define RECOMP_GENERATED_CODE 1\n" + "".join(
+        d + "\n" for d in perf_defines(perf_opts.from_args(None))), 1)]
     for name, _, _, _ in prepared:
         out.append(f"void nat_{name}(void);")
     out.append("")

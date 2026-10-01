@@ -155,7 +155,10 @@ def _lift(code_bytes):
     for insn in d._cs.disasm(code_bytes, 0x00100000):
         mnemonics.append(insn.mnemonic)
         insns.append(d._decode_instruction(insn))
-    lifter = Lifter()
+    # XBOXRECOMP_PERF_OPTS, so the native comparison can run with the
+    # perf options on (docs/technical/performance-upgrades-testing.md).
+    from tools.recomp import perf_opts
+    lifter = Lifter(perf_opts=perf_opts.from_args(None))
     # FunctionTranslator sets this per function, and the lifter only bothers
     # producing CF when something consumes it. Without it the snippet would be
     # lifted differently from how recomp would lift the same bytes.

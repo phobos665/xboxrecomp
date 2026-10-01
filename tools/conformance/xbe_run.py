@@ -28,6 +28,8 @@ runs under an exception guard regardless.
 import re
 
 from . import image
+from tools.recomp import perf_opts
+from tools.recomp.translator import perf_defines
 
 # push ebp ; mov ebp, esp -- the frame prologue MSVC emits for a function that
 # is not FPO-optimised. Not every function looks like this, and that is fine:
@@ -253,7 +255,8 @@ def lift(data, sections, candidates):
                             s.is_code) for s in sections],
             entry_point=min(s.va for s in sections if s.is_code),
             kernel_thunk_addr=0, origin="conformance-xbe")
-        tr = FunctionTranslator(data, func_db)
+        tr = FunctionTranslator(data, func_db,
+                                perf_opts=perf_opts.from_args(None))
         for va, size, _ in candidates:
             body = tr.translate_function(va, func_db[va])
             gaps = [l.strip() for l in body.splitlines()
@@ -529,7 +532,8 @@ def harness_source(xbe_path, sections, lifted, entries):
                    f"0x{s.raw_size:08X}u }},   /* {s.name} */")
     out.append("};")
     out.append(f'#define XBE_PATH {_c_string(xbe_path)}')
-    out.append(_HARNESS)
+    out.append(_HARNESS.replace("#define RECOMP_GENERATED_CODE 1\n", "#define RECOMP_GENERATED_CODE 1\n" + "".join(
+        d + "\n" for d in perf_defines(perf_opts.from_args(None))), 1))
     # Forward declarations before any body, stubs included: an undeclared call
     # is assumed to return int and then clashes with its own definition.
     defined = {va for va, _, _ in lifted}

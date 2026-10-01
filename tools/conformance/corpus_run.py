@@ -14,6 +14,8 @@ code's MEM32() reads the real bytes.
 import re
 
 from . import image
+from tools.recomp import perf_opts
+from tools.recomp.translator import perf_defines
 
 IMAGE_BASE = 0x30000000
 
@@ -84,7 +86,8 @@ def lift_all(dll_bytes, map_text, wanted):
             [config.Section(s.name, s.va, s.vsize, s.raw_off, s.raw_size,
                             s.is_code) for s in sections],
             entry_point=base, kernel_thunk_addr=base, origin="conformance-corpus")
-        translator = FunctionTranslator(dll_bytes, func_db)
+        translator = FunctionTranslator(dll_bytes, func_db,
+                                        perf_opts=perf_opts.from_args(None))
 
         todo = [n for n in wanted if n in extents]
         missing = [n for n in wanted if n not in extents]
@@ -254,7 +257,8 @@ def _section_blob(dll_bytes, sections, base):
 def harness_source(entries, lifted, dll_bytes, sections, base, addr_of):
     """entries: corpus Fn dicts under test. lifted: ordered [(symbol, C)]."""
     # includes first, then the image arrays, then the code that uses them
-    out = [_PREAMBLE, _section_blob(dll_bytes, sections, base),
+    out = [_PREAMBLE.replace("#define RECOMP_GENERATED_CODE 1\n", "#define RECOMP_GENERATED_CODE 1\n" + "".join(
+        d + "\n" for d in perf_defines(perf_opts.from_args(None))), 1), _section_blob(dll_bytes, sections, base),
            _PREAMBLE_TAIL]
     for fn in entries:
         s = _SIG[fn["sig"]]
