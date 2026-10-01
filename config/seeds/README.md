@@ -16,3 +16,9 @@ real function it sat inside and costing it its epilogue. Nothing said so.
 The format is a list of objects, each with a `start` and a `note` saying how
 the address was found. The note is the point: a seed with no reason cannot be
 audited later.
+
+A title with more than one XBE -- 007: Nightfire ships `default.xbe` and
+`Driving.xbe` under one title ID -- gets one file per image: the second is
+`<TITLEID>-<XBE stem>.json` (`45410026-Driving.json`). Both tools derive the
+name from the XBE given, so a seed observed in one image is never applied to
+the other's bytes.

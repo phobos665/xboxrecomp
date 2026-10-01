@@ -23,6 +23,7 @@ set(KERNEL_SOURCES
     xbox_watchpoint.c
     icall_feedback.c
     exit_trace.c
+    launch_chain.c
     recomp_trace.c
     recomp_fps.c
     recomp_sample.c

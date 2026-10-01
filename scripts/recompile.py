@@ -252,13 +252,19 @@ def main() -> int:
         args.seeds = []
         title = xbe_title_id(xbe)
         if title:
-            per_title = REPO / "config" / "seeds" / (title + ".json")
+            # A title with more than one XBE (Nightfire's default.xbe and
+            # Driving.xbe) has one title ID for both, and a seed is a claim
+            # about one image's bytes: the second image gets its own file,
+            # <TITLEID>-<stem>.json, the name tools.seed_from_log writes.
+            stem = Path(xbe).stem
+            name = title + ("" if stem.lower() == "default" else "-" + stem) + ".json"
+            per_title = REPO / "config" / "seeds" / name
             if per_title.is_file():
                 args.seeds = [per_title]
                 if args.verbose:
                     print(f"seeds: {per_title.name} (title {title})")
             elif args.verbose:
-                print(f"seeds: none for title {title}")
+                print(f"seeds: none for title {title} ({name})")
         legacy = REPO / "config" / "seed_functions.json"
         if legacy.is_file():
             print(f"warning: {legacy} is ignored; seeds are per-title now, "

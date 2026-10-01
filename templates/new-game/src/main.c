@@ -84,6 +84,10 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define YOUR_GAME_ENTRY_POINT   0x00000000  /* XBE entry point VA */
 #define YOUR_GAME_XBE_PATH      "game\\Your Game Title\\default.xbe"
 #define YOUR_GAME_DIR            "game\\Your Game Title"
+/* The XBE in that folder this build runs. A title with more than one
+ * (Nightfire's default.xbe and Driving.xbe) is two projects, one per XBE,
+ * and the kernel follows an XLaunchNewImage from one to the other. */
+#define YOUR_GAME_XBE_NAME       "default.xbe"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -135,7 +139,7 @@ static BOOL find_game(char *tried, size_t tried_bytes)
     tried[0] = '\0';
     if (env && *env) {
         snprintf(g_game_dir, sizeof g_game_dir, "%s", env);
-        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\default.xbe", env);
+        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\%s", env, YOUR_GAME_XBE_NAME);
         if (file_exists(g_xbe_path))
             return TRUE;
         snprintf(tried, tried_bytes, "RECOMP_GAME_DIR: %s", g_xbe_path);
@@ -154,7 +158,7 @@ static BOOL find_game(char *tried, size_t tried_bytes)
             snprintf(candidate, sizeof candidate, "%s\\game", dir);
         else
             snprintf(candidate, sizeof candidate, "%s\\%s", dir, YOUR_GAME_DIR);
-        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\default.xbe", candidate);
+        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\%s", candidate, YOUR_GAME_XBE_NAME);
         if (file_exists(g_xbe_path)) {
             snprintf(g_game_dir, sizeof g_game_dir, "%s", candidate);
             return TRUE;
@@ -531,7 +535,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             snprintf(message, sizeof message,
                      "This needs the game's own files, which are not included.\n\n"
                      "Put them in a folder called \"game\" next to this program, so that\n"
-                     "\"game\\default.xbe\" exists, or set RECOMP_GAME_DIR to where they are.\n\n"
+                     "\"game\\" YOUR_GAME_XBE_NAME "\" exists, or set RECOMP_GAME_DIR to where they are.\n\n"
                      "Looked for:\n%s", tried);
             fprintf(stderr, "%s\n", message);
             log_hint(message, sizeof message);
@@ -541,7 +545,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         printf("Game files: %s\n", g_game_dir);
         if (!load_xbe(g_xbe_path, &xbe_data, &xbe_size)) {
             snprintf(message, sizeof message,
-                     "Found the game at\n%s\nbut could not read default.xbe.",
+                     "Found the game at\n%s\nbut could not read " YOUR_GAME_XBE_NAME ".",
                      g_game_dir);
             log_hint(message, sizeof message);
             MessageBoxA(NULL, message, "YOUR_GAME_NAME", MB_ICONERROR);
@@ -565,6 +569,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
+    xbox_SetImageFileName(YOUR_GAME_XBE_NAME);   /* XeImageFileName, launch log */
     xbox_kernel_init();
 
     /* Step 4: Set game directory for file I/O path translation */

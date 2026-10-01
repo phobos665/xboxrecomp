@@ -116,6 +116,18 @@ static UINT               g_shadow_width, g_shadow_height;
  * title selected (shadow_set_render_target). Viewports and the programs'
  * screen-space undo are relative to it. */
 static UINT               g_target_width, g_target_height;
+/* The title's size for the current target, when that differs from the host
+ * target it is drawn into. A device created with multisampling renders into
+ * a target larger than its back buffers and the XDK filters it down at Swap:
+ * 007 Nightfire's driving half draws 1280x480 for a 640x480 screen. The
+ * title's viewports, scissors and pre-transformed vertices arrive in its
+ * units and are scaled by g_target_width / g_title_target_w onto the host.
+ * Equal to the host size for every other target. */
+static UINT               g_title_target_w, g_title_target_h;
+/* The target CreateDevice gave the device, by identity, and its size. It is
+ * the screen even when its memory is not a back buffer's (see above). */
+static uint32_t           g_device_target_va;
+static UINT               g_device_target_w, g_device_target_h;
 static unsigned long      g_target_sets, g_target_scratch, g_target_failed;
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
 static HWND               g_shadow_hwnd;
@@ -553,8 +565,12 @@ static float xbox_depth_z_scale(uint32_t format)
 
 static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
 {
-    float half_w = (float)g_target_width / 2.0f;
-    float half_h = (float)g_target_height / 2.0f;
+    /* In the title's units: its programs and pre-transformed vertices work
+     * in the target size it sees, and the host maps that size to clip space. */
+    UINT tw = g_title_target_w ? g_title_target_w : g_target_width;
+    UINT th = g_title_target_h ? g_title_target_h : g_target_height;
+    float half_w = (float)tw / 2.0f;
+    float half_h = (float)th / 2.0f;
     float reserved[8] = {
         (float)vp->Width / 2.0f, -(float)vp->Height / 2.0f,
         (vp->MaxZ - vp->MinZ) * g_z_scale, 1.0f,
@@ -577,6 +593,16 @@ static void shadow_use_viewport(int whole_target)
     g_host_viewport_mode = whole_target;
     if (!whole_target && g_title_viewport_set) {
         vp = g_title_viewport;
+        /* The title's viewport is in its target's units; the host target may
+         * be smaller (a supersampled device target, g_title_target_w). */
+        if (g_title_target_w && g_title_target_w != g_target_width) {
+            vp.X = (DWORD)((uint64_t)vp.X * g_target_width / g_title_target_w);
+            vp.Width = (DWORD)((uint64_t)vp.Width * g_target_width / g_title_target_w);
+        }
+        if (g_title_target_h && g_title_target_h != g_target_height) {
+            vp.Y = (DWORD)((uint64_t)vp.Y * g_target_height / g_title_target_h);
+            vp.Height = (DWORD)((uint64_t)vp.Height * g_target_height / g_title_target_h);
+        }
     } else {
         vp.X = 0;
         vp.Y = 0;
@@ -683,8 +709,16 @@ static void shadow_create(uint32_t pp_va)
  * of the title's X_D3DVertexShader with bit 0 set (Cxbx-Reloaded,
  * XbVertexShader.h, VshHandleIsVertexShader). FVF bits are the PC's, so an
  * FVF code goes to the host as it is. A program is created on the host when
- * the title creates it, and found again here by its guest handle. */
-#define SHADOW_MAX_PROGRAMS 128
+ * the title creates it, and found again here by its guest handle.
+ *
+ * 1024 because a title's count is not small: 007 Nightfire (4831) creates
+ * 130 vertex shaders before its front end has drawn anything, and with the
+ * table at 128 the last few were "not tracked", so every one of its 75,000
+ * front-end draws was skipped as "unknown shader" and the screen stayed
+ * black. Nothing takes an entry back when the title deletes a shader; a
+ * handle created again is reused, which covers an allocator handing the
+ * same address out. */
+#define SHADOW_MAX_PROGRAMS 1024
 
 enum { SHADER_DECLARATION, SHADER_HOST_PROGRAM, SHADER_NOT_REPLAYED };
 
@@ -3115,19 +3149,23 @@ HLE_EXPORT(D3DDevice_SetViewport)
     if (g_shadow && viewport) {
         D3DVIEWPORT8 vp;
 
+        UINT tw = g_title_target_w ? g_title_target_w : g_target_width;
+        UINT th = g_title_target_h ? g_title_target_h : g_target_height;
+
         memcpy(&vp, HLE_PTR(viewport), sizeof vp);
         /* XDK code passes Width and Height of INT_MAX to mean "the whole
          * render target" (Cxbx-Reloaded, CxbxImpl_SetViewport), and D3D11
          * would take that literally, so the viewport is kept inside the
-         * current render target. */
-        if (vp.X > g_target_width)
-            vp.X = g_target_width;
-        if (vp.Y > g_target_height)
-            vp.Y = g_target_height;
-        if (vp.Width > g_target_width - vp.X)
-            vp.Width = g_target_width - vp.X;
-        if (vp.Height > g_target_height - vp.Y)
-            vp.Height = g_target_height - vp.Y;
+         * current render target -- in the title's units; shadow_use_viewport
+         * scales it onto the host target. */
+        if (vp.X > tw)
+            vp.X = tw;
+        if (vp.Y > th)
+            vp.Y = th;
+        if (vp.Width > tw - vp.X)
+            vp.Width = tw - vp.X;
+        if (vp.Height > th - vp.Y)
+            vp.Height = th - vp.Y;
         g_title_viewport = vp;
         g_title_viewport_set = 1;
         g_host_viewport_mode = -1;       /* the next draw picks which to use */
@@ -3159,6 +3197,17 @@ HLE_EXPORT(D3DDevice_SetScissors)
 
         if (n && rects)
             memcpy(rect, HLE_PTR(rects), n * sizeof rect[0]);
+        /* In the title's target units; the host target may be smaller. */
+        if (g_title_target_w && g_title_target_h &&
+            (g_title_target_w != g_target_width || g_title_target_h != g_target_height)) {
+            uint32_t k;
+            for (k = 0; k < n; k++) {
+                rect[k].x1 = (LONG)((int64_t)rect[k].x1 * (int64_t)g_target_width / (int64_t)g_title_target_w);
+                rect[k].x2 = (LONG)((int64_t)rect[k].x2 * (int64_t)g_target_width / (int64_t)g_title_target_w);
+                rect[k].y1 = (LONG)((int64_t)rect[k].y1 * (int64_t)g_target_height / (int64_t)g_title_target_h);
+                rect[k].y2 = (LONG)((int64_t)rect[k].y2 * (int64_t)g_target_height / (int64_t)g_title_target_h);
+            }
+        }
         else
             n = 0;
         host_SetScissors(n, exclusive != 0, rect);
@@ -3280,6 +3329,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     IDirect3DTexture8 *texture = NULL;
     IDirect3DSurface8 *depth = NULL;
     UINT w, h, zw = 0, zh = 0, face = 0, level = 0;
+    UINT title_w = 0, title_h = 0;       /* the title's size when the host's differs */
     uint32_t fmt, zfmt = 0, parent;
     int kind, i;                         /* 0 back buffer, 1 texture, 2 scratch, 3 cube */
 
@@ -3309,6 +3359,20 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             } else {
                 kind = 2;
             }
+        } else if (rt == g_device_target_va) {
+            /* The target CreateDevice gave the device is the screen by
+             * identity, even after GetBackBuffer2 has named a back buffer.
+             * With multisampling they are different surfaces: 007 Nightfire's
+             * driving half renders every frame into its 1280x480 device
+             * target and the XDK filters that into the 640x480 back buffer
+             * inside Swap, a blit no replacement sees. Judged by memory this
+             * surface was "scratch" and 500,000 draws a minute went nowhere.
+             * Drawn as the screen, with the title's size kept for scaling. */
+            kind = 0;
+            title_w = w;
+            title_h = h;
+            w = g_shadow_width;
+            h = g_shadow_height;
         } else if (is_swap_data(HLE_MEM32(rt + 4))) {
             /* The surface's memory is a frame buffer, so this is the screen
              * even when the surface hangs off a texture the title made over
@@ -3441,12 +3505,15 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     }
     g_target_width = w;
     g_target_height = h;
+    g_title_target_w = title_w ? title_w : w;
+    g_title_target_h = title_h ? title_h : h;
 
-    /* The Xbox resets the viewport to the whole new target. */
+    /* The Xbox resets the viewport to the whole new target (in the title's
+     * units; the host viewport is scaled from it when it is applied). */
     g_title_viewport.X = 0;
     g_title_viewport.Y = 0;
-    g_title_viewport.Width = w;
-    g_title_viewport.Height = h;
+    g_title_viewport.Width = g_title_target_w;
+    g_title_viewport.Height = g_title_target_h;
     g_title_viewport.MinZ = 0.0f;
     g_title_viewport.MaxZ = 1.0f;
     g_title_viewport_set = 1;
@@ -3591,11 +3658,22 @@ HLE_EXPORT(D3DDevice_SetRenderTarget)
     HLE_CALL_ORIGINAL(D3DDevice_SetRenderTarget);
 #ifdef _WIN32
     if (g_in_create_device && rt) {
+        UINT dw = 0, dh = 0;
+        uint32_t dfmt = 0;
+
         g_backbuffer_va = rt;
         g_autodepth_va = zs;
         note_swap_surface(rt);
-        fprintf(stderr, "[HLE-D3D8] CreateDevice set target 0x%08X, depth 0x%08X: "
-                "the frame buffer and the device's depth\n", rt, zs);
+        surface_measure(rt, &dw, &dh, &dfmt);
+        g_device_target_va = rt;
+        g_device_target_w = dw;
+        g_device_target_h = dh;
+        fprintf(stderr, "[HLE-D3D8] CreateDevice set target 0x%08X (%ux%u, data 0x%08X), "
+                "depth 0x%08X: the frame buffer and the device's depth%s\n", rt, dw, dh,
+                HLE_MEM32(rt + 4), zs,
+                g_shadow_width && ((dw && dw != g_shadow_width) || (dh && dh != g_shadow_height))
+                    ? "; larger than the screen, so a multisampled target the "
+                      "XDK filters down at Swap -- drawn here as the screen, scaled" : "");
     }
     if (g_shadow)
         shadow_set_render_target(rt, zs);

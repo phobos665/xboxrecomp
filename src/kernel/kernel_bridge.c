@@ -182,8 +182,36 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *launch_file = getenv("RECOMP_LAUNCH_DATA_FILE");
 
-        if (cmdline && *cmdline) {
+        /* Launched by another recompiled image (launch_chain.c): the page it
+         * wrote, 4 KB, exactly as XLaunchNewImage left it. The file is this
+         * process's to consume; a leftover one would hand a stale launch to
+         * the next run started from the same shell. */
+        if (launch_file && *launch_file) {
+            FILE *f = fopen(launch_file, "rb");
+            uint32_t page = f ? xbox_HeapAlloc(0x1000, 4096) : 0;
+
+            if (f && page) {
+                uint8_t buf[0x1000];
+                size_t got = fread(buf, 1, sizeof buf, f), i;
+                for (i = 0; i < got; i++)
+                    BRIDGE_MEM8(page + (uint32_t)i) = buf[i];
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page;
+                fprintf(stderr, "  Launch data: from %s (type %u, title 0x%08X, "
+                                "path '%.64s'), as %s\n", launch_file,
+                        BRIDGE_MEM32(page), BRIDGE_MEM32(page + 4),
+                        (const char *)XBOX_TO_NATIVE(page + 8),
+                        xbox_ImageFileName());
+            } else {
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
+                fprintf(stderr, "  Launch data: RECOMP_LAUNCH_DATA_FILE=%s could not be "
+                                "read; starting with none\n", launch_file);
+            }
+            if (f) fclose(f);
+            DeleteFileA(launch_file);
+            SetEnvironmentVariableA("RECOMP_LAUNCH_DATA_FILE", NULL);
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -278,6 +306,7 @@ static void kernel_data_init(void)
      * HalRandGather reads the bytes for entropy. Build the struct and its text
      * inside the kernel data area so both are addressable. */
     {
+        char image[64];
         struct { uint32_t str_off, buf_off; const char *text; } d[] = {
             { KDATA_DISK_MODEL_STR,  KDATA_DISK_MODEL_BUF,  "XBOXRECOMP VIRTUAL HDD" },
             { KDATA_DISK_SERIAL_STR, KDATA_DISK_SERIAL_BUF, "XR0000000000" },
@@ -285,10 +314,12 @@ static void kernel_data_init(void)
              * its Buffer held whatever was in the page -- Half-Life 2's CRT
              * reads it while working out the running image's path, took the
              * uninitialised bytes as a char*, and dereferenced 0x68737572
-             * (the ASCII "rush"). A disc-booted title's value looks like this. */
-            { KDATA_XE_IMAGE_FILENAME, KDATA_XE_IMAGE_BUF,
-              "\\Device\\CdRom0\\default.xbe" },
+             * (the ASCII "rush"). A disc-booted title's value looks like this.
+             * The file name is the image this process runs: a title with two
+             * XBEs (Nightfire's Driving.xbe) can read it to learn which. */
+            { KDATA_XE_IMAGE_FILENAME, KDATA_XE_IMAGE_BUF, image },
         };
+        snprintf(image, sizeof image, "\\Device\\CdRom0\\%s", xbox_ImageFileName());
         for (int k = 0; k < (int)(sizeof(d) / sizeof(d[0])); k++) {
             uint32_t str_va = XBOX_KERNEL_DATA_BASE + d[k].str_off;
             uint32_t buf_va = XBOX_KERNEL_DATA_BASE + d[k].buf_off;
@@ -1274,6 +1305,20 @@ static void bridge_HalReturnToFirmware(void)
         if (waited)
             fprintf(stderr, "  [KERNEL] waited %dms for the video to finish\n",
                     waited);
+    }
+
+    /* A quick reboot into a named image is a launch, not an exit: run the
+     * recompiled executable mapped to that image and leave with its code
+     * (launch_chain.c). Routine 2 is what XLaunchNewImage asks for; a page
+     * naming no image is XLaunchNewImage(NULL), the dashboard. */
+    if (routine == 2) {
+        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+        int code = page ? xbox_LaunchChain(page) : -1;
+
+        if (code >= 0) {
+            fflush(stderr);
+            ExitProcess((UINT)code);
+        }
     }
 
     xbox_HalReturnToFirmware(routine);
