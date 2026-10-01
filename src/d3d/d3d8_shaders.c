@@ -1090,7 +1090,7 @@ void d3d8_shaders_prepare_draw(DWORD handle)
         /* A program that never reads the projection's first column is
          * placing vertices in screen coordinates it worked out itself; one
          * that reads it but with an orthographic matrix in it is doing the
-         * same through the matrix (OutRun 2's HUD). */
+         * same through the matrix. */
         d3d8_SetTwoDSqueeze(!d3d8_vsh_bound_uses_projection()
                             || d3d8_vsh_bound_projection_is_ortho());
     } else {
