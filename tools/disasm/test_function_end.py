@@ -135,6 +135,116 @@ def test_jump_table_past_next_function_is_ignored():
     assert end == 0x2004, f"expected {0x2004:#x}, got {end:#x}"
 
 
+# A gap_prologue start inside a function found later is absorbed.
+#
+# Jet Set Radio Future's sub_00025040: eleven conditional jumps from the body
+# land on a shared epilogue parked after an early ret, and the byte after that
+# ret began with a prologue shape. _pass_gap_prologues saw a gap there (the
+# function itself was only found by the later tail-jump alias pass) and made
+# it a start; clamped to it, the body's own jumps past it were lifted as tail
+# calls to stubs, and the title skipped its epilogue.
+def _gap_detector():
+    insns = [
+        _Insn(0x1000, 2),                                   # push esi...
+        _Insn(0x1002, 6, "jb", target=0x1030, is_cond_jump=True),
+        _Insn(0x1008, 2),
+        _Insn(0x100A, 1, "ret", is_ret=True),
+        _Insn(0x100B, 2),                                   # the "prologue"
+        _Insn(0x100D, 5),
+        _Insn(0x1012, 1, "ret", is_ret=True),
+        _Insn(0x1013, 0x1D),                                # padding, decoded
+        _Insn(0x1030, 2),                                   # shared epilogue
+        _Insn(0x1032, 1, "ret", is_ret=True),
+        _Insn(0x1040, 1, "ret", is_ret=True),               # the real next function
+    ]
+    det = _detector(insns)
+    det._candidates = {0x1000: (0.9, "tail_jump_alias"),
+                       0x100B: (0.85, "gap_prologue"),
+                       0x1040: (0.9, "call_target")}
+    det.functions = {}
+    det._absorbed = set()
+    return det
+
+
+def test_body_jumping_past_the_gap_start_absorbs_it():
+    det = _gap_detector()
+    end = det._find_function_end(0x1000, next_func=0x100B, sec_end=0x2000)
+    assert end == 0x1033, f"expected {0x1033:#x}, got {end:#x}"
+    assert 0x100B not in det._candidates, "the gap start is dropped"
+    assert 0x100B in det._absorbed
+
+
+def test_a_gap_start_nothing_jumps_past_is_kept():
+    det = _gap_detector()
+    det.engine.by_addr[0x1002] = _Insn(0x1002, 6, "jb", target=0x1008,
+                                       is_cond_jump=True)
+    end = det._find_function_end(0x1000, next_func=0x100B, sec_end=0x2000)
+    assert end == 0x100B, f"expected {0x100B:#x}, got {end:#x}"
+    assert 0x100B in det._candidates
+
+
+def test_a_tail_call_to_the_gap_start_keeps_it():
+    # The body jumps *to* the start, not past it: a tail call to a real
+    # function, which must stay a function. (Absorbing on "the walk ran
+    # past it" alone cost Jet Set Radio Future 252 functions.)
+    det = _gap_detector()
+    det.engine.by_addr[0x1002] = _Insn(0x1002, 6, "jmp", target=0x100B,
+                                       is_jump=True)
+    end = det._find_function_end(0x1000, next_func=0x100B, sec_end=0x2000)
+    # `push; jmp foo` ends at the jmp, and the clamp stands.
+    assert end == 0x1008, f"expected {0x1008:#x}, got {end:#x}"
+    assert 0x100B in det._candidates
+
+
+def test_a_conditional_jump_to_the_gap_start_absorbs_it():
+    # Compiled code never tail-calls through a jcc, so a `je` *to* the start
+    # is an internal branch: JSRF's sub_00025040 reaches 0x25233 with one.
+    det = _gap_detector()
+    det.engine.by_addr[0x1002] = _Insn(0x1002, 6, "je", target=0x100B,
+                                       is_cond_jump=True)
+    end = det._find_function_end(0x1000, next_func=0x100B, sec_end=0x2000)
+    # Nothing reaches 0x1030 here, so the body ends at the absorbed code's ret.
+    assert end == 0x1013, f"expected {0x1013:#x}, got {end:#x}"
+    assert 0x100B in det._absorbed
+
+
+def test_a_switch_case_past_the_gap_start_absorbs_it():
+    det = _gap_detector()
+    det.engine.by_addr[0x1002] = _Insn(0x1002, 6, "jmp", is_jump=True,
+                                       jump_table=0x1800)
+    det.engine.entries[0x1800] = [0x1008, 0x1030]
+    end = det._find_function_end(0x1000, next_func=0x100B, sec_end=0x2000)
+    assert end == 0x1033, f"expected {0x1033:#x}, got {end:#x}"
+    assert 0x100B in det._absorbed
+
+
+def test_an_absorbed_start_bounds_nothing():
+    det = _gap_detector()
+    det._absorbed.add(0x100B)
+    det._candidates.pop(0x100B)
+    end = det._find_function_end(0x1000, next_func=0x100B, sec_end=0x2000)
+    assert end == 0x1033, f"expected {0x1033:#x}, got {end:#x}"
+
+
+def test_an_alias_body_keeps_the_measurement_past_an_absorbed_clamp():
+    # The alias passes clamp to the next known start and only ever accepted
+    # a *shorter* measurement, so an absorbed clamp was dropped from the
+    # function list while the alias still ended on it.
+    det = _gap_detector()
+    assert not det._measured_extends(0x1000, 0x100B, 0x1033)
+    assert det._measured_extends(0x1000, 0x100B, 0x1008)
+    det._absorbed.add(0x100B)
+    assert det._measured_extends(0x1000, 0x100B, 0x1033)
+    assert not det._measured_extends(0x1000, 0x100B, None)
+
+
+def test_a_start_found_by_another_pass_still_clamps():
+    det = _gap_detector()
+    det._candidates[0x100B] = (0.9, "call_target")
+    end = det._find_function_end(0x1000, next_func=0x100B, sec_end=0x2000)
+    assert end == 0x100B, f"expected {0x100B:#x}, got {end:#x}"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
@@ -148,3 +258,4 @@ if __name__ == "__main__":
             print(f"  FAIL {name}: {exc}")
     print("function end: " + ("OK" if not failures else f"{failures} FAILED"))
     sys.exit(1 if failures else 0)
+
