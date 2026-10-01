@@ -32,7 +32,8 @@ import subprocess
 import sys
 
 from ..recomp import config
-from ..recomp.translator import FunctionTranslator
+from ..recomp import perf_opts
+from ..recomp.translator import FunctionTranslator, perf_defines
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -64,14 +65,14 @@ def assemble(path, va, workdir):
         return f.read()
 
 
-def lift(path, va, workdir):
+def lift(path, va, workdir, opts=frozenset()):
     image = assemble(path, va, workdir)
     config._install(
         [config.Section(".text", va, len(image), 0, len(image), True)],
         entry_point=va, kernel_thunk_addr=va, origin="codegen_bench")
     db = {va: {"start": f"0x{va:08X}", "end": va + len(image),
                "_addr": va, "size": len(image)}}
-    c = FunctionTranslator(image, db).translate_function(va, db[va])
+    c = FunctionTranslator(image, db, perf_opts=opts).translate_function(va, db[va])
     if not c:
         raise SystemExit(f"{path}: the translator returned nothing")
     return c
@@ -313,7 +314,16 @@ VARIANTS = {
     "locals_m128": ("m128", {"matmul": lambda cs: [cache_registers(cs[0])]}),
     "liveness":    ("base", {"calls": lambda cs: list(calls_liveness_sync(*cs)),
                              "x87sum": lambda cs: [x87_static_slots(cs[0])]}),
+    # The real thing rather than a model of it: lifted by tools.recomp with
+    # --perf-opts (third field), against the unmodified header.
+    "perf_cheap":  ("base", {}, frozenset({"stosd", "rmw-snapshot", "fcmp-float",
+                                           "xmm-intrinsics"})),
+    "perf_all":    ("base", {}, frozenset(perf_opts.OPTS)),
 }
+
+
+def variant_opts(v):
+    return VARIANTS[v][2] if len(VARIANTS[v]) > 2 else frozenset()
 
 
 # ── build and run ────────────────────────────────────────────────────────
@@ -346,13 +356,20 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     os.makedirs(args.workdir, exist_ok=True)
-    lifted = {b: [lift(os.path.join(HERE, "snippets", f), va, args.workdir)
-                  for f, va in snips]
-              for b, (snips, _, _) in BENCHES.items()}
+    lifted_by = {}
+
+    def lifted_for(opts):
+        if opts not in lifted_by:
+            lifted_by[opts] = {
+                b: [lift(os.path.join(HERE, "snippets", f), va, args.workdir, opts)
+                    for f, va in snips]
+                for b, (snips, _, _) in BENCHES.items()}
+        return lifted_by[opts]
     with open(RUNTIME_HEADER) as f:
         header = f.read()
 
     def sources(variant, bench):
+        lifted = lifted_for(variant_opts(variant))
         transform = VARIANTS[variant][1].get(bench)
         return transform(lifted[bench]) if transform else lifted[bench]
 
@@ -375,7 +392,9 @@ def main(argv=None):
         for b in BENCHES:
             path = os.path.join(args.workdir, f"{b}.{v}.c")
             with open(path, "w") as f:
-                f.write('#define RECOMP_GENERATED_CODE\n#include "recomp_types.h"\n'
+                f.write('#define RECOMP_GENERATED_CODE\n'
+                        + "".join(d + "\n" for d in perf_defines(variant_opts(v)))
+                        + '#include "recomp_types.h"\n'
                         "#include <string.h>\nvoid sub_00090100(void);\n\n"
                         + "\n".join(sources(v, b)))
             srcs.append((b, path))

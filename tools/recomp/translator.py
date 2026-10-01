@@ -21,6 +21,7 @@ import struct
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
+from . import leaf_cache
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS,
@@ -1583,7 +1584,10 @@ class FunctionTranslator:
         lines.append(f"}}")
         lines.append(f"")
 
-        return "\n".join(lines)
+        text = "\n".join(lines)
+        if "leaf-cache" in self.perf_opts:
+            text = leaf_cache.apply(text)
+        return text
 
     def _find_used_registers(self, instructions):
         """Find which 32-bit registers are referenced by any instruction."""
