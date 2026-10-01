@@ -535,7 +535,7 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
     /* Once per frame: the picture it should hold is this frame's, so far. */
     if (e->checked_swap != now) {
         e->checked_swap = now;
-        xbox_D3D8CopyBackBufferToTexture(e->host);
+        host_CopyBackBufferToTexture(e->host);
         framebuffer_probe(e, now);
     }
     return e->host;

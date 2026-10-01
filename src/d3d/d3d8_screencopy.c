@@ -285,6 +285,9 @@ static HRESULT copy_to_texture(IDirect3DTexture8 *dst, const RECT *src, const PO
     rhi_set_shader(RHI_STAGE_VERTEX, g.vs);
     rhi_set_shader(RHI_STAGE_PIXEL, g.ps);
     rhi_set_uniform_buffers(RHI_STAGE_PIXEL, 7, 1, &g.cb);
+    /* Asked for every time: while frame interpolation draws an in-between
+     * frame, the scene is a second image (xbox_D3D8InterpBegin). */
+    g.back_srv = d3d8_GetSceneView();
     rhi_set_textures(9, 1, &g.back_srv);
     rhi_set_blend_state(g.blend, blend_factor, 0xFFFFFFFF);
     rhi_set_depth_state(g.depth, 0);

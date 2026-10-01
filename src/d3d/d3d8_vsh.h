@@ -150,6 +150,10 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
 /* Which constant register the experimental Hor+ scale applies to. */
 int  d3d8_vsh_hor_plus_reg(void);
+/* The registers frame interpolation blends (xbox_D3D8SetInterpRegisters):
+ * the projection's first register or -1, and a run of 4-register affine
+ * matrices (count a multiple of 4; first -1 and count 0 for none). */
+void d3d8_vsh_interp_registers(int *projection, int *affine_first, int *affine_count);
 
 /**
  * The whole constant bank, as NV2A_VS_MAX_CONSTANTS float4 registers laid out
@@ -246,6 +250,11 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle);
  * the projection's first column. False means it draws in screen
  * coordinates of its own -- the HUD, a menu, a full-screen quad. */
 int  d3d8_vsh_bound_uses_projection(void);
+
+/* Of the 4-register groups from c[first] (count registers), which the
+ * bound program reads: bit g for c[first+4g..first+4g+3]. A program that
+ * indexes through a0 is taken to read them all. */
+uint32_t d3d8_vsh_bound_reads(int first, int count);
 
 /* The input register the bound program copies oPos from, or -1; and where
  * a register sits in the vertex, per that program's own declaration.

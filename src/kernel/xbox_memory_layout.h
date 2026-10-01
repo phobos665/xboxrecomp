@@ -248,6 +248,16 @@ void xbox_GuestConcurrencyReport(void);
 void xbox_Nv2aFlipGateArm(void);
 void xbox_Nv2aFlipGateRelease(void);
 
+/* Lend the gate's wait to fn (frame interpolation draws its in-between
+ * frames in it). While the gate holds a Swap, it calls fn with the time now
+ * and the time it expects the release (the next vblank), both
+ * QueryPerformanceCounter ticks; fn does what is due and returns when it
+ * wants to be called again, or 0 for not again this frame. The release ends
+ * the loan whatever fn wanted. Only while the cadence is one Swap a vblank
+ * (adaptive, or a cap of the vblank rate). NULL takes it back. */
+typedef long long (*xbox_FlipGateIdleFn)(long long now, long long release);
+void xbox_Nv2aFlipGateSetIdle(xbox_FlipGateIdleFn fn);
+
 /* The setting by name ("adaptive", "60", "30", "off", or "custom" for one
  * RECOMP_FPS_CAP asked for that is not a stop on the cycle), and the next
  * one along. For a key the player presses while the title runs. */
