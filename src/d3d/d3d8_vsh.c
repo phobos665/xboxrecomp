@@ -121,6 +121,40 @@ int d3d8_vsh_bound_projection_is_ortho(void)
     if (!g_bound_uses_proj || reg >= NV2A_VS_MAX_CONSTANTS)
         return 0;
     w = g_vsh_constants.c[reg];
+
+    /* RECOMP_D3D8_PROJ_PROBE=1: each distinct projection the 3D programs draw
+     * with, once -- the four rows as uploaded -- so a title's HUD matrix can
+     * be told from its camera's without guessing. At most 24 lines. */
+    {
+        static int probe = -1, shown;
+        static int seen[40][12];
+        if (probe < 0)
+            probe = getenv("RECOMP_D3D8_PROJ_PROBE") != NULL;
+        if (probe && shown < 40) {
+            /* Keyed on the rotation and scale of the four rows, rounded,
+             * so a camera that moves every frame prints once and a HUD's
+             * fixed matrix is not crowded out. */
+            const float *r0 = g_vsh_constants.c[reg - 3], *r1 = g_vsh_constants.c[reg - 2];
+            const float *r2 = g_vsh_constants.c[reg - 1];
+            int key[12], i, k;
+            for (k = 0; k < 3; k++) {
+                key[k]     = (int)(r0[k] * 100.0f);
+                key[3 + k] = (int)(r1[k] * 100.0f);
+                key[6 + k] = (int)(r2[k] * 100.0f);
+                key[9 + k] = (int)(w[k] * 100.0f);
+            }
+            for (i = 0; i < shown; i++)
+                if (memcmp(seen[i], key, sizeof key) == 0)
+                    break;
+            if (i == shown) {
+                memcpy(seen[shown++], key, sizeof key);
+                fprintf(stderr, "[VSH-PROJ] c[%d..%d]: x(%g %g %g %g) y(%g %g %g %g) "
+                        "z(%g %g %g %g) w(%g %g %g %g)\n", reg - 3, reg,
+                        r0[0], r0[1], r0[2], r0[3], r1[0], r1[1], r1[2], r1[3],
+                        r2[0], r2[1], r2[2], r2[3], w[0], w[1], w[2], w[3]);
+            }
+        }
+    }
     return fabsf(w[0]) < 1e-6f && fabsf(w[1]) < 1e-6f && fabsf(w[2]) < 1e-6f
         && fabsf(w[3] - 1.0f) < 1e-4f;
 }
