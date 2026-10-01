@@ -1233,6 +1233,13 @@ int  xbox_D3D8GetTwoDPlacement(uint32_t *tag);
    nothing renders on that side. Scales if the texture is not screen-sized.
    The destination must be a render-target texture. */
 HRESULT       xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+/* The same for one of CopyRects' rectangles: `src` in the title's own
+   pixels, copied to the same size at `at` in the texture (NULL: its
+   corner), as CopyRects does -- it does not scale. A title draws a small
+   picture (a handheld's map, a monitor's view) into a corner of the back
+   buffer and copies that corner out; the whole frame was the wrong answer. */
+HRESULT       xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst,
+                                                   const RECT *src, const POINT *at);
 unsigned long xbox_D3D8ScreenCopyCount(void);
 void          xbox_D3D8ScreenCopyShutdown(void);
 
