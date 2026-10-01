@@ -838,3 +838,30 @@ HLE_EXPORT(DirectSoundDoWork)
     hle_dsound_stream_tick(now);      /* streams: feed the host, complete packets */
     HLE_RETURN(0);
 }
+
+/* ── The chip side of a voice's settings ──────────────────────────
+ *
+ * CDirectSoundVoice_SetVolume, SetHeadroom, SetPitch, SetMixBins and
+ * SetMixBinVolumes each write the voice settings object (the volume this
+ * file reads at every submission, see SET_VOLUME) and then call one of
+ * these three to program the MCPX voice: descriptor writes and MMIO register
+ * writes, each register write an exception trap here, each trap waking the
+ * APU thread. The chip voice is never started -- IDirectSoundBuffer_Play is
+ * replaced above and keeps the sound in the host model -- so the programming
+ * was pure cost. Outrun 2 sets volume, headroom, pitch and mix bins on every
+ * voice every frame: CMcpxVoiceClient_SetVolume and SetMixBins were 15% of
+ * the guest thread's time in a race, the exception dispatcher under them 6%
+ * and the APU wake-ups 2% (1 Oct 2026, caller-attributed sampling).
+ *
+ * Replaced here, below the setters, so every setter still keeps its own
+ * settings exactly as the XDK does and only the chip part is skipped. All
+ * three are thiscall with no stack arguments and return S_OK.
+ *
+ * Pitch is therefore recorded by the XDK but not yet heard: nothing in this
+ * file applies it, and the XAudio2 backend recreates a source voice when its
+ * rate changes, which a per-frame engine pitch would do every frame. Hearing
+ * it needs a frequency-ratio path in the backend first. It was not heard
+ * before this change either. */
+HLE_EXPORT(CMcpxVoiceClient_SetVolume)  { HLE_RETURN(0); }
+HLE_EXPORT(CMcpxVoiceClient_SetMixBins) { HLE_RETURN(0); }
+HLE_EXPORT(CMcpxVoiceClient_SetPitch)   { HLE_RETURN(0); }
