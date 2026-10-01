@@ -301,6 +301,16 @@ def _fixup_icall_esp_save(lines):
     return result
 
 
+def perf_defines(perf_opts):
+    """Lines a generated TU needs before recomp_types.h for these options.
+
+    Only xmm-intrinsics changes the runtime header, and only for the TUs that
+    ask: hand-written code including the header keeps the portable helpers."""
+    if "xmm-intrinsics" in (perf_opts or ()):
+        return ["#define RECOMP_XMM_INTRINSICS 1"]
+    return []
+
+
 # The x87 stack accessors the lifter's output is written against. Module-level
 # so tools/conformance emits byte-identical macros: a harness with its own copy
 # would still pass after these changed, which is the dangerous direction.
@@ -366,9 +376,10 @@ class FunctionTranslator:
                  setjmp_fn=None, longjmp_fn=None,
                  trace_functions=None, trace_all_entries=False,
                  icall_sites=None,
-                 force_returns=None):
+                 force_returns=None, perf_opts=None):
         """
         xbe_data: bytes - raw XBE file contents
+        perf_opts: names from tools.recomp.perf_opts (default: none)
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
                      that site reach (tools.recomp.icall_feedback merge)
         func_db: dict - addr → function info from functions.json
@@ -391,11 +402,12 @@ class FunctionTranslator:
         # inflated by whichever loop happens to be spinning.
         self.trace_all_entries = bool(trace_all_entries)
         self.force_returns = dict(force_returns or {})
+        self.perf_opts = frozenset(perf_opts or ())
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
                              setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-                             seh_epilog=seh_epilog)
+                             seh_epilog=seh_epilog, perf_opts=self.perf_opts)
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
         self.jump_table_entry_starts = set()
@@ -1293,8 +1305,15 @@ class FunctionTranslator:
         # -- so reconstructing the comparison at the jcc read `esi + eax*4`
         # with eax already holding a pointer. The address wrapped to guest
         # 0x651BCD20 and the level load died in CDispCollTree.
-        if any(insn.mnemonic in ("comiss", "comisd", "ucomiss", "ucomisd")
-               for insn in instructions):
+        fcmps = {insn.mnemonic for insn in instructions
+                 if insn.mnemonic in ("comiss", "comisd", "ucomiss", "ucomisd")}
+        if fcmps and "fcmp-float" in self.perf_opts and fcmps <= {"comiss", "ucomiss"}:
+            # Both operands are floats, so a float snapshot compares exactly
+            # as the double did; MSVC widens both sides of every compare
+            # against a double. comisd keeps the double: its operand is one.
+            lines.append("    float _fca = 0.0f, _fcb = 0.0f;")
+            lines.append("    (void)_fca; (void)_fcb;")
+        elif fcmps:
             lines.append("    double _fca = 0.0, _fcb = 0.0;")
             lines.append("    (void)_fca; (void)_fcb;")
 
@@ -1604,8 +1623,9 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, trace_all_entries=False,
                  icall_sites_json_path=None,
-                 force_returns=None):
+                 force_returns=None, perf_opts=None):
         self.xbe_path = xbe_path
+        self.perf_opts = frozenset(perf_opts or ())
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -1686,7 +1706,8 @@ class BatchTranslator:
             trace_functions=trace_functions,
             trace_all_entries=trace_all_entries,
             icall_sites=self.icall_sites,
-            force_returns=force_returns)
+            force_returns=force_returns,
+            perf_opts=self.perf_opts)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
         self.translator.discover_jump_table_entries()
@@ -1761,6 +1782,7 @@ class BatchTranslator:
         c_chunks.append(" */")
         c_chunks.append("")
         c_chunks.append('#define RECOMP_GENERATED_CODE')
+        c_chunks.extend(perf_defines(getattr(self, "perf_opts", ())))
         c_chunks.append('#include "recomp_types.h"')
         c_chunks.append('#include <math.h>')
         c_chunks.append("")
@@ -2077,6 +2099,7 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+            ] + perf_defines(getattr(self, "perf_opts", ())) + [
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",

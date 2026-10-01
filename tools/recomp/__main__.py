@@ -25,6 +25,7 @@ import sys
 import time
 
 from . import config
+from . import perf_opts
 from .translator import BatchTranslator
 from .output import write_summary, print_stats, generate_header
 
@@ -315,12 +316,23 @@ def main():
                              "not implement yet: the body still runs, only "
                              "the answer changes, and the emitted code is "
                              "inert unless RECOMP_FORCE_RETURN is set")
+    parser.add_argument("--perf-opts", metavar="LIST", default=None,
+                        help="Opt-in code generation changes for speed: 'all', "
+                             "'none', or a comma list of "
+                             + ", ".join(perf_opts.OPTS) +
+                             ". Default: $" + perf_opts.ENV_VAR + ", else none. "
+                             "See docs/technical/performance-upgrades-testing.md")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
+    try:
+        args.perf_opts = perf_opts.from_args(args.perf_opts)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(f"perf-opts: {perf_opts.describe(args.perf_opts)}", file=sys.stderr)
 
     if args.game_name:
         config.set_game_name(args.game_name)
@@ -373,6 +385,7 @@ def main():
         trace_functions=_load_addrs(args.trace_functions),
         trace_all_entries=args.trace_all_entries,
         force_returns=_parse_force_returns(args.force_return),
+        perf_opts=args.perf_opts,
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
         # Per title, never the shared tools output: two titles lifted side

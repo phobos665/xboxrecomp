@@ -139,6 +139,11 @@ def build_commands(args, xbe: Path, analysis_json: Path):
         lift += ["--game-name", args.game_name]
     if args.trace_all_entries:
         lift.append("--trace-all-entries")
+    # Without the flag tools.recomp falls back to $XBOXRECOMP_PERF_OPTS, which
+    # reaches it through the environment: a title's build script that knows
+    # nothing about these still passes them on.
+    if getattr(args, "perf_opts", None) is not None:
+        lift += ["--perf-opts", args.perf_opts]
     # XDK functions with a name-keyed replacement (tools/recomp/hle.py), used
     # whenever tools.xdk_symbols has been run for this XBE.
     hle_symbols = xbe.with_name(xbe.stem + "_xdk_symbols.json")
@@ -232,6 +237,11 @@ def main() -> int:
                     help="Run only this stage")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the commands without running them")
+    ap.add_argument("--perf-opts", metavar="LIST", default=None,
+                    help="Opt-in code generation changes for speed, passed to "
+                         "the lift: 'all', 'none' or a comma list (see "
+                         "tools/recomp/perf_opts.py). Default: "
+                         "$XBOXRECOMP_PERF_OPTS, else none")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 

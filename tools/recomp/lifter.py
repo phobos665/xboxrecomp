@@ -1436,7 +1436,8 @@ class Lifter:
 
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
                  seh_prolog=None, seh_epilog=None,
-                 setjmp_fn=None, longjmp_fn=None, manual_functions=None):
+                 setjmp_fn=None, longjmp_fn=None, manual_functions=None,
+                 perf_opts=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
@@ -1444,7 +1445,10 @@ class Lifter:
         xbe_data: raw XBE file bytes (for reading jump tables)
         seh_prolog/seh_epilog: override the detected __SEH_prolog/__SEH_epilog
         manual_functions: addresses replaced through recomp_lookup_manual
+        perf_opts: names from tools.recomp.perf_opts; empty emits the
+                   long-standing spelling of every instruction
         """
+        self.perf_opts = frozenset(perf_opts or ())
         self.func_db = func_db or {}
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
@@ -2067,6 +2071,29 @@ class Lifter:
         return (f"_fa = (uint32_t)({dst}) & {mask};"
                 f" _fas = (int32_t){sx}(_fa); /* {m} result */")
 
+    def _write_result(self, ops, expr, m):
+        """The write of a result-setter and its flag snapshot.
+
+        The snapshot reads the destination back after the write. For a
+        register that read is free -- the compiler forwards the value. For
+        guest memory it is a volatile load the compiler must perform even when
+        no branch ever reads _fa: one extra load per `add [m], r`, and on a
+        trapped MMIO register a second read of a register that may change when
+        read. With rmw-snapshot the value is computed once, stored, and the
+        snapshot taken from it. The masks are the snapshot's own, so `_fa`
+        holds exactly what reading the destination back would have given.
+        """
+        if "rmw-snapshot" in self.perf_opts and ops[0].type == "mem":
+            size = _operand_width(ops[0])
+            if size not in self._SNAP_MASK:
+                size = 4
+            mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
+            return [f"{{ uint32_t _r = (uint32_t)({expr}); "
+                    f"{_fmt_operand_write(ops[0], '_r')} "
+                    f"_fa = _r & {mask}; _fas = (int32_t){sx}(_fa); }}"
+                    f" /* {m} result, from the value written */"]
+        return [_fmt_operand_write(ops[0], expr), self._result_snapshot(ops, m)]
+
     def _lift_alu_binop(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
@@ -2092,8 +2119,7 @@ class Lifter:
                 out.append(f"_cf = (int)((uint32_t)({dst}) < (uint32_t)({src}));")
             else:
                 out.append("_cf = 0; /* logical op clears CF */")
-        out.append(_fmt_operand_write(ops[0], expr))
-        out.append(self._result_snapshot(ops, m))
+        out.extend(self._write_result(ops, expr, m))
         return out
 
     def _lift_inc_dec(self, insn, ops, m):
@@ -2111,6 +2137,13 @@ class Lifter:
         size = _operand_width(ops[0]) or 4
         mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
         overflow_result = (1 << (size * 8 - 1)) - (m == "dec")
+        if "rmw-snapshot" in self.perf_opts and ops[0].type == "mem":
+            # See _write_result: no second read of the destination.
+            out = [f"{{ uint32_t _r = (uint32_t)({val} {op_char} {delta}); "
+                   f"{_fmt_operand_write(ops[0], '_r')} _fa = _r & {mask}; }}"]
+            out.append(f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u);"
+                       f" /* {m} result/SF/OF; CF unchanged */")
+            return out
         out += [f"_fa = (uint32_t)({val}) & {mask};",
                 f"_fas = (int32_t){sx}(_fa); _fb = (_fa == 0x{overflow_result:X}u); /* {m} result/SF/OF; CF unchanged */"]
         return out
@@ -2123,8 +2156,7 @@ class Lifter:
         if preserve_carry or self.needs_cf:
             # neg sets CF iff the operand was non-zero (neg/sbb sign-extract).
             out.append(f"_cf = (int)(({val}) != 0);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"))
-        out.append(self._result_snapshot(ops, "neg"))
+        out.extend(self._write_result(ops, f"(uint32_t)(-(int32_t){val})", "neg"))
         return out
 
     def _lift_not(self, insn, ops):
@@ -2259,8 +2291,7 @@ class Lifter:
             # CF is the last bit shifted out; a zero count leaves CF alone.
             bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
-        out.append(self._result_snapshot(ops, "shift"))
+        out.extend(self._write_result(ops, f"{dst} {c_op} {cnt}", "shift"))
         return out
 
     def _lift_sar(self, insn, ops):
@@ -2300,8 +2331,7 @@ class Lifter:
         out = []
         if self.needs_cf:
             out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
-        out.append(self._result_snapshot(ops, "sar"))
+        out.extend(self._write_result(ops, f"(uint32_t)(({signed}) >> {cnt})", "sar"))
         return out
 
     def _lift_rotate_carry(self, insn, ops, m):
@@ -3071,6 +3101,10 @@ class Lifter:
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
                     "ecx = 0; /* rep stosb */"]
+        if "stosd" in m and "stosd" in self.perf_opts:
+            return self._rep_stos_fast(4)
+        if "stosw" in m and "stosd" in self.perf_opts:
+            return self._rep_stos_fast(2)
         if "stosd" in m:
             return [
                 "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);"
@@ -3154,6 +3188,36 @@ class Lifter:
                 f"}} }} /* {m} */",
             ]
         return [f"/* {m} */"]
+
+    def _rep_stos_fast(self, step):
+        """rep stosd / rep stosw with ecx, eax and edi read once.
+
+        The long-standing loop names the registers in its condition and body,
+        and they are guest-register globals, so every element reloads all
+        three: a guest store may have changed them as far as the compiler can
+        tell. Locals take that away. And when DF is clear and the value is one
+        byte repeated -- a clear, nearly always -- the fill is a memset, as
+        `rep stosb` already is.
+
+        memset only below 0xF0000000 and only when the range does not wrap
+        the 4 GB guest space: the hardware apertures live above that, and a
+        trapped register cannot take a vector store (the MMIO decoder handles
+        plain moves only). Anything else takes the element loop, as before.
+        """
+        acc, val = ("MEM32", "eax") if step == 4 else ("MEM16", "LO16(eax)")
+        splat = ("(_v & 0xFFu) * 0x01010101u == _v" if step == 4 else
+                 "(_v & 0xFFu) * 0x0101u == _v")
+        return [
+            f"{{ uint32_t _n = ecx, _v = {val}, _d = edi;"
+            f" int32_t _st = RECOMP_DF_STEP({step});",
+            f"  if (_st > 0 && {splat} && (uint64_t)_d + (uint64_t)_n * {step}u"
+            f" <= 0xF0000000ull)",
+            f"    memset((void*)XBOX_PTR(_d), (int)(_v & 0xFFu), (size_t)_n * {step}u);",
+            f"  else {{ uint32_t _i; for (_i = 0; _i < _n; _i++)"
+            f" {acc}(_d + _i*(uint32_t)_st) = _v; }}",
+            f"  edi = _d + _n * (uint32_t)_st; }}",
+            f"ecx = 0; /* rep stos{'d' if step == 4 else 'w'} */",
+        ]
 
     def _lift_string_op(self, insn, m):
         # Unprefixed forms; direction still comes from EFLAGS.DF.
