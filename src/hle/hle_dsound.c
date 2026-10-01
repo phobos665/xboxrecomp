@@ -373,6 +373,8 @@ enum {
     DS_CALL_BUF_GETCURRENTPOSITION,
     DS_CALL_BUF_SETCURRENTPOSITION,
     DS_CALL_BUF_SETFREQUENCY,
+    DS_CALL_BUF_SETFORMAT,
+    DS_CALL_BUF_SETBUFFERDATA,
     DS_CALL_DIRECTSOUNDDOWORK,
     DS_CALL_COUNT
 };
@@ -386,6 +388,8 @@ static const char *const g_ds_call_names[DS_CALL_COUNT] = {
     "IDirectSoundBuffer_GetCurrentPosition",
     "IDirectSoundBuffer_SetCurrentPosition",
     "IDirectSoundBuffer_SetFrequency",
+    "IDirectSoundBuffer_SetFormat",
+    "IDirectSoundBuffer_SetBufferData",
     "DirectSoundDoWork",
 };
 
@@ -699,6 +703,92 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
     }
     unlock();
     HLE_RETURN(result);
+}
+
+/* HRESULT IDirectSoundBuffer_SetFormat(this, LPCWAVEFORMATEX format)
+ *
+ * The game's own SetFormat ends in CMcpxBuffer_SetBufferData, which first
+ * waits for the buffer's hardware voice to be released by the chip -- a voice
+ * the replaced Play never put on the chip, so the release never comes.
+ * Outrun 2 calls it at the start of every race and spun there for ever, its
+ * 0.5 s retry re-arming the same command each time.
+ *
+ * So the format goes where the game's packer would put it, the voice
+ * settings this file reads (tag | channels << 16 | bits << 24, rate, block
+ * alignment), and the model notices the change and rebuilds. */
+HLE_EXPORT(IDirectSoundBuffer_SetFormat)
+{
+    g_ds_calls[DS_CALL_BUF_SETFORMAT]++;
+    uint32_t iface = HLE_ARG(0), wfx = HLE_ARG(1), result = RECOMP_DSOUND_OK;
+    uint64_t now = now_ms();
+    uint32_t holder = iface - 0x0Cu, object;
+    static unsigned said;
+
+    if (!wfx || !guest_readable(wfx, 16u) || !guest_readable(holder, 4u)
+            || !guest_readable(HLE_MEM32(holder) + SET_ALIGN, 4u))
+        HLE_RETURN(RECOMP_DSOUND_INVALID_PARAM);
+    object = HLE_MEM32(holder);
+    {
+        uint32_t tag      = HLE_MEM32(wfx) & 0xFFFFu;
+        uint32_t channels = HLE_MEM32(wfx) >> 16;
+        uint32_t rate     = HLE_MEM32(wfx + 4u);
+        uint32_t align    = HLE_MEM32(wfx + 12u) & 0xFFFFu;
+        uint32_t bits     = HLE_MEM32(wfx + 12u) >> 16;
+
+        if (said < 8) {
+            said++;
+            fprintf(stderr, "[DSOUND] SetFormat buffer=%08X tag %04X, %u ch, %u Hz, "
+                            "%u bit, align %u\n", iface, tag, channels, rate,
+                    bits, align);
+        }
+        lock();
+        HLE_MEM32(object + SET_FORMAT) = tag | (channels & 0xFFu) << 16 | (bits & 0xFFu) << 24;
+        HLE_MEM32(object + SET_RATE) = rate;
+        HLE_MEM32(object + SET_ALIGN) = align;
+        if (model_for(iface, now))
+            ;   /* rebuilt from the new settings */
+        unlock();
+    }
+    HLE_RETURN(result);
+}
+
+/* HRESULT IDirectSoundBuffer_SetBufferData(this, LPVOID data, DWORD bytes)
+ *
+ * The game's own version stops the buffer through CMcpxBuffer_Stop_Ex, which
+ * waits for the chip to release a hardware voice the replaced Play never
+ * used -- the same wait as SetFormat above. Outrun 2 swaps a buffer's data
+ * mid-race and lost about 40 seconds to that wait each time.
+ *
+ * So: stop the modelled buffer, as the replaced Stop does, and write what the
+ * game's settings code would -- the data and size, and play and loop regions
+ * back to the whole buffer (zero). The model rebuilds from them. */
+HLE_EXPORT(IDirectSoundBuffer_SetBufferData)
+{
+    g_ds_calls[DS_CALL_BUF_SETBUFFERDATA]++;
+    uint32_t iface = HLE_ARG(0), data = HLE_ARG(1), bytes = HLE_ARG(2);
+    uint64_t now = now_ms();
+    uint32_t object;
+    static unsigned said;
+
+    if (!guest_readable(iface, 4u) || !guest_readable(HLE_MEM32(iface) + SET_LOOP_LEN, 4u))
+        HLE_RETURN(RECOMP_DSOUND_INVALID_PARAM);
+    if (said < 8) {
+        said++;
+        fprintf(stderr, "[DSOUND] SetBufferData buffer=%08X data 0x%08X, %u bytes\n",
+                iface, data, bytes);
+    }
+    stop(iface);
+    lock();
+    object = HLE_MEM32(iface);
+    HLE_MEM32(object + SET_DATA) = data;
+    HLE_MEM32(object + SET_SIZE) = bytes;
+    HLE_MEM32(object + SET_PLAY_START) = 0u;
+    HLE_MEM32(object + SET_PLAY_LEN) = 0u;
+    HLE_MEM32(object + SET_LOOP_START) = 0u;
+    HLE_MEM32(object + SET_LOOP_LEN) = 0u;
+    (void)model_for(iface, now);
+    unlock();
+    HLE_RETURN(RECOMP_DSOUND_OK);
 }
 
 /* void DirectSoundDoWork(void) -- the title's regular audio tick. The game's

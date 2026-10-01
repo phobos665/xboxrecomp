@@ -326,8 +326,14 @@ static void dsp_ack_frame(MCPXAPUState *d)
      * with the explicit list the title reaches 1,345,011 guest calls and
      * without it 109,999.
      */
-    if (getenv("RECOMP_APU_DSP_SCAN"))
-        dsp_ack_discovered(d);
+    {
+        /* Once: this runs every APU frame. */
+        static int scan = -1;
+        if (scan < 0)
+            scan = getenv("RECOMP_APU_DSP_SCAN") ? 1 : 0;
+        if (scan)
+            dsp_ack_discovered(d);
+    }
 }
 
 void mcpx_apu_dsp_init(MCPXAPUState *d)

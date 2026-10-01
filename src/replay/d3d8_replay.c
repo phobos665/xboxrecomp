@@ -124,7 +124,7 @@ static long g_draw_index;           /* draws seen in this loop */
 static DWORD g_cur_vs, g_cur_token;
 #define LIST_TEX_IDS 8192
 static struct { uint32_t format, width, height; } g_tex_info[LIST_TEX_IDS];
-static uint32_t g_stage_tex[2];
+static uint32_t g_stage_tex[4];
 
 static void tex_desc(char *buf, size_t n, uint32_t id)
 {
@@ -144,11 +144,15 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
 
     if (g_list_draws) {
         const DWORD *rs = d3d8_GetRenderStates();
-        char t0[48], t1[48];
+        char t0[48], t1[48], t2[48], t3[48];
 
+        /* All four stages: a combiner that samples t2 or t3 reads whatever
+         * is bound there, and listing two hid exactly that. */
         tex_desc(t0, sizeof t0, g_stage_tex[0]);
         tex_desc(t1, sizeof t1, g_stage_tex[1]);
-        fprintf(stderr, "[draw %4ld] tex %s %s\n", n, t0, t1);
+        tex_desc(t2, sizeof t2, g_stage_tex[2]);
+        tex_desc(t3, sizeof t3, g_stage_tex[3]);
+        fprintf(stderr, "[draw %4ld] tex %s %s %s %s\n", n, t0, t1, t2, t3);
         fprintf(stderr, "[draw %4ld] %-8s prim %u x%-5u stride %2u  vs 0x%05lX  ps %lu  "
                 "blend %lu %lu>%lu  atest %lu ref %lu  z %lu/%lu  fog %lu  cull %lu%s%s\n",
                 n, kind, prim, count, stride, (unsigned long)g_cur_vs,
@@ -995,7 +999,7 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
-        if (p->stage < 2)
+        if (p->stage < 4)
             g_stage_tex[p->stage] = p->texture_id;
         slot = texture_slot(r, p->texture_id, 0);
         if (p->texture_id && (!slot || !slot->tex))
