@@ -24,7 +24,8 @@ from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS,
-                     detect_setjmp_helpers, _func_ident, _operand_width)
+                     detect_setjmp_helpers, _func_ident, _operand_width,
+                     _is_rep_compare)
 
 
 def _merge_flag_states(states):
@@ -1265,10 +1266,14 @@ class FunctionTranslator:
         elif "ebp" in used_regs:
             lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
-        # Add _flags variable if function has conditional instructions
+        # Add _flags variable if function has conditional instructions --
+        # or a repe/repne cmps/scas, whose loop writes _flags whether or not
+        # anything reads it afterwards. The inline strlen idiom is exactly
+        # that: `repne scasb; not ecx; dec ecx` and no jcc, which declared
+        # nothing and failed to compile.
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
-            or insn.mnemonic.startswith("cmov")
+            or insn.mnemonic.startswith("cmov") or _is_rep_compare(insn)
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
