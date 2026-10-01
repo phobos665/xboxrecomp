@@ -32,7 +32,7 @@
 #endif
 
 #define WINDOW_W 900
-#define WINDOW_H 740                    /* seven Video rows, their help, the footer */
+#define WINDOW_H 800                    /* eight Video rows, their help, the footer */
 
 /* The client area as it really is. On a display at 125% these are not
  * WINDOW_W/H: asking Windows not to scale us and then laying out
@@ -61,7 +61,7 @@ static RecompSettings g_settings;
 static int            g_frame_cap_index;   /* into k_frame_caps */
 static int            g_wide_camera;       /* hor_plus as a switch, see below */
 
-static Row  g_video_rows[8];
+static Row  g_video_rows[12];
 static int  g_video_count;
 
 /* ---- input ---- */
@@ -143,9 +143,13 @@ static void build_rows(void)
     r++;
 
     r->label = "Fullscreen";
-    r->help  = "Fill the screen; a G-SYNC or FreeSync display then shows an even 60."
-               " Alt+Enter in game.";
+    r->help  = "Fill the screen, without a window frame. Alt+Enter switches in game.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.fullscreen;
+    r++;
+
+    r->label = "Variable refresh rate";
+    r->help  = "In fullscreen on a G-SYNC or FreeSync display: an even 60, no judder.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.vrr;
     r++;
 
     g_video_count = (int)(r - g_video_rows);
