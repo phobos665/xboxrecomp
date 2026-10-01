@@ -3600,13 +3600,62 @@ HLE_EXPORT(D3DDevice_CopyRects)
                              : (!src_parent && sw == g_shadow_width && sh == g_shadow_height)) &&
             dst_parent && HLE_MEM32(dst_parent + 4) == HLE_MEM32(dst + 4)) {
             IDirect3DTexture8 *tex = hle_d3d8_render_texture(g_shadow, dst_parent);
+            /* CopyRects(src, rects, count, dst, points): with rectangles,
+             * only those, each to its point (or, with no points, to where
+             * it was). TimeSplitters 2 draws its handheld's map into a
+             * corner of the back buffer and copies that corner into the
+             * handheld's screen; copying the whole frame showed the frame
+             * there instead of the map. */
+            uint32_t rects_va = HLE_ARG(1), count = HLE_ARG(2), points_va = HLE_ARG(4);
+            static int said_rect;
 
-            if (tex && SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(tex)))
+            if (tex && rects_va && count) {
+                uint32_t i, n = count > 16 ? 16 : count;
+
+                for (i = 0; i < n; i++) {
+                    RECT r;
+                    POINT p;
+
+                    r.left   = (LONG)HLE_MEM32(rects_va + i * 16 + 0);
+                    r.top    = (LONG)HLE_MEM32(rects_va + i * 16 + 4);
+                    r.right  = (LONG)HLE_MEM32(rects_va + i * 16 + 8);
+                    r.bottom = (LONG)HLE_MEM32(rects_va + i * 16 + 12);
+                    p.x = points_va ? (LONG)HLE_MEM32(points_va + i * 8 + 0) : r.left;
+                    p.y = points_va ? (LONG)HLE_MEM32(points_va + i * 8 + 4) : r.top;
+                    if (SUCCEEDED(xbox_D3D8CopyBackBufferRectToTexture(tex, &r, &p)))
+                        from_screen++;
+                    if (said_rect++ < 4)
+                        fprintf(stderr, "[HLE-D3D8] the title copies part of its screen: "
+                                "%ld,%ld-%ld,%ld to %ld,%ld in texture 0x%08X (%ux%u)\n",
+                                (long)r.left, (long)r.top, (long)r.right, (long)r.bottom,
+                                (long)p.x, (long)p.y, dst_parent, dw, dh);
+                }
+            } else if (tex && dw && dh && (dw < sw || dh < sh)) {
+                /* No rectangles and a smaller destination: CopyRects does
+                 * not scale, so it copies the destination's size from the
+                 * top left. TimeSplitters 2 composes its handheld's map in
+                 * the top left 128x128 of the back buffer and copies it into
+                 * the handheld's screen this way, every frame; scaling the
+                 * whole frame into it showed the frame instead of the map. */
+                RECT r;
+                POINT p;
+
+                r.left = r.top = 0;
+                r.right = (LONG)dw;
+                r.bottom = (LONG)dh;
+                p.x = p.y = 0;
+                if (SUCCEEDED(xbox_D3D8CopyBackBufferRectToTexture(tex, &r, &p)))
+                    from_screen++;
+                if (said_rect++ < 4)
+                    fprintf(stderr, "[HLE-D3D8] the title copies the top left %ux%u of its "
+                            "screen into texture 0x%08X\n", dw, dh, dst_parent);
+            } else if (tex && SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(tex))) {
                 from_screen++;
-            if (from_screen == 1)
-                fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "
-                        "copying the host frame into texture 0x%08X (%ux%u)\n",
-                        dst_parent, dw, dh);
+                if (from_screen == 1)
+                    fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "
+                            "copying the host frame into texture 0x%08X (%ux%u)\n",
+                            dst_parent, dw, dh);
+            }
         } else {
             elsewhere++;
             if (dst == g_backbuffer_va || !dst_parent) {
