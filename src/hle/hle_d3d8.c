@@ -518,6 +518,14 @@ static void shadow_use_viewport(int whole_target)
  * The host struct holds a pointer-sized HWND, so only the fields the host
  * device needs are copied, one by one. One attempt per process: a title that
  * recreates its device must not leave a window behind for each failure. */
+/* Vertex shaders the title created before this device existed (further down,
+ * with D3DDevice_CreateVertexShader). */
+static void shadow_track_vertex_shader(uint32_t guest, int has_function,
+                                       uint32_t header, const DWORD *code);
+static void shadow_keep_early_vertex_shader(uint32_t guest, int has_function,
+                                            uint32_t header, const DWORD *code);
+static void shadow_replay_early_vertex_shaders(void);
+
 static void shadow_create(uint32_t pp_va)
 {
     D3DPRESENT_PARAMETERS pp;
@@ -587,6 +595,7 @@ static void shadow_create(uint32_t pp_va)
             "scale %g\n", width, height, (unsigned long)g_shadow_create_thread,
             g_z_scale);
     fflush(stderr);
+    shadow_replay_early_vertex_shaders();
 }
 
 /* xbox_clear_flags_to_host() is in d3d8_xbox_map.h with the other Xbox-to-host
@@ -854,9 +863,259 @@ static void note_draw_format(uint32_t xpt, uint32_t stride)
     }
 }
 
+/* Fixed function described by a declaration.
+ *
+ * CreateVertexShader with a declaration and no program is the Xbox's
+ * fixed-function pipeline fed by an arbitrary vertex layout: the registers
+ * are the fixed-function inputs (D3DVSDE_POSITION 0, NORMAL 2, DIFFUSE 3,
+ * SPECULAR 4, TEXCOORD0..3 9..12), in any order, any format and any stream.
+ * The host's fixed-function pipeline is driven by an FVF instead, so each
+ * draw copies its vertices into the FVF that carries the same inputs, in FVF
+ * order, with every format the FVF cannot hold converted to floats.
+ *
+ * Mortal Kombat: Deadly Alliance draws its arenas this way -- FLOAT3
+ * position, NORMPACKED3 normal, FLOAT2 texture coordinates, a second set in
+ * stream 1 -- 35,000 draws a minute that were all skipped as "declaration
+ * shader", leaving every fight on black. */
+#define FF_MAX_INPUTS 8
+
+static struct {
+    DWORD    fvf;
+    UINT     out_stride;
+    int      count;
+    uint8_t  stream[FF_MAX_INPUTS];
+    UINT     offset[FF_MAX_INPUTS];      /* in the guest vertex of that stream */
+    uint32_t format[FF_MAX_INPUTS];      /* X_D3DVSDT */
+    UINT     out[FF_MAX_INPUTS];         /* in the FVF vertex */
+    int      as_color[FF_MAX_INPUTS];    /* written as a D3DCOLOR, not floats */
+    int      floats[FF_MAX_INPUTS];      /* else how many floats are written */
+    int      tex_set[FF_MAX_INPUTS];     /* the texture set it fills, or -1 */
+} g_ff;
+static int g_ff_active;                  /* the current draw goes through g_ff */
+static unsigned long g_draws_ff_declaration;
+
+/* An X_D3DVSDT element as floats: how many, or 0 for a format this cannot
+ * read. D3DCOLOR comes back as r, g, b, a in 0..1. */
+static int ff_read_floats(uint32_t format, const uint8_t *at, float f[4])
+{
+    int n = (int)(format >> 4), c;
+
+    switch (format & 0x0F) {
+    case 0x2:                                    /* FLOAT1..4 */
+        if (format == 0x72 || n < 1 || n > 4)
+            return 0;                            /* FLOAT2H, or garbage */
+        memcpy(f, at, (size_t)n * sizeof *f);
+        return n;
+    case 0x0:                                    /* D3DCOLOR: B, G, R, A bytes */
+        if (format != 0x40)
+            return 0;
+        f[0] = at[2] / 255.0f; f[1] = at[1] / 255.0f;
+        f[2] = at[0] / 255.0f; f[3] = at[3] / 255.0f;
+        return 4;
+    case 0x1:                                    /* NORMSHORT1..4 */
+    case 0x5:                                    /* SHORT1..4 */
+        if (n < 1 || n > 4)
+            return 0;
+        for (c = 0; c < n; c++) {
+            int16_t s;
+            memcpy(&s, at + 2 * c, sizeof s);
+            f[c] = (format & 0x0F) == 0x1 ? s / 32767.0f : (float)s;
+        }
+        return n;
+    case 0x4:                                    /* PBYTE1..4 */
+        if (n < 1 || n > 4)
+            return 0;
+        for (c = 0; c < n; c++)
+            f[c] = at[c] / 255.0f;
+        return n;
+    case 0x6:                                    /* NORMPACKED3 */
+        if (format != 0x16)
+            return 0;
+        {
+            uint32_t bits;
+            memcpy(&bits, at, sizeof bits);
+            f[0] = (float)((int32_t)(bits << 21) >> 21) / 1023.0f;
+            f[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
+            f[2] = (float)((int32_t)bits >> 22) / 511.0f;
+        }
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+/* Bytes an X_D3DVSDT element occupies in the guest vertex. */
+static UINT ff_format_size(uint32_t format)
+{
+    UINT n = format >> 4;
+
+    switch (format & 0x0F) {
+    case 0x2: return 4 * n;
+    case 0x0: return 4;
+    case 0x1: case 0x5: return 2 * n;
+    case 0x4: return n;
+    case 0x6: return 4;
+    default:  return 0;
+    }
+}
+
+/* Build g_ff from the selected declaration-only shader object. 1 when the host
+ * can draw it; otherwise 0, with a note the first few times saying why. */
+static int ff_from_declaration(uint32_t handle, uint32_t stride)
+{
+    static int notes;
+    uint32_t object = handle & ~1u, i;
+    int have_tex[4] = { 0, 0, 0, 0 }, ntex = 0, dropped = 0;
+    struct { int reg; uint32_t stream, offset, format; } in[16];
+    int n = 0, k;
+    const char *why = NULL;
+    UINT out = 0;
+
+    memset(&g_ff, 0, sizeof g_ff);
+    for (i = 0; i < 16u; i++) {
+        uint32_t attr = object + 20u + i * 16u;
+        uint32_t format = HLE_MEM32(attr + 8u);
+
+        if (format <= 0x02u)
+            continue;                            /* not in the declaration */
+        in[n].reg = (int)i;
+        in[n].stream = HLE_MEM32(attr);
+        in[n].offset = HLE_MEM32(attr + 4u);
+        in[n].format = format;
+        n++;
+    }
+
+    /* FVF order: position, normal, diffuse, specular, texture sets. */
+    {
+        static const int order[] = { 0, 2, 3, 4, 9, 10, 11, 12 };
+        int o;
+
+        for (o = 0; o < (int)(sizeof order / sizeof order[0]) && !why; o++) {
+            for (k = 0; k < n; k++)
+                if (in[k].reg == order[o])
+                    break;
+            if (k == n) {
+                if (order[o] == 0)
+                    why = "no position";
+                continue;
+            }
+            {
+                UINT size = ff_format_size(in[k].format);
+                float probe[4];
+                int floats;
+
+                if (!size || in[k].stream > 15u || in[k].offset > 0xFFFFu) {
+                    why = "a format or stream it cannot read";
+                    break;
+                }
+                if (in[k].stream == 0u && in[k].offset + size > stride) {
+                    why = "a register past the end of the vertex";
+                    break;
+                }
+                /* the count a format reads to, without reading any vertex */
+                floats = ff_read_floats(in[k].format,
+                                        (const uint8_t *)"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+                                        probe);
+                if (!floats) {
+                    why = "a format it cannot convert";
+                    break;
+                }
+                if (g_ff.count == FF_MAX_INPUTS) {
+                    why = "too many inputs";
+                    break;
+                }
+                g_ff.stream[g_ff.count] = (uint8_t)in[k].stream;
+                g_ff.offset[g_ff.count] = in[k].offset;
+                g_ff.format[g_ff.count] = in[k].format;
+                switch (order[o]) {
+                case 0:
+                    if (floats == 3)
+                        g_ff.fvf |= 0x002;       /* XYZ */
+                    else if (floats == 4)
+                        g_ff.fvf |= 0x004;       /* XYZRHW */
+                    else
+                        why = "a position that is not 3 or 4 wide";
+                    g_ff.floats[g_ff.count] = floats;
+                    break;
+                case 2:
+                    if (floats != 3)
+                        why = "a normal that is not 3 wide";
+                    g_ff.fvf |= 0x010;
+                    g_ff.floats[g_ff.count] = 3;
+                    break;
+                case 3:
+                case 4:
+                    g_ff.fvf |= order[o] == 3 ? 0x040 : 0x080;
+                    g_ff.as_color[g_ff.count] = 1;
+                    break;
+                default:
+                    have_tex[order[o] - 9] = floats;
+                    g_ff.floats[g_ff.count] = floats;
+                    g_ff.tex_set[g_ff.count] = order[o] - 9;
+                    break;
+                }
+                if (order[o] < 9)
+                    g_ff.tex_set[g_ff.count] = -1;
+                g_ff.count++;
+            }
+        }
+    }
+    for (k = 0; k < n; k++)
+        if (in[k].reg == 1 || in[k].reg == 5 || in[k].reg == 6 ||
+            in[k].reg == 7 || in[k].reg == 8 || in[k].reg > 12)
+            dropped++;                           /* weights, fog, point size, back colours */
+
+    if (!why) {
+        /* Texture sets are positional in an FVF: up to the highest one used,
+         * with any gap below it filled by a 2D set of zeros. */
+        for (k = 3; k >= 0 && !have_tex[k]; k--)
+            ;
+        ntex = k + 1;
+        g_ff.fvf |= (DWORD)ntex << 8;
+        for (k = 0; k < ntex; k++) {
+            static const DWORD code[5] = { 0, 3, 0, 1, 2 };   /* by width */
+            int w = have_tex[k] ? have_tex[k] : 2;
+            g_ff.fvf |= code[w] << (16 + 2 * k);
+        }
+        /* Offsets in the FVF vertex. The inputs are already in FVF order; a
+         * texture set that is missing below a used one is left as two zero
+         * floats (the copy is zero-filled). */
+        {
+            int next_set = 0;
+            for (k = 0; k < g_ff.count; k++) {
+                int set = g_ff.tex_set[k];
+                for (; set >= 0 && next_set < set; next_set++)
+                    out += 8u;
+                if (set >= 0)
+                    next_set = set + 1;
+                g_ff.out[k] = out;
+                out += g_ff.as_color[k] ? 4u : (UINT)g_ff.floats[k] * 4u;
+            }
+        }
+        g_ff.out_stride = fvf_stride(g_ff.fvf);
+        if (out != g_ff.out_stride)
+            why = "a layout that does not add up to its FVF";
+    }
+    if (why) {
+        if (notes++ < 8)
+            fprintf(stderr, "[HLE-D3D8] fixed-function declaration 0x%08X: %s; "
+                            "its draws are skipped\n", handle, why);
+        return 0;
+    }
+    if (notes < 8 && dropped) {
+        notes++;
+        fprintf(stderr, "[HLE-D3D8] fixed-function declaration 0x%08X: drawn as FVF "
+                        "0x%08lX without %d input(s) an FVF cannot carry (blend "
+                        "weights, fog, point size or back-face colours)\n",
+                handle, (unsigned long)g_ff.fvf, dropped);
+    }
+    return 1;
+}
+
 /* Common checks for a draw under the current vertex shader. */
 static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
+    g_ff_active = 0;
     if (g_shadow_swap_thread && GetCurrentThreadId() != g_shadow_swap_thread)
         g_draws_off_thread++;
     note_draw_format(xpt, stride);
@@ -864,8 +1123,16 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
         const struct shadow_program *p;
 
         if (g_shadow_vs_kind == SHADER_DECLARATION) {
-            g_draws_declaration++;       /* fixed function by declaration */
-            return 0;
+            /* fixed function by declaration: drawn as the equivalent FVF */
+            if (!ff_from_declaration(g_shadow_vs, stride)) {
+                g_draws_declaration++;
+                return 0;
+            }
+            host_SetVertexShader(g_shadow, g_ff.fvf);
+            g_ff_active = 1;
+            g_draws_ff_declaration++;
+            shadow_use_viewport(0);
+            goto states;
         }
         if (g_shadow_vs_kind != SHADER_HOST_PROGRAM || g_shadow_vs_slot < 0) {
             g_draws_unknown_vs++;
@@ -888,6 +1155,7 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
         }
         shadow_use_viewport(0);
     }
+states:
     /* RECOMP_HLE_D3D8_SKIP_FULLSCREEN=1: drop the title's full-screen passes
      * over its own frame -- the draws that sample the frame buffer at stage 0.
      *
@@ -1689,11 +1957,13 @@ static void frame_end_shadow(void)
         } else if (now - g_shadow_last_report >= 5000) {
             fprintf(stderr, "[HLE-D3D8] shadow: %lu swaps, %lu clears, last clear "
                     "color 0x%08X | draws: %lu UP + %lu indexed UP + %lu buffer + "
-                    "%lu indexed buffer drawn; skipped %lu program without layout, %lu "
+                    "%lu indexed buffer drawn (%lu of them fixed function by "
+                    "declaration); skipped %lu program without layout, %lu "
                     "declaration shader, %lu unknown shader, %lu stride, %lu "
                     "primitive, %lu failed; %lu off the swapping thread\n",
                     g_shadow_swaps, g_shadow_clears, g_shadow_last_color,
                     g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
+                    g_draws_ff_declaration,
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                     g_draws_stride, g_draws_primitive, g_draws_failed,
                     g_draws_off_thread);
@@ -2101,9 +2371,75 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_CreateVertexShader);
 #ifdef _WIN32
-    if (g_shadow && (int32_t)g_eax >= 0 && handle_va) {
+    if ((int32_t)g_eax >= 0 && handle_va) {
         uint32_t guest = HLE_MEM32(handle_va);
         uint32_t header = function ? HLE_MEM32(function) : 0;
+        const DWORD *code = function ? (const DWORD *)HLE_PTR(function + 4) : NULL;
+
+        if (g_shadow)
+            shadow_track_vertex_shader(guest, function != 0, header, code);
+        else
+            shadow_keep_early_vertex_shader(guest, function != 0, header, code);
+    }
+#endif
+}
+
+#ifdef _WIN32
+/* Shaders created before the device.
+ *
+ * Mortal Kombat: Deadly Alliance calls CreateVertexShader before
+ * Direct3D_CreateDevice, so the shadow device did not exist yet and the
+ * program was never recorded; every draw under it was then "unknown
+ * shader" -- 3,796 of them in a minute, its HUD among them. The guest's
+ * function buffer need not outlive the call, so the microcode is copied
+ * here and replayed when the device is made. */
+#define SHADOW_EARLY_SHADERS 16
+
+static struct {
+    uint32_t guest;
+    int      has_function;
+    uint32_t header;
+    DWORD    code[136 * 4];
+} g_early_vs[SHADOW_EARLY_SHADERS];
+static int g_early_vs_count;
+
+static void shadow_keep_early_vertex_shader(uint32_t guest, int has_function,
+                                            uint32_t header, const DWORD *code)
+{
+    uint32_t n = header >> 16;
+
+    if (g_early_vs_count >= SHADOW_EARLY_SHADERS) {
+        fprintf(stderr, "[HLE-D3D8] vertex shader 0x%08X created before the "
+                "device, past the %d kept: it will be unknown\n", guest,
+                SHADOW_EARLY_SHADERS);
+        return;
+    }
+    g_early_vs[g_early_vs_count].guest = guest;
+    g_early_vs[g_early_vs_count].has_function = has_function;
+    g_early_vs[g_early_vs_count].header = header;
+    if (has_function && n <= 136)
+        memcpy(g_early_vs[g_early_vs_count].code, code, n * 4 * sizeof(DWORD));
+    g_early_vs_count++;
+}
+
+static void shadow_replay_early_vertex_shaders(void)
+{
+    int i;
+
+    for (i = 0; i < g_early_vs_count; i++) {
+        fprintf(stderr, "[HLE-D3D8] vertex shader 0x%08X was created before the "
+                "device; recording it now\n", g_early_vs[i].guest);
+        shadow_track_vertex_shader(g_early_vs[i].guest, g_early_vs[i].has_function,
+                                   g_early_vs[i].header, g_early_vs[i].code);
+    }
+    g_early_vs_count = 0;
+}
+
+/* Record a created vertex shader against the shadow device. */
+static void shadow_track_vertex_shader(uint32_t guest, int has_function,
+                                       uint32_t header, const DWORD *code)
+{
+    {
         int slot = shadow_program_find(guest);
         DWORD host = 0;
         HRESULT hr = E_FAIL;
@@ -2119,11 +2455,10 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
 
         /* The host device's vtable has no CreateVertexShader slot; its vertex
          * program layer is called directly, with the header's count. */
-        if (function && (header & 0xFFFF) == 0x2078 &&
+        if (has_function && (header & 0xFFFF) == 0x2078 &&
             (header >> 16) != 0 && (header >> 16) <= 136)
-            hr = host_vsh_create_shader((const DWORD *)HLE_PTR(function + 4),
-                                        (int)(header >> 16), &host);
-        kind = !function ? SHADER_DECLARATION
+            hr = host_vsh_create_shader(code, (int)(header >> 16), &host);
+        kind = !has_function ? SHADER_DECLARATION
              : SUCCEEDED(hr) ? SHADER_HOST_PROGRAM : SHADER_NOT_REPLAYED;
         if (slot >= 0) {
             g_programs[slot].guest = guest;
@@ -3309,6 +3644,60 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     int k;
 
     *failed = 0;
+    if (g_ff_active) {
+        /* Fixed function by declaration (ff_from_declaration): every vertex
+         * rebuilt in FVF order from wherever its inputs are. */
+        const uint8_t *src[FF_MAX_INPUTS];
+        uint32_t sst[FF_MAX_INPUTS];
+
+        for (k = 0; k < g_ff.count; k++) {
+            if (!g_ff.stream[k]) {
+                src[k] = (const uint8_t *)verts;
+                sst[k] = in_stride;
+                continue;
+            }
+            src[k] = first == NO_FIRST_VERTEX ? NULL
+                   : (const uint8_t *)hle_d3d8_stream_vertices(g_ff.stream[k], first,
+                                                               vertices, &sst[k]);
+            if (!src[k] || sst[k] < g_ff.offset[k] + ff_format_size(g_ff.format[k])) {
+                *failed = 1;
+                return NULL;
+            }
+        }
+        out_stride = g_ff.out_stride;
+        out = calloc((size_t)vertices, out_stride);
+        if (!out) {
+            *failed = 1;
+            return NULL;
+        }
+        for (v = 0; v < vertices; v++) {
+            uint8_t *dst = out + (size_t)v * out_stride;
+            for (k = 0; k < g_ff.count; k++) {
+                const uint8_t *at = src[k] + (size_t)v * sst[k] + g_ff.offset[k];
+                float f[4];
+                int c = ff_read_floats(g_ff.format[k], at, f);
+
+                if (g_ff.as_color[k]) {
+                    if (g_ff.format[k] == 0x40) {
+                        memcpy(dst + g_ff.out[k], at, 4);   /* already a D3DCOLOR */
+                    } else {
+                        uint8_t bgra[4];
+                        float r = c > 0 ? f[0] : 0, g = c > 1 ? f[1] : 0;
+                        float b = c > 2 ? f[2] : 0, a = c > 3 ? f[3] : 1;
+#define FF_U8(x) (uint8_t)((x) <= 0 ? 0 : (x) >= 1 ? 255 : (int)((x) * 255.0f + 0.5f))
+                        bgra[0] = FF_U8(b); bgra[1] = FF_U8(g);
+                        bgra[2] = FF_U8(r); bgra[3] = FF_U8(a);
+#undef FF_U8
+                        memcpy(dst + g_ff.out[k], bgra, 4);
+                    }
+                } else {
+                    memcpy(dst + g_ff.out[k], f, (size_t)g_ff.floats[k] * sizeof f[0]);
+                }
+            }
+        }
+        *stride = out_stride;
+        return out;
+    }
     if (!g_shadow_vs_is_program || g_shadow_vs_slot < 0)
         return NULL;
     p = &g_programs[g_shadow_vs_slot];

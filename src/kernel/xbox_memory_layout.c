@@ -1466,23 +1466,65 @@ extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi;
 #define RECOMP_JMPBUF_SLOTS 32
 
 typedef struct {
-    uint32_t buf_va;
-    jmp_buf  native;
+    uint32_t  buf_va;
+    uintptr_t stack;    /* a native address on the stack it was armed on */
+    jmp_buf   native;
 } recomp_jmp_slot;
 
 static RECOMP_TLS recomp_jmp_slot s_jmp[RECOMP_JMPBUF_SLOTS];
 static RECOMP_TLS int             s_jmp_used;
+
+/* A native address on the current stack: this frame's, which sits just below
+ * the caller's setjmp. Taken as an integer so it is never dereferenced. */
+static uintptr_t recomp_native_sp(void)
+{
+    volatile char here = 0;
+    return (uintptr_t)&here;
+}
+
+/* A title that runs guest code on more than one native stack -- host fibers
+ * standing in for a coroutine scheduler, as Mortal Kombat: Deadly Alliance's
+ * mk_tasks.c does -- can see a guest longjmp whose buffer was armed on another
+ * stack. On hardware that is ordinary: everything shares one stack, and MKDA's
+ * main loop arms a buffer that its tasks jump back to. A native longjmp across
+ * stacks cannot work (Windows refuses the unwind with STATUS_BAD_STACK), so the
+ * runtime detects it and hands it to whoever owns the stacks. The handler must
+ * not return: it switches to the owning stack and does the jump there. */
+/* Same type as recomp_types.h declares for the title side. */
+typedef void (*recomp_foreign_longjmp_fn)(jmp_buf *target, int value,
+                                          uintptr_t armed_stack);
+static recomp_foreign_longjmp_fn s_foreign_longjmp;
+
+void recomp_set_foreign_longjmp(recomp_foreign_longjmp_fn fn)
+{
+    s_foreign_longjmp = fn;
+}
+
+static int recomp_on_current_stack(uintptr_t a)
+{
+#if defined(_WIN32)
+    ULONG_PTR lo, hi;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    return a >= lo && a < hi;
+#else
+    (void)a;
+    return 1;   /* nothing switches native stacks here yet */
+#endif
+}
 
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va)
 {
     int i;
 
     for (i = 0; i < s_jmp_used; i++)
-        if (s_jmp[i].buf_va == buf_va)
+        if (s_jmp[i].buf_va == buf_va) {
+            s_jmp[i].stack = recomp_native_sp();
             return &s_jmp[i].native;      /* the same buffer, re-armed */
+        }
     if (s_jmp_used >= RECOMP_JMPBUF_SLOTS)
         s_jmp_used = RECOMP_JMPBUF_SLOTS - 1;   /* keep the deepest */
     s_jmp[s_jmp_used].buf_va = buf_va;
+    s_jmp[s_jmp_used].stack = recomp_native_sp();
     return &s_jmp[s_jmp_used++].native;
 }
 
@@ -1510,6 +1552,16 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value)
         g_ebp     = g_seh_ebp;
 
         s_jmp_used = i + 1;   /* the inner buffers died with their frames */
+        if (!recomp_on_current_stack(s_jmp[i].stack)) {
+            fprintf(stderr, "[LONGJMP] guest longjmp to buffer 0x%08X, which was "
+                            "armed on another native stack (%s)\n", buf_va,
+                    s_foreign_longjmp ? "handing it to that stack's owner"
+                                      : "no handler: the unwind will fail");
+            fflush(stderr);
+            if (s_foreign_longjmp)
+                s_foreign_longjmp(&s_jmp[i].native, value ? (int)value : 1,
+                                  s_jmp[i].stack);
+        }
         longjmp(s_jmp[i].native, value ? (int)value : 1);
     }
     return 0;
