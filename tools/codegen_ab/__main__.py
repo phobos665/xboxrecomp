@@ -78,6 +78,34 @@ def corpus_lifts(args, workdir):
     return out, None
 
 
+def read_function_list(path):
+    """Function VAs, hottest first when the file is a profile.
+
+    Either a RECOMP_SAMPLE_DUMP file -- its `leaf <samples> <symbol>` lines are
+    summed over threads per sub_XXXXXXXX and ranked -- or any text with one
+    function per line, as sub_XXXXXXXX, 0xXXXXXXXX or XXXXXXXX."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    samples = {}
+    for line in lines:
+        cols = line.split("\t")
+        if len(cols) >= 3 and cols[0] == "leaf":
+            m = re.fullmatch(r"sub_([0-9A-Fa-f]{8})", cols[2].strip())
+            if m:
+                va = int(m.group(1), 16)
+                samples[va] = samples.get(va, 0) + int(cols[1])
+    if samples:
+        return sorted(samples, key=lambda va: -samples[va])
+    out = []
+    for line in lines:
+        line = line.split("#")[0]
+        m = (re.search(r"\bsub_([0-9A-Fa-f]{8})\b", line)
+             or re.search(r"\b(?:0x)?([0-9A-Fa-f]{8})\b", line))
+        if m:
+            out.append(int(m.group(1), 16))
+    return out
+
+
 def xbe_lifts(args, workdir):
     """A title's functions, lifted the way scripts/recompile.py lifts them."""
     from ..recomp.__main__ import find_data_files
@@ -104,10 +132,7 @@ def xbe_lifts(args, workdir):
 
     bt_a, bt_b = batch(frozenset()), batch(args.opts)
     if args.functions:
-        with open(args.functions) as f:
-            wanted = [int(tok, 16) for line in f
-                      for tok in re.findall(r"(?:0x)?([0-9A-Fa-f]{6,8})\b",
-                                            line.split("#")[0])[:1]]
+        wanted = read_function_list(args.functions)
     else:
         wanted = sorted(bt_a.func_db)
     if args.limit:
@@ -343,8 +368,9 @@ def main(argv=None):
     ap.add_argument("--xbe", help="lift this title's functions instead")
     ap.add_argument("--work-dir", help="the title's pipeline output "
                     "(scripts/recompile.py --work-dir)")
-    ap.add_argument("--functions", help="file of function VAs (hex, first on "
-                    "each line), e.g. the hot list from a RECOMP_SAMPLE run")
+    ap.add_argument("--functions", help="with --xbe: a RECOMP_SAMPLE_DUMP file "
+                    "(functions ranked by samples; use --limit for the top N) or "
+                    "a list of VAs, one per line")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--include-identical", action="store_true",
                     help="with --xbe, also run functions the options leave "
