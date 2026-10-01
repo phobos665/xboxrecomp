@@ -10,7 +10,7 @@
  * and the capture would be of an empty screen. 120 swaps is far enough in to
  * have textures and a real draw list, and still inside the first minute.
  *
- * RECOMP_D3D8_CAPTURE_EVERY=<n> (n >= 2) keeps capturing: after the frame
+ * RECOMP_D3D8_CAPTURE_EVERY=<n> (n >= 1) keeps capturing: after the frame
  * at the requested swap, one more every n swaps, each to <path>_<swap> with
  * the capture extension, at most CAPTURE_MAX_FILES files. A title never
  * reaches the same moment at the same swap twice, so one long run captured
@@ -542,7 +542,7 @@ static void capture_configure(void)
     if (swap && atol(swap) > 0)
         g_target_swap = (unsigned long)atol(swap);
     every = getenv("RECOMP_D3D8_CAPTURE_EVERY");
-    if (every && atol(every) >= 2)
+    if (every && atol(every) >= 1)
         g_every = (unsigned long)atol(every);
     min_draws = getenv("RECOMP_D3D8_CAPTURE_MINDRAWS");
     if (min_draws && atol(min_draws) > 0)
@@ -618,6 +618,11 @@ void hle_d3d8_capture_swap(unsigned long swaps, uint32_t width, uint32_t height)
             g_target_swap = g_frame + g_every;
         else
             g_path = NULL;               /* done: one frame, or the file cap */
+        /* EVERY=1: the next frame starts at this very swap. Consecutive
+         * frames are what frame interpolation is measured on -- two frames
+         * and the one between them. */
+        if (g_path && g_target_swap == swaps)
+            goto start;
         return;
     }
 start:
