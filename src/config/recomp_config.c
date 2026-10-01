@@ -184,6 +184,7 @@ void recomp_settings_defaults(RecompSettings *s)
     s->fps_overlay       = 0;
     s->fullscreen        = 0;
     s->vrr               = 1;
+    s->frame_interp      = 1;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
 }
 
@@ -234,6 +235,8 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->fullscreen = !off_word(v);
         if ((v = from_table("vrr")) != NULL)
             s->vrr = !off_word(v);
+        if ((v = from_table("frame_interp")) != NULL)
+            s->frame_interp = clamp_int(atoi(v), 1, 4);
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
     }
@@ -338,12 +341,17 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# must have it switched on. 0 turns it off.             [RECOMP_VRR]\n"
         "vrr = %d\n"
         "\n"
+        "# Frame interpolation: draw frames between the game's own, so 2 shows\n"
+        "# 120 a second while the game itself still runs at 60. Best with\n"
+        "# variable refresh. 1 is off.                   [RECOMP_FRAME_INTERP]\n"
+        "frame_interp = %d\n"
+        "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
         s->widescreen_2d[0] ? s->widescreen_2d : "auto",
         s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay,
-        s->fullscreen, s->vrr);
+        s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp);
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);

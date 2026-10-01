@@ -1250,6 +1250,23 @@ HRESULT       xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst,
 unsigned long xbox_D3D8ScreenCopyCount(void);
 void          xbox_D3D8ScreenCopyShutdown(void);
 
+/* Frame interpolation (src/hle/hle_d3d8_interp.c). Begin points "the back
+   buffer" at a second image so a frame can be drawn while the title's own
+   waits to be shown; Present shows it without counting a frame; End puts
+   the scene target back. FALSE from Begin: no second image, draw nothing. */
+BOOL xbox_D3D8InterpBegin(void);
+void xbox_D3D8InterpPresent(void);
+void xbox_D3D8InterpEnd(void);
+
+/* Which vertex shader constants hold the transforms frame interpolation
+   blends, for a title that knows: `projection` the first of 4 registers of
+   the projection (-1 none), and `affine_count` registers from
+   `affine_first` in 4-register affine matrices (a model-view, a bone),
+   rows with (0,0,0,1) last. The interp_projection and interp_affine
+   settings override it. Without either, the projection is the Hor+
+   register and nothing is taken for affine. */
+void xbox_D3D8SetInterpRegisters(int projection, int affine_first, int affine_count);
+
 /**
  * Present frame and pump window messages.
  * Called from recompiled game code (replaces RW driver Present path).

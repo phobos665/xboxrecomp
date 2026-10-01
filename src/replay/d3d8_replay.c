@@ -54,6 +54,9 @@
  *                    (a multiplied or added backdrop), which solo draws
  *                    over black and so draws as nothing: its difference
  *                    from the full frame is what it contributes.
+ *   --const-patch <file>  vertex shader constants to set just before given
+ *                    draws: lines of "<draw> <reg> <x> <y> <z> <w>", in draw
+ *                    order. How frame interpolation is tried on captures.
  *
  * A player, not an emulator. A capture holds the calls shadow mode
  * made on the host renderer after all of its Xbox conversion (d3d8_capture.h),
@@ -138,9 +141,60 @@ static void tex_desc(char *buf, size_t n, uint32_t id)
 }
 
 /* 1 if this draw should run, after listing it if asked. */
+/* --const-patch <file>: vertex shader constants to set just before given
+ * draws, one per line, "<draw> <reg> <x> <y> <z> <w>", in draw order. For
+ * trying what a draw would look like with other constants -- frame
+ * interpolation's prototype writes the blend of two frames' matrices here
+ * and replays one of them with it. */
+typedef struct { long draw; int reg; float v[4]; } ConstPatch;
+static ConstPatch *g_patch;
+static size_t      g_patch_count, g_patch_next;
+
+static int load_const_patch(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    size_t cap = 0;
+    ConstPatch p;
+
+    if (!f)
+        return 0;
+    while (fscanf(f, "%ld %d %f %f %f %f", &p.draw, &p.reg,
+                  &p.v[0], &p.v[1], &p.v[2], &p.v[3]) == 6) {
+        if (g_patch_count == cap) {
+            ConstPatch *n;
+
+            cap = cap ? cap * 2 : 1024;
+            n = realloc(g_patch, cap * sizeof *n);
+            if (!n)
+                break;
+            g_patch = n;
+        }
+        g_patch[g_patch_count++] = p;
+    }
+    fclose(f);
+    return 1;
+}
+
+/* The patch lines for draw n, applied; the file is in draw order, so a
+ * cursor walks it once per pass (replay_pass rewinds it). */
+static void apply_const_patch(long n)
+{
+    while (g_patch_next < g_patch_count && g_patch[g_patch_next].draw < n)
+        g_patch_next++;
+    while (g_patch_next < g_patch_count && g_patch[g_patch_next].draw == n) {
+        const ConstPatch *p = &g_patch[g_patch_next++];
+
+        if (p->reg >= 0)
+            d3d8_vsh_set_constant(p->reg, p->v, 1);
+    }
+}
+
 static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t stride)
 {
     long n = g_draw_index++;
+
+    if (g_patch_count)
+        apply_const_patch(n);
 
     if (g_list_draws) {
         const DWORD *rs = d3d8_GetRenderStates();
@@ -1161,6 +1215,7 @@ static void replay_pass(Replay *r, D3D8CapReader *cap, int loop)
     d3d8cap_rewind(cap);
     g_draw_index = 0;
     g_cur_tag = 0;
+    g_patch_next = 0;
     while (d3d8cap_next(cap, &c))
         replay_chunk(r, &c);
     if (!r->kinds[D3D8CAP_FRAME_START])
@@ -1196,7 +1251,8 @@ static void usage(void)
         "                   [--list-draws] [--dump-target] [--present] [--backend <name>]\n"
         "                   [--place <tag|all>=<placement>]...\n"
         "                   [--solo-tag <tag>] [--each-tag]\n"
-        "                   [--hide-tag <tag>] [--each-tag-hidden]\n",
+        "                   [--hide-tag <tag>] [--each-tag-hidden]\n"
+        "                   [--const-patch <file>]\n",
         D3D8CAP_EXTENSION);
 }
 
@@ -1251,6 +1307,14 @@ int main(int argc, char **argv)
             each_tag = 1;
         else if (!strcmp(argv[i], "--each-tag-hidden"))
             each_tag = 2;
+        else if (!strcmp(argv[i], "--const-patch") && i + 1 < argc) {
+            if (!load_const_patch(argv[++i])) {
+                fprintf(stderr, "[replay] --const-patch: cannot read %s\n", argv[i]);
+                return 2;
+            }
+            note("[replay] %lu constant patch lines from %s\n",
+                 (unsigned long)g_patch_count, argv[i]);
+        }
         else if (!strcmp(argv[i], "--place") && i + 1 < argc) {
             const char *a = argv[++i], *eq = strchr(a, '=');
             static const char *names[] = { "auto", "stretch", "centre", "left", "right", "side" };
