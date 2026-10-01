@@ -39,9 +39,10 @@ static struct {
     unsigned long   copies;
 } g;
 
-/* Source pixel = destination pixel * scale. One when the sizes agree, which
- * they do whenever a title reads back its own screen. */
-typedef struct { float scale_x, scale_y, pad0, pad1; } ScreenCopyConstants;
+/* Source pixel = destination pixel * scale + offset. Scale is one when the
+ * sizes agree, which they do whenever a title reads back its whole screen;
+ * the offset places a rectangle (xbox_D3D8CopyBackBufferRectToTexture). */
+typedef struct { float scale_x, scale_y, off_x, off_y; } ScreenCopyConstants;
 
 static const char kSource[] =
     "cbuffer ScreenCopy : register(b7) { float4 scale; };\n"
@@ -54,7 +55,7 @@ static const char kSource[] =
     "}\n"
     "Texture2D<float4> screen : register(t9);\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
-    "    int2 p = int2(i.pos.xy * scale.xy);\n"
+    "    int2 p = int2(i.pos.xy * scale.xy + scale.zw);\n"
     "    return screen.Load(int3(p, 0));\n"
     "}\n";
 
@@ -184,7 +185,24 @@ static void probe_source(const RhiOutputState *saved, const D3D8Texture *tex,
     fflush(stderr);
 }
 
+/* The copy itself. With src NULL: the whole frame, scaled to the whole
+ * texture. With src: that rectangle of the frame, in the title's own
+ * pixels, to the same size at `at` in the texture -- CopyRects does not
+ * scale. */
+static HRESULT copy_to_texture(IDirect3DTexture8 *dst, const RECT *src, const POINT *at);
+
 HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
+{
+    return copy_to_texture(dst, NULL, NULL);
+}
+
+HRESULT xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
+                                             const POINT *at)
+{
+    return copy_to_texture(dst, src, at);
+}
+
+static HRESULT copy_to_texture(IDirect3DTexture8 *dst, const RECT *src, const POINT *at)
 {
     D3D8Texture *tex = (D3D8Texture *)dst;
     RhiImage *dst_image;
@@ -218,17 +236,46 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     rhi_output_save(&saved);
     probe_source(&saved, tex, back_w, back_h);
 
-    if ((mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)) != NULL) {
-        c.scale_x = tex->width ? (float)back_w / (float)tex->width : 1.0f;
-        c.scale_y = tex->height ? (float)back_h / (float)tex->height : 1.0f;
-        c.pad0 = c.pad1 = 0.0f;
-        memcpy(mapped, &c, sizeof c);
-        rhi_buffer_unmap(g.cb);
-    }
-
     vp.x = vp.y = 0.0f;
     vp.width = (float)tex->width;
     vp.height = (float)tex->height;
+    c.scale_x = tex->width ? (float)back_w / (float)tex->width : 1.0f;
+    c.scale_y = tex->height ? (float)back_h / (float)tex->height : 1.0f;
+    c.off_x = c.off_y = 0.0f;
+    if (src) {
+        /* The rectangle is in the title's pixels and the frame may be
+         * rendered larger (RECOMP_RES_SCALE): one texture pixel is
+         * back/guest frame pixels. A title drawing its handheld's map into
+         * a corner of the back buffer and copying that corner out got the
+         * whole frame squeezed into the texture, map and all. */
+        UINT guest_w = d3d8_GetGuestWidth(), guest_h = d3d8_GetGuestHeight();
+        float kx = guest_w ? (float)back_w / (float)guest_w : 1.0f;
+        float ky = guest_h ? (float)back_h / (float)guest_h : 1.0f;
+        LONG ax = at ? at->x : 0, ay = at ? at->y : 0;
+        LONG w = src->right - src->left, h = src->bottom - src->top;
+
+        if (w <= 0 || h <= 0 || ax >= (LONG)tex->width || ay >= (LONG)tex->height) {
+            rhi_output_restore(&saved);
+            rhi_view_destroy(rtv);
+            return S_OK;                /* nothing of it lands in the texture */
+        }
+        if (ax < 0) { w += ax; ax = 0; }
+        if (ay < 0) { h += ay; ay = 0; }
+        if (ax + w > (LONG)tex->width)  w = (LONG)tex->width - ax;
+        if (ay + h > (LONG)tex->height) h = (LONG)tex->height - ay;
+        vp.x = (float)ax;
+        vp.y = (float)ay;
+        vp.width = (float)w;
+        vp.height = (float)h;
+        c.scale_x = kx;
+        c.scale_y = ky;
+        c.off_x = (float)src->left * kx - (float)ax * kx;
+        c.off_y = (float)src->top * ky - (float)ay * ky;
+    }
+    if ((mapped = rhi_buffer_map(g.cb, RHI_MAP_WRITE_DISCARD)) != NULL) {
+        memcpy(mapped, &c, sizeof c);
+        rhi_buffer_unmap(g.cb);
+    }
     vp.min_depth = 0.0f;
     vp.max_depth = 1.0f;
     rhi_set_render_target(rtv, NULL);

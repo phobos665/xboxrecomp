@@ -1088,6 +1088,13 @@ HRESULT xbox_D3D8CopyBackBufferToTexture(IDirect3DTexture8 *dst)
     return E_NOTIMPL;
 }
 
+HRESULT xbox_D3D8CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
+                                             const POINT *at)
+{
+    (void)dst; (void)src; (void)at;
+    return E_NOTIMPL;
+}
+
 unsigned long xbox_D3D8ScreenCopyCount(void) { return 0; }
 void xbox_D3D8ScreenCopyShutdown(void) {}
 
