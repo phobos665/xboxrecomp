@@ -155,6 +155,17 @@ fill runs with a NULL base and zeroes guest 0..0x80000 (found with
 precedes it. **Seeds are applied by the disassembly stage:** `--only lift` and
 `--from identify` leave a new seed undetected; use `--from disasm`.
 
+**Mortal Kombat: Deadly Alliance (XDK 4721) reaches its Arcade fights (1 Oct 2026).** Its
+engine runs game logic as cooperative tasks that switch stacks by hand and `jmp` into the
+middle of functions, which lifted C cannot express; `titles/mkda/src/mk_tasks.c` runs each
+task on a host fiber instead (`docs/technical/mkda-coroutine.md`, "Resolution"). Three
+toolkit changes came with it: a guest `longjmp` to a buffer armed on another native stack is
+detected and handed to a title handler (`recomp_set_foreign_longjmp`), vertex shaders
+created before `CreateDevice` are replayed to the shadow device, and fixed-function draws
+described by a declaration (no program) are drawn through an equivalent FVF instead of being
+skipped. `scripts/run_and_report.py` now counts `[ICALL] unresolved ... target` lines; it
+had matched only the old `Failed to resolve VA` wording and reported 0 for every title.
+
 **Process exits are traced (22 Sep 2026):** `src/kernel/exit_trace.c` hooks
 ExitProcess/TerminateProcess/ExitThread and the ntdll funnel under them in every loaded
 module's import table and prints `[EXIT] <call>(code)` with host and guest stacks.

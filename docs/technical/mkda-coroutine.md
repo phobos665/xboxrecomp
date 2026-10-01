@@ -1,5 +1,12 @@
 # Mortal Kombat: Deadly Alliance — the loader is a hand-rolled coroutine
 
+> **Resolved, 1 October 2026.** MKDA runs its menus, attract mode and Arcade
+> fights, arenas and HUD included. The "coroutine" is the engine's whole
+> cooperative task scheduler; it now runs on host fibers
+> (`titles/mkda/src/mk_tasks.c`). See [Resolution](#resolution-1-october-2026)
+> at the end, which also corrects two misreadings below. The rest of this
+> page is the 20 September diagnosis, kept as it was.
+
 20 September 2026. XDK 4721, title `0x4D57000C`, entry `0x0015ADAC`. It lifts
 8406 functions with none failed, boots through XAPI, input and DirectSound
 init, builds its heaps and creates a D3D device. It never draws a frame,
@@ -154,3 +161,97 @@ and printing the buffer turns every diagnosis the title makes about itself
 into a line on stderr, and is what identified the heap failure in one run
 after a day of reading disassembly. Worth looking for in any title — the
 shape is a function that ends in `vsprintf` to a fixed address.
+
+---
+
+## Resolution, 1 October 2026
+
+### It is a scheduler, not a loader
+
+`sub_000E0350` is the engine's task list, walked once a frame from the main
+loop (`sub_000CAB60` → `sub_000E0300`). For each task whose delay has run
+out it calls the task's **resume** method, vtable `+0x14`; the refused jump to
+`0x000E0535` is that call's own return site. Three task classes share one
+method layout:
+
+| vtable | class | resume | sleep `+0x18` | to/from main stack `+0x1C/+0x20` | change function `+0x24` | where the task runs |
+|---|---|---|---|---|---|---|
+| `0x2702A0` | C | `E05D0` | `E0680` | `E08D0` (`ret`) | `E08E0` | main stack; cannot sleep |
+| `0x2702C8` | A | `E0690` | `E0800` | `E08D0` (`ret`) | `E08E0` | main stack, **copied out** on a sleep |
+| `0x2702F0` | B | `E0920` | `E0A50` | `E0AC0` / `E0AE0` | `E0B00` | its own stack inside the task |
+
+plus **die**, `sub_000E0550`, called directly from 84 sites. Two corrections
+to the diagnosis above: `sub_000E0A50` is class B's *sleep*, not a pump, and
+`sub_000E05D0` is class C's *resume*. `E0680` (class C's sleep) is `xor eax,
+eax; test eax, eax; jne` falling straight into class A's resume: class C has
+nowhere to keep a stack and never sleeps.
+
+Task fields the scheduler uses: `+0x04` linked, `+0x0C` delay (float),
+`+0x10..+0x1C` saved `ebp ebx esi edi`, `+0x2C` post hook, `+0x30` task
+function, `+0x34` continuation, `+0x40` top of the stack buffer, `+0x44`
+saved stack pointer. `+0x40 > +0x44` is the "asleep mid-function" test every
+resume makes; constructors start every task with the two equal, and
+`sub_000E0060` restarts a task from outside by setting them equal again.
+
+Class A's sleep is the unusual one: it copies the live stack, from its own
+`esp` up to the scheduler's, into the task's buffer, and the resume copies
+it back below the scheduler's frame. So class A tasks share one stretch of
+the main stack and the stack pointer it resumes at must not move.
+
+### What fixed it: option 2, host fibers
+
+`titles/mkda/src/mk_tasks.c` replaces all eleven primitives (defined under
+their guest names in `recomp_manual.c`, with the override log there). Each
+running task gets a host fiber from a pool:
+
+- **resume** switches to the task's parked fiber, or starts one running the
+  class's root loop (call `+0x30`, store the delay, again while it is 0, post
+  hook, destroy on a negative delay);
+- **sleep** parks the fiber, which keeps the task's lifted C frames alive;
+- **die** and **change function** `longjmp` to the fiber's root, which is
+  what the guest's `mov esp, <root>; ret` means.
+
+Everything the guest can see is kept as on hardware: the task fields, the
+scheduler globals at `0x2D4D30..0x2D4D60`, and class A's stack copy. A
+sleeping task whose object is restarted under it is unwound and its fiber
+reused. `RECOMP_MK_TASK_LOG=1` prints every task's end and every unwind.
+
+### Two more things the fibers exposed
+
+**A guest longjmp across stacks.** The main loop arms a `setjmp` at
+`0x000CACAE`, and class B tasks `longjmp` back to it — ordinary on hardware,
+where every task stack is the main stack or memory beside it. With fibers the
+buffer is on the main fiber's stack and the jump comes from a task fiber,
+which Windows refuses to unwind: the first fiber build drew 587 frames and
+died with `STATUS_BAD_STACK` 20 seconds in. The runtime
+(`src/kernel/xbox_memory_layout.c`) now records which native stack each guest
+`setjmp` was armed on, reports a jump to a different one, and hands it to a
+handler the title registers (`recomp_set_foreign_longjmp`); `mk_tasks.c`
+switches to the owning fiber and jumps there, and retires the task fiber.
+Five such jumps in a minute of attract mode.
+
+**Two shadow-renderer gaps, both toolkit-wide** (`src/hle/hle_d3d8.c`):
+
+- *Vertex shaders created before the device.* MKDA calls
+  `CreateVertexShader` before `Direct3D_CreateDevice`, so the program was
+  never recorded and its draws — the HUD and menu text — were all "unknown
+  shader". The microcode is now copied and replayed when the device is made.
+- *Fixed function described by a declaration.* `CreateVertexShader` with a
+  declaration and no program; MKDA draws every arena this way (FLOAT3
+  position, NORMPACKED3 normal, texture sets in two streams). Each draw is
+  now copied into the equivalent FVF and drawn through the host's fixed
+  function pipeline: 221,606 such draws in a 100-second driven run, none
+  skipped. Inputs an FVF cannot carry (blend weights, fog, point size,
+  back-face colours) are dropped with a note.
+
+### Where it stands
+
+A 100-second driven run (`RECOMP_INPUT_SEQ="20000:start,24000:a,..."`) goes
+legal screen, memory-unit check, title, main menu, character select, the
+arcade portal, a loading screen and a full Arcade fight with health bars and
+the round timer. Nothing skipped, no fault. Not yet checked: sound in a
+fight, a whole match to its end, Konquest, and any of the other modes.
+
+Option 1 of the plan above (a generic fiber service in the runtime, with a
+per-title table of switch points) is the natural next step if another title
+hand-rolls a scheduler; `mk_tasks.c` is written to be lifted out.

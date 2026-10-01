@@ -104,7 +104,13 @@ def summarise(err_path: Path) -> dict:
     text = err_path.read_text(encoding="utf-8", errors="replace")
 
     icall_totals = [int(m) for m in re.findall(r"total calls: (\d+)", text)]
-    failed = sorted(set(re.findall(r"Failed to resolve VA (0x[0-9A-Fa-f]+)", text)))
+    # Both log forms: the old "Failed to resolve VA", and the one the runtime
+    # prints now, "[ICALL] unresolved call|jump target". Matching only the old
+    # one reported "unresolved icalls 0" for a Mortal Kombat run in which one
+    # jump target was refused a billion times.
+    failed = sorted(set(re.findall(r"Failed to resolve VA (0x[0-9A-Fa-f]+)", text))
+                    | set(re.findall(r"\[ICALL\] unresolved (?:call |jump )?target "
+                                     r"(0x[0-9A-Fa-f]+)", text)))
     abi = re.findall(r"^\[ABI\] (sub_[0-9A-Fa-f]+):(.*)$", text, re.M)
 
     # The profiler reports "[PROFILE] N functions entered" periodically, so a

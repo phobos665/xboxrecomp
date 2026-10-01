@@ -76,6 +76,7 @@ set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
     src/mk_probe.c
+    src/mk_tasks.c   # the engine task scheduler on host fibers
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
