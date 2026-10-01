@@ -59,6 +59,16 @@ typedef struct {
     unsigned  count;
 } SampleSlot;
 
+/* The leaf and the three frames above it, as one key. "getenv is 7% of the
+ * thread" names a cost; this names who pays it, which is what decides the
+ * fix. Kept per thread beside the leaf and inclusive tables. */
+#define SAMPLE_CHAIN        6
+#define SAMPLE_CHAIN_SLOTS  (1u << 13)
+typedef struct {
+    uintptr_t f[SAMPLE_CHAIN];
+    unsigned  count;
+} SampleChain;
+
 typedef struct {
     DWORD      tid;
     HANDLE     handle;
@@ -67,7 +77,8 @@ typedef struct {
     unsigned   samples;
     SampleSlot *leaf;        /* exclusive: the instruction pointer */
     SampleSlot *incl;        /* inclusive: every frame on the stack, once */
-    unsigned   leaf_used, incl_used;
+    SampleChain *chain;      /* leaf plus its callers, for the report's "via" lines */
+    unsigned   leaf_used, incl_used, chain_used;
     ULONGLONG  cpu_100ns_at_start;
 } SampleThread;
 
@@ -94,6 +105,32 @@ static void slot_add(SampleSlot *table, unsigned *used, uintptr_t addr)
         if (table[i].addr == addr) { table[i].count++; return; }
         if (!table[i].addr) {
             table[i].addr = addr;
+            table[i].count = 1;
+            (*used)++;
+            return;
+        }
+    }
+}
+
+/* The leaf and up to three callers, keyed together. A full table drops new
+ * chains rather than evicting: the hot ones were there first. */
+static void chain_add(SampleChain *table, unsigned *used, const uintptr_t *fr, int n)
+{
+    uintptr_t f[SAMPLE_CHAIN];
+    unsigned h = 0, i, k;
+
+    for (k = 0; k < SAMPLE_CHAIN; k++) {
+        f[k] = (int)k < n ? fr[k] : 0;
+        h = h * 2654435761u + (unsigned)(f[k] >> 2);
+    }
+    i = h & (SAMPLE_CHAIN_SLOTS - 1);
+    for (k = 0; k < SAMPLE_CHAIN_SLOTS; k++, i = (i + 1) & (SAMPLE_CHAIN_SLOTS - 1)) {
+        if (table[i].count && memcmp(table[i].f, f, sizeof f) == 0) {
+            table[i].count++;
+            return;
+        }
+        if (!table[i].count) {
+            memcpy(table[i].f, f, sizeof f);
             table[i].count = 1;
             (*used)++;
             return;
@@ -168,8 +205,9 @@ static void refresh_threads(void)
                 t->alive = 1;
                 t->leaf = (SampleSlot *)calloc(SAMPLE_SLOTS, sizeof(SampleSlot));
                 t->incl = (SampleSlot *)calloc(SAMPLE_SLOTS, sizeof(SampleSlot));
-                if (!t->leaf || !t->incl) {
-                    free(t->leaf); free(t->incl); CloseHandle(h);
+                t->chain = (SampleChain *)calloc(SAMPLE_CHAIN_SLOTS, sizeof(SampleChain));
+                if (!t->leaf || !t->incl || !t->chain) {
+                    free(t->leaf); free(t->incl); free(t->chain); CloseHandle(h);
                     continue;
                 }
                 {
@@ -406,6 +444,121 @@ static int aggregate(const SampleSlot *table, Agg *out, int max_out,
 
 #define AGG_MAX 40000
 
+/* A chain folded to symbol bases, so two samples at different instructions
+ * of the same four functions count together. */
+typedef struct {
+    uintptr_t b[SAMPLE_CHAIN];
+    const ResolvedAddr *r[SAMPLE_CHAIN];
+    unsigned count;
+} ChainAgg;
+#define CHAIN_AGG_SLOTS (1u << 14)
+
+static int chain_cmp(const void *a, const void *b)
+{
+    unsigned ca = ((const ChainAgg *)a)->count, cb = ((const ChainAgg *)b)->count;
+    return ca < cb ? 1 : ca > cb ? -1 : 0;
+}
+
+/* For the hottest leaves of the thread's exclusive table (agg, n entries,
+ * hottest first), the callers each was sampled under. Three chains per leaf,
+ * the first twelve leaves that are not a wait. */
+static void report_chains(const SampleThread *t, const Agg *agg, int n,
+                          unsigned running, FILE *dump)
+{
+    static ChainAgg *table;
+    unsigned i, k, used = 0;
+    int shown_leaves = 0, k2;
+
+    if (!running || !t->chain)
+        return;
+    if (!table)
+        table = (ChainAgg *)calloc(CHAIN_AGG_SLOTS, sizeof *table);
+    if (!table)
+        return;
+    memset(table, 0, CHAIN_AGG_SLOTS * sizeof *table);
+
+    /* Fold the per-address chains to per-symbol ones. */
+    for (i = 0; i < SAMPLE_CHAIN_SLOTS; i++) {
+        const SampleChain *c = &t->chain[i];
+        uintptr_t b[SAMPLE_CHAIN];
+        const ResolvedAddr *r[SAMPLE_CHAIN];
+        unsigned h = 0, j, m;
+
+        if (!c->count)
+            continue;
+        for (k = 0; k < SAMPLE_CHAIN; k++) {
+            r[k] = c->f[k] ? resolve(c->f[k]) : NULL;
+            b[k] = r[k] ? r[k]->base : c->f[k];
+            h = h * 2654435761u + (unsigned)(b[k] >> 2);
+        }
+        if (!r[0])
+            continue;
+        j = h & (CHAIN_AGG_SLOTS - 1);
+        for (m = 0; m < CHAIN_AGG_SLOTS; m++, j = (j + 1) & (CHAIN_AGG_SLOTS - 1)) {
+            if (table[j].count && memcmp(table[j].b, b, sizeof b) == 0) {
+                table[j].count += c->count;
+                break;
+            }
+            if (!table[j].count) {
+                memcpy(table[j].b, b, sizeof b);
+                memcpy(table[j].r, r, sizeof r);
+                table[j].count = c->count;
+                used++;
+                break;
+            }
+        }
+    }
+    if (!used)
+        return;
+    /* Compact and sort, hottest first. */
+    {
+        unsigned w = 0;
+        for (i = 0; i < CHAIN_AGG_SLOTS; i++)
+            if (table[i].count)
+                table[w++] = table[i];
+        qsort(table, w, sizeof *table, chain_cmp);
+        used = w;
+    }
+
+    fprintf(stderr, "      hottest leaves, by caller:\n");
+    if (dump)
+        fprintf(dump, "# chain\tsamples\tleaf\tcallers, nearest first\n");
+    for (k2 = 0; k2 < n && shown_leaves < 12; k2++) {
+        int shown = 0;
+
+        if (categorise(agg[k2].r) == CAT_WAIT)
+            continue;
+        shown_leaves++;
+        for (i = 0; i < used && shown < 3; i++) {
+            const ChainAgg *c = &table[i];
+            int d;
+
+            if (c->b[0] != agg[k2].base)
+                continue;
+            fprintf(stderr, "      %6.2f%%  %s", 100.0 * c->count / (double)running,
+                    c->r[0]->name);
+            for (d = 1; d < SAMPLE_CHAIN; d++) {
+                if (!c->b[d])
+                    break;
+                fprintf(stderr, " <- %s", c->r[d] ? c->r[d]->name : "?");
+            }
+            fprintf(stderr, "\n");
+            shown++;
+        }
+    }
+    if (dump) {
+        for (i = 0; i < used; i++) {
+            const ChainAgg *c = &table[i];
+            int d;
+
+            fprintf(dump, "chain\t%u", c->count);
+            for (d = 0; d < SAMPLE_CHAIN; d++)
+                fprintf(dump, "\t%s", c->b[d] ? (c->r[d] ? c->r[d]->name : "?") : "");
+            fprintf(dump, "\n");
+        }
+    }
+}
+
 static void report(int final)
 {
     static Agg *agg;
@@ -486,6 +639,11 @@ static void report(int final)
                 fprintf(dump, "leaf\t%u\t%s\t%s\n", agg[k].count,
                         agg[k].r->name, agg[k].r->module);
         }
+
+        /* Who pays for each of the hottest leaves: the callers above it,
+         * folded to symbols. A leaf in the C runtime or the driver is only
+         * actionable through the toolkit function that called it. */
+        report_chains(t, agg, n, running, dump);
 
         /* Inclusive: what the leaf time belongs to. */
         n = aggregate(t->incl, agg, AGG_MAX, NULL);
@@ -587,6 +745,7 @@ static DWORD WINAPI sampler_thread(LPVOID unused)
                 continue;
             t->samples++;
             slot_add(t->leaf, &t->leaf_used, frames[0]);
+            chain_add(t->chain, &t->chain_used, frames, n);
             for (k = 0; k < n; k++) {
                 for (j = 0; j < k; j++)
                     if (frames[j] == frames[k])
