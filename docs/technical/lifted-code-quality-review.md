@@ -5,6 +5,18 @@ called "the report" below. Every claim was checked against this tree. The codege
 reproduced with the real lifter, the GCC 13 and Clang 18 compilers and a timing harness
 (`tools/codegen_bench`). That harness is new; it runs on Linux and needs no game files.*
 
+**Status (branch `feat/performance-upgrades`).** These items of §5 now exist, all opt-in through
+`--perf-opts` and off by default:
+
+- step 1, as `tools/codegen_ab`;
+- step 2's fast paths: N1, N5, N6 and the `float` compare snapshots;
+- step 3's leaf caching, for general-purpose and XMM registers. The x87 static slots are not
+  done yet.
+
+On the way, `tools/codegen_ab` found two lifter bugs, fixed for every lift: an undeclared
+`_flags`, and unmasked `shl/shr` counts. How to test the options on a title is in
+[performance-upgrades-testing.md](performance-upgrades-testing.md).
+
 **Summary.** The report's diagnosis is right. Lifted code is slow because every guest register is an
 addressable thread-local that any guest store might alias, so it is reloaded after every store.
 Its recommendation to cache registers in locals and keep the globals as the ABI is also the right
