@@ -2669,7 +2669,7 @@ HLE_EXPORT(D3DDevice_SetPixelShader)
 {
     static int seen;
 #ifdef _WIN32
-    static int dumped;
+    static int dumped, probe = -1;
     uint32_t handle = HLE_ARG(0);
 #endif
 
@@ -2681,8 +2681,13 @@ HLE_EXPORT(D3DDevice_SetPixelShader)
 #ifdef _WIN32
     if (g_shadow)
         hle_d3d8_pixel_shader_selected(handle);
-    if (handle >= 0x10000u && handle < 0x08000000u && !(handle & 3u) &&
-        dumped < 6 && getenv("RECOMP_HLE_D3D8_PS_PROBE")) {
+    /* Read once: this runs on every SetPixelShader, which Outrun 2 makes
+     * before most draws, and the switch was being looked up in the
+     * environment each time. */
+    if (probe < 0)
+        probe = getenv("RECOMP_HLE_D3D8_PS_PROBE") ? 1 : 0;
+    if (probe && handle >= 0x10000u && handle < 0x08000000u && !(handle & 3u) &&
+        dumped < 6) {
         int i;
 
         dumped++;

@@ -3582,7 +3582,10 @@ static void bridge_NtCreateFile(void)
      *
      * Off unless RECOMP_FMV_HOST is set: it is a substitute for the title's
      * own output, and that should be a decision rather than a default. */
-    if (g_eax == 0 && getenv("RECOMP_FMV_HOST")) {
+    static int fmv_host = -1;
+    if (fmv_host < 0)
+        fmv_host = getenv("RECOMP_FMV_HOST") ? 1 : 0;   /* once, not per file open */
+    if (g_eax == 0 && fmv_host) {
         /* Declared here rather than included: the player lives in xbox_video,
          * which links xbox_d3d8, and having the kernel include its header
          * would make the dependency circular for no gain. Both land in the

@@ -1568,7 +1568,16 @@ static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *self, IDirect3DSu
      * it); a NULL depth surface is no depth, as in D3D8 -- the device's own
      * is the surface GetDepthStencilSurface returns at creation. */
     if (rt && !rt->rtv) {
-        fprintf(stderr, "D3D8: SetRenderTarget on non-renderable surface\n");
+        /* Said with the surface's shape the first few times and then
+         * counted: Outrun 2 hits this once a frame for a cube face, and a
+         * line a frame on the swapping thread is a cost of its own. */
+        static unsigned refused;
+        refused++;
+        if (refused <= 3 || (refused % 1000) == 0)
+            fprintf(stderr, "D3D8: SetRenderTarget on non-renderable surface: "
+                    "%ux%u format %d usage 0x%X subresource %u (%u time(s))\n",
+                    rt->width, rt->height, (int)rt->format, (unsigned)rt->usage,
+                    rt->subresource, refused);
         return E_INVALIDARG;
     }
     if (ds && !ds->dsv) {
