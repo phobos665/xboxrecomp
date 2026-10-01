@@ -480,6 +480,35 @@ typedef union RecompXmm {
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 
+/* The packed helpers on the host's own SSE, for generated code lifted with
+ * --perf-opts xmm-intrinsics (which defines RECOMP_XMM_INTRINSICS before this
+ * header). Same instructions the guest ran, so the same results lane for lane
+ * -- MINPS's tie-break, CMPNEQPS's unordered form, ANDNPS's operand order are
+ * the hardware's, not reimplementations of it.
+ *
+ * Two things change, both on purpose. A packed load or store is one 16-byte
+ * access instead of four volatile dwords: that is what movaps does, and the
+ * four volatile loads could neither be merged nor kept in a register. And the
+ * values stay in SSE registers between helpers instead of round-tripping
+ * through the union lane by lane.
+ *
+ * RecompXmm keeps its layout and alignment -- the vector lives only inside
+ * the helpers -- so nothing that stores, passes or captures one changes, and
+ * the 32-bit MSVC conformance build, which rejects a 16-byte-aligned type
+ * passed by value, still compiles. Hosts without SSE keep the lane-wise C. */
+#if defined(RECOMP_XMM_INTRINSICS) && \
+    (defined(__SSE__) || defined(_M_X64) || defined(_M_AMD64) || \
+     (defined(_M_IX86_FP) && _M_IX86_FP >= 1))
+#define RECOMP_XMM_USE_SSE 1
+#include <xmmintrin.h>
+static inline __m128 recomp_xmm_v(RecompXmm a) { return _mm_loadu_ps(a.f); }
+static inline RecompXmm recomp_xmm_r(__m128 v) {
+    RecompXmm r; _mm_storeu_ps(r.f, v); return r;
+}
+#else
+#define RECOMP_XMM_USE_SSE 0
+#endif
+
 /* -- construction -- */
 
 static inline RecompXmm XMM_ZERO(void) {
@@ -505,6 +534,15 @@ static inline RecompXmm XMM_SCALAR_BITS(uint32_t bits) {
  * Addresses are guest VAs, so they go through MEM32 like every other
  * access. Done lane-wise, which is also unaligned-safe for movups. */
 
+#if RECOMP_XMM_USE_SSE
+static inline RecompXmm XMM_MEM(uint32_t addr) {
+    return recomp_xmm_r(_mm_loadu_ps((const float *)XBOX_PTR(addr)));
+}
+
+static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
+    _mm_storeu_ps((float *)XBOX_PTR(addr), recomp_xmm_v(v));
+}
+#else
 static inline RecompXmm XMM_MEM(uint32_t addr) {
     RecompXmm r;
     r.u[0] = MEM32(addr);      r.u[1] = MEM32(addr + 4);
@@ -516,6 +554,7 @@ static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
     MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
     MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
 }
+#endif
 
 /* movlps/movhps move 8 bytes into or out of one half, leaving the
  * other half alone. */
@@ -555,6 +594,35 @@ static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RecompXmm a, RecompXmm b) {
         return r;                                                         \
     }
 
+#if RECOMP_XMM_USE_SSE
+#define RECOMP_XMM_SSE2(name, intrin)                                     \
+    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
+        return recomp_xmm_r(intrin(recomp_xmm_v(a), recomp_xmm_v(b)));    \
+    }
+RECOMP_XMM_SSE2(XMM_ADD, _mm_add_ps)
+RECOMP_XMM_SSE2(XMM_SUB, _mm_sub_ps)
+RECOMP_XMM_SSE2(XMM_MUL, _mm_mul_ps)
+RECOMP_XMM_SSE2(XMM_DIV, _mm_div_ps)
+RECOMP_XMM_SSE2(XMM_MIN, _mm_min_ps)
+RECOMP_XMM_SSE2(XMM_MAX, _mm_max_ps)
+RECOMP_XMM_SSE2(XMM_AND,  _mm_and_ps)
+RECOMP_XMM_SSE2(XMM_OR,   _mm_or_ps)
+RECOMP_XMM_SSE2(XMM_XOR,  _mm_xor_ps)
+RECOMP_XMM_SSE2(XMM_ANDN, _mm_andnot_ps)
+RECOMP_XMM_SSE2(XMM_CMP_EQ,  _mm_cmpeq_ps)
+RECOMP_XMM_SSE2(XMM_CMP_LT,  _mm_cmplt_ps)
+RECOMP_XMM_SSE2(XMM_CMP_LE,  _mm_cmple_ps)
+RECOMP_XMM_SSE2(XMM_CMP_NEQ, _mm_cmpneq_ps)
+RECOMP_XMM_SSE2(XMM_UNPACK_LOW,  _mm_unpacklo_ps)
+RECOMP_XMM_SSE2(XMM_UNPACK_HIGH, _mm_unpackhi_ps)
+/* shufps takes its selector as an immediate; the lifter always writes the
+ * instruction's literal, which is what _mm_shuffle_ps requires. */
+#define XMM_SHUFFLE(a, b, imm) \
+    recomp_xmm_r(_mm_shuffle_ps(recomp_xmm_v(a), recomp_xmm_v(b), (imm)))
+static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
+    return (uint32_t)_mm_movemask_ps(recomp_xmm_v(a));
+}
+#else
 RECOMP_XMM_LANEWISE(XMM_ADD, a.f[i] + b.f[i])
 RECOMP_XMM_LANEWISE(XMM_SUB, a.f[i] - b.f[i])
 RECOMP_XMM_LANEWISE(XMM_MUL, a.f[i] * b.f[i])
@@ -611,6 +679,7 @@ static inline RecompXmm XMM_UNPACK_HIGH(RecompXmm a, RecompXmm b) {
     r.u[0] = a.u[2]; r.u[1] = b.u[2]; r.u[2] = a.u[3]; r.u[3] = b.u[3];
     return r;
 }
+#endif /* RECOMP_XMM_USE_SSE */
 
 /* ================================================================
  * Flag computation helpers
