@@ -258,12 +258,55 @@ static int make_back_buffer_view(void)
     return g_present_view ? 0 : -1;
 }
 
+/* The swap chain is the flip model where the system has it: a variable-
+ * refresh display can only follow a flip-model swap chain, and only one
+ * created to allow tearing can present without waiting for a vblank while
+ * it owns its screen. Tried in that order, then the flip model without
+ * tearing, then the blit model (DISCARD) it always used. ResizeBuffers must
+ * repeat the creation flags. */
+#define D3D11_SC_FLAG_ALLOW_TEARING 2048u           /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING */
+#ifndef DXGI_PRESENT_ALLOW_TEARING
+#define DXGI_PRESENT_ALLOW_TEARING 0x00000200UL
+#endif
+#ifndef DXGI_SWAP_EFFECT_FLIP_DISCARD
+#define DXGI_SWAP_EFFECT_FLIP_DISCARD ((DXGI_SWAP_EFFECT)4)
+#endif
+static UINT g_swap_flags;   /* the swap chain's creation flags */
+static int  g_tearing;      /* created with ALLOW_TEARING */
+static int  g_vrr;          /* rhi_swapchain_set_vrr */
+
+static HRESULT create_device_and_swap(DXGI_SWAP_CHAIN_DESC *scd, UINT *create_flags,
+                                      D3D_FEATURE_LEVEL *feature_level)
+{
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                               *create_flags, NULL, 0, D3D11_SDK_VERSION,
+                                               scd, &g_swap, &g_dev, feature_level, &g_ctx);
+
+    /* The debug layer is only present with Graphics Tools installed. Without
+     * it a Debug build would have no device at all. */
+    if (FAILED(hr) && (*create_flags & D3D11_CREATE_DEVICE_DEBUG)) {
+        fprintf(stderr, "D3D8: D3D11 debug layer unavailable (0x%08lX), creating without it\n", hr);
+        *create_flags &= ~(UINT)D3D11_CREATE_DEVICE_DEBUG;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                           *create_flags, NULL, 0, D3D11_SDK_VERSION,
+                                           scd, &g_swap, &g_dev, feature_level, &g_ctx);
+    }
+    return hr;
+}
+
 static int d_device_create(const RhiDeviceDesc *dd)
 {
+    static const struct { DXGI_SWAP_EFFECT effect; UINT flags; const char *name; } tries[] = {
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD, D3D11_SC_FLAG_ALLOW_TEARING,
+          "flip model, tearing allowed (variable refresh possible)" },
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD, 0, "flip model, no tearing (no variable refresh)" },
+        { DXGI_SWAP_EFFECT_DISCARD, 0, "blit model (no variable refresh)" },
+    };
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
     UINT create_flags = dd->debug ? D3D11_CREATE_DEVICE_DEBUG : 0;
-    HRESULT hr;
+    HRESULT hr = E_FAIL;
+    int t;
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = dd->buffer_count ? dd->buffer_count : 1;
@@ -279,20 +322,27 @@ static int d_device_create(const RhiDeviceDesc *dd)
     scd.SampleDesc.Count = 1;
     scd.SampleDesc.Quality = 0;
     scd.Windowed = dd->windowed ? TRUE : FALSE;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
-                                       NULL, 0, D3D11_SDK_VERSION, &scd, &g_swap, &g_dev,
-                                       &feature_level, &g_ctx);
+    for (t = 0; t < (int)(sizeof tries / sizeof tries[0]); t++) {
+        UINT buffers = dd->buffer_count ? dd->buffer_count : 1;
 
-    /* The debug layer is only present with Graphics Tools installed. Without
-     * it a Debug build would have no device at all. */
-    if (FAILED(hr) && (create_flags & D3D11_CREATE_DEVICE_DEBUG)) {
-        fprintf(stderr, "D3D8: D3D11 debug layer unavailable (0x%08lX), creating without it\n", hr);
-        create_flags &= ~(UINT)D3D11_CREATE_DEVICE_DEBUG;
-        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                                           create_flags, NULL, 0, D3D11_SDK_VERSION,
-                                           &scd, &g_swap, &g_dev, &feature_level, &g_ctx);
+        /* The flip model wants two buffers at least, and a window. */
+        if (tries[t].effect != DXGI_SWAP_EFFECT_DISCARD) {
+            if (!scd.Windowed)
+                continue;
+            if (buffers < 2)
+                buffers = 2;
+        }
+        scd.BufferCount = buffers;
+        scd.SwapEffect = tries[t].effect;
+        scd.Flags = tries[t].flags;
+        hr = create_device_and_swap(&scd, &create_flags, &feature_level);
+        if (SUCCEEDED(hr)) {
+            g_swap_flags = tries[t].flags;
+            g_tearing = (tries[t].flags & D3D11_SC_FLAG_ALLOW_TEARING) != 0;
+            fprintf(stderr, "[RHI] d3d11: %s swap chain\n", tries[t].name);
+            break;
+        }
     }
 
     if (FAILED(hr)) {
@@ -341,7 +391,7 @@ static int d_swapchain_resize(uint32_t w, uint32_t h)
     ID3D11DeviceContext_OMGetRenderTargets(g_ctx, 1, &saved_rtv, &saved_dsv);
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 0, NULL, NULL);
     release_back_buffer_view();
-    if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(g_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, 0)))
+    if (SUCCEEDED(IDXGISwapChain_ResizeBuffers(g_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, g_swap_flags)))
         ok = make_back_buffer_view();
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &saved_rtv, saved_dsv);
     if (saved_rtv) ID3D11RenderTargetView_Release(saved_rtv);
@@ -349,18 +399,33 @@ static int d_swapchain_resize(uint32_t w, uint32_t h)
     return ok;
 }
 
-/* rhi_swapchain_set_vrr. The DISCARD (blit) swap chain here cannot present
- * for a variable-refresh display, so for now this only records the wish. */
-static int g_vrr;
-
+/* rhi_swapchain_set_vrr: while on, a present that does not wait for a vblank
+ * (interval 0) is allowed to tear, which with the window owning its screen
+ * is what hands it to a variable-refresh display at once. Only for a swap
+ * chain created to allow it; otherwise said once and ignored. */
 static void d_swapchain_set_vrr(int on)
 {
-    g_vrr = on ? 1 : 0;
+    static int said;
+
+    on = on ? 1 : 0;
+    if (on == g_vrr)
+        return;
+    g_vrr = on;
+    if (on && !g_tearing) {
+        if (!said++)
+            fprintf(stderr, "[RHI] d3d11: this swap chain cannot present for variable "
+                    "refresh (no tearing support); presenting as before\n");
+    } else {
+        fprintf(stderr, "[RHI] d3d11: variable refresh %s\n", on ? "on" : "off");
+    }
+    fflush(stderr);
 }
 
 static int32_t d_present(uint32_t interval)
 {
-    return g_swap ? (int32_t)IDXGISwapChain_Present(g_swap, interval, 0) : -1;
+    UINT flags = (interval == 0 && g_vrr && g_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+
+    return g_swap ? (int32_t)IDXGISwapChain_Present(g_swap, interval, flags) : -1;
 }
 
 static int d_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitch);
