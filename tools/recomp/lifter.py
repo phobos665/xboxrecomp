@@ -2281,16 +2281,43 @@ class Lifter:
         return [f"/* {m}: unhandled */"]
 
     def _lift_shift(self, insn, ops, c_op):
+        """shl/shr, with x86's count rule rather than C's.
+
+        x86 masks the count to five bits for 8-, 16- and 32-bit operands, so
+        `shl eax, cl` with cl = 65 shifts by 1. C leaves a shift of 32 or more
+        undefined, and the compiler takes it at its word: while the count is a
+        run-time value it emits the hardware's masking shift and the result
+        looks right, and once the count is a constant it can fold the shift to
+        anything. Caching registers in locals (--perf-opts leaf-cache) makes
+        exactly that happen -- `mov ecx, 65 ... shl byte [esi], cl` came out
+        different with the count known -- so the count is masked here as
+        _lift_sar already does. An immediate is masked at lift time, so its
+        spelling does not change.
+
+        CF is the last bit shifted out. Counts at or beyond an 8- or 16-bit
+        operand's width leave it undefined on x86, and the left-shift
+        expression for it would shift by a negative amount, which C leaves
+        undefined too; those set CF to 0.
+        """
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        if ops[1].type == "imm":
+            cnt = _fmt_imm(ops[1].imm & 31)
+        else:
+            cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
             # CF is the last bit shifted out; a zero count leaves CF alone.
             bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
+            if c_op == "<<" and w < 32 and ops[1].type != "imm":
+                out.append(f"if ({cnt}) _cf = ({cnt}) <= {w} ? "
+                           f"(int)((({dst}) >> ({bit})) & 1) : 0;")
+            elif c_op == "<<" and w < 32 and (ops[1].imm & 31) > w:
+                out.append("_cf = 0; /* count beyond the operand: CF undefined */")
+            else:
+                out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
         out.extend(self._write_result(ops, f"{dst} {c_op} {cnt}", "shift"))
         return out
 
