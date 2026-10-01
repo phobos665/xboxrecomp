@@ -32,7 +32,7 @@
 #endif
 
 #define WINDOW_W 900
-#define WINDOW_H 620
+#define WINDOW_H 740                    /* seven Video rows, their help, the footer */
 
 /* The client area as it really is. On a display at 125% these are not
  * WINDOW_W/H: asking Windows not to scale us and then laying out
@@ -140,6 +140,12 @@ static void build_rows(void)
     r->label = "Show frame rate";
     r->help  = "Start with the counter on screen. F9 toggles it while playing.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.fps_overlay;
+    r++;
+
+    r->label = "Fullscreen";
+    r->help  = "Fill the screen; a G-SYNC or FreeSync display then shows an even 60."
+               " Alt+Enter in game.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.fullscreen;
     r++;
 
     g_video_count = (int)(r - g_video_rows);

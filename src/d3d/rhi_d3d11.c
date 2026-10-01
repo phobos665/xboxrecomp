@@ -349,6 +349,15 @@ static int d_swapchain_resize(uint32_t w, uint32_t h)
     return ok;
 }
 
+/* rhi_swapchain_set_vrr. The DISCARD (blit) swap chain here cannot present
+ * for a variable-refresh display, so for now this only records the wish. */
+static int g_vrr;
+
+static void d_swapchain_set_vrr(int on)
+{
+    g_vrr = on ? 1 : 0;
+}
+
 static int32_t d_present(uint32_t interval)
 {
     return g_swap ? (int32_t)IDXGISwapChain_Present(g_swap, interval, 0) : -1;
@@ -1140,7 +1149,7 @@ static void d_clear_depth(RhiView *v, uint32_t flags, float z, uint8_t s)
 const RhiBackend rhi_d3d11_backend = {
     "d3d11",
     d_device_create, d_device_destroy, d_device_ready, d_swapchain_view, d_swapchain_resize,
-    d_present, d_swapchain_readback,
+    d_present, d_swapchain_readback, d_swapchain_set_vrr,
     d_buffer_create, d_buffer_destroy, d_buffer_map, d_buffer_unmap, d_buffer_update,
     d_image_create, d_image_retain, d_image_destroy, d_image_get_desc, d_image_update, d_image_readback,
     d_view_create, d_view_destroy, d_view_image,

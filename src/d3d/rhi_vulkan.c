@@ -278,6 +278,7 @@ static struct {
     int              acquired, wait_pending, stale;
     VkPresentModeKHR mode;
     uint32_t         interval;
+    int              vrr;               /* rhi_swapchain_set_vrr */
     RhiImage         proxy_image;
     RhiView          proxy_view;
 } SC;
@@ -637,6 +638,18 @@ static VkPresentModeKHR choose_mode(uint32_t interval)
         VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR,
         VK_PRESENT_MODE_FIFO_RELAXED_KHR, VK_PRESENT_MODE_FIFO_KHR
     };
+    /* For a variable-refresh display (rhi_swapchain_set_vrr): IMMEDIATE
+     * hands each frame to the display as it is made, which is what lets the
+     * display refresh when a frame arrives -- a 60 fps title shown at an
+     * even 60 on a 144 Hz screen rather than for two refreshes, then three.
+     * MAILBOX holds the frame for the display's next fixed refresh, which is
+     * the judder variable refresh exists to remove, so it comes after.
+     * Still none that blocks, for the reason above. */
+    static const VkPresentModeKHR order_vrr[] = {
+        VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+        VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR
+    };
+    const VkPresentModeKHR *pick = SC.vrr ? order_vrr : order;
     VkPresentModeKHR modes[16];
     uint32_t n = 16, i, k;
 
@@ -660,9 +673,24 @@ static VkPresentModeKHR choose_mode(uint32_t interval)
     }
     for (k = 0; k < sizeof order / sizeof order[0]; k++)
         for (i = 0; i < n; i++)
-            if (modes[i] == order[k])
-                return order[k];
+            if (modes[i] == pick[k])
+                return pick[k];
     return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+static void v_swapchain_set_vrr(int on)
+{
+    on = on ? 1 : 0;
+    if (on == SC.vrr)
+        return;
+    SC.vrr = on;
+    if (!V.dev)
+        return;
+    SC.mode = choose_mode(SC.interval);
+    SC.stale = 1;                       /* the next acquire recreates it */
+    fprintf(stderr, "[RHI] vulkan: variable refresh %s, present mode %s\n",
+            on ? "on" : "off", mode_name(SC.mode));
+    fflush(stderr);
 }
 
 static void destroy_swapchain_views(void)
@@ -3272,7 +3300,7 @@ static void v_draw_indexed(uint32_t n, uint32_t first, int32_t base)
 const RhiBackend rhi_vulkan_backend = {
     "vulkan",
     v_device_create, v_device_destroy, v_device_ready, v_swapchain_view, v_swapchain_resize,
-    v_present, v_swapchain_readback,
+    v_present, v_swapchain_readback, v_swapchain_set_vrr,
     v_buffer_create, v_buffer_destroy, v_buffer_map, v_buffer_unmap, v_buffer_update,
     v_image_create, v_image_retain, v_image_destroy, v_image_get_desc, v_image_update, v_image_readback,
     v_view_create, v_view_destroy, v_view_image,

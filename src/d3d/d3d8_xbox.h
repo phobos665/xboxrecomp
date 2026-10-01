@@ -1194,6 +1194,13 @@ float xbox_D3D8ClaimHorPlus(void);
  * widescreen, nothing. */
 void xbox_D3D8SetWideFrames(BOOL wide);
 
+/* The window now fills its screen (borderless fullscreen), or no longer
+ * does. While it does, and the vrr setting allows (RECOMP_VRR, on by
+ * default), frames are presented for a variable-refresh display
+ * (rhi_swapchain_set_vrr). Called by whoever owns the window, from any
+ * thread; the swap chain follows at the next present. */
+void xbox_D3D8SetFullscreen(BOOL on);
+
 /* Where the title's next screen-space draws belong in widescreen, for a title
  * that knows what it is drawing. A 4:3-only title's 2D is squeezed back to
  * 4:3 so the 16:9 stretch leaves it in proportion; the renderer can only
