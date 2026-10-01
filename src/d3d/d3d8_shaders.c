@@ -1096,8 +1096,14 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     } else {
         ff_vs_prepare_draw(handle);
         /* The fixed-function equivalent: pre-transformed vertices arrive
-         * already in screen pixels. */
-        d3d8_SetTwoDSqueeze(d3d8_fvf_transformed(d3d8_GetCurrentFVF()));
+         * already in screen pixels. Judged by the handle, which is the FVF
+         * here, the same one ff_vs_prepare_draw just laid the vertices out
+         * by. d3d8_GetCurrentFVF() is the bound vertex buffer's, and a
+         * DrawPrimitiveUP binds none: it answered 0 for every user-pointer
+         * draw, so OutRun 2's HUD (XYZRHW, 0x144, all UP) was never a
+         * screen-space draw to this test and was left unsqueezed in
+         * widescreen -- a third wider on screen while the race was right. */
+        d3d8_SetTwoDSqueeze(d3d8_fvf_transformed(handle));
     }
 
     /* Pixel state is independent of whether the vertex shader is programmable.
