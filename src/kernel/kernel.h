@@ -510,6 +510,17 @@ extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 
 /* Initialize the thunk table - must be called before game code runs */
 void xbox_kernel_init(void);
+
+/* The file name of the XBE this process runs ("default.xbe" unless the
+ * title's main.c says otherwise, before xbox_kernel_init): XeImageFileName
+ * and the launch log read it. launch_chain.c. */
+void xbox_SetImageFileName(const char *name);
+const char *xbox_ImageFileName(void);
+
+/* Follow an XLaunchNewImage into the recompiled executable mapped to the
+ * image the launch data page names, wait for it, and return its exit code;
+ * -1 when there is nothing to follow. launch_chain.c. */
+int xbox_LaunchChain(uint32_t page_va);
 void xbox_kernel_shutdown(void);
 
 /* Resolve a kernel ordinal to a function/data pointer */

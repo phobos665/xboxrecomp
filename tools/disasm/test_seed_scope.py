@@ -74,7 +74,9 @@ class SeedFilesAreKeyedToATitle(unittest.TestCase):
         found = 0
         for f in seeds.glob("*.json"):
             found += 1
-            self.assertRegex(f.stem, r"^[0-9A-F]{8}$",
+            # <TITLEID>.json, or <TITLEID>-<XBE stem>.json for a second XBE
+            # of the same title (Nightfire's Driving.xbe): README.md.
+            self.assertRegex(f.stem, r"^[0-9A-F]{8}(-[A-Za-z0-9_]+)?$",
                              "%s is not named for a title ID" % f.name)
             entries = json.loads(f.read_text(encoding="utf-8"))
             self.assertIsInstance(entries, list)

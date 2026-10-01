@@ -140,14 +140,19 @@ def main(argv=None):
     # what keeps them apart, so default to the right one and say so when an
     # explicit path disagrees.
     title = _xbe_title_id(args.xbe)
+    # A second XBE of the same title (Nightfire's Driving.xbe) shares the
+    # title ID but not the bytes, so its seeds go to <TITLEID>-<stem>.json,
+    # which scripts/recompile.py loads for that XBE and no other.
+    stem = Path(args.xbe).stem
+    seed_name = (title or "") + ("" if stem.lower() == "default" else "-" + stem)
     if args.seeds is None:
         if not title:
             print("error: cannot read a title ID from %s; pass --seeds"
                   % args.xbe, file=sys.stderr)
             return 2
-        args.seeds = (REPO / "config" / "seeds" / (title + ".json"))
+        args.seeds = (REPO / "config" / "seeds" / (seed_name + ".json"))
         print("seeds: %s (title %s)" % (args.seeds.name, title))
-    elif title and args.seeds.stem.upper() != title:
+    elif title and args.seeds.stem.upper() != seed_name.upper():
         print("warning: %s is not named for title %s; a seed written to the "
               "wrong title's file is applied to that title instead"
               % (args.seeds.name, title), file=sys.stderr)
