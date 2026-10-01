@@ -789,9 +789,53 @@ static void park_enter(void)
     }
 }
 
+/* RECOMP_GUEST_ONE_CPU: every guest thread on one host core, as on the Xbox.
+ *
+ * Guest code is written for a single CPU. It finishes a job and publishes
+ * the semaphore for it in two steps, or checks a count and then sleeps on
+ * it, trusting that nothing runs in between unless it blocks or its quantum
+ * ends. Run on several host cores at once, other guest threads land in those
+ * gaps all the time: Outrun 2 hung on its AM2 logo in 4 of 4 runs, a task
+ * finishing between "is it still running?" and "here is your semaphore".
+ * Host threads (the renderer, audio, the window) are left free.
+ *
+ * 1 picks the highest core this process may run on; a number above 1 is
+ * taken as a core index + 1 (2 = core 1, ...). Off when unset or 0. */
+static DWORD_PTR guest_cpu_mask(void)
+{
+    static DWORD_PTR mask = (DWORD_PTR)-1;
+    if (mask == (DWORD_PTR)-1) {
+        const char *v = getenv("RECOMP_GUEST_ONE_CPU");
+        long n = v ? strtol(v, NULL, 0) : 0;
+        DWORD_PTR proc = 0, sys = 0;
+        mask = 0;
+        if (n > 0 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && proc) {
+            if (n == 1) {
+                /* the highest core the process is allowed */
+                for (mask = (DWORD_PTR)1 << (sizeof mask * 8 - 1); !(mask & proc); mask >>= 1)
+                    ;
+            } else {
+                mask = ((DWORD_PTR)1 << (n - 2)) & proc;
+            }
+            fprintf(stderr, "[THREAD] guest threads on one host core (mask 0x%llX, "
+                    "RECOMP_GUEST_ONE_CPU)\n", (unsigned long long)mask);
+        }
+    }
+    return mask;
+}
+
 void xbox_GuestLiftedEnter(void)
 {
     LONG n;
+    {
+        static RECOMP_TLS int pinned;
+        if (!pinned) {
+            DWORD_PTR m = guest_cpu_mask();
+            pinned = 1;
+            if (m)
+                SetThreadAffinityMask(GetCurrentThread(), m);
+        }
+    }
     park_enter();
     if (!xbox_GuestConcurrencyOn())
         return;

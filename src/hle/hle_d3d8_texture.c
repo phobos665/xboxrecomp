@@ -154,6 +154,24 @@ static int read_layout(uint32_t va, texture_layout *t)
         return 0;
     }
     if ((format & FORMAT_CUBEMAP) || ((format >> 4) & 0xF) != 2) {
+        /* Say what was refused, once per kind: a skipped bind samples the
+         * 1x1 white placeholder, and in a combiner that adds or multiplies
+         * that stage the draw comes out white with nothing in the log. */
+        static uint32_t seen[16];
+        static int nseen;
+        int k;
+        for (k = 0; k < nseen && seen[k] != format; k++)
+            ;
+        if (k == nseen && nseen < 16) {
+            seen[nseen++] = format;
+            fprintf(stderr, "[HLE-D3D8] texture 0x%08X not mirrored: format word "
+                    "0x%08X (%s, %u dimension(s), format 0x%02X, %u level(s), "
+                    "log2 size %u x %u x %u), Size field 0x%08X; it samples white\n",
+                    va, format, (format & FORMAT_CUBEMAP) ? "cube" : "not cube",
+                    (format >> 4) & 0xF, (format >> 8) & 0xFF, (format >> 16) & 0xF,
+                    (format >> 20) & 0xF, (format >> 24) & 0xF, (format >> 28) & 0xF,
+                    size);
+        }
         g_skip_cube++;
         return 0;
     }

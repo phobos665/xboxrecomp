@@ -736,17 +736,21 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         const char *omp = output_map_prefix(rgb_out->output_map);
         const char *oms = output_map_suffix(rgb_out->output_map);
 
-        /* Write to destination registers */
+        /* Write to destination registers. The NV2A clamps every general
+         * combiner output to [-1, 1] after the scale/bias, as
+         * NV_register_combiners specifies. Leaving it out let a sum meant to
+         * be a 0..1 light factor reach ~2: Outrun 2's road is
+         * (t0 * v0 * 2) * t1 * (c0 + t3), and it came out white. */
         if (rgb_out->ab_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.rgb = %sab_rgb%s;\n",
+            EMIT("        %s.rgb = clamp(%sab_rgb%s, -1.0, 1.0);\n",
                  reg_name(rgb_out->ab_dst), omp, oms);
         }
         if (rgb_out->cd_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.rgb = %scd_rgb%s;\n",
+            EMIT("        %s.rgb = clamp(%scd_rgb%s, -1.0, 1.0);\n",
                  reg_name(rgb_out->cd_dst), omp, oms);
         }
         if (rgb_out->sum_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.rgb = %ssum_rgb%s;\n",
+            EMIT("        %s.rgb = clamp(%ssum_rgb%s, -1.0, 1.0);\n",
                  reg_name(rgb_out->sum_dst), omp, oms);
         }
 
@@ -785,15 +789,15 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         oms = output_map_suffix(alpha_out->output_map);
 
         if (alpha_out->ab_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.a = %sab_a%s;\n",
+            EMIT("        %s.a = clamp(%sab_a%s, -1.0, 1.0);\n",
                  reg_name(alpha_out->ab_dst), omp, oms);
         }
         if (alpha_out->cd_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.a = %scd_a%s;\n",
+            EMIT("        %s.a = clamp(%scd_a%s, -1.0, 1.0);\n",
                  reg_name(alpha_out->cd_dst), omp, oms);
         }
         if (alpha_out->sum_dst != NV2A_REG_ZERO) {
-            EMIT("        %s.a = %ssum_a%s;\n",
+            EMIT("        %s.a = clamp(%ssum_a%s, -1.0, 1.0);\n",
                  reg_name(alpha_out->sum_dst), omp, oms);
         }
 
@@ -895,7 +899,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          * (the fog factor), fogon (white where fog is enabled), tc0 (stage 0
          * coordinates, wrapped) and tc0raw (their size, /16). */
         static const char *show = (const char *)-1;
-        static const char *names[] = { "v0", "v1", "t0", "t1", "r0", "r1" };
+        static const char *names[] = { "v0", "v1", "t0", "t1", "t2", "t3", "r0", "r1" };
         size_t n;
 
         if (show == (const char *)-1)
