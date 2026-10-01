@@ -9,6 +9,7 @@ tools/func_id/output/
 tools/recomp/output/
 tools/abi_analysis/output/
 tools/codegen_bench/build/
+tools/codegen_ab/build/
 
 
 #xbox-specific
