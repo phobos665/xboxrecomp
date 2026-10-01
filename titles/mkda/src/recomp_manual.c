@@ -106,6 +106,52 @@ extern RECOMP_MANUAL_TLS uint32_t g_icall_saved_esp;
  * means this title was lifted before the macros published it. */
 extern RECOMP_MANUAL_TLS uint32_t g_icall_dispatch_form;
 
+/* ── The engine's task scheduler, on host fibers (mk_tasks.c) ─ */
+
+/*
+ * Override log, 1 Oct 2026. Every one of these is a hand-written stack switch
+ * ending in `jmp [saved address]` into the middle of a function, which lifted
+ * code cannot express: the jump back to the scheduler at 0x000E0535 was
+ * refused 1,000,000,000 times in a 45-second run and no task ever ran past its
+ * first sleep (docs/technical/mkda-coroutine.md). mk_tasks.c runs each task on
+ * a host fiber instead and keeps the guest-visible state -- the task fields,
+ * the scheduler globals, class A's stack copy -- exactly as the original does.
+ *
+ *   E05D0  class C resume (vtable 0x2702A0 +0x14)
+ *   E0680  class C sleep: falls into class A's resume on hardware; logged
+ *   E0690  class A resume (0x2702C8 +0x14): copies the saved stack back
+ *   E0800  class A sleep (+0x18): copies the stack out to the task
+ *   E08E0  class A/C change function (+0x24): unwinds to the root loop
+ *   E0920  class B resume (0x2702F0 +0x14): its own stack
+ *   E0A50  class B sleep (+0x18)
+ *   E0AC0  class B onto the main stack (+0x1C) -- `jmp [ret]`, not `ret`
+ *   E0AE0  class B back to its own stack (+0x20)
+ *   E0B00  class B change function (+0x24)
+ *   E0550  die, called directly from 84 sites
+ */
+void mk_task_resume_a(void);
+void mk_task_resume_b(void);
+void mk_task_resume_c(void);
+void mk_task_sleep_a(void);
+void mk_task_sleep_b(void);
+void mk_task_sleep_c(void);
+void mk_task_change(void);
+void mk_task_die(void);
+void mk_task_to_big(void);
+void mk_task_from_big(void);
+
+void sub_000E05D0(void) { mk_task_resume_c(); }
+void sub_000E0680(void) { mk_task_sleep_c(); }
+void sub_000E0690(void) { mk_task_resume_a(); }
+void sub_000E0800(void) { mk_task_sleep_a(); }
+void sub_000E08E0(void) { mk_task_change(); }
+void sub_000E0920(void) { mk_task_resume_b(); }
+void sub_000E0A50(void) { mk_task_sleep_b(); }
+void sub_000E0AC0(void) { mk_task_to_big(); }
+void sub_000E0AE0(void) { mk_task_from_big(); }
+void sub_000E0B00(void) { mk_task_change(); }
+void sub_000E0550(void) { mk_task_die(); }
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*

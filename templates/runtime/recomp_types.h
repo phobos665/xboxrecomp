@@ -237,6 +237,11 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+/* A guest longjmp to a buffer armed on another native stack (host fibers):
+ * the handler switches to that stack and jumps there; it does not return. */
+typedef void (*recomp_foreign_longjmp_fn)(jmp_buf *target, int value,
+                                          uintptr_t armed_stack);
+void recomp_set_foreign_longjmp(recomp_foreign_longjmp_fn fn);
 extern RECOMP_TLS uint32_t g_ebp;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
