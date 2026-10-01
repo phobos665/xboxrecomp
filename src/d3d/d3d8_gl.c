@@ -1104,6 +1104,14 @@ float xbox_D3D8ClaimHorPlus(void) { return 1.0f; }
 void xbox_D3D8SetFullscreen(BOOL on) { (void)on; }
 /* Nor widescreen by screen. */
 void xbox_D3D8SetWideFrames(BOOL wide) { (void)wide; }
+/* Nor frame interpolation. */
+BOOL xbox_D3D8InterpBegin(void) { return FALSE; }
+void xbox_D3D8InterpPresent(void) {}
+void xbox_D3D8InterpEnd(void) {}
+void xbox_D3D8SetInterpRegisters(int projection, int affine_first, int affine_count)
+{
+    (void)projection; (void)affine_first; (void)affine_count;
+}
 
 /* No widescreen 2D squeeze on this backend, so nothing to place. */
 void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag)

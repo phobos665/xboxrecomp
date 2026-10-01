@@ -652,6 +652,7 @@ static void shadow_create(uint32_t pp_va)
     g_target_width = width;
     g_target_height = height;
     g_device_depth = host_DeviceDepthSurface(g_shadow);
+    hle_d3d8_interp_init();
     {
         /* Until the title sets one: the whole back buffer. */
         D3DVIEWPORT8 whole = { 0, 0, width, height, 0.0f, 1.0f };
@@ -1324,6 +1325,79 @@ static void shadow_frame_brightness(void)
     fflush(stderr);
 }
 
+/* The back buffer as it is now, to a 24-bit BMP at path. 0 on success. */
+static int dump_back_buffer(const char *path)
+{
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    uint8_t hdr[54];
+    UINT w, h, y, x, pad;
+    uint32_t filesz;
+    FILE *f;
+    int ok = -1;
+
+    if (!g_shadow)
+        return -1;
+    if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
+        return -1;
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        surf->lpVtbl->Release(surf);
+        return -1;
+    }
+    /* R8G8B8A8 (d3d8_device.c), but not necessarily the guest's size: the
+     * host renders the scene larger than the guest asked whenever
+     * supersampling is on, and GetBackBuffer hands back that scene. Taking
+     * the size from the surface keeps the dump whole at any scale --
+     * g_shadow_width here wrote the top-left corner and called it a frame. */
+    {
+        D3DSURFACE_DESC sd;
+
+        if (SUCCEEDED(surf->lpVtbl->GetDesc(surf, &sd)) && sd.Width && sd.Height) {
+            w = sd.Width;
+            h = sd.Height;
+        } else {
+            w = g_shadow_width;
+            h = g_shadow_height;
+        }
+    }
+    pad = (4 - ((w * 3) & 3)) & 3;
+    filesz = 54 + (w * 3 + pad) * h;
+    f = fopen(path, "wb");
+    if (f) {
+        memset(hdr, 0, sizeof hdr);
+        hdr[0] = 'B'; hdr[1] = 'M';
+        memcpy(hdr + 2, &filesz, 4);
+        hdr[10] = 54;
+        hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4);
+        memcpy(hdr + 22, &h, 4);
+        hdr[26] = 1;
+        hdr[28] = 24;
+        fwrite(hdr, 1, sizeof hdr, f);
+        for (y = h; y-- > 0; ) {         /* BMP rows run bottom-up */
+            const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
+            for (x = 0; x < w; x++) {
+                const uint8_t *p = row + x * 4;
+                uint8_t bgr[3] = { p[2], p[1], p[0] };
+                fwrite(bgr, 1, 3, f);
+            }
+            fwrite("\0\0\0", 1, pad, f);
+        }
+        fclose(f);
+        ok = 0;
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+    return ok;
+}
+
+/* For frame interpolation's RECOMP_INTERP_DUMP: an in-between frame, read
+ * while it is the back buffer. */
+int hle_d3d8_dump_back_buffer(const char *path)
+{
+    return dump_back_buffer(path);
+}
+
 static void shadow_dump_frame(void)
 {
     static const char *prefix;
@@ -1332,13 +1406,7 @@ static void shadow_dump_frame(void)
     static char ring[24][512];
     static char asked_prefix[8];
     int asked;
-    IDirect3DSurface8 *surf = NULL;
-    D3DLOCKED_RECT lr;
     char path[512];
-    uint8_t hdr[54];
-    UINT w, h, y, x, pad;
-    uint32_t filesz;
-    FILE *f;
 
     if (!configured) {
         const char *e = getenv("RECOMP_HLE_D3D8_DUMP_EVERY");
@@ -1390,31 +1458,6 @@ static void shadow_dump_frame(void)
         }
     }
 
-    if (FAILED(g_shadow->lpVtbl->GetBackBuffer(g_shadow, 0, 0, &surf)) || !surf)
-        return;
-    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
-        surf->lpVtbl->Release(surf);
-        return;
-    }
-    /* R8G8B8A8 (d3d8_device.c), but not necessarily the guest's size: the
-     * host renders the scene larger than the guest asked whenever
-     * supersampling is on, and GetBackBuffer hands back that scene. Taking
-     * the size from the surface keeps the dump whole at any scale --
-     * g_shadow_width here wrote the top-left corner and called it a frame. */
-    {
-        D3DSURFACE_DESC sd;
-
-        if (SUCCEEDED(surf->lpVtbl->GetDesc(surf, &sd)) && sd.Width && sd.Height) {
-            w = sd.Width;
-            h = sd.Height;
-        } else {
-            w = g_shadow_width;
-            h = g_shadow_height;
-        }
-    }
-    pad = (4 - ((w * 3) & 3)) & 3;
-    filesz = 54 + (w * 3 + pad) * h;
-
     if (!asked && keep_last && written >= 24 - keep_last) {
         char *slot = ring[(written - (24 - keep_last)) % keep_last];
 
@@ -1426,32 +1469,8 @@ static void shadow_dump_frame(void)
     } else {
         snprintf(path, sizeof path, "%s%03d.bmp", prefix, written++);
     }
-    f = fopen(path, "wb");
-    if (f) {
-        memset(hdr, 0, sizeof hdr);
-        hdr[0] = 'B'; hdr[1] = 'M';
-        memcpy(hdr + 2, &filesz, 4);
-        hdr[10] = 54;
-        hdr[14] = 40;
-        memcpy(hdr + 18, &w, 4);
-        memcpy(hdr + 22, &h, 4);
-        hdr[26] = 1;
-        hdr[28] = 24;
-        fwrite(hdr, 1, sizeof hdr, f);
-        for (y = h; y-- > 0; ) {         /* BMP rows run bottom-up */
-            const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch;
-            for (x = 0; x < w; x++) {
-                const uint8_t *p = row + x * 4;
-                uint8_t bgr[3] = { p[2], p[1], p[0] };
-                fwrite(bgr, 1, 3, f);
-            }
-            fwrite("\0\0\0", 1, pad, f);
-        }
-        fclose(f);
+    if (dump_back_buffer(path) == 0)
         fprintf(stderr, "[HLE-D3D8] shadow frame %lu -> %s\n", g_shadow_swaps, path);
-    }
-    surf->lpVtbl->UnlockRect(surf);
-    surf->lpVtbl->Release(surf);
 }
 
 #endif /* _WIN32 */
@@ -1879,12 +1898,26 @@ static void swap_timing_report(void)
  * RECOMP_FPS counts, so the number on screen and the number in the log are
  * the same measurement.
  */
+/* The overlay's line, and whether it is shown: kept here so an in-between
+ * frame (hle_d3d8_interp.c) carries the same line as the frames around it. */
+static int  g_overlay_shown;
+static char g_overlay_line[96];
+
+void hle_d3d8_overlay_redraw(void)
+{
+    if (g_overlay_shown)
+        d3d8_overlay_draw(g_overlay_line);
+}
+
 static void overlay_frame(void)
 {
-    static int configured, enabled, f9_was_down, f10_was_down, f11_was_down;
+    static int configured, f9_was_down, f10_was_down, f11_was_down;
     static LARGE_INTEGER qpf, window_start;
     static unsigned window_frames;
-    static char line[96];
+    static unsigned long window_extra;
+    int enabled = g_overlay_shown;
+    char *line = g_overlay_line;
+    const size_t line_size = sizeof g_overlay_line;
     LARGE_INTEGER now;
     int front, f9, f10, f11;
 
@@ -1895,7 +1928,7 @@ static void overlay_frame(void)
         enabled = v && *v && strcmp(v, "0") != 0;
         QueryPerformanceFrequency(&qpf);
         QueryPerformanceCounter(&window_start);
-        snprintf(line, sizeof line, "-- fps   cap %s", xbox_Nv2aFlipGateModeName());
+        snprintf(line, line_size, "-- fps   cap %s", xbox_Nv2aFlipGateModeName());
         fprintf(stderr, "[HLE-D3D8] F9 shows the frame rate on screen, F10 steps the "
                 "frame cap (now %s)\n", xbox_Nv2aFlipGateModeName());
         fflush(stderr);
@@ -1926,18 +1959,28 @@ static void overlay_frame(void)
     if (!window_start.QuadPart) {
         window_start = now;
         window_frames = 0;
+        window_extra = hle_d3d8_interp_presents();
     }
     window_frames++;
     if (qpf.QuadPart &&
         now.QuadPart - window_start.QuadPart >= qpf.QuadPart / 2) {
         double secs = (double)(now.QuadPart - window_start.QuadPart) / (double)qpf.QuadPart;
+        unsigned long extra = hle_d3d8_interp_presents() - window_extra;
 
-        snprintf(line, sizeof line, "%.1f fps   cap %s",
-                 (double)window_frames / secs, xbox_Nv2aFlipGateModeName());
+        /* With frame interpolation, what reaches the screen as well. */
+        if (extra)
+            snprintf(line, line_size, "%.1f fps (%.1f shown)   cap %s",
+                     (double)window_frames / secs,
+                     (double)(window_frames + extra) / secs, xbox_Nv2aFlipGateModeName());
+        else
+            snprintf(line, line_size, "%.1f fps   cap %s",
+                     (double)window_frames / secs, xbox_Nv2aFlipGateModeName());
         window_start = now;
         window_frames = 0;
+        window_extra = hle_d3d8_interp_presents();
     }
 
+    g_overlay_shown = enabled;
     if (enabled)
         d3d8_overlay_draw(line);
 }
@@ -1948,6 +1991,15 @@ static void overlay_frame(void)
  * the capture boundary, the frame dump, the overlay, the host present and
  * the five-second report. Shared because a title reaches this point
  * through either entry point -- see the Present replacement below. */
+/* A movie went over the last frame on the movie layer, which is not one of
+ * the frame's own draws: frame interpolation stands aside. */
+static int g_movie_drawn;
+
+int hle_d3d8_movie_layer_shown(void)
+{
+    return g_movie_drawn;
+}
+
 static void frame_end_shadow(void)
 {
     if (g_shadow) {
@@ -1988,8 +2040,10 @@ static void frame_end_shadow(void)
         /* A movie on the video overlay (UpdateOverlay, below) is a plane the
          * scan-out puts over the frame buffer; here it is drawn over the
          * finished frame, before the dump so captures show it. */
+        g_movie_drawn = 0;
         if (g_overlay_enabled && g_overlay_updated) {
             d3d8_movie_draw();
+            g_movie_drawn = 1;
         } else if (g_movie_phys &&
                    (!g_movie_sampled || g_movie_yuy2 || movie_layer_forced())) {
             /* A movie is playing and no draw this frame sampled its picture.
@@ -2006,6 +2060,7 @@ static void frame_end_shadow(void)
              * the layer shows its promo exactly (RECOMP_XMV_LAYER=1). The
              * cost is that anything drawn over such a movie is covered. */
             d3d8_movie_draw();
+            g_movie_drawn = 1;
         }
         g_movie_sampled = 0;
         shadow_dump_frame();             /* before Present discards the buffer */
@@ -2027,6 +2082,9 @@ static void frame_end_shadow(void)
             if (b.QuadPart - a.QuadPart > g_swap_present_max)
                 g_swap_present_max = b.QuadPart - a.QuadPart;
         }
+        /* The frame just shown is the one frame interpolation draws toward
+         * next; it starts keeping the one after. */
+        hle_d3d8_interp_frame_end();
         if (!g_shadow_last_report) {
             g_shadow_last_report = now;
         } else if (now - g_shadow_last_report >= 5000) {
@@ -2053,6 +2111,7 @@ static void frame_end_shadow(void)
                         "title's own frame dropped (RECOMP_HLE_D3D8_SKIP_FULLSCREEN)\n",
                         g_skipped_fullscreen);
             swap_timing_report();
+            hle_d3d8_interp_report();
             if (g_slot_reloads)
                 fprintf(stderr, "[HLE-D3D8] shadow vertex programs: %lu loads answered from "
                         "the %d cached host programs\n", g_slot_reloads, g_slot_program_count);
@@ -3697,7 +3756,7 @@ HLE_EXPORT(D3DDevice_CopyRects)
                     r.bottom = (LONG)HLE_MEM32(rects_va + i * 16 + 12);
                     p.x = points_va ? (LONG)HLE_MEM32(points_va + i * 8 + 0) : r.left;
                     p.y = points_va ? (LONG)HLE_MEM32(points_va + i * 8 + 4) : r.top;
-                    if (SUCCEEDED(xbox_D3D8CopyBackBufferRectToTexture(tex, &r, &p)))
+                    if (SUCCEEDED(host_CopyBackBufferRectToTexture(tex, &r, &p)))
                         from_screen++;
                     if (said_rect++ < 4)
                         fprintf(stderr, "[HLE-D3D8] the title copies part of its screen: "
@@ -3719,12 +3778,12 @@ HLE_EXPORT(D3DDevice_CopyRects)
                 r.right = (LONG)dw;
                 r.bottom = (LONG)dh;
                 p.x = p.y = 0;
-                if (SUCCEEDED(xbox_D3D8CopyBackBufferRectToTexture(tex, &r, &p)))
+                if (SUCCEEDED(host_CopyBackBufferRectToTexture(tex, &r, &p)))
                     from_screen++;
                 if (said_rect++ < 4)
                     fprintf(stderr, "[HLE-D3D8] the title copies the top left %ux%u of its "
                             "screen into texture 0x%08X\n", dw, dh, dst_parent);
-            } else if (tex && SUCCEEDED(xbox_D3D8CopyBackBufferToTexture(tex))) {
+            } else if (tex && SUCCEEDED(host_CopyBackBufferToTexture(tex))) {
                 from_screen++;
                 if (from_screen == 1)
                     fprintf(stderr, "[HLE-D3D8] the title reads its own screen back: "

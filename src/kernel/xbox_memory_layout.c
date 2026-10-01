@@ -1005,6 +1005,68 @@ void xbox_Nv2aFlipGateCycle(void)
     fflush(stderr);
 }
 
+/* The gate's wait, lent out (xbox_Nv2aFlipGateSetIdle). The time of the
+ * last vblank and the period are what the hook is told the release will be:
+ * the next vblank is the last one plus a period. */
+static xbox_FlipGateIdleFn g_flip_gate_idle;
+static volatile LONGLONG   g_flip_gate_last_vblank;
+static LONGLONG            g_flip_gate_period, g_flip_gate_qpf;
+
+void xbox_Nv2aFlipGateSetIdle(xbox_FlipGateIdleFn fn)
+{
+    g_flip_gate_idle = fn;
+}
+
+/* Lend the wait to the hook until it wants nothing more or the vblank comes.
+ * TRUE if the vblank came (the gate is released). */
+static BOOL flip_gate_lend(void)
+{
+    static HANDLE timer;
+    HANDLE both[2];
+
+    if (!g_flip_gate_period)
+        return FALSE;
+    if (!timer) {
+        /* High resolution: a slot a few milliseconds away has to be met to
+         * well under a millisecond, which the default timer cannot do. */
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+        if (!timer)
+            timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+        if (!timer)
+            return FALSE;
+    }
+    both[0] = g_flip_gate_event;
+    both[1] = timer;
+    for (;;) {
+        LARGE_INTEGER now, due;
+        LONGLONG want;
+        DWORD r;
+
+        if (WaitForSingleObject(g_flip_gate_event, 0) == WAIT_OBJECT_0)
+            return TRUE;
+        QueryPerformanceCounter(&now);
+        want = g_flip_gate_idle(now.QuadPart, g_flip_gate_last_vblank + g_flip_gate_period);
+        if (want <= 0)
+            return FALSE;
+        QueryPerformanceCounter(&now);
+        if (want <= now.QuadPart)
+            continue;
+        /* Relative, in 100 ns units. */
+        due.QuadPart = -(LONGLONG)((double)(want - now.QuadPart) * 1e7 /
+                                   (double)g_flip_gate_qpf);
+        if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+            return FALSE;
+        r = WaitForMultipleObjects(2, both, FALSE, 250);
+        if (r == WAIT_OBJECT_0) {
+            CancelWaitableTimer(timer);
+            return TRUE;
+        }
+        if (r != WAIT_OBJECT_0 + 1)
+            return FALSE;                               /* the plain wait reports it */
+    }
+}
+
 void xbox_Nv2aFlipGateArm(void)
 {
     static int said;
@@ -1017,6 +1079,10 @@ void xbox_Nv2aFlipGateArm(void)
         return;
     if (g_flip_gate_strict)
         ResetEvent(g_flip_gate_event);                  /* the next vblank, not a past one */
+    /* Only while one Swap a vblank is the cadence: the release is then
+     * always the next vblank, which is what the hook is told. */
+    if (g_flip_gate_idle && flip_gate_divisor() == 1 && flip_gate_lend())
+        return;
     if (WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
         fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "
                         "the title is not being paced\n");
@@ -1028,7 +1094,19 @@ void xbox_Nv2aFlipGateRelease(void)
 {
     LONG n = InterlockedIncrement(&g_flip_gate_vblanks);
     int d = flip_gate_divisor();
+    LARGE_INTEGER now;
 
+    QueryPerformanceCounter(&now);
+    if (!g_flip_gate_qpf) {
+        LARGE_INTEGER f;
+        const char *hz = getenv("RECOMP_VBLANK_HZ");
+        double rate = hz && atof(hz) >= 1.0 ? atof(hz) : 60.0;
+
+        QueryPerformanceFrequency(&f);
+        g_flip_gate_period = (LONGLONG)((double)f.QuadPart / rate);
+        g_flip_gate_qpf = f.QuadPart;
+    }
+    g_flip_gate_last_vblank = now.QuadPart;
     if (!g_flip_gate_event)
         g_flip_gate_event = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset */
     if (g_flip_gate_event && (d <= 1 || n % d == 0))
