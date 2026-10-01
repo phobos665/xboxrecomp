@@ -29,7 +29,7 @@ WINDOW = re.compile(
 SHADOW = re.compile(r"^\[HLE-D3D8\] shadow: (\d+) swaps,", re.M)
 
 
-def summarise(err: Path, keep_first: bool) -> dict:
+def summarise(err: Path, keep_first: bool, after: float = None) -> dict:
     text = err.read_text(encoding="utf-8", errors="replace")
     rows = WINDOW.findall(text)
     meta = err.with_suffix(".meta")
@@ -40,6 +40,24 @@ def summarise(err: Path, keep_first: bool) -> dict:
             switches = m.group(1)
 
     out = {"run": err.stem, "switches": switches, "windows": 0}
+    if rows and after is not None:
+        # Only the windows that end after `after` seconds -- the part of a
+        # scripted run that is in the level, past the menus. Windows are equal
+        # in length, so the mean of their rates is total swaps over total time.
+        rows = [r for r in rows if float(r[0]) > after]
+        if not rows:
+            return out
+        fps = [float(r[1]) for r in rows]
+        out.update({
+            "windows": len(rows),
+            "mean_fps": sum(fps) / len(fps),
+            "median_fps": statistics.median(fps),
+            "best_fps": max(fps),
+            "worst_fps": min(fps),
+            "vblank_hz": statistics.median(float(r[3]) for r in rows),
+            "seconds": float(rows[-1][0]) - float(rows[0][0]),
+        })
+        return out
     if rows:
         if not keep_first and len(rows) > 1:
             rows = rows[1:]
@@ -139,6 +157,10 @@ def main() -> int:
                     help="per window, what the title was doing: draws per frame "
                          "from the shadow stats, files opened, and the sampler's "
                          "split of the guest thread when RECOMP_SAMPLE was on")
+    ap.add_argument("--after", type=float, default=None, metavar="SECONDS",
+                    help="only the windows ending after this many seconds, e.g. "
+                         "the in-level part of a scripted run; the mean is then "
+                         "over those windows alone")
     args = ap.parse_args()
 
     if args.phases:
@@ -153,7 +175,7 @@ def main() -> int:
         if not err.is_file():
             print(f"{err.stem:<28} missing", file=sys.stderr)
             continue
-        s = summarise(err, args.keep_first)
+        s = summarise(err, args.keep_first, args.after)
         if not s["windows"]:
             print(f"{s['run']:<28} no [FPS] windows (run without RECOMP_FPS?)")
             continue

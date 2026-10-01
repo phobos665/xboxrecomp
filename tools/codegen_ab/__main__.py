@@ -350,7 +350,8 @@ def main(argv=None):
                     help="with --xbe, also run functions the options leave "
                          "unchanged (skipped by default: nothing to compare)")
     ap.add_argument("--workdir", default=os.path.join(HERE, "build"))
-    ap.add_argument("--keep-going", action="store_true")
+    ap.add_argument("--chunk", type=int, default=400,
+                    help="functions per build (default 400)")
     args = ap.parse_args(argv)
     try:
         args.opts = perf_opts.parse(args.opts)
@@ -370,42 +371,56 @@ def main(argv=None):
           file=sys.stderr)
     if not lifts:
         return 0
-    write_build(lifts, args.opts, args.workdir)
-    exe = build(args.cc, args.workdir, args.opt)
-    r = subprocess.run([exe, str(args.states), str(args.timeout), "-1",
-                        image or "", str(args.seed)], capture_output=True, text=True)
-    with open(os.path.join(args.workdir, "runs.txt"), "w") as f:
-        f.write(r.stdout)
-    runs = parse_runs(r.stdout)
+    # Built and run in chunks: a title's few thousand functions in one
+    # translation unit is a compile nobody wants to wait for. Each chunk keeps
+    # its own directory, so the C behind a mismatch is still there afterwards.
+    bad, nan_only, outcomes, total = [], [], {}, 0
+    chunk = max(1, args.chunk)
+    for c0 in range(0, len(lifts), chunk):
+        part = lifts[c0:c0 + chunk]
+        cdir = os.path.join(args.workdir, f"chunk_{c0 // chunk:03d}")
+        os.makedirs(cdir, exist_ok=True)
+        if len(lifts) > chunk:
+            print(f"  chunk {c0 // chunk + 1}/{(len(lifts) + chunk - 1) // chunk}: "
+                  f"{len(part)} functions", file=sys.stderr)
+        write_build(part, args.opts, cdir)
+        exe = build(args.cc, cdir, args.opt)
+        r = subprocess.run([exe, str(args.states), str(args.timeout), "-1",
+                            image or "", str(args.seed)], capture_output=True, text=True)
+        with open(os.path.join(cdir, "runs.txt"), "w") as f:
+            f.write(r.stdout)
+        runs = parse_runs(r.stdout)
+        total += len(runs)
+        if len(runs) != len(part) * args.states:
+            print("runner stopped early; see " + os.path.join(cdir, "runs.txt"))
+            bad.append(("(runner)", -1, ["incomplete", cdir]))
 
-    bad, nan_only, outcomes = [], [], {}
-    dump_cache = {}
-    for (fi, st), (_, _, name, fa, fb, pa, pb) in sorted(runs.items()):
-        key = (fa or {}).get("outcome", "?").split()[0]
-        outcomes[key] = outcomes.get(key, 0) + 1
-        diffs = compare(fa, fb)
-        if diffs is None:
-            outcomes["not compared (A did not return)"] = \
-                outcomes.get("not compared (A did not return)", 0) + 1
-        elif diffs:
-            keys = [d.split()[0] for d in diffs]
-            reg_keys = [k for k in keys if k != "pages"]
-            nan = reg_keys == [] or nan_only_registers(fa, fb, reg_keys)
-            if nan and "pages" in keys:
-                if fi not in dump_cache:
-                    dump_cache[fi] = dumps_for(exe, fi, args.states, args.timeout,
-                                               image, args.seed)
-                da, db = dump_cache[fi].get(st, ({}, {}))
-                nan = nan_only_pages(da, db)
-            if any(d.startswith("pages") for d in diffs) and pa and pb:
-                diffs.append("pages differing: " + " ".join(page_diff(pa, pb)[:8]))
-            (nan_only if nan else bad).append((name, st, diffs))
+        dump_cache = {}
+        for (fi, st), (_, _, name, fa, fb, pa, pb) in sorted(runs.items()):
+            key = (fa or {}).get("outcome", "?").split()[0]
+            outcomes[key] = outcomes.get(key, 0) + 1
+            diffs = compare(fa, fb)
+            if diffs is None:
+                outcomes["not compared (A did not return)"] = \
+                    outcomes.get("not compared (A did not return)", 0) + 1
+            elif diffs:
+                keys = [d.split()[0] for d in diffs]
+                reg_keys = [k for k in keys if k != "pages"]
+                nan = reg_keys == [] or nan_only_registers(fa, fb, reg_keys)
+                if nan and "pages" in keys:
+                    if fi not in dump_cache:
+                        dump_cache[fi] = dumps_for(exe, fi, args.states, args.timeout,
+                                                   image, args.seed)
+                    da, db = dump_cache[fi].get(st, ({}, {}))
+                    nan = nan_only_pages(da, db)
+                if any(d.startswith("pages") for d in diffs) and pa and pb:
+                    diffs.append("pages differing: " + " ".join(page_diff(pa, pb)[:8]))
+                diffs.append(f"C in {cdir}")
+                (nan_only if nan else bad).append((name, st, diffs))
+
     expected = len(lifts) * args.states
-    print(f"{len(runs)} of {expected} runs: " +
+    print(f"{total} of {expected} runs: " +
           ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items())))
-    if len(runs) != expected:
-        print("runner stopped early; see " + os.path.join(args.workdir, "runs.txt"))
-        bad.append(("(runner)", -1, ["incomplete"]))
     for name, st, diffs in nan_only[:10]:
         print(f"NaN payload only (not a failure) {name} state {st}: "
               + "; ".join(diffs))
@@ -415,8 +430,8 @@ def main(argv=None):
     for name, st, diffs in bad[:40]:
         print(f"MISMATCH {name} state {st}: " + "; ".join(diffs))
     if bad:
-        print(f"\n{len(bad)} mismatching runs. Both builds' C: "
-              f"{args.workdir}/ab_a.c, ab_b.c")
+        print(f"\n{len(bad)} mismatching runs. Each names the directory "
+              f"holding both builds' C (ab_a.c, ab_b.c).")
         return 1
     print("A and B agree on every run.")
     return 0
