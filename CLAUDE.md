@@ -130,6 +130,14 @@ because the kernel puts the video flags in the low half-word and XAPI reads the 
 Xbox widescreen is anamorphic, so a title that has a 16:9 mode needs no stretching anywhere
 while a title that has none (TimeSplitters 2) cannot be given one natively.
 
+**Frame interpolation (Oct 2026):** `RECOMP_FRAME_INTERP=2` (launcher row "Frame
+interpolation") shows twice the frames while the title still runs at 60. The newest frame's
+host calls are kept and drawn again in the flip gate's wait with their matrix constants
+blended toward the frame before (`src/hle/hle_d3d8_interp.c`). A title says which registers
+hold its projection and affine matrices with `xbox_D3D8SetInterpRegisters`; without that only
+the projection blends. The `[INTERP]` five-second line says what was shown and why a frame was
+held. See `docs/technical/frame-interpolation.md`.
+
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
 `%APPDATA%\xboxrecomp\input_bindings.json`, else one beside the executable — and falls

@@ -32,7 +32,7 @@
 #endif
 
 #define WINDOW_W 900
-#define WINDOW_H 800                    /* eight Video rows, their help, the footer */
+#define WINDOW_H 862                    /* nine Video rows, their help, the footer */
 
 /* The client area as it really is. On a display at 125% these are not
  * WINDOW_W/H: asking Windows not to scale us and then laying out
@@ -152,6 +152,12 @@ static void build_rows(void)
     r->kind  = ROW_BOOL; r->ival = &g_settings.vrr;
     r++;
 
+    r->label = "Frame interpolation";
+    r->help  = "Draw frames between the game's own: smoother motion while the game"
+               " still runs at 60. Best with Variable refresh rate.";
+    r->kind  = ROW_INT; r->lo = 1; r->hi = 4; r->ival = &g_settings.frame_interp;
+    r++;
+
     g_video_count = (int)(r - g_video_rows);
 }
 
@@ -167,6 +173,8 @@ static void row_value(const Row *r, char *out, size_t n)
                      *r->ival, 640 * *r->ival, 480 * *r->ival);
         else if (*r->ival == 1)
             snprintf(out, n, "Off");
+        else if (r->ival == &g_settings.frame_interp)
+            snprintf(out, n, "%dx (%d frames a second)", *r->ival, 60 * *r->ival);
         else
             snprintf(out, n, "%dx", *r->ival);
         break;

@@ -85,6 +85,56 @@ void hle_d3d8_defer_op(void (*fn)(const void *arg), const void *arg, size_t size
 /* Run everything queued, in order. Safe to call when nothing is. */
 void hle_d3d8_defer_flush(void);
 
+/* --------------------------------------------------- frame interpolation
+ *
+ * RECOMP_FRAME_INTERP=<n> (or `frame_interp = n`): hle_d3d8_interp.c draws
+ * n-1 frames between each two the title draws, by drawing the newest one
+ * again with its transforms blended toward the one before. The wrappers
+ * below feed it: while hle_d3d8_interp_rec is set, each call that changes
+ * state or draws is also kept as an op (the deferred queue's format), and
+ * a draw is kept with what identifies it from one frame to the next. */
+extern int hle_d3d8_interp_rec;
+
+typedef struct {
+    uint64_t content;     /* hash of the index and vertex bytes */
+    DWORD    vs;          /* program handle or FVF */
+    UINT     stride, prims;
+    DWORD    prim_type, index_format;
+    const void *tex[4];   /* bound textures, as keys only */
+    const void *target;   /* render target texture, NULL for the back buffer */
+    int      uses_proj;   /* drawn through the projection: 3D */
+} HleInterpDrawKey;
+
+void hle_d3d8_interp_op(void (*fn)(const void *arg), const void *arg, size_t size);
+void hle_d3d8_interp_draw(void (*fn)(const void *arg), const void *arg, size_t size,
+                          const HleInterpDrawKey *key);
+/* Run fn(arg) once the frame being kept is no longer needed: a release or a
+ * delete the kept ops may still name. */
+void hle_d3d8_interp_retire(void (*fn)(const void *arg), const void *arg, size_t size);
+/* Keep, as ops, everything the next frame draws with that was set before it
+ * (the frame-start state), and the vertex constants as the title gave them
+ * (before Hor+ scaled any). */
+void hle_d3d8_interp_snapshot(void);
+const float *hle_d3d8_interp_constants(void);   /* NV2A_VS_MAX_CONSTANTS float4s */
+/* hle_d3d8.c: the F9 overlay over an in-between frame too; and whether a
+ * movie went over the last frame on the movie layer. */
+void hle_d3d8_overlay_redraw(void);
+int  hle_d3d8_movie_layer_shown(void);
+/* hle_d3d8.c: the back buffer now, to a BMP (RECOMP_INTERP_DUMP). */
+int  hle_d3d8_dump_back_buffer(const char *path);
+/* Called by hle_d3d8.c: once the device exists, and after each frame is
+ * presented. */
+void hle_d3d8_interp_init(void);
+void hle_d3d8_interp_frame_end(void);
+/* The five-second report's line, and in-between frames shown so far. */
+void hle_d3d8_interp_report(void);
+unsigned long hle_d3d8_interp_presents(void);
+
+/* Screen copies, wrapped so frame interpolation draws them again. */
+HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst);
+HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
+                                         const POINT *at);
+
 /* ----------------------------------------------------------- device calls */
 
 HRESULT host_Clear(IDirect3DDevice8 *dev, DWORD count, const D3DRECT *rects,
