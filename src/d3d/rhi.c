@@ -79,6 +79,7 @@ int      rhi_swapchain_readback(void *dst, uint32_t pitch, uint32_t *w, uint32_t
 {
     return g_rhi ? g_rhi->swapchain_readback(dst, pitch, w, h) : -1;
 }
+void     rhi_swapchain_set_vrr(int on)                 { if (g_rhi) g_rhi->swapchain_set_vrr(on); }
 
 RhiBuffer *rhi_buffer_create(const RhiBufferDesc *d, const void *init) { return g_rhi->buffer_create(d, init); }
 void  rhi_buffer_destroy(RhiBuffer *b)                  { if (b) g_rhi->buffer_destroy(b); }

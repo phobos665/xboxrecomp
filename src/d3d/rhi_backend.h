@@ -22,6 +22,7 @@ typedef struct RhiBackend {
     int      (*swapchain_resize)(uint32_t, uint32_t);
     int32_t  (*present)(uint32_t);
     int      (*swapchain_readback)(void *, uint32_t, uint32_t *, uint32_t *);
+    void     (*swapchain_set_vrr)(int);
 
     RhiBuffer *(*buffer_create)(const RhiBufferDesc *, const void *);
     void  (*buffer_destroy)(RhiBuffer *);

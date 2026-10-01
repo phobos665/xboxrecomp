@@ -238,9 +238,30 @@ static int shadow_requested(void)
 /* kernel_bridge.c: the flushes a title's own exit does, then ExitProcess. */
 extern void xbox_HostExit(const char *why);
 
+static void shadow_set_fullscreen(HWND hwnd, int on);
+static int  g_shadow_fullscreen;
+
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_SYSKEYDOWN:
+        /* Alt+Enter, the usual Windows key for it: fullscreen and back. */
+        if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {
+            shadow_set_fullscreen(hwnd, !g_shadow_fullscreen);
+            return 0;
+        }
+        break;
+    case WM_SYSCHAR:
+        if (wp == '\r')
+            return 0;                   /* no beep for Alt+Enter */
+        break;
+    case WM_SETCURSOR:
+        /* The game has no pointer; over a fullscreen picture it is in the way. */
+        if (g_shadow_fullscreen && LOWORD(lp) == HTCLIENT) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
     case WM_CLOSE:
         /* This window is the game's display now, so closing it is the user
          * quitting. (It used to hide, from when it sat beside the title's
@@ -258,6 +279,56 @@ static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+/* Borderless fullscreen: the window, without its frame, covering the monitor
+ * it is on. Not an exclusive mode -- nothing changes the display -- but a
+ * window that covers its screen is one the driver can flip straight to,
+ * which is what lets a variable-refresh display follow the game (the
+ * renderer is told, xbox_D3D8SetFullscreen). Alt+Enter switches; the
+ * fullscreen setting (RECOMP_FULLSCREEN) starts in it. Runs on the window's
+ * own thread. */
+static WINDOWPLACEMENT g_shadow_restore;
+
+static void shadow_set_fullscreen(HWND hwnd, int on)
+{
+    on = on ? 1 : 0;
+    if (on == g_shadow_fullscreen)
+        return;
+    if (on) {
+        MONITORINFOEXA mi;
+        DEVMODEA dm;
+        int w, h;
+
+        memset(&mi, 0, sizeof mi);
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                             (MONITORINFO *)&mi))
+            return;
+        g_shadow_restore.length = sizeof g_shadow_restore;
+        GetWindowPlacement(hwnd, &g_shadow_restore);
+        w = mi.rcMonitor.right - mi.rcMonitor.left;
+        h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        SetWindowLongA(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, w, h,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        memset(&dm, 0, sizeof dm);
+        dm.dmSize = sizeof dm;
+        if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+            fprintf(stderr, "[HLE-D3D8] fullscreen: %dx%d at %lu Hz (Alt+Enter for a window)\n",
+                    w, h, (unsigned long)dm.dmDisplayFrequency);
+        else
+            fprintf(stderr, "[HLE-D3D8] fullscreen: %dx%d (Alt+Enter for a window)\n", w, h);
+    } else {
+        SetWindowLongA(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(hwnd, &g_shadow_restore);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        fprintf(stderr, "[HLE-D3D8] windowed\n");
+    }
+    fflush(stderr);
+    g_shadow_fullscreen = on;
+    xbox_D3D8SetFullscreen(on ? TRUE : FALSE);
 }
 
 typedef struct {
@@ -305,6 +376,10 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
                          SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
         } else {
             ShowWindow(req->hwnd, SW_SHOW);
+            /* Not for a background run: covering the screen is the opposite
+             * of staying out of the way. */
+            if (recomp_config_bool("RECOMP_FULLSCREEN", "fullscreen", 0))
+                shadow_set_fullscreen(req->hwnd, 1);
         }
     }
 

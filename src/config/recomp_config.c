@@ -182,6 +182,8 @@ void recomp_settings_defaults(RecompSettings *s)
     snprintf(s->widescreen_2d, sizeof s->widescreen_2d, "auto");
     s->anisotropy        = 1;
     s->fps_overlay       = 0;
+    s->fullscreen        = 0;
+    s->vrr               = 1;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
 }
 
@@ -228,6 +230,10 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             snprintf(s->frame_cap, sizeof s->frame_cap, "%s", v);
         if ((v = from_table("fps_overlay")) != NULL)
             s->fps_overlay = !off_word(v);
+        if ((v = from_table("fullscreen")) != NULL)
+            s->fullscreen = !off_word(v);
+        if ((v = from_table("vrr")) != NULL)
+            s->vrr = !off_word(v);
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
     }
@@ -322,11 +328,22 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# while playing either way.                      [RECOMP_FPS_OVERLAY]\n"
         "fps_overlay = %d\n"
         "\n"
+        "# Fill the screen the window is on, without borders. Alt+Enter\n"
+        "# switches while playing either way.             [RECOMP_FULLSCREEN]\n"
+        "fullscreen = %d\n"
+        "\n"
+        "# Variable refresh rate (G-SYNC, FreeSync): in fullscreen, hand each\n"
+        "# frame to the display the moment it is ready, so a 60 fps game is\n"
+        "# shown at an even 60 on a 144 Hz screen. The display and its driver\n"
+        "# must have it switched on. 0 turns it off.             [RECOMP_VRR]\n"
+        "vrr = %d\n"
+        "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
         s->widescreen_2d[0] ? s->widescreen_2d : "auto",
-        s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay);
+        s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay,
+        s->fullscreen, s->vrr);
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);

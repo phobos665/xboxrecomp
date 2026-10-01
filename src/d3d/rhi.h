@@ -333,6 +333,14 @@ int32_t     rhi_present(uint32_t interval);
  * output through this. */
 int         rhi_swapchain_readback(void *dst, uint32_t dst_pitch,
                                    uint32_t *width, uint32_t *height);
+/* Present for a variable-refresh display, or stop. On: each present goes to
+ * the display as soon as it is made (no waiting for a vblank, nothing held
+ * back for the next one), so the display can refresh when a frame arrives;
+ * only right while the window owns its screen. Off: the default, where a
+ * windowed swap chain is paced by the compositor. Neither blocks (rhi_present
+ * with interval 0). Takes effect at the next present; call it from the
+ * thread that presents. */
+void        rhi_swapchain_set_vrr(int on);
 
 /* Buffers */
 RhiBuffer *rhi_buffer_create(const RhiBufferDesc *desc, const void *initial);

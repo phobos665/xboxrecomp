@@ -17,6 +17,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_display.h"
+#include "recomp_config.h"   /* RECOMP_VRR */
 #include <stdio.h>
 #include <string.h>
 /* malloc: without <stdlib.h> its pointer is truncated to int. */
@@ -253,10 +254,40 @@ static void present_scene(void);
 /* Every way a frame reaches the screen comes through here: put the scene
  * on it, at the shape d3d8_display_wide_now gives for this frame, then
  * note the frame done. */
+static void follow_vrr(void);
+
 static void present_resolve(void)
 {
+    follow_vrr();
     present_scene();
     d3d8_display_frame_done();
+}
+
+/* xbox_D3D8SetFullscreen: set by the window's thread, acted on here, on the
+ * thread that presents, because the swap chain is not the window thread's
+ * to change. */
+static volatile LONG g_fullscreen;
+
+void xbox_D3D8SetFullscreen(BOOL on)
+{
+    InterlockedExchange(&g_fullscreen, on ? 1 : 0);
+}
+
+/* Variable refresh only while the window owns its screen: windowed, the
+ * compositor shows frames at the display's fixed rate whatever the swap
+ * chain does, and presenting without waiting would only tear. */
+static void follow_vrr(void)
+{
+    static int setting = -1, applied = -1;
+    int want;
+
+    if (setting < 0)
+        setting = recomp_config_bool("RECOMP_VRR", "vrr", 1);
+    want = setting && InterlockedCompareExchange(&g_fullscreen, 0, 0);
+    if (want != applied) {
+        applied = want;
+        rhi_swapchain_set_vrr(want);
+    }
 }
 
 /* Set while drawing something positioned in screen coordinates the title

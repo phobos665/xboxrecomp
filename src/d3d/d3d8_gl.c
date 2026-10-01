@@ -1100,6 +1100,8 @@ void xbox_D3D8ScreenCopyShutdown(void) {}
 
 /* No Hor+ on this backend, so nothing for a title to widen. */
 float xbox_D3D8ClaimHorPlus(void) { return 1.0f; }
+/* SDL owns this backend's window and its fullscreen; nothing to follow. */
+void xbox_D3D8SetFullscreen(BOOL on) { (void)on; }
 /* Nor widescreen by screen. */
 void xbox_D3D8SetWideFrames(BOOL wide) { (void)wide; }
 

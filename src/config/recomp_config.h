@@ -71,6 +71,8 @@ typedef struct RecompSettings {
     int  anisotropy;            /* 1..16 */
     char frame_cap[16];         /* "adaptive", "60", "30", "0" */
     int  fps_overlay;           /* 0 or 1 */
+    int  fullscreen;            /* 0 or 1: borderless, on the window's monitor */
+    int  vrr;                   /* 0 or 1: present for variable refresh when fullscreen */
     char game_dir[512];         /* empty means beside the executable */
 } RecompSettings;
 
