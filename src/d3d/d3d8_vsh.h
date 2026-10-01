@@ -246,6 +246,9 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle);
  * the projection's first column. False means it draws in screen
  * coordinates of its own -- the HUD, a menu, a full-screen quad. */
 int  d3d8_vsh_bound_uses_projection(void);
+/* ... and whether that projection, as uploaded right now, is orthographic:
+ * a constant w row. A HUD drawn through the 3D programs looks like this. */
+int  d3d8_vsh_bound_projection_is_ortho(void);
 
 /* The input register the bound program copies oPos from, or -1; and where
  * a register sits in the vertex, per that program's own declaration.
