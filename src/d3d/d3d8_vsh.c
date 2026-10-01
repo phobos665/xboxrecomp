@@ -20,6 +20,7 @@
 
 #include "d3d8_internal.h"
 #include <float.h>
+#include <math.h>
 #include "d3d8_vsh.h"
 #include "recomp_config.h"
 #include <string.h>
@@ -100,6 +101,29 @@ static int g_emit_uses_proj;
 static int g_bound_uses_proj;
 
 int d3d8_vsh_bound_uses_projection(void) { return g_bound_uses_proj; }
+
+/* Whether the projection the bound program reads is orthographic right now.
+ *
+ * Reading the projection register says a program transforms through a
+ * matrix; it does not say which. OutRun 2 draws its HUD through the same
+ * programs as its road, with an orthographic matrix in the same registers
+ * (c[160..163]), so the register alone put the HUD among the 3D draws and
+ * left it stretched in widescreen. The matrix tells them apart: a
+ * perspective projection derives w from z, an orthographic one has a
+ * constant w row, (0, 0, 0, 1) in the register that produces oPos.w
+ * (column 3, i.e. reg + 3 of the transposed matrix the program dp4s by).
+ * Checked against the constants as currently uploaded, per draw. */
+int d3d8_vsh_bound_projection_is_ortho(void)
+{
+    const float *w;
+    int reg = d3d8_vsh_hor_plus_reg() + 3;
+
+    if (!g_bound_uses_proj || reg >= NV2A_VS_MAX_CONSTANTS)
+        return 0;
+    w = g_vsh_constants.c[reg];
+    return fabsf(w[0]) < 1e-6f && fabsf(w[1]) < 1e-6f && fabsf(w[2]) < 1e-6f
+        && fabsf(w[3] - 1.0f) < 1e-4f;
+}
 
 /* For a program that writes oPos straight from an input register -- the
  * shape every screen-space program has -- the register that input came
