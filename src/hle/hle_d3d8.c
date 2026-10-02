@@ -602,12 +602,25 @@ static void shadow_use_viewport(int whole_target)
  * The host struct holds a pointer-sized HWND, so only the fields the host
  * device needs are copied, one by one. One attempt per process: a title that
  * recreates its device must not leave a window behind for each failure. */
+/* A vertex declaration as the title's own D3DVSD tokens give it: each
+ * register's stream, offset and X_D3DVSDT type, and how many registers it
+ * declares (0: no tokens). Decoded at CreateVertexShader (decl_from_tokens),
+ * because the token buffer, like the microcode, need not outlive the call. */
+typedef struct {
+    int      regs;
+    uint8_t  stream[16];
+    uint16_t offset[16];
+    uint8_t  format[16];
+} shadow_decl_tokens;
+
 /* Vertex shaders the title created before this device existed (further down,
  * with D3DDevice_CreateVertexShader). */
 static void shadow_track_vertex_shader(uint32_t guest, int has_function,
-                                       uint32_t header, const DWORD *code);
+                                       uint32_t header, const DWORD *code,
+                                       const shadow_decl_tokens *tokens);
 static void shadow_keep_early_vertex_shader(uint32_t guest, int has_function,
-                                            uint32_t header, const DWORD *code);
+                                            uint32_t header, const DWORD *code,
+                                            const shadow_decl_tokens *tokens);
 static void shadow_replay_early_vertex_shaders(void);
 
 static void shadow_create(uint32_t pp_va)
@@ -724,6 +737,15 @@ struct shadow_program {
     UINT     packed_size[SHADOW_MAX_PACKED];
     int      other_streams;              /* any register from stream 1..15 */
     UINT     expanded_bytes;
+    /* The declaration as the title's own D3DVSD tokens give it, decoded at
+     * CreateVertexShader. Used instead of the copy the XDK parses into the
+     * shader object when the two disagree: that copy is read at object + 20,
+     * 16 bytes a register, which is its layout from XDK 4627 on but not on
+     * XDK 3925 (Halo), where every "format" read there is another register's
+     * offset and every program's draws were skipped as "no host layout". The
+     * token stream is the same on every XDK. */
+    int      use_tokens;
+    shadow_decl_tokens tok;
 };
 
 /* The first vertex of the buffer draw about to be made, so other streams can
@@ -2328,6 +2350,106 @@ static const RhiFormat FLOATN_FORMAT[5] = {
     RHI_FORMAT_R32G32B32_FLOAT, RHI_FORMAT_R32G32B32A32_FLOAT,
 };
 
+/* Bytes an X_D3DVSDT type occupies in a vertex (count in the high nibble). */
+static UINT vsdt_bytes(uint32_t fmt)
+{
+    UINT count = fmt >> 4;
+
+    switch (fmt & 0xFu) {
+    case 0x0: return 4u;                 /* D3DCOLOR */
+    case 0x1: case 0x5: return count * 2u; /* NORMSHORTn, SHORTn */
+    case 0x2: return fmt == 0x72u ? 12u  /* FLOAT2H: three floats */
+                     : count * 4u;       /* FLOATn; 0x02 is NONE */
+    case 0x4: return count;              /* PBYTEn */
+    case 0x6: return 4u;                 /* NORMPACKED3 */
+    default:  return 0u;
+    }
+}
+
+/* The declaration from the title's D3DVSD token stream: bits 31..29 are the
+ * token type -- 1 STREAM (bit 28 clear: the stream number in the low bits),
+ * 2 STREAMDATA (bit 28 clear: REG, the register in bits 4..0 and the type in
+ * bits 23..16; bit 28 set: SKIP, a count in bits 26..16 of dwords, or of
+ * bytes when bit 27 is set), 3 TESSELLATOR, 4 CONSTMEM (4 * bits 28..25
+ * constant dwords follow), 5 EXT (bits 28..24 dwords follow), 0 NOP, and
+ * 0xFFFFFFFF ends it. Returns the number of registers it declares. */
+static int decl_from_tokens(uint32_t decl, shadow_decl_tokens *t)
+{
+    uint32_t stream = 0, offset = 0, i;
+
+    memset(t, 0, sizeof *t);
+    if (!decl)
+        return 0;
+    for (i = 0; i < 256u; i++) {
+        uint32_t w = HLE_MEM32(decl + 4u * i);
+        uint32_t type = w >> 29;
+
+        if (w == 0xFFFFFFFFu)
+            break;
+        if (type == 1u) {
+            if (!(w & 0x10000000u)) {
+                stream = w & 0xFu;
+                offset = 0;
+            }
+        } else if (type == 2u) {
+            if (w & 0x10000000u) {
+                uint32_t n = (w >> 16) & 0x7FFu;
+                offset += (w & 0x08000000u) ? n : n * 4u;
+            } else {
+                uint32_t reg = w & 0x1Fu, fmt = (w >> 16) & 0xFFu;
+                if (reg < 16u) {
+                    t->stream[reg] = (uint8_t)stream;
+                    t->offset[reg] = (uint16_t)offset;
+                    t->format[reg] = (uint8_t)fmt;
+                    t->regs++;
+                }
+                offset += vsdt_bytes(fmt);
+            }
+        } else if (type == 4u) {
+            i += 4u * ((w >> 25) & 0xFu);
+        } else if (type == 5u) {
+            i += (w >> 24) & 0x1Fu;
+        }
+    }
+    return t->regs;
+}
+
+/* Register i's stream, offset and X_D3DVSDT type: from the tokens when this
+ * program uses them, else from the shader object's parsed copy. */
+static void decl_attr(const struct shadow_program *p, uint32_t object, uint32_t i,
+                      uint32_t *stream, uint32_t *offset, uint32_t *format)
+{
+    if (p->use_tokens) {
+        *stream = p->tok.stream[i];
+        *offset = p->tok.offset[i];
+        *format = p->tok.format[i];
+    } else {
+        uint32_t attr = object + 20u + i * 16u;
+        *stream = HLE_MEM32(attr);
+        *offset = HLE_MEM32(attr + 4u);
+        *format = HLE_MEM32(attr + 8u);
+    }
+}
+
+/* Whether the object's copy says what the tokens say, register by register.
+ * Where it does, nothing changes: the object is read as it always was. */
+static int decl_object_agrees(const struct shadow_program *p, uint32_t object)
+{
+    uint32_t i;
+
+    for (i = 0; i < 16u; i++) {
+        uint32_t attr = object + 20u + i * 16u;
+        uint32_t f = HLE_MEM32(attr + 8u), t = p->tok.format[i];
+
+        if (t <= 0x02u && f <= 0x02u)
+            continue;
+        if (f != t || HLE_MEM32(attr + 4u) != p->tok.offset[i] ||
+            HLE_MEM32(attr) != p->tok.stream[i])
+            return 0;
+    }
+    return 1;
+}
+
 /* The host program's vertex layout, from the same slots: each register at its
  * declared offset in the stream 0 vertex. Registers in a format the host
  * cannot read as it is (xbox_vsdt_expanded) are unpacked to floats per draw:
@@ -2364,18 +2486,18 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     if (!object)
         return;
     for (i = 0; i < 16u; i++) {
-        uint32_t attr = object + 20u + i * 16u;
-        uint32_t format = HLE_MEM32(attr + 8u);
+        uint32_t stream, offset, format;
         RhiFormat dxgi;
         UINT size;
         int floats;
 
+        decl_attr(p, object, i, &stream, &offset, &format);
         if (format <= 0x02u)
             continue;
         if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             packed++;
             shift += (UINT)floats * 4u;
-        } else if ((HLE_MEM32(attr) != 0u || (HLE_MEM32(attr + 4u) & 3u)) &&
+        } else if ((stream != 0u || (offset & 3u)) &&
                    xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
             packed++;
             shift += (size + 3u) & ~3u;
@@ -2386,13 +2508,12 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     packed = 0;
 
     for (i = 0; i < 16u; i++) {
-        uint32_t attr = object + 20u + i * 16u;
-        uint32_t stream = HLE_MEM32(attr), offset = HLE_MEM32(attr + 4u);
-        uint32_t format = HLE_MEM32(attr + 8u);
+        uint32_t stream, offset, format;
         RhiFormat dxgi;
         UINT size;
         int floats;
 
+        decl_attr(p, object, i, &stream, &offset, &format);
         if (format <= 0x02u)
             continue;
         if (stream > 15u || offset > 0xFFFFu) {
@@ -2541,11 +2662,17 @@ HLE_EXPORT(D3DDevice_CreateVertexShader)
         uint32_t guest = HLE_MEM32(handle_va);
         uint32_t header = function ? HLE_MEM32(function) : 0;
         const DWORD *code = function ? (const DWORD *)HLE_PTR(function + 4) : NULL;
+        shadow_decl_tokens tokens;
 
-        if (g_shadow)
-            shadow_track_vertex_shader(guest, function != 0, header, code);
+        /* Only a program's declaration is ever read from its tokens. */
+        if (function)
+            decl_from_tokens(declaration, &tokens);
         else
-            shadow_keep_early_vertex_shader(guest, function != 0, header, code);
+            memset(&tokens, 0, sizeof tokens);
+        if (g_shadow)
+            shadow_track_vertex_shader(guest, function != 0, header, code, &tokens);
+        else
+            shadow_keep_early_vertex_shader(guest, function != 0, header, code, &tokens);
     }
 #endif
 }
@@ -2566,11 +2693,13 @@ static struct {
     int      has_function;
     uint32_t header;
     DWORD    code[136 * 4];
+    shadow_decl_tokens tokens;
 } g_early_vs[SHADOW_EARLY_SHADERS];
 static int g_early_vs_count;
 
 static void shadow_keep_early_vertex_shader(uint32_t guest, int has_function,
-                                            uint32_t header, const DWORD *code)
+                                            uint32_t header, const DWORD *code,
+                                            const shadow_decl_tokens *tokens)
 {
     uint32_t n = header >> 16;
 
@@ -2583,6 +2712,7 @@ static void shadow_keep_early_vertex_shader(uint32_t guest, int has_function,
     g_early_vs[g_early_vs_count].guest = guest;
     g_early_vs[g_early_vs_count].has_function = has_function;
     g_early_vs[g_early_vs_count].header = header;
+    g_early_vs[g_early_vs_count].tokens = *tokens;
     if (has_function && n <= 136)
         memcpy(g_early_vs[g_early_vs_count].code, code, n * 4 * sizeof(DWORD));
     g_early_vs_count++;
@@ -2596,14 +2726,16 @@ static void shadow_replay_early_vertex_shaders(void)
         fprintf(stderr, "[HLE-D3D8] vertex shader 0x%08X was created before the "
                 "device; recording it now\n", g_early_vs[i].guest);
         shadow_track_vertex_shader(g_early_vs[i].guest, g_early_vs[i].has_function,
-                                   g_early_vs[i].header, g_early_vs[i].code);
+                                   g_early_vs[i].header, g_early_vs[i].code,
+                                   &g_early_vs[i].tokens);
     }
     g_early_vs_count = 0;
 }
 
 /* Record a created vertex shader against the shadow device. */
 static void shadow_track_vertex_shader(uint32_t guest, int has_function,
-                                       uint32_t header, const DWORD *code)
+                                       uint32_t header, const DWORD *code,
+                                       const shadow_decl_tokens *tokens)
 {
     {
         int slot = shadow_program_find(guest);
@@ -2632,6 +2764,7 @@ static void shadow_track_vertex_shader(uint32_t guest, int has_function,
             g_programs[slot].kind = kind;
             g_programs[slot].has_declaration = 0;
             g_programs[slot].packed_count = 0;
+            g_programs[slot].use_tokens = 0;
         } else if (kind == SHADER_HOST_PROGRAM) {
             host_vsh_delete_shader(host);
         }
@@ -2640,6 +2773,17 @@ static void shadow_track_vertex_shader(uint32_t guest, int has_function,
                 : kind == SHADER_HOST_PROGRAM ? "host program" : "program not replayed",
                 slot < 0 ? " (table full, not tracked)" : "");
         note_vertex_attributes(guest);
+        if (slot >= 0 && kind == SHADER_HOST_PROGRAM && tokens && tokens->regs > 0) {
+            g_programs[slot].tok = *tokens;
+            if (!decl_object_agrees(&g_programs[slot], guest & ~1u)) {
+                static int said;
+                g_programs[slot].use_tokens = 1;
+                if (said++ < 4)
+                    fprintf(stderr, "[HLE-D3D8] shadow declaration 0x%08X: the shader "
+                            "object's parsed copy is not laid out as XDK 4627+ lays it "
+                            "out; reading the title's declaration tokens instead\n", guest);
+            }
+        }
         if (slot >= 0 && kind == SHADER_HOST_PROGRAM)
             shadow_read_declaration(slot, guest);
         /* This entry may be the selected one, recreated under the same handle. */
@@ -4436,6 +4580,87 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
         hle_d3d8_shadow_draw_indexed(xpt, count, (const uint16_t *)HLE_PTR(index_va),
                                      HLE_PTR(data), stride, 0);
 #endif
+}
+
+/* HRESULT D3DDevice_GetVisibilityTestResult(DWORD Index, UINT *pResult,
+ *     ULONGLONG *pTimeStamp)
+ *
+ * A visibility test's answer is written by the GPU: EndVisibilityTest puts a
+ * GET_REPORT in the push buffer, the NV2A writes the pixel count and a time
+ * stamp into a report slot, and this function answers D3DERR_TESTINCOMPLETE
+ * (0x88760828) until the slot's status word leaves -1. Here nothing executes
+ * the push buffer -- the host draws from the replaced calls -- so no report
+ * is ever written, and a title that waits for one spins for ever. Halo's main
+ * menu does exactly that, with no timeout (XDK 3925, its wait at 0x00063460).
+ *
+ * The original runs first, so a report that does arrive (RECOMP_PB_EXEC, the
+ * software executor) is used, and nothing is changed while that executor is
+ * on. Otherwise an incomplete test is answered as complete with no pixels
+ * drawn: the conservative count, under which a lens flare or a corona that
+ * tests its own visibility draws nothing rather than shining through walls.
+ * RECOMP_HLE_D3D8_VISIBLE_PIXELS=<n> answers n instead. Answering from the
+ * host -- an occlusion query around the test's draws -- is not done yet.
+ *
+ * Only a title that waits for the answer gets one. Halo spins on its test;
+ * TimeSplitters 2 and Future Perfect poll theirs once a frame and draw on
+ * without the result. Answered, a poller starts a new test every frame, and
+ * each one waits on the GPU's acknowledgement; with the acknowledge thread
+ * idling between passes (RECOMP_NV2A_ACK_IDLE_US, #34) TimeSplitters 2's
+ * first level fell to 5 fps. So a test is answered once it has been asked
+ * VISIBILITY_SPIN times running with no frame presented in between; one
+ * polled a frame at a time keeps seeing "not yet", as it does without
+ * this replacement. */
+#define VISIBILITY_SPIN 64u
+HLE_ORIGINAL(D3DDevice_GetVisibilityTestResult);
+HLE_EXPORT(D3DDevice_GetVisibilityTestResult)
+{
+    static int seen, executor = -1;
+    static unsigned long answered, polled;
+    static uint32_t pixels, spin_index = 0xFFFFFFFFu, spin_polls;
+    static unsigned long spin_swap;
+    uint32_t index = HLE_ARG(0), result_va = HLE_ARG(1), stamp_va = HLE_ARG(2);
+
+    first_call(&seen, "D3DDevice_GetVisibilityTestResult", index);
+    if (original_missing(hle_original_D3DDevice_GetVisibilityTestResult,
+                         "D3DDevice_GetVisibilityTestResult"))
+        HLE_RETURN(0x80004005u);
+    HLE_CALL_ORIGINAL(D3DDevice_GetVisibilityTestResult);
+    if (g_eax != 0x88760828u)                 /* not D3DERR_TESTINCOMPLETE */
+        return;
+    if (executor < 0) {
+        const char *e = getenv("RECOMP_HLE_D3D8_VISIBLE_PIXELS");
+        executor = getenv("RECOMP_PB_EXEC") != NULL;
+        pixels = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0u;
+    }
+    if (executor)
+        return;                               /* the executor will write it */
+    if (index != spin_index || g_shadow_swaps != spin_swap) {
+        spin_index = index;                   /* another test, or a new frame */
+        spin_swap = g_shadow_swaps;
+        spin_polls = 0;
+    }
+    if (++spin_polls < VISIBILITY_SPIN) {
+        if (polled++ == 0) {
+            fprintf(stderr, "[HLE-D3D8] visibility test %u: no GPU report; left "
+                    "incomplete unless the title asks %u times in one frame "
+                    "(it is waiting)\n", index, VISIBILITY_SPIN);
+            fflush(stderr);
+        }
+        return;                               /* D3DERR_TESTINCOMPLETE stands */
+    }
+    if (result_va)
+        HLE_MEM32(result_va) = pixels;
+    if (stamp_va) {
+        HLE_MEM32(stamp_va) = 0;
+        HLE_MEM32(stamp_va + 4) = 0;
+    }
+    if (answered++ == 0) {
+        fprintf(stderr, "[HLE-D3D8] visibility test %u: no GPU report (nothing "
+                "executes the push buffer); answered complete, %u pixel(s) "
+                "(RECOMP_HLE_D3D8_VISIBLE_PIXELS)\n", index, pixels);
+        fflush(stderr);
+    }
+    HLE_RETURN(0);                            /* S_OK */
 }
 
 #ifdef _WIN32
