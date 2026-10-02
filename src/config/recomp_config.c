@@ -44,6 +44,11 @@ void recomp_config_set_title(uint32_t title_id)
     g_title_id = title_id;
 }
 
+uint32_t recomp_config_title_id(void)
+{
+    return g_title_id;
+}
+
 /* Defined below, beside the lookups it belongs to; needed by the
  * settings reader above it. */
 static const char *from_table(const char *key);
@@ -143,6 +148,11 @@ static int user_dir(char *out, size_t n)
         return 0;
     snprintf(out, n, "%s%s", home, tail);
     return 1;
+}
+
+int recomp_config_user_dir(char *out, size_t n)
+{
+    return user_dir(out, n);
 }
 
 static void title_file(char *out, size_t n, const char *dir)
