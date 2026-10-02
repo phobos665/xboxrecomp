@@ -18,6 +18,10 @@
  * folder and kept there; RECOMP_SYSLINK_MAC overrides it. */
 void xbox_NicMacAddress(uint8_t out[6]);
 
+/* XboxLANKey: the player's own, from keys.ini or RECOMP_XBOX_LAN_KEY, else
+ * zeros (which only other recompiled builds share). See xbox_nic.c. */
+void xbox_NetLanKey(uint8_t out[16]);
+
 /* Trap the register page if anything asks for it (RECOMP_SYSLINK for the
  * card, RECOMP_NIC_TRACE for the log). host is the page's host address. Call
  * once, after the MCPX aperture is mapped. */
