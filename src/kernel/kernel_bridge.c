@@ -2181,10 +2181,15 @@ static void bridge_MmGetPhysicalAddress(void)
      * calls and then stopped advancing DMA_PUT at all.
      */
     if (addr >= XBOX_CONTIG_BASE
-        && (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        && (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
         g_eax = addr - XBOX_CONTIG_BASE;
-    else
+        xbox_PhysNoteSource(g_eax, 0);
+    } else {
         g_eax = addr;
+        /* The two storages share physical numbers here, so say which one
+         * this answer was for (xbox_PhysToGuest). */
+        xbox_PhysNoteSource(g_eax, 1);
+    }
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -2734,6 +2739,32 @@ static void kernel_apu_tick(void)
     }
 }
 
+/* The network card's interrupt, delivered (xbox_nic.c).
+ *
+ * Bus level 4, as on the console: XNet asks HalGetInterruptVector(4) and
+ * connects its ISR there. Level-triggered like the APU's: raised on every tick
+ * while (IrqStatus & IrqMask) is non-zero, and the ISR masks it and queues the
+ * DPC that acknowledges it, which runs in the drain straight after. The card
+ * takes received frames on the same tick, just before. */
+#define NIC_VECTOR 4u
+
+static void kernel_nic_tick(void)
+{
+    static unsigned n;
+    int claimed;
+
+    xbox_NicTick();
+    if (!xbox_NicIrqPending() || !xbox_GetConnectedInterrupt(NIC_VECTOR))
+        return;
+    claimed = kernel_raise_interrupt(NIC_VECTOR);
+    if (n++ < 3) {
+        fprintf(stderr, "  [NIC] interrupt -> ISR %s\n",
+                claimed < 0 ? "not callable" :
+                claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
@@ -3037,7 +3068,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
-        xbox_NicTick();        /* the network card (xbox_nic.c) */
+        kernel_nic_tick();     /* the network card's frames and interrupt */
         {
             /* DPCs run at DISPATCH_LEVEL, so not while a guest thread is
              * there (kernel_hal.c, RECOMP_DISPATCH_LOCK). */
