@@ -400,6 +400,10 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_PSTEXTUREMODES           = 251,
     D3DRS_PSDOTMAPPING             = 252,
     D3DRS_PSINPUTTEXTURE           = 253,
+    /* Xbox D3DRS_SHADOWFUNC: how a depth-format texture's texel is compared
+     * with the texture coordinate's r/q (a shadow map). A D3DCMPFUNC; 0
+     * while the title has not set it. */
+    D3DRS_SHADOWFUNC               = 254,
 } D3DRENDERSTATETYPE;
 
 typedef enum D3DTEXTURESTAGESTATETYPE {

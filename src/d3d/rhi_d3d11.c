@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "rhi_backend.h"
+#include "rhi_shader_cache.h"
 #include "d3d8_internal.h"
 
 /* ---- the numbering the RHI borrows ------------------------------------------ */
@@ -508,6 +509,37 @@ static int is_block_compressed(RhiFormat f)
            f == RHI_FORMAT_BC3_UNORM || f == RHI_FORMAT_BC5_UNORM;
 }
 
+/* A depth image that is also sampled: a shadow map, which the title
+ * renders depth into and then reads as a texture. D3D11 refuses a typed
+ * depth format with SHADER_RESOURCE, so the resource is made typeless and
+ * each view names its own format -- the depth format for the depth view, the
+ * matching colour format for the sampled one. */
+static DXGI_FORMAT depth_typeless(uint32_t f)
+{
+    switch (f) {
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM:         return DXGI_FORMAT_R16_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT:         return DXGI_FORMAT_R32_TYPELESS;
+    default:                            return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static DXGI_FORMAT depth_sampled(uint32_t f)
+{
+    switch (f) {
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_D16_UNORM:         return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_D32_FLOAT:         return DXGI_FORMAT_R32_FLOAT;
+    default:                            return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static int is_sampled_depth(const RhiImageDesc *d)
+{
+    return (d->bind & RHI_BIND_DEPTH) && (d->bind & RHI_BIND_SAMPLED) &&
+           depth_typeless(d->format) != DXGI_FORMAT_UNKNOWN;
+}
+
 static RhiImage *d_image_create(const RhiImageDesc *d, const RhiSubresourceData *initial)
 {
     D3D11_SUBRESOURCE_DATA sd[16 * 6];
@@ -546,7 +578,7 @@ static RhiImage *d_image_create(const RhiImageDesc *d, const RhiSubresourceData 
         td.Height = d->height;
         td.MipLevels = d->mip_levels;
         td.ArraySize = d->depth ? d->depth : 1;
-        td.Format = (DXGI_FORMAT)d->format;
+        td.Format = is_sampled_depth(d) ? depth_typeless(d->format) : (DXGI_FORMAT)d->format;
         td.SampleDesc.Count = d->samples ? d->samples : 1;
         td.SampleDesc.Quality = d->sample_quality;
         td.Usage = (D3D11_USAGE)d->usage;
@@ -704,16 +736,27 @@ static RhiView *d_view_create(RhiImage *img, uint32_t kind, const RhiViewDesc *d
 {
     RhiView *v = calloc(1, sizeof *v);
     HRESULT hr = E_FAIL;
+    int typeless = is_sampled_depth(&img->desc);
+    RhiViewDesc whole;
 
     if (!v)
         return NULL;
     v->kind = kind;
     v->image = img;
+    /* A typeless resource has no format of its own for a default view. */
+    if (typeless && !d) {
+        memset(&whole, 0, sizeof whole);
+        whole.format = img->desc.format;
+        whole.dim = RHI_VIEW_DIM_2D;
+        whole.mip_count = img->desc.mip_levels ? img->desc.mip_levels : 1;
+        whole.layer_count = 1;
+        d = &whole;
+    }
     if (kind == RHI_VIEW_SAMPLED) {
         D3D11_SHADER_RESOURCE_VIEW_DESC sd;
         if (d) {
             memset(&sd, 0, sizeof sd);
-            sd.Format = (DXGI_FORMAT)d->format;
+            sd.Format = typeless ? depth_sampled(img->desc.format) : (DXGI_FORMAT)d->format;
             switch (d->dim) {
             case RHI_VIEW_DIM_CUBE:
                 sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
@@ -772,7 +815,7 @@ static RhiView *d_view_create(RhiImage *img, uint32_t kind, const RhiViewDesc *d
         D3D11_DEPTH_STENCIL_VIEW_DESC dd;
         if (d) {
             memset(&dd, 0, sizeof dd);
-            dd.Format = (DXGI_FORMAT)d->format;
+            dd.Format = typeless ? (DXGI_FORMAT)img->desc.format : (DXGI_FORMAT)d->format;
             switch (d->dim) {
             case RHI_VIEW_DIM_2D_ARRAY:
             case RHI_VIEW_DIM_CUBE:
@@ -813,6 +856,10 @@ static RhiImage *d_view_image(const RhiView *v)
 
 /* ---- shaders and layouts ---------------------------------------------------------------- */
 
+/* Names the compiler and its settings in the disk cache's key: D3DCompile
+ * with the flags d_shader_create passes. */
+#define D3D11_CACHE_TAG "d3d11-fxc-1"
+
 static RhiShader *d_shader_create(uint32_t stage, const RhiShaderSource *src, char *err, size_t err_len)
 {
     D3D_SHADER_MACRO macros[16];
@@ -830,12 +877,26 @@ static RhiShader *d_shader_create(uint32_t stage, const RhiShaderSource *src, ch
         macros[n].Definition = NULL;
     }
     d3d8_hlsl_note(src->hlsl, src->len, src->name, src->macros, src->entry, src->target);
+    if (err && err_len)
+        err[0] = 0;
+    /* A blob from an earlier run (rhi_shader_cache.c) skips the compiler. */
+    {
+        void *cached = NULL;
+        size_t cached_bytes = 0;
+
+        if (rhi_shader_cache_get(src, D3D11_CACHE_TAG, &cached, &cached_bytes) &&
+            SUCCEEDED(D3DCreateBlob(cached_bytes, &code))) {
+            memcpy(ID3D10Blob_GetBufferPointer(code), cached, cached_bytes);
+            free(cached);
+            goto compiled;
+        }
+        free(cached);
+        code = NULL;
+    }
     hr = D3DCompile(src->hlsl, (SIZE_T)src->len, src->name, src->macros ? macros : NULL, NULL,
                     src->entry, src->target,
                     src->optimize ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : 0, 0,
                     &code, &errors);
-    if (err && err_len)
-        err[0] = 0;
     if (errors) {
         if (err && err_len)
             snprintf(err, err_len, "%s", (const char *)ID3D10Blob_GetBufferPointer(errors));
@@ -846,6 +907,9 @@ static RhiShader *d_shader_create(uint32_t stage, const RhiShaderSource *src, ch
             snprintf(err, err_len, "D3DCompile failed (0x%08lX)", (unsigned long)hr);
         return NULL;
     }
+    rhi_shader_cache_put(src, D3D11_CACHE_TAG, ID3D10Blob_GetBufferPointer(code),
+                         ID3D10Blob_GetBufferSize(code));
+compiled:
     s = calloc(1, sizeof *s);
     if (!s) {
         ID3D10Blob_Release(code);

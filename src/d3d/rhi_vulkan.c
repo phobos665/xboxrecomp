@@ -49,6 +49,7 @@
 
 #include "rhi_backend.h"
 #include "rhi_vulkan_bindings.h"
+#include "rhi_shader_cache.h"
 
 /* d3d8_compile.c: every backend shows each HLSL source to it first. */
 void d3d8_hlsl_note(const char *src, size_t len, const char *name,
@@ -1202,6 +1203,85 @@ static int binding_declared(uint32_t binding, uint32_t kind)
     return 0;
 }
 
+/* The pipeline cache, kept between runs beside the shader cache
+ * (rhi_shader_cache.c). Pipelines are built on first use of each draw-state
+ * combination, and each build is a driver compile -- a hitch the shader
+ * cache does not remove. The driver keys the cache's entries by the shaders'
+ * contents, so it is valid across runs on the same device and driver; the
+ * header is checked against this device first and a mismatch starts empty. */
+#define PIPELINE_CACHE_DIR  "vulkan-pipelines"
+#define PIPELINE_CACHE_FILE "pipelines.bin"
+
+static void *pcache_load(size_t *bytes)
+{
+    char path[1024];
+    FILE *f;
+    long n;
+    unsigned char *data = NULL;
+
+    *bytes = 0;
+    if (!rhi_cache_file_path(PIPELINE_CACHE_DIR, PIPELINE_CACHE_FILE, path, sizeof path))
+        return NULL;
+    f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) == 0 && (n = ftell(f)) >= 32 && n < 256L * 1024 * 1024 &&
+        fseek(f, 0, SEEK_SET) == 0 && (data = malloc((size_t)n)) != NULL &&
+        fread(data, 1, (size_t)n, f) == (size_t)n) {
+        uint32_t hsize, hver, vendor, device;
+
+        memcpy(&hsize, data + 0, 4);
+        memcpy(&hver, data + 4, 4);
+        memcpy(&vendor, data + 8, 4);
+        memcpy(&device, data + 12, 4);
+        if (hsize >= 32 && hver == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+            vendor == V.props.vendorID && device == V.props.deviceID &&
+            memcmp(data + 16, V.props.pipelineCacheUUID, VK_UUID_SIZE) == 0) {
+            *bytes = (size_t)n;
+        } else {
+            fprintf(stderr, "[RHI] vulkan: pipeline cache on disk is for another "
+                    "device or driver; starting empty\n");
+            free(data);
+            data = NULL;
+        }
+    }
+    fclose(f);
+    if (data)
+        fprintf(stderr, "[RHI] vulkan: pipeline cache loaded (%zu bytes)\n", *bytes);
+    return data;
+}
+
+static void pcache_save(void)
+{
+    char path[1024], tmp[1100];
+    size_t n = 0;
+    void *data;
+    FILE *f;
+    int ok;
+
+    if (!V.pcache || !rhi_cache_file_path(PIPELINE_CACHE_DIR, PIPELINE_CACHE_FILE,
+                                          path, sizeof path))
+        return;
+    if (vkGetPipelineCacheData(V.dev, V.pcache, &n, NULL) != VK_SUCCESS || !n)
+        return;
+    data = malloc(n);
+    if (!data)
+        return;
+    if (vkGetPipelineCacheData(V.dev, V.pcache, &n, data) != VK_SUCCESS) {
+        free(data);
+        return;
+    }
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
+    f = fopen(tmp, "wb");
+    if (f) {
+        ok = fwrite(data, 1, n, f) == n;
+        ok = (fclose(f) == 0) && ok;
+        if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+            DeleteFileA(tmp);
+    }
+    free(data);
+}
+
 static int create_layouts(void)
 {
     VkDescriptorSetLayoutBinding b[32];
@@ -1232,7 +1312,23 @@ static int create_layouts(void)
     lci.setLayoutCount = 1;
     lci.pSetLayouts = &V.set_layout;
     VKCHECK(vkCreatePipelineLayout(V.dev, &lci, NULL, &V.pipe_layout), "pipeline layout");
-    VKCHECK(vkCreatePipelineCache(V.dev, &pci, NULL, &V.pcache), "pipeline cache");
+    {
+        size_t initial = 0;
+        void *data = pcache_load(&initial);
+        VkResult r;
+
+        pci.initialDataSize = initial;
+        pci.pInitialData = data;
+        r = vkCreatePipelineCache(V.dev, &pci, NULL, &V.pcache);
+        if (r != VK_SUCCESS && data) {
+            /* The driver refused what it wrote last time: start empty. */
+            pci.initialDataSize = 0;
+            pci.pInitialData = NULL;
+            r = vkCreatePipelineCache(V.dev, &pci, NULL, &V.pcache);
+        }
+        free(data);
+        VKCHECK(r, "pipeline cache");
+    }
     return 0;
 }
 
@@ -1427,6 +1523,7 @@ static void v_device_destroy(void)
     destroy_swapchain_views();
     if (SC.sc) vkDestroySwapchainKHR(V.dev, SC.sc, NULL);
     vkDestroySemaphore(V.dev, V.timeline, NULL);
+    pcache_save();
     vkDestroyPipelineCache(V.dev, V.pcache, NULL);
     vkDestroyPipelineLayout(V.dev, V.pipe_layout, NULL);
     vkDestroyDescriptorSetLayout(V.dev, V.set_layout, NULL);
@@ -2393,6 +2490,14 @@ static int reflect(RhiShader *sh)
 
 /* ---- shaders and layouts -------------------------------------------------------------------------------- */
 
+/* Names the compiler and its settings in the disk cache's key: DXC to
+ * SPIR-V with rhi_vk_dxc_compile's arguments, which bake in the binding
+ * shifts below. Bump the trailing number if those arguments change. */
+#define VK_CACHE_STR2(x) #x
+#define VK_CACHE_STR(x)  VK_CACHE_STR2(x)
+#define VK_CACHE_TAG "vulkan-dxc-1-b" VK_CACHE_STR(RHI_VK_PS_UNIFORM_BASE) \
+                     "-t" VK_CACHE_STR(RHI_VK_TEXTURE_BASE) "-s" VK_CACHE_STR(RHI_VK_SAMPLER_BASE)
+
 static RhiShader *v_shader_create(uint32_t stage, const RhiShaderSource *src, char *err, size_t err_len)
 {
     VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -2401,8 +2506,16 @@ static RhiShader *v_shader_create(uint32_t stage, const RhiShaderSource *src, ch
     size_t bytes = 0;
 
     d3d8_hlsl_note(src->hlsl, src->len, src->name, src->macros, src->entry, src->target);
-    if (!rhi_vk_dxc_compile(stage, src, &code, &bytes, err, err_len))
-        return NULL;
+    /* A blob from an earlier run (rhi_shader_cache.c) skips DXC, which a
+     * fully warm run then never loads. */
+    if (!rhi_shader_cache_get(src, VK_CACHE_TAG, (void **)&code, &bytes) ||
+        bytes < 20 || (bytes & 3)) {
+        free(code);
+        code = NULL;
+        if (!rhi_vk_dxc_compile(stage, src, &code, &bytes, err, err_len))
+            return NULL;
+        rhi_shader_cache_put(src, VK_CACHE_TAG, code, bytes);
+    }
     s = calloc(1, sizeof *s);
     if (!s) {
         free(code);
@@ -3069,8 +3182,13 @@ static Pipe *find_pipeline(void)
     s = pipe_slot(&k);
     if (!*s) {
         *s = build_pipeline(&k);
-        if (*s)
+        if (*s) {
             V.npipes++;
+            /* Saved as it grows too, not only at shutdown: a run that is
+             * killed or crashes never reaches the destroy path. */
+            if (V.npipes % 32 == 0)
+                pcache_save();
+        }
     }
     return *s;
 }

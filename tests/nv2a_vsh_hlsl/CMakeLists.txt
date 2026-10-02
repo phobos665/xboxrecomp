@@ -11,6 +11,7 @@ add_executable(nv2a_vsh_hlsl_test
     # d3d8_vsh.c creates its objects through rhi.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi_d3d11.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi_shader_cache.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_compile.c
 )
 target_include_directories(nv2a_vsh_hlsl_test PRIVATE
