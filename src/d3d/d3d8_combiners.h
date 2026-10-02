@@ -235,6 +235,12 @@ typedef struct NV2ACombinerState {
     /* --- Flags --- */
     DWORD flags;     /* Dot mapping and other flags from token bits 24-31 */
 
+    /* --- Shadow-map stages --- */
+    /* Nonzero where the stage's texture is a depth format: the NV2A then
+     * compares the texel with r/q instead of returning it (D3DRS_SHADOWFUNC).
+     * Set per draw from the bound textures, not from the token. */
+    BYTE shadow[NV2A_MAX_TEXTURES];
+
     /* Everything above decides the generated shader and is its cache key
      * (NV2A_COMBINER_KEY_BYTES). Everything below is uploaded to the
      * constant buffer each draw and never appears in the HLSL, so it must
@@ -278,6 +284,15 @@ typedef struct NV2APSConstants {
      * texel. TimeSplitters: Future Perfect's colour-grading pass samples its
      * frame buffer this way and came out a single flat colour without it. */
     float tex_scale[NV2A_MAX_TEXTURES][4];
+    /* Shadow-map stages: the depth format's largest value per stage (the
+     * texel is stored 0..1 on the host, the title's r/q is in the format's
+     * own units), the compare (D3DCMPFUNC, 0 = unset), and whether to compare
+     * the other way round (RECOMP_D3D8_SHADOW_SWAP, for checking the order
+     * against a real frame). */
+    float shadow_max[NV2A_MAX_TEXTURES];
+    UINT  shadow_func;
+    UINT  shadow_swap;
+    UINT  shadow_pad[2];
 } NV2APSConstants;
 
 /* ================================================================
