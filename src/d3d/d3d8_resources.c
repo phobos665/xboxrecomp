@@ -32,8 +32,9 @@ static void d3d8_upload_mip_level(RhiImage *image, D3DFORMAT fmt,
  * Format conversion: Xbox D3DFORMAT → DXGI_FORMAT
  *
  * Xbox binary format constants follow the packed XDK layout above.
- * Formats that need a different D3D11 storage (YUV, P8, AL8) are
- * converted in software during LockRect upload.
+ * Formats that need a different D3D11 storage (YUV, P8, the luminance
+ * formats L8, AL8 and A8L8) are converted in software during LockRect
+ * upload.
  * ================================================================ */
 
 RhiFormat d3d8_to_dxgi_format(D3DFORMAT fmt)
@@ -111,18 +112,22 @@ RhiFormat d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_A8:
     case D3DFMT_LIN_A8:
         return RHI_FORMAT_A8_UNORM;
+    /* L8, AL8 and A8L8 are expanded to BGRA at upload, their channels
+     * replicated the way the NV2A samples them (xemu, kelvin_color_format_gl_map:
+     * Y8 RRR1, AY8 RRRR, A8Y8 RRRG). Kept as R8 or R8G8 they sampled as
+     * (r, 0, 0, 1) or (r, g, 0, 1): red luminance, and alpha 1 for formats
+     * whose whole point is their alpha. */
     case D3DFMT_L8:
     case D3DFMT_LIN_L8:
-        return RHI_FORMAT_R8_UNORM;
+        return RHI_FORMAT_B8G8R8A8_UNORM;
     case D3DFMT_L16:
     case D3DFMT_LIN_L16:
         return RHI_FORMAT_R16_UNORM;
-    case D3DFMT_A8L8:
+    case D3DFMT_A8L8:           /* expanded to BGRA at upload, see L8 */
     case D3DFMT_LIN_A8L8:
-        return RHI_FORMAT_R8G8_UNORM;
-    case D3DFMT_AL8:            /* expanded to 16-bit at upload */
+    case D3DFMT_AL8:
     case D3DFMT_LIN_AL8:
-        return RHI_FORMAT_R8G8_UNORM;
+        return RHI_FORMAT_B8G8R8A8_UNORM;
 
     /* 16-bit color channel pairs */
     case D3DFMT_G8B8:
@@ -446,10 +451,13 @@ UINT d3d8_upload_bpp(D3DFORMAT fmt)
     case D3DFMT_YUY2:
     case D3DFMT_UYVY:
     case D3DFMT_P8:
-        return 32;   /* converted to BGRA */
+    case D3DFMT_L8:
+    case D3DFMT_LIN_L8:
     case D3DFMT_AL8:
     case D3DFMT_LIN_AL8:
-        return 16;   /* expanded to A8L8-style R8G8 */
+    case D3DFMT_A8L8:
+    case D3DFMT_LIN_A8L8:
+        return 32;   /* converted to BGRA */
     default:
         return d3d8_format_bpp(fmt);
     }
@@ -461,8 +469,12 @@ BOOL d3d8_format_has_conversion(D3DFORMAT fmt)
     case D3DFMT_YUY2:
     case D3DFMT_UYVY:
     case D3DFMT_P8:
+    case D3DFMT_L8:
+    case D3DFMT_LIN_L8:
     case D3DFMT_AL8:
     case D3DFMT_LIN_AL8:
+    case D3DFMT_A8L8:
+    case D3DFMT_LIN_A8L8:
     case D3DFMT_R5G5B5A1:
     case D3DFMT_LIN_R5G5B5A1:
     case D3DFMT_R4G4B4A4:
@@ -502,16 +514,36 @@ void d3d8_convert_linear_pixels(D3DFORMAT fmt, UINT width, UINT height,
     UINT x, y;
 
     switch (fmt) {
+    case D3DFMT_L8:
+    case D3DFMT_LIN_L8:
     case D3DFMT_AL8:
     case D3DFMT_LIN_AL8: {
-        /* 8-bit packed: high nibble alpha, low nibble luma.
-         * Expand to 16-bit A8L8 (byte0 = luma, byte1 = alpha). */
+        /* One byte per texel: luminance in B, G and R, and in A as well for
+         * AL8, whose single byte is both (NV2A AY8 samples RRRR; it is not
+         * two nibbles). Halo's atmospheric fog density ramp is AL8: read
+         * with alpha 1 its fog pass replaced every wall with the fog colour. */
+        BOOL al = fmt == D3DFMT_AL8 || fmt == D3DFMT_LIN_AL8;
         for (y = 0; y < height; y++) {
             const BYTE *s = src + (size_t)y * width;
-            BYTE *d = dst + (size_t)y * width * 2;
+            BYTE *d = dst + (size_t)y * width * 4;
             for (x = 0; x < width; x++) {
-                d[x * 2 + 0] = (BYTE)(((s[x] & 0x0F) << 4) | (s[x] & 0x0F));
-                d[x * 2 + 1] = (BYTE)(((s[x] >> 4) << 4) | (s[x] >> 4));
+                d[x * 4 + 0] = d[x * 4 + 1] = d[x * 4 + 2] = s[x];
+                d[x * 4 + 3] = al ? s[x] : 0xFF;
+            }
+        }
+        break;
+    }
+
+    case D3DFMT_A8L8:
+    case D3DFMT_LIN_A8L8: {
+        /* Luminance in the low byte, alpha in the high one (NV2A A8Y8
+         * samples RRRG). */
+        for (y = 0; y < height; y++) {
+            const BYTE *s = src + (size_t)y * width * 2;
+            BYTE *d = dst + (size_t)y * width * 4;
+            for (x = 0; x < width; x++) {
+                d[x * 4 + 0] = d[x * 4 + 1] = d[x * 4 + 2] = s[x * 2 + 0];
+                d[x * 4 + 3] = s[x * 2 + 1];
             }
         }
         break;
