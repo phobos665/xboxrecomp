@@ -6,7 +6,7 @@
  *   D:\               -> <game_dir>/
  *   T:\               -> <save_dir>/TitleData/
  *   U:\               -> <save_dir>/UserData/
- *   Z:\               -> <save_dir>/Cache/
+ *   Z:\               -> <save_dir>/Cache/<title id>/
  *
  * The Win32 build emits UTF-16 paths (for CreateFileW); the Linux build
  * emits UTF-8 paths with '/' separators (for open()).
@@ -14,10 +14,37 @@
 
 #include "kernel.h"
 #include "xbox_watchpoint.h"
+#include "recomp_config.h"   /* recomp_config_title_id: per-title cache */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+/*
+ * The cache partitions (X:, Y:, Z:, Partition3-5) are one host folder per
+ * title, <save_dir>/Cache/<title id>.
+ *
+ * They were all one folder, shared by every title, and a cache is the one
+ * place titles reuse file names: a title copies its data from the disc to the
+ * cache once and afterwards trusts what it finds there. OutRun 2 found
+ * another title's Voice1.xwb (880,640 bytes, from 21 Sep 2026) where it
+ * keeps its own voice bank, read a wave-bank header out of it, asked its own
+ * heap for that much and stopped at "* OUT OF MEMORY ERROR *" on the start-up
+ * screens -- on every boot, for a player whose save folder had run other
+ * titles, and never on a fresh one. On a console a cache partition is wiped
+ * when another title claims it; a folder per title gets the same result
+ * without wiping anything. The title id comes from the XBE certificate,
+ * read before any file is opened; 0 (not known) keeps the shared folder.
+ */
+static const char *cache_sub_dir(const char *sub, char sep, char *buf, size_t n)
+{
+    uint32_t id = recomp_config_title_id();
+
+    if (!sub || !id || (strcmp(sub, "\\Cache") != 0 && strcmp(sub, "/Cache") != 0))
+        return sub;
+    snprintf(buf, n, "%s%c%08X", sub, sep, (unsigned)id);
+    return buf;
+}
 
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
@@ -406,6 +433,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const char*  remainder = NULL;
     const WCHAR* base_dir  = NULL;
     const char*  sub_dir   = NULL;
+    char         sub_buf[64];   /* cache_sub_dir */
     int          skip;
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
@@ -431,7 +459,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
-            sub_dir   = s_rules[i].sub_win;
+            sub_dir   = cache_sub_dir(s_rules[i].sub_win, '\\', sub_buf, sizeof sub_buf);
             goto translate;
         }
     }
@@ -460,7 +488,7 @@ translate:
             WCHAR dir_path[MAX_PATH];
             swprintf_s(dir_path, MAX_PATH, L"%s%s", base_dir, sub_wide);
             CreateDirectoryW(s_save_dir, NULL);
-            CreateDirectoryW(dir_path, NULL);
+            SHCreateDirectoryExW(NULL, dir_path, NULL);   /* Cache\<title id> is two deep */
         } else {
             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
         }
@@ -581,6 +609,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const char* remainder = NULL;
     const char* base_dir  = NULL;
     const char* sub_dir   = NULL;
+    char        sub_buf[64];   /* cache_sub_dir */
     int         skip;
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
@@ -600,7 +629,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
-            sub_dir   = s_rules[i].sub_posix;
+            sub_dir   = cache_sub_dir(s_rules[i].sub_posix, '/', sub_buf, sizeof sub_buf);
             goto translate;
         }
     }
