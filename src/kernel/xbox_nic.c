@@ -57,6 +57,7 @@
 #include "xbox_memory_layout.h"
 #include "xbox_nic.h"
 #include "xbox_net_udp.h"
+#include "recomp_config.h"   /* recomp_config_user_dir: keys.ini */
 
 #ifdef _WIN32
 #include <bcrypt.h>
@@ -231,6 +232,96 @@ void xbox_NicMacAddress(uint8_t out[6])
         fflush(stderr);
     }
     memcpy(out, g_mac, 6);
+}
+
+/* ---- the LAN key ------------------------------------------------------- */
+
+/* XboxLANKey, the kernel export XNet derives every title's System Link keys
+ * from: HMAC(XboxLANKey, 0 || the certificate's LAN key). It is one fixed key
+ * in every retail kernel, and Microsoft's secret, so it is never in this
+ * repository: two recompiled builds agree on zeros, and talking to xemu or a
+ * real console needs the player's own, from their own BIOS:
+ *
+ *     %APPDATA%\xboxrecomp\keys.ini      lan_key = <32 hex digits>
+ *     RECOMP_XBOX_LAN_KEY=<32 hex digits>   overrides the file
+ */
+static int parse_hex16(const char *s, uint8_t out[16])
+{
+    int i;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    for (i = 0; i < 16; i++) {
+        int hi = hex_digit((unsigned char)s[2 * i]);
+        int lo = hi < 0 ? -1 : hex_digit((unsigned char)s[2 * i + 1]);
+        if (lo < 0)
+            return 0;
+        out[i] = (uint8_t)(hi << 4 | lo);
+    }
+    s += 32;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    return *s == 0;
+}
+
+static void load_lan_key(uint8_t out[16]);
+
+void xbox_NetLanKey(uint8_t out[16])
+{
+    static uint8_t key[16];
+    static int loaded;
+
+    if (!loaded) {
+        load_lan_key(key);
+        loaded = 1;
+    }
+    memcpy(out, key, 16);
+}
+
+static void load_lan_key(uint8_t out[16])
+{
+    const char *env = getenv("RECOMP_XBOX_LAN_KEY");
+    char dir[1024], path[1100], line[256];
+    FILE *f;
+
+    memset(out, 0, 16);
+    if (env && *env) {
+        if (parse_hex16(env, out)) {
+            fprintf(stderr, "[NET] XboxLANKey from RECOMP_XBOX_LAN_KEY\n");
+            return;
+        }
+        fprintf(stderr, "[NET] RECOMP_XBOX_LAN_KEY is not 32 hex digits; "
+                        "ignored\n");
+        memset(out, 0, 16);
+    }
+    if (recomp_config_user_dir(dir, sizeof dir)) {
+#ifdef _WIN32
+        snprintf(path, sizeof path, "%s\\keys.ini", dir);
+#else
+        snprintf(path, sizeof path, "%s/keys.ini", dir);
+#endif
+        f = fopen(path, "r");
+        if (f) {
+            int found = 0;
+            while (!found && fgets(line, sizeof line, f)) {
+                char *p = line, *eq;
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (strncmp(p, "lan_key", 7) != 0)
+                    continue;
+                eq = strchr(p, '=');
+                if (eq)
+                    found = parse_hex16(eq + 1, out);
+            }
+            fclose(f);
+            if (found) {
+                fprintf(stderr, "[NET] XboxLANKey from %s\n", path);
+                return;
+            }
+            memset(out, 0, 16);
+        }
+    }
+    /* Say nothing here: most runs never touch the network, and the card
+     * says it when System Link actually starts (tunnel_start). */
 }
 
 /* ---- the registers ---------------------------------------------------- */
@@ -484,6 +575,14 @@ static void tunnel_start(void)
         return;
     xbox_NicMacAddress(mac);
     s_nic.tunnel = xbox_NetUdpStart(mac) ? 1 : -1;
+    if (s_nic.tunnel > 0) {
+        uint8_t key[16], zero[16] = { 0 };
+        xbox_NetLanKey(key);
+        if (memcmp(key, zero, 16) == 0)
+            fprintf(stderr, "[NET] no XboxLANKey (keys.ini): this build can "
+                            "play other recompiled builds, not xemu or a "
+                            "console\n");
+    }
 }
 
 /* A kick: send everything queued from where the last kick stopped.
