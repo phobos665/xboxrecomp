@@ -191,6 +191,18 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 int      xbox_ContiguousFree(uint32_t xbox_va);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 
+/* Which storage a physical address names.
+ *
+ * On a console low RAM and the 0x80000000 window are one memory; here they
+ * are separate storage, so a physical address does not say which one the
+ * guest meant. MmGetPhysicalAddress knows -- it was handed the VA -- and
+ * notes it per page; a device model asks here. Returns the guest VA the
+ * physical address was handed out for: phys itself for low RAM, 0x80000000
+ * + phys for the window, which is also the answer for a page never handed
+ * out (where the APU and GPU have always looked). */
+void     xbox_PhysNoteSource(uint32_t phys, int low_ram);
+uint32_t xbox_PhysToGuest(uint32_t phys);
+
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 

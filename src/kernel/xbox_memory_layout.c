@@ -3493,6 +3493,41 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return g_contig_next - XBOX_CONTIG_BASE;
 }
 
+/* One bit per 4 KB physical page of the 64 MB window: set when the last
+ * MmGetPhysicalAddress for that page was answered for a low-RAM VA.
+ *
+ * XNet is why. It hands the network card both kinds in one ring: its
+ * descriptor rings come from MmAllocateContiguousMemory (the window), its
+ * frame buffers from its own pool in low RAM, and the card is told only
+ * physical addresses. Read through the window, a frame buffer at physical
+ * 0x011FE8F2 was another allocator's fill; read through low RAM it was the
+ * frame. The window cannot be ruled out by "is this a live contiguous
+ * block" either, because both storages are in use at the same physical
+ * addresses. MmGetPhysicalAddress is the one place that knows. */
+static uint32_t g_phys_low[(XBOX_CONTIG_SIZE / 4096u) / 32u];
+
+void xbox_PhysNoteSource(uint32_t phys, int low_ram)
+{
+    uint32_t page = phys / 4096u;
+
+    if (phys >= XBOX_CONTIG_SIZE)
+        return;
+    if (low_ram)
+        g_phys_low[page / 32u] |= 1u << (page % 32u);
+    else
+        g_phys_low[page / 32u] &= ~(1u << (page % 32u));
+}
+
+uint32_t xbox_PhysToGuest(uint32_t phys)
+{
+    uint32_t page = phys / 4096u;
+
+    if (phys < XBOX_CONTIG_SIZE &&
+        (g_phys_low[page / 32u] & (1u << (page % 32u))))
+        return phys;
+    return XBOX_CONTIG_BASE + phys;
+}
+
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {

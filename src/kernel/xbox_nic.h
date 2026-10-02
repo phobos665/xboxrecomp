@@ -18,8 +18,9 @@
  * folder and kept there; RECOMP_SYSLINK_MAC overrides it. */
 void xbox_NicMacAddress(uint8_t out[6]);
 
-/* Trap the register page if anything asks for it (RECOMP_NIC_TRACE). host is
- * the page's host address. Call once, after the MCPX aperture is mapped. */
+/* Trap the register page if anything asks for it (RECOMP_SYSLINK for the
+ * card, RECOMP_NIC_TRACE for the log). host is the page's host address. Call
+ * once, after the MCPX aperture is mapped. */
 void xbox_NicInit(void *host);
 
 /* Offer an access violation at guest address xbox_va to the card. Returns
@@ -27,8 +28,12 @@ void xbox_NicInit(void *host);
  * caller must return EXCEPTION_CONTINUE_EXECUTION. ctx is the PCONTEXT. */
 int xbox_NicHandleMmio(void *ctx, uint32_t xbox_va, int is_write);
 
-/* From the kernel's timer thread: periodic work. Today only the register
- * summary every five seconds while the trace is on. */
+/* From the kernel's timer thread: received frames into the receive ring,
+ * and the summary every five seconds. */
 void xbox_NicTick(void);
+
+/* Whether the card's interrupt line is asserted ((IrqStatus & IrqMask) != 0),
+ * for the kernel to raise the ISR on bus level 4. */
+int  xbox_NicIrqPending(void);
 
 #endif /* XBOX_NIC_H */
