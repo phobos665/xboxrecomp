@@ -1416,6 +1416,12 @@ int main(int argc, char **argv)
      * any Hor+ scaling. Scaling them again here (RECOMP_HOR_PLUS, or the
      * settings file) would widen the replayed view twice. */
     xbox_D3D8ClaimHorPlus();
+    /* --place all=: also the placement the frame starts under. A title that
+     * never sets one (OutRun 2) records no placement chunk to override, so
+     * without this the option would do nothing there. */
+    for (i = 0; i < g_place_count; i++)
+        if (g_place[i].all)
+            xbox_D3D8SetTwoDPlacement(g_place[i].placement, 0);
     if (SUCCEEDED(r.dev->lpVtbl->GetDepthStencilSurface(r.dev, &r.device_depth)) &&
         r.device_depth)
         r.device_depth->lpVtbl->Release(r.device_depth);   /* the device keeps it */
