@@ -1399,6 +1399,18 @@ HRESULT host_CreateCubeTexture(IDirect3DDevice8 *dev, UINT edge, UINT levels,
                                           pool, texture);
 }
 
+HRESULT host_CubeLockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
+                          UINT level, D3DLOCKED_RECT *locked)
+{
+    return cube->lpVtbl->LockRect(cube, face, level, locked, NULL, 0);
+}
+
+HRESULT host_CubeUnlockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
+                            UINT level)
+{
+    return cube->lpVtbl->UnlockRect(cube, face, level);
+}
+
 HRESULT host_LockRect(IDirect3DTexture8 *texture, UINT level,
                       D3DLOCKED_RECT *locked, const RECT *rect, DWORD flags)
 {

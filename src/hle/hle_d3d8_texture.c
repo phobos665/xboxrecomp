@@ -289,20 +289,36 @@ static uint32_t level0_checksum(const texture_layout *t)
     }
 }
 
-/* A cheap look at level 0: 4,096 bytes spread across it. */
+/* A cheap look at level 0: 1,024 eight-byte words spread across it.
+ *
+ * It was 4,096 single bytes through one FNV chain, each multiply waiting on
+ * the last; at ~380 binds a frame in an OutRun 2 race that was a millisecond
+ * or two of the main thread. Words cover twice the bytes with a quarter of
+ * the steps, and four independent lanes let the multiplies overlap. */
 static uint32_t texel_sample(const texture_layout *t)
 {
     const uint8_t *p = (const uint8_t *)HLE_PTR(CONTIG_BASE + t->phys);
     uint32_t n = t->linear
         ? t->guest_pitch * level_rows(t->fmt, t->height)
         : d3d8_row_pitch((D3DFORMAT)t->fmt, t->width) * level_rows(t->fmt, t->height);
-    uint32_t h = 2166136261u, i, step = n > 4096 ? n / 4096 : 1;
+    uint64_t h[4] = { 0xCBF29CE484222325ull, 0x84222325CBF29CE4ull,
+                      0x9E3779B97F4A7C15ull, 0x7F4A7C159E3779B9ull };
+    uint64_t w;
+    uint32_t i, k, words = n / 8, step;
 
-    for (i = 0; i < n; i += step) {
-        h ^= p[i];
-        h *= 16777619u;
+    if (!words) {
+        uint32_t s = 2166136261u;
+        for (i = 0; i < n; i++)
+            s = (s ^ p[i]) * 16777619u;
+        return s;
     }
-    return h;
+    step = words > 1024 ? words / 1024 : 1;
+    for (i = 0, k = 0; i < words; i += step, k = (k + 1) & 3) {
+        memcpy(&w, p + (size_t)i * 8, 8);
+        h[k] = (h[k] ^ w) * 0x100000001B3ull;
+    }
+    w = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+    return (uint32_t)(w ^ (w >> 32));
 }
 
 /* Have this texture's texels changed since the host copy was made?
@@ -626,7 +642,11 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e->size = size;
     e->checksum = level0_checksum(&t);
     e->quick = texel_sample(&t);
-    e->full_swap = now;
+    /* Spread the full checks: textures made together (a level's load) would
+     * otherwise all take their full hash in the same frame, every 8th frame,
+     * which is a periodic spike rather than a cost spread across frames.
+     * texels_changed keeps each texture's phase from here on. */
+    e->full_swap = now - ((va >> 5) ^ (data >> 12)) % 8u;
     e->checked_swap = e->used_swap = now;
     e->p8 = t.fmt == XFMT_P8;
     e->pal_sum = 0;
@@ -985,6 +1005,159 @@ static IDirect3DCubeTexture8 *bound_cube(uint32_t va)
     return NULL;
 }
 
+/* Cube textures a title fills from memory rather than rendering into: an
+ * environment map loaded with the rest of a level. OutRun 2 binds two static
+ * DXT5 ones in a race, and while they were refused (read_layout does not
+ * take cubes) the stage read nothing and the road came out pale.
+ *
+ * The layout is hle_d3d8_cube_face's: six faces one after another, each
+ * with its whole mip chain, each starting on a 128-byte boundary. The host
+ * cube's LockRect/UnlockRect take one face level at a time in the guest's
+ * own format and swizzle, and unswizzle it on unlock as a 2D level would be.
+ *
+ * Kept apart from the rendered cubes above, which carry no contents and
+ * are looked up first: a cube the title renders into is that, whatever it
+ * held before. Rechecked by checksum every RECOMP_HLE_D3D8_TEX_FULL_EVERY
+ * frames it is bound (8 by default), since static cubes are static. */
+#define STATIC_CUBE_CACHE 32
+
+static struct {
+    uint32_t va, data, format;
+    IDirect3DCubeTexture8 *host;    /* NULL: the host refused it, do not retry */
+    uint32_t checksum;
+    unsigned long checked_swap;
+} g_static_cubes[STATIC_CUBE_CACHE];
+static int g_static_cube_count;
+static unsigned long g_static_cube_uploads, g_static_cube_reuploads, g_static_cube_full;
+
+/* Bytes in one face's mip chain, unpadded. */
+static uint32_t cube_chain_bytes(uint32_t fmt, uint32_t edge, uint32_t levels)
+{
+    uint32_t l, chain = 0;
+
+    for (l = 0; l < levels; l++)
+        chain += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(edge, l)) *
+                 level_rows(fmt, level_dim(edge, l));
+    return chain;
+}
+
+static uint32_t guest_bytes_hash(uint32_t phys, uint32_t n)
+{
+    const uint8_t *p = (const uint8_t *)HLE_PTR(CONTIG_BASE + phys);
+    uint64_t h = 0x9E3779B97F4A7C15ull, w;
+    uint32_t i;
+
+    for (i = 0; i + 8 <= n; i += 8) {
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+static void upload_static_cube(IDirect3DCubeTexture8 *host, uint32_t phys, uint32_t fmt,
+                               uint32_t edge, uint32_t levels, uint32_t stride)
+{
+    uint32_t face, l;
+
+    for (face = 0; face < 6; face++) {
+        const uint8_t *src = (const uint8_t *)HLE_PTR(CONTIG_BASE + phys + face * stride);
+
+        for (l = 0; l < levels; l++) {
+            uint32_t d = level_dim(edge, l);
+            uint32_t pitch = d3d8_row_pitch((D3DFORMAT)fmt, d);
+            uint32_t rows = level_rows(fmt, d), y;
+            D3DLOCKED_RECT lr;
+
+            if (FAILED(host_CubeLockRect(host, (D3DCUBEMAP_FACES)face, l, &lr)))
+                return;
+            if ((uint32_t)lr.Pitch == pitch) {
+                memcpy(lr.pBits, src, (size_t)pitch * rows);
+            } else {
+                for (y = 0; y < rows; y++)
+                    memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch,
+                           src + (size_t)y * pitch, pitch);
+            }
+            host_CubeUnlockRect(host, (D3DCUBEMAP_FACES)face, l);
+            src += (size_t)pitch * rows;
+        }
+    }
+}
+
+/* The host copy of a static guest cube, made or refreshed. NULL if the
+ * container is not one this can mirror. */
+static IDirect3DCubeTexture8 *static_cube(IDirect3DDevice8 *dev, uint32_t va)
+{
+    static int full_every = -1;
+    uint32_t common = HLE_MEM32(va + 0), data = HLE_MEM32(va + 4);
+    uint32_t format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    uint32_t fmt = (format >> 8) & 0xFF, levels = (format >> 16) & 0xF;
+    uint32_t edge = 1u << ((format >> 20) & 0xF);
+    uint32_t phys = data & 0x0FFFFFFFu, chain, stride, total;
+    unsigned long now = hle_d3d8_shadow_swaps();
+    int i;
+
+    if (full_every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_FULL_EVERY");
+        full_every = v && atoi(v) > 0 ? atoi(v) : 8;
+    }
+    if ((common & COMMON_TYPE_MASK) != COMMON_TYPE_TEXTURE || !(format & FORMAT_CUBEMAP) ||
+        size || !levels || !data || d3d8_format_bpp((D3DFORMAT)fmt) == 0)
+        return NULL;
+    chain = cube_chain_bytes(fmt, edge, levels);
+    stride = (chain + (CUBE_FACE_ALIGN - 1u)) & ~(CUBE_FACE_ALIGN - 1u);
+    total = 5u * stride + chain;
+    if (!chain || (uint64_t)phys + total > CONTIG_SIZE)
+        return NULL;
+
+    for (i = 0; i < g_static_cube_count; i++)
+        if (g_static_cubes[i].va == va && g_static_cubes[i].data == data &&
+            g_static_cubes[i].format == format)
+            break;
+    if (i < g_static_cube_count) {
+        IDirect3DCubeTexture8 *host = g_static_cubes[i].host;
+
+        if (host && now - g_static_cubes[i].checked_swap >= (unsigned long)full_every) {
+            uint32_t sum = guest_bytes_hash(phys, total);
+
+            g_static_cubes[i].checked_swap = now;
+            if (sum != g_static_cubes[i].checksum) {
+                g_static_cubes[i].checksum = sum;
+                upload_static_cube(host, phys, fmt, edge, levels, stride);
+                g_static_cube_reuploads++;
+            }
+        }
+        return host;
+    }
+    if (g_static_cube_count >= STATIC_CUBE_CACHE) {
+        if (!g_static_cube_full++)
+            fprintf(stderr, "[HLE-D3D8] static cubes: the cache holds %d and this "
+                    "title wants more; 0x%08X and any after it sample nothing\n",
+                    STATIC_CUBE_CACHE, va);
+        return NULL;
+    }
+    g_static_cubes[i].va = va;
+    g_static_cubes[i].data = data;
+    g_static_cubes[i].format = format;
+    g_static_cubes[i].checked_swap = now;
+    g_static_cubes[i].checksum = guest_bytes_hash(phys, total);
+    g_static_cube_count++;
+    if (FAILED(host_CreateCubeTexture(dev, edge, levels, 0, (D3DFORMAT)fmt,
+                                      D3DPOOL_MANAGED, &g_static_cubes[i].host)) ||
+        !g_static_cubes[i].host) {
+        g_static_cubes[i].host = NULL;
+        g_skip_create++;
+        return NULL;
+    }
+    upload_static_cube(g_static_cubes[i].host, phys, fmt, edge, levels, stride);
+    g_static_cube_uploads++;
+    fprintf(stderr, "[HLE-D3D8] static cube 0x%08X mirrored: format 0x%02X %ux%u, "
+            "%u level(s), face stride %u\n", va, fmt, edge, edge, levels, stride);
+    return g_static_cubes[i].host;
+}
+
 /* The host render target for a 2D guest texture the title renders into, for
  * hle_d3d8.c's SetRenderTarget. The same cache entry SetTexture finds, so a
  * texture drawn into and then bound samples what was drawn. A texture already
@@ -1156,10 +1329,15 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
         if (!dev || stage >= MAX_STAGES)
             return;
         if (texture) {
-            /* A cube the title rendered into is bound as itself; every other
-             * cube is one this file does not mirror, and falls through to the
-             * white texture below. */
+            /* A cube the title rendered into is bound as itself, and one it
+             * filled from memory as a copy of those bytes (static_cube). */
+            static int static_cubes = -1;
             IDirect3DCubeTexture8 *cube = bound_cube(texture);
+
+            if (static_cubes < 0)
+                static_cubes = xbox_EnvSwitch("RECOMP_HLE_D3D8_STATIC_CUBES", 1);
+            if (!cube && static_cubes)
+                cube = static_cube(dev, texture);
 
             if (cube) {
                 g_bound[stage] = NULL;
