@@ -6302,11 +6302,13 @@ static void bridge_MmDeleteKernelStack(void)
 
 /* ── Xc* remaining crypto (ordinals 341-345, 347-351)
  *
- * Split into two kinds, both of which clear the memory-model bar:
- *  - the public-key / DES / ModExp entries are documented stubs that ignore
- *    their arguments (no Xbox Live, no on-console key derivation), so the
- *    pointers pass through without being dereferenced;
- *  - XcBlockCrypt/XcKeyTable/XcCryptService/XcUpdateCrypto are the same shape.
+ * All of them clear the memory-model bar: every pointer is a caller-supplied
+ * guest buffer, translated here, and nothing is handed back.
+ *  - XcModExp and the DES entries (XcKeyTable, XcBlockCrypt, XcBlockCryptCBC,
+ *    and XcDESKeyParity above) are real: XNet's System Link key exchange and
+ *    traffic run through them (xbox_crypto_soft.c);
+ *  - the public-key entries are documented stubs that ignore their
+ *    arguments, and XcCryptService/XcUpdateCrypto the same shape.
  * XcVerifyPKCS1Signature is worth singling out: it returns TRUE so that
  * signature checks succeed instead of rebooting the dashboard. */
 static void bridge_XcPKGetKeyLen(void)
