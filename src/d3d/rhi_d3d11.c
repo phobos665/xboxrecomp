@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "rhi_backend.h"
+#include "rhi_shader_cache.h"
 #include "d3d8_internal.h"
 
 /* ---- the numbering the RHI borrows ------------------------------------------ */
@@ -813,6 +814,10 @@ static RhiImage *d_view_image(const RhiView *v)
 
 /* ---- shaders and layouts ---------------------------------------------------------------- */
 
+/* Names the compiler and its settings in the disk cache's key: D3DCompile
+ * with the flags d_shader_create passes. */
+#define D3D11_CACHE_TAG "d3d11-fxc-1"
+
 static RhiShader *d_shader_create(uint32_t stage, const RhiShaderSource *src, char *err, size_t err_len)
 {
     D3D_SHADER_MACRO macros[16];
@@ -830,12 +835,26 @@ static RhiShader *d_shader_create(uint32_t stage, const RhiShaderSource *src, ch
         macros[n].Definition = NULL;
     }
     d3d8_hlsl_note(src->hlsl, src->len, src->name, src->macros, src->entry, src->target);
+    if (err && err_len)
+        err[0] = 0;
+    /* A blob from an earlier run (rhi_shader_cache.c) skips the compiler. */
+    {
+        void *cached = NULL;
+        size_t cached_bytes = 0;
+
+        if (rhi_shader_cache_get(src, D3D11_CACHE_TAG, &cached, &cached_bytes) &&
+            SUCCEEDED(D3DCreateBlob(cached_bytes, &code))) {
+            memcpy(ID3D10Blob_GetBufferPointer(code), cached, cached_bytes);
+            free(cached);
+            goto compiled;
+        }
+        free(cached);
+        code = NULL;
+    }
     hr = D3DCompile(src->hlsl, (SIZE_T)src->len, src->name, src->macros ? macros : NULL, NULL,
                     src->entry, src->target,
                     src->optimize ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : 0, 0,
                     &code, &errors);
-    if (err && err_len)
-        err[0] = 0;
     if (errors) {
         if (err && err_len)
             snprintf(err, err_len, "%s", (const char *)ID3D10Blob_GetBufferPointer(errors));
@@ -846,6 +865,9 @@ static RhiShader *d_shader_create(uint32_t stage, const RhiShaderSource *src, ch
             snprintf(err, err_len, "D3DCompile failed (0x%08lX)", (unsigned long)hr);
         return NULL;
     }
+    rhi_shader_cache_put(src, D3D11_CACHE_TAG, ID3D10Blob_GetBufferPointer(code),
+                         ID3D10Blob_GetBufferSize(code));
+compiled:
     s = calloc(1, sizeof *s);
     if (!s) {
         ID3D10Blob_Release(code);
