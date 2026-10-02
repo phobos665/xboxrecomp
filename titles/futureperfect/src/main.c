@@ -40,6 +40,7 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "xbox_watchpoint.h"
+#include "xbox_nic.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -255,8 +256,8 @@ static void print_guest_context(void *rip)
  * Each has a handler in the runtime that decodes the faulting instruction,
  * performs the access and moves RIP past it; this handler's job is only to
  * route the fault to the right one. The pages are trapped only when the
- * matching switch is set (RECOMP_VBLANK, RECOMP_AC97_READY), so without it
- * these ranges never fault and this code is never reached. */
+ * matching switch is set (RECOMP_VBLANK, RECOMP_AC97_READY, RECOMP_NIC_TRACE),
+ * so without it these ranges never fault and this code is never reached. */
 #define GUEST_NV2A_BASE        0xFD000000u
 #define GUEST_NV2A_PCRTC_PAGE  0xFD600000u   /* interrupt status: write-trapped */
 #define GUEST_APU_REGS_BASE    0xFE800000u   /* APU registers: PAGE_NOACCESS   */
@@ -281,6 +282,10 @@ static LONG route_device_fault(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     if (is_write && va >= GUEST_AC97_PAGE && va < GUEST_AC97_PAGE + 0x1000u) {
         if (mcpx_ac97_handle_write(ep->ContextRecord, fault_addr,
                                    va - GUEST_APU_REGS_BASE))
+            return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (va >= XBOX_NIC_BASE && va < XBOX_NIC_BASE + XBOX_NIC_SIZE) {
+        if (xbox_NicHandleMmio(ep->ContextRecord, va, is_write))
             return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;

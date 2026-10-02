@@ -1,0 +1,34 @@
+/**
+ * The console's network card: its Ethernet address, and its registers.
+ *
+ * See xbox_nic.c for what is modelled so far and how to use it.
+ */
+#ifndef XBOX_NIC_H
+#define XBOX_NIC_H
+
+#include <stdint.h>
+
+/* The card's register page. The nForce MAC answers on 1 KB from here; the
+ * whole page is trapped, because protection is per page. */
+#define XBOX_NIC_BASE 0xFEF00000u
+#define XBOX_NIC_SIZE 0x00001000u
+
+/* This console's Ethernet address, which XNet reads through
+ * ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR). Chosen once per save
+ * folder and kept there; RECOMP_SYSLINK_MAC overrides it. */
+void xbox_NicMacAddress(uint8_t out[6]);
+
+/* Trap the register page if anything asks for it (RECOMP_NIC_TRACE). host is
+ * the page's host address. Call once, after the MCPX aperture is mapped. */
+void xbox_NicInit(void *host);
+
+/* Offer an access violation at guest address xbox_va to the card. Returns
+ * non-zero when it was the card's and has been serviced, in which case the
+ * caller must return EXCEPTION_CONTINUE_EXECUTION. ctx is the PCONTEXT. */
+int xbox_NicHandleMmio(void *ctx, uint32_t xbox_va, int is_write);
+
+/* From the kernel's timer thread: periodic work. Today only the register
+ * summary every five seconds while the trace is on. */
+void xbox_NicTick(void);
+
+#endif /* XBOX_NIC_H */

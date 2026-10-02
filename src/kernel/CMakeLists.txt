@@ -21,6 +21,7 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     xbox_memory_layout.c
     xbox_watchpoint.c
+    xbox_nic.c
     icall_feedback.c
     exit_trace.c
     recomp_trace.c

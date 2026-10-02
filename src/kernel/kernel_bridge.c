@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "xbox_nic.h"
 #ifdef _WIN32
 #include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
 #endif
@@ -3026,6 +3027,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
+        xbox_NicTick();        /* the network card (xbox_nic.c) */
         {
             /* DPCs run at DISPATCH_LEVEL, so not while a guest thread is
              * there (kernel_hal.c, RECOMP_DISPATCH_LOCK). */
