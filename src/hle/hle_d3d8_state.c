@@ -465,8 +465,9 @@ static DWORD ts_to_host(uint8_t kind, uint32_t v)
  * which is what Burnout 2's road does.
  *
  * The two numberings run in different orders, hence the groups. Xbox
- * PSCOMPAREMODE (42) and PSFINALCOMBINERCONSTANT0/1 (43, 44) have no host
- * state and are not forwarded. */
+ * PSCOMPAREMODE (42) has no host state and is not forwarded;
+ * PSFINALCOMBINERCONSTANT0/1 (43, 44) go to the host's 198/199, which the
+ * final combiner's C0 and C1 read. */
 static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = {
     {  0, 200, 8 },      /* PSALPHAINPUTS0-7                   */
     {  8, 208, 2 },      /* PSFINALCOMBINERINPUTSABCD, ...EFG  */
@@ -476,6 +477,7 @@ static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = 
     { 34, 210, 8 },      /* PSRGBINPUTS0-7                     */
     { 45, 218, 8 },      /* PSRGBOUTPUTS0-7                    */
     { 53, 234, 1 },      /* PSCOMBINERCOUNT                    */
+    { 43, 198, 2 },      /* PSFINALCOMBINERCONSTANT0, 1        */
     { 55, 252, 2 },      /* PSDOTMAPPING, PSINPUTTEXTURE       */
 };
 
@@ -484,31 +486,26 @@ static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = 
  * checked against ~0x000FFFFF). The values are the NV2A's, 0x00 to 0x12
  * (xboxdevwiki, NV2A/Pixel Combiner).
  *
- * The host does not model the NV2A's addressing modes. It keeps only which
- * kind of texture a stage samples -- 0 2D, 1 volume, 2 cube, 3 none
- * (d3d8_combiners.h, NV2ATextureMode) -- packed 4 bits per stage in its own
- * PSTEXTUREMODES. So each mode is reduced to the kind it samples, and the
- * addressing itself (bump mapping, dot product and dependent reads) is not
- * reproduced yet; anything past the four plain modes is logged once. */
+ * They go to the host as they are, marked D3D8_PSTEXTUREMODES_XBOX, and
+ * d3d8_combiners.c implements them (emit_xbox_textures): the dot-product,
+ * reflection and dependent-read modes take PSDOTMAPPING and PSINPUTTEXTURE,
+ * forwarded beside them. This used to reduce each mode to the kind of
+ * texture it samples, which turned a dot-product stage into a plain lookup
+ * of whatever was bound: Halo's bumped cube-map reflections (DOTPRODUCT,
+ * DOT_RFLCT_DIFF, DOT_RFLCT_SPEC) never reached its surfaces. The modes the
+ * host only approximates are logged once. */
 static uint32_t host_texture_modes(uint32_t xbox_modes)
 {
-    static const uint8_t kind[0x13] = {
-        3, 0, 1, 2,      /* NONE, PROJECT2D, PROJECT3D, CUBEMAP            */
-        0, 0, 0, 0,      /* PASSTHRU, CLIPPLANE, BUMPENVMAP, ..._LUM       */
-        1, 0, 0, 2,      /* BRDF, DOT_ST, DOT_ZW, DOT_RFLCT_DIFF           */
-        2, 1, 2, 0,      /* DOT_RFLCT_SPEC, DOT_STR_3D, DOT_STR_CUBE, DPNDNT_AR */
-        0, 0, 2          /* DPNDNT_GB, DOTPRODUCT, DOT_RFLCT_SPEC_CONST    */
-    };
-    uint32_t host = 0, i;
+    uint32_t i;
 
     for (i = 0; i < 4u; i++) {
         uint32_t mode = (xbox_modes >> (i * 5u)) & 0x1Fu;
 
-        if (mode > 0x04u)
+        if (mode > 0x12u || mode == 0x05u || mode == 0x06u || mode == 0x07u ||
+            mode == 0x08u || mode == 0x0Au || mode == 0x12u)
             unmapped("PS texture mode", mode);
-        host |= (uint32_t)(mode < 0x13u ? kind[mode] : 3u) << (i * 4u);
     }
-    return host;
+    return D3D8_PSTEXTUREMODES_XBOX | (xbox_modes & 0x000FFFFFu);
 }
 
 /* The pixel shader the title selected, as a D3DPIXELSHADERDEF.
@@ -769,10 +766,10 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
             last_modes = modes;
             lines++;
             fprintf(stderr, "[HLE-D3D8] shadow pixel shader: combiner count 0x%X, "
-                    "texture modes 0x%05X -> host 0x%04X, stage 0 rgb inputs "
-                    "0x%08X outputs 0x%08X, final ABCD 0x%08X EFG 0x%08X\n",
-                    count, modes, host_texture_modes(modes), ps_state(34),
-                    ps_state(45), ps_state(8), ps_state(9));
+                    "texture modes 0x%05X, dot mapping 0x%X, input texture 0x%X, "
+                    "stage 0 rgb inputs 0x%08X outputs 0x%08X, final ABCD 0x%08X "
+                    "EFG 0x%08X\n", count, modes, ps_state(55), ps_state(56),
+                    ps_state(34), ps_state(45), ps_state(8), ps_state(9));
         }
     }
 }

@@ -195,6 +195,8 @@ typedef struct NV2ACombinerOutput {
     int                  cd_dot;     /* 1 = dot product for CD */
     int                  mux_sum;    /* 1 = mux(R0.a, AB, CD) instead of AB+CD */
     NV2AOutputMapping    output_map; /* Scale/bias applied to results */
+    int                  ab_blue_to_alpha; /* RGB only: AB's blue also to .a */
+    int                  cd_blue_to_alpha; /* RGB only: CD's blue also to .a */
 } NV2ACombinerOutput;
 
 /* ================================================================
@@ -206,6 +208,12 @@ typedef struct NV2ACombinerOutput {
 
 /** Maximum texture stages. */
 #define NV2A_MAX_TEXTURES 4
+
+/** NV2ACombinerState.count_flags: PSCOMBINERCOUNT was given. */
+#define NV2A_COUNT_KNOWN 0x80000000u
+
+/** NV2ACombinerState.xmode when the title's texture modes are not known. */
+#define NV2A_XMODE_UNKNOWN 0xFF
 
 /**
  * Complete NV2A register combiner configuration.
@@ -230,10 +238,28 @@ typedef struct NV2ACombinerState {
     NV2ACombinerInput final_input[7]; /* A, B, C, D, E, F, G */
 
     /* --- Texture modes --- */
-    NV2ATextureMode tex_mode[NV2A_MAX_TEXTURES];
+    NV2ATextureMode tex_mode[NV2A_MAX_TEXTURES];   /* the sampler each stage declares */
+
+    /* The title's own PS_TEXTUREMODES per stage (0x00-0x12, xemu psh.c), when
+     * D3DRS_PSTEXTUREMODES carries them (D3D8_PSTEXTUREMODES_XBOX), or
+     * NV2A_XMODE_UNKNOWN: then tex_mode alone says what each stage samples.
+     * With them come the dot-product stages' input mapping (PSDotMapping) and
+     * source stage (PSInputTexture). */
+    uint8_t xmode[NV2A_MAX_TEXTURES];
+    uint8_t dot_map[NV2A_MAX_TEXTURES];
+    uint8_t input_tex[NV2A_MAX_TEXTURES];
 
     /* --- Flags --- */
     DWORD flags;     /* Dot mapping and other flags from token bits 24-31 */
+
+    /* PSCOMBINERCOUNT's flags (bits 8-19 shifted down: MUX_MSB 0x001,
+     * UNIQUE_C0 0x010, UNIQUE_C1 0x100) with NV2A_COUNT_KNOWN set, or 0
+     * when the state was never given: then every stage reads its own
+     * constants and the mux tests r0.a >= 0.5, as before. */
+    DWORD count_flags;
+    /* The final combiner settings, PSFINALCOMBINERINPUTSEFG's low byte:
+     * CLAMP_SUM 0x80, COMPLEMENT_V1 0x40, COMPLEMENT_R0 0x20. */
+    DWORD final_flags;
 
     /* --- Shadow-map stages --- */
     /* Nonzero where the stage's texture is a depth format: the NV2A then
@@ -252,8 +278,8 @@ typedef struct NV2ACombinerState {
     DWORD c1[NV2A_MAX_COMBINER_STAGES]; /* D3DCOLOR (ARGB) per stage */
 
     /* --- Final combiner constants --- */
-    DWORD final_c0; /* Final combiner C0 (same as stage[final].c0) */
-    DWORD final_c1; /* Final combiner C1 (same as stage[final].c1) */
+    DWORD final_c0; /* Final combiner C0: its own, PSFINALCOMBINERCONSTANT0 */
+    DWORD final_c1; /* Final combiner C1: its own, PSFINALCOMBINERCONSTANT1 */
 } NV2ACombinerState;
 
 /* The bytes of NV2ACombinerState that select a shader. */
