@@ -3357,6 +3357,15 @@ static HANDLE bridge_take_handle(uint32_t token)
     return NULL;   /* untagged -> not a table handle, do not close */
 }
 
+/* The host handle behind a guest handle token, for runtime code outside this
+ * file that is handed a guest HANDLE: a DirectSound stream packet's completion
+ * event (src/hle/hle_dsound_stream.c). Same rule as the bridges: a tagged token
+ * goes through the table, anything else passes through unchanged. */
+void *xbox_bridge_resolve_handle(uint32_t token)
+{
+    return (void *)bridge_resolve_handle(token);
+}
+
 /* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
 static void bridge_build_oa(uint32_t obj_attrs_va,
                             XBOX_OBJECT_ATTRIBUTES* oa, XBOX_ANSI_STRING* name)
