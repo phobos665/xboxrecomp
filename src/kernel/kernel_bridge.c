@@ -3073,13 +3073,17 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, 0x1C, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
+    /* Zero the structure: an Xbox KDPC is 0x1C bytes -- Type, Inserted and
+     * padding, the list entry, the routine, its context and two system
+     * arguments. This used to clear 32, which wiped the next field of
+     * whatever embeds the DPC: XNet keeps its interrupt vector right after
+     * its DPC, so the card's ISR was connected on vector 0 instead of 4. */
+    memset(XBOX_TO_NATIVE(dpc_va), 0, 0x1C);
 
     /* Set Type (0x13 = DpcObject) and fields */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
@@ -3136,6 +3140,12 @@ static void bridge_KeInitializeInterrupt(void)
     BRIDGE_MEM32(interrupt_va + 0)  = routine;
     BRIDGE_MEM32(interrupt_va + 4)  = context;
     BRIDGE_MEM32(interrupt_va + 8)  = vector;
+    /* A title calls this a handful of times, and the vector it passes is
+     * the one a device model must raise -- worth a line each. */
+    fprintf(stderr, "  [KERNEL] KeInitializeInterrupt: object 0x%08X vector %u "
+                    "irql %u routine 0x%08X\n",
+            interrupt_va, vector, STACK_ARG(4), routine);
+    fflush(stderr);
     g_eax = 0;
 }
 
