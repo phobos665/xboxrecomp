@@ -447,6 +447,10 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
     return 0;
 }
 
+/* Bumped by the ack thread's pass whenever it changed a guest-visible word,
+ * so the thread can tell a quiet spell from a busy one (nv2a_ack_wait). */
+static LONG g_ack_activity;
+
 static void counter_mirrors_tick(void)
 {
     for (int i = 0; i < g_counter_mirror_count; i++) {
@@ -466,8 +470,10 @@ static void counter_mirrors_tick(void)
             uint32_t src =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].src_off)
                                        + g_memory_offset);
-            if (*dst != src)
+            if (*dst != src) {
                 *dst = src;
+                g_ack_activity++;
+            }
         }
     }
 }
@@ -1195,8 +1201,10 @@ static void fence_mirrors_tick(void)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
-            if (*fence != put)
+            if (*fence != put) {
                 *fence = put;
+                g_ack_activity++;
+            }
         }
     }
 }
@@ -1261,6 +1269,68 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* Between passes of the ack thread.
+ *
+ * It used to be Sleep(0) and nothing else, which returns at once unless a
+ * thread of the same priority is waiting, so the thread spun a whole host
+ * core for the life of the process (OutRun 2: 172 s of CPU in a 180 s run)
+ * -- on a laptop that is power and thermal headroom the guest's own core
+ * needs. A guest waiting on one of these words is spinning on another core,
+ * so while words keep changing the thread still goes round at full speed;
+ * once nothing has changed for a millisecond it waits on a high-resolution
+ * timer between passes instead (RECOMP_NV2A_ACK_IDLE_US, default 500; 0 for
+ * the old spin). The cost is that the first wait after a quiet spell -- the
+ * first kickoff after a vblank wait, say -- can be answered up to that much
+ * later. */
+static void nv2a_ack_wait(void)
+{
+    static int      idle_us = -1;
+    static HANDLE   timer;
+    static LONG     seen;
+    static LONGLONG quiet_since, qpf;
+    LARGE_INTEGER   now, due;
+
+    if (idle_us < 0) {
+        const char *v = getenv("RECOMP_NV2A_ACK_IDLE_US");
+        LARGE_INTEGER f;
+
+        idle_us = v ? atoi(v) : 500;
+        if (idle_us < 0)
+            idle_us = 0;
+        if (idle_us) {
+            timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
+                                           TIMER_ALL_ACCESS);
+            if (!timer)
+                timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+            if (!timer)
+                idle_us = 0;
+        }
+        QueryPerformanceFrequency(&f);
+        qpf = f.QuadPart;
+        fprintf(stderr, "  NV2A busy-bit ack: %s\n",
+                idle_us ? "waits between passes once idle (RECOMP_NV2A_ACK_IDLE_US)"
+                        : "spins (RECOMP_NV2A_ACK_IDLE_US=0)");
+    }
+    if (!idle_us) {
+        Sleep(0);
+        return;
+    }
+    QueryPerformanceCounter(&now);
+    if (g_ack_activity != seen) {
+        seen = g_ack_activity;
+        quiet_since = now.QuadPart;
+    }
+    if (now.QuadPart - quiet_since < qpf / 1000) {
+        Sleep(0);   /* busy: a waiter is spinning on another core */
+        return;
+    }
+    due.QuadPart = -(LONGLONG)idle_us * 10;   /* relative, 100 ns units */
+    if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+        WaitForSingleObject(timer, 50);
+    else
+        Sleep(1);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -1294,6 +1364,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
+                g_ack_activity++;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -1301,6 +1372,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
+                g_ack_activity++;
             }
         }
         {
@@ -1310,6 +1382,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
             if (*get != *put) {
                 *get = *put;
+                g_ack_activity++;
             }
         }
         fence_mirrors_tick();
@@ -1416,7 +1489,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        nv2a_ack_wait();
     }
     return 0;
 }
