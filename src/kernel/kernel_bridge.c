@@ -737,6 +737,8 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        /* And the arena must not hand these pages out again. */
+        xbox_ContiguousPin(xbox_va, size);
 
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "

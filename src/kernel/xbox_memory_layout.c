@@ -3457,6 +3457,92 @@ int xbox_ContiguousFree(uint32_t xbox_va)
     return 1;
 }
 
+/* Pinned physical ranges.
+ *
+ * MmAllocateContiguousMemoryEx with a range that brackets exactly one
+ * allocation names a physical address -- XPhysicalAlloc(size, phys, ...) sends
+ * low = phys, high = phys + size - 1 -- and the bridge answers it with that
+ * address without asking this arena. The arena still has to know: its free
+ * blocks and its bump pointer can cover the pinned pages, and the next
+ * ordinary request is then carved across them. Halo pins its game state at
+ * physical 0x61000 and its tag cache at 0x3A6000 after its first D3D device
+ * has freed the blocks there; its 22 MB texture cache, asked for anywhere,
+ * landed on both, and texture uploads overwrote the game state.
+ *
+ * So a pin takes the pages it covers out of the arena. Free blocks are split
+ * around it, and a pin above the bump pointer moves the pointer past it (the
+ * gap below becomes a free block). Pages a live block already holds stay with
+ * it and are reported: the title asked for that address, and moving either
+ * would be wrong. The pinned part becomes a live block of its own, so
+ * MmFreeContiguousMemory on the pinned address gives it back. */
+static int contig_take_free(int i, uint32_t lo, uint32_t hi)
+{
+    uint32_t a = g_contig_blocks[i].addr;
+    uint32_t e = a + g_contig_blocks[i].span;
+
+    if (lo < a) lo = a;
+    if (hi > e) hi = e;
+    if (hi < e)                                   /* the free tail */
+        contig_insert(i + 1, hi, 0u, e - hi, 1);
+    if (lo > a) {                                 /* the free head */
+        g_contig_blocks[i].span = lo - a;
+        contig_insert(i + 1, lo, hi - lo, hi - lo, 0);
+        return i + 2;
+    }
+    g_contig_blocks[i].span = hi - lo;
+    g_contig_blocks[i].size = hi - lo;
+    g_contig_blocks[i].free = 0;
+    return i + 1;
+}
+
+void xbox_ContiguousPin(uint32_t xbox_va, uint32_t size)
+{
+    uint32_t lo = xbox_va & ~(XBOX_CONTIG_PAGE - 1u);
+    uint32_t hi = contig_round(xbox_va + (size ? size : 1u));
+    uint32_t floor = XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW;
+    uint32_t top = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT;
+    uint32_t bump_was = g_contig_next, live_lo = 0, live_hi = 0;
+    int i;
+
+    if (lo < floor)
+        lo = floor;             /* below the arena: never handed out anyway */
+    if (hi > top)
+        hi = top;
+    if (hi <= lo)
+        return;
+    for (i = 0; i < g_contig_block_count; ) {
+        uint32_t a = g_contig_blocks[i].addr;
+        uint32_t e = a + g_contig_blocks[i].span;
+
+        if (e <= lo) { i++; continue; }
+        if (a >= hi) break;
+        if (!g_contig_blocks[i].free) {
+            if (!live_lo) live_lo = a;
+            live_hi = e;
+            i++;
+            continue;
+        }
+        i = contig_take_free(i, lo, hi);
+    }
+    if (hi > g_contig_next) {
+        uint32_t start = lo > g_contig_next ? lo : g_contig_next;
+
+        if (start > g_contig_next)
+            contig_insert(g_contig_block_count, g_contig_next, 0u,
+                          start - g_contig_next, 1);
+        contig_insert(g_contig_block_count, start, hi - start, hi - start, 0);
+        g_contig_next = hi;
+    }
+    fprintf(stderr, "  [CONTIG] pinned 0x%08X..0x%08X taken out of the arena "
+                    "(bump pointer 0x%08X -> 0x%08X)\n",
+            lo, hi, bump_was, g_contig_next);
+    if (live_lo)
+        fprintf(stderr, "  [CONTIG] pinned 0x%08X..0x%08X overlaps live blocks "
+                        "0x%08X..0x%08X; both now use those pages\n",
+                lo, hi, live_lo, live_hi);
+    fflush(stderr);
+}
+
 /* Walk the contiguous blocks this runtime handed out.
  *
  * Exposed because the DirectSound DSP doorbell lives inside one of them and
