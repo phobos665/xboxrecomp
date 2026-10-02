@@ -265,8 +265,16 @@ static void kernel_data_init(void)
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
 
-    /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
+    /* XboxLANKey (ordinal 353): the player's own if they gave it, else zeros.
+     * XNet derives every System Link key from it, so zeros talk only to other
+     * recompiled builds (xbox_nic.c, xbox_NetLanKey). */
+    {
+        uint8_t lan_key[16];
+        xbox_NetLanKey(lan_key);
+        memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset),
+               lan_key, 16);
+        memcpy(xbox_LANKey, lan_key, 16);
+    }
 
     /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
