@@ -29,6 +29,7 @@
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include "platform/host_timer.h"   /* the vblank clock's precise sleep */
+#include "xbox_nic.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -3352,6 +3353,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
+        xbox_NicTick();        /* the network card (xbox_nic.c) */
         {
             /* DPCs run at DISPATCH_LEVEL, so not while a guest thread is
              * there (kernel_hal.c, RECOMP_DISPATCH_LOCK). */

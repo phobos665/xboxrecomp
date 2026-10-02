@@ -18,6 +18,7 @@
 #include "xbox_watchpoint.h"
 #include "platform/fault_emulate.h" /* recomp_fault_set_guest_base */
 #include "platform/host_timer.h"   /* the flip gate's and the ack thread's waits */
+#include "xbox_nic.h"
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
  *
@@ -4031,6 +4032,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
                     XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
+
+            /* The network card's page, trapped only when something asks
+             * for it (xbox_nic.c); otherwise plain memory like the rest. */
+            xbox_NicInit((char *)g_mcpx_memory
+                         + (XBOX_NIC_BASE - XBOX_MCPX_BASE));
         } else {
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",

@@ -12,6 +12,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
 #include "recomp_config.h"
+#include "xbox_nic.h"
 #include <string.h>
 /* getenv: without <stdlib.h> its pointer is truncated to int. */
 #include <stdlib.h>
@@ -330,9 +331,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     case XC_FACTORY_ETHERNET_ADDR: {
         /* Six bytes, in Microsoft's Xbox OUI so a title that sanity-checks
-         * the prefix is satisfied. System Link keys off this being stable
-         * rather than being any particular value. */
-        static const unsigned char mac[6] = { 0x00, 0x50, 0xF2, 0x00, 0x00, 0x01 };
+         * the prefix is satisfied. System Link needs it stable and different
+         * on every console in a game, so it is chosen once per save folder
+         * (xbox_nic.c) rather than being the one address every install had. */
+        uint8_t mac[6];
+        xbox_NicMacAddress(mac);
         if (ValueLength >= sizeof mac) {
             memcpy(Value, mac, sizeof mac);
             if (Type) *Type = 3;
