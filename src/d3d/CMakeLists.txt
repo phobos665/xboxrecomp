@@ -16,6 +16,7 @@ if(WIN32)
         d3d8_display.c
         d3d8_compile.c
         rhi.c
+        rhi_shader_cache.c
         rhi_d3d11.c
     )
     # gdi32: the overlay renders its text with GDI rather than an embedded font.

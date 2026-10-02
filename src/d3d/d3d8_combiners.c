@@ -580,7 +580,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     /* ---- Texture samplers ---- */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         if (state->tex_mode[i] != NV2A_TEXMODE_NONE) {
-            if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
+            if (state->shadow[i]) {
+                /* A depth texture: read as 2D whatever the stage mode, and
+                 * compared rather than filtered (below). */
+                EMIT("Texture2D    tex%d : register(t%d);\n", i, i);
+            } else if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
                 EMIT("TextureCube  tex%d : register(t%d);\n", i, i);
             } else if (state->tex_mode[i] == NV2A_TEXMODE_3D) {
                 EMIT("Texture3D    tex%d : register(t%d);\n", i, i);
@@ -605,6 +609,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    uint   fog_enable;\n");
     EMIT("    uint4  alpha_only;\n");
     EMIT("    float4 tex_scale[4];\n");   /* texel -> normalised, linear textures */
+    EMIT("    float4 shadow_max;\n");     /* per stage: the depth format's top */
+    EMIT("    uint4  shadow_func;\n");    /* x: D3DCMPFUNC, y: compare reversed */
     EMIT("};\n\n");
 
     /* ---- Input structure ---- */
@@ -612,18 +618,42 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float4 pos     : SV_POSITION;\n");
     EMIT("    float4 color0  : COLOR0;\n");
     EMIT("    float4 color1  : COLOR1;\n");
-    EMIT("    float3 tc0     : TEXCOORD0;\n");
-    EMIT("    float3 tc1     : TEXCOORD1;\n");
-    EMIT("    float3 tc2     : TEXCOORD2;\n");
-    EMIT("    float3 tc3     : TEXCOORD3;\n");
+    /* A shadow stage needs q as well, to divide by. Only there: a vertex
+     * stage that writes three components would not link with four. */
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+        EMIT("    float%d tc%d     : TEXCOORD%d;\n", state->shadow[i] ? 4 : 3, i, i);
     /* The fog register's alpha is the fog factor the vertex stage
      * interpolated, which both vertex paths write to TEXCOORD4
      * (d3d8_shaders.c for fixed function, d3d8_vsh.c for a program). */
     EMIT("    float  fog     : TEXCOORD4;\n");
     EMIT("};\n\n");
 
+    /* ---- Shadow compare ---- */
+    for (i = 0; i < NV2A_MAX_TEXTURES && !state->shadow[i]; i++)
+        ;
+    if (i < NV2A_MAX_TEXTURES) {
+        /* The NV2A's shadow-map read: the texel, in the depth format's own
+         * units, against r/q under D3DRS_SHADOWFUNC; 1 where the test
+         * passes. 0 (unset) passes everywhere rather than shadowing all. */
+        EMIT("float shadow_test(float texel, float ref) {\n");
+        EMIT("    float a = shadow_func.y ? ref : texel;\n");
+        EMIT("    float b = shadow_func.y ? texel : ref;\n");
+        EMIT("    switch (shadow_func.x) {\n");
+        EMIT("    case 1: return 0.0;\n");
+        EMIT("    case 2: return a <  b ? 1.0 : 0.0;\n");
+        EMIT("    case 3: return a == b ? 1.0 : 0.0;\n");
+        EMIT("    case 4: return a <= b ? 1.0 : 0.0;\n");
+        EMIT("    case 5: return a >  b ? 1.0 : 0.0;\n");
+        EMIT("    case 6: return a != b ? 1.0 : 0.0;\n");
+        EMIT("    case 7: return a >= b ? 1.0 : 0.0;\n");
+        EMIT("    default: return 1.0;\n");
+        EMIT("    }\n");
+        EMIT("}\n\n");
+    }
+
     /* ---- Main function ---- */
     EMIT("float4 main(PS_IN input) : SV_TARGET {\n");
+    EMIT("    float shadow_dbg = 0.0;\n");
 
     /* Initialize register file */
     EMIT("    /* Register file initialization */\n");
@@ -651,6 +681,41 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         if (state->tex_mode[i] == NV2A_TEXMODE_NONE) {
             EMIT("    float4 r_t%d = float4(0, 0, 0, 0);\n", i);
+        } else if (state->shadow[i]) {
+            /* Projected, then four neighbouring texels compared and the
+             * results filtered bilinearly: the hardware's soft edge. Load,
+             * so the comparison sees stored depth, not a blend of it. */
+            EMIT("    float4 r_t%d;\n", i);
+            EMIT("    {\n");
+            EMIT("        float4 q = input.tc%d;\n", i);
+            EMIT("        float qw = abs(q.w) > 1e-20 ? q.w : 1.0;\n");
+            EMIT("        float2 uv = q.xy / qw * tex_scale[%d].xy;\n", i);
+            EMIT("        float ref = q.z / qw;\n");
+            EMIT("        float m = shadow_max[%d];\n", i);
+            EMIT("        float2 sz; tex%d.GetDimensions(sz.x, sz.y);\n", i);
+            EMIT("        float2 p = uv * sz - 0.5;\n");
+            EMIT("        float2 f = frac(p);\n");
+            EMIT("        int2 c0 = (int2)floor(p), hi = (int2)sz - 1;\n");
+            EMIT("        float s00 = shadow_test(tex%d.Load(int3(clamp(c0, 0, hi), 0)).r * m, ref);\n", i);
+            EMIT("        float s10 = shadow_test(tex%d.Load(int3(clamp(c0 + int2(1, 0), 0, hi), 0)).r * m, ref);\n", i);
+            EMIT("        float s01 = shadow_test(tex%d.Load(int3(clamp(c0 + int2(0, 1), 0, hi), 0)).r * m, ref);\n", i);
+            EMIT("        float s11 = shadow_test(tex%d.Load(int3(clamp(c0 + int2(1, 1), 0, hi), 0)).r * m, ref);\n", i);
+            EMIT("        float s = lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);\n");
+            /* RECOMP_D3D8_SHADOW_VIEW: the draw shows one of these instead
+             * of its colour -- 1 the stored depth, 2 the reference r/q, 3 and
+             * 4 the texel position across and down, 5 the filtered test, 6
+             * the reference unscaled and 7 its fraction (its range, when 2
+             * reads black). */
+            EMIT("        if (shadow_func.z == 1) shadow_dbg = tex%d.Load(int3(clamp(c0, 0, hi), 0)).r;\n", i);
+            EMIT("        if (shadow_func.z == 2) shadow_dbg = saturate(ref / m);\n");
+            EMIT("        if (shadow_func.z == 3) shadow_dbg = saturate(uv.x);\n");
+            EMIT("        if (shadow_func.z == 4) shadow_dbg = saturate(uv.y);\n");
+            EMIT("        if (shadow_func.z == 5) shadow_dbg = s;\n");
+            EMIT("        if (shadow_func.z == 6) shadow_dbg = saturate(ref);\n");
+            EMIT("        if (shadow_func.z == 7) shadow_dbg = frac(ref);\n");
+            EMIT("        r_t%d = float4(s, s, s, s);\n", i);
+            EMIT("    }\n");
+            continue;   /* no alpha_only fix-up: the result is the test */
         } else if (state->tex_mode[i] == NV2A_TEXMODE_CUBEMAP) {
             /* Cube map: use the full 3-component reflection/TCI vector */
             EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d);\n",
@@ -940,6 +1005,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         }
     }
 
+    for (i = 0; i < NV2A_MAX_TEXTURES && !state->shadow[i]; i++)
+        ;
+    if (i < NV2A_MAX_TEXTURES)
+        EMIT("    if (shadow_func.z) return float4(shadow_dbg, shadow_dbg, shadow_dbg, 1.0);\n");
     EMIT("    return result;\n");
     EMIT("}\n");
 
@@ -1192,6 +1261,28 @@ BOOL d3d8_combiners_prepare_draw(void)
         g_last_shader = NULL;
     }
 
+    /* Shadow-map stages come from the textures bound for this draw, not the
+     * token: a depth-format texture is compared, not sampled. Part of the
+     * shader key, so a change selects another shader. */
+    {
+        static int enabled = -1;
+
+        if (enabled < 0) {
+            const char *v = getenv("RECOMP_D3D8_SHADOW_COMPARE");
+            enabled = !(v && v[0] == '0');
+        }
+        for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            D3DFORMAT f = d3d8_base_format(d3d8_GetStageTexture(i));
+            BYTE sh = (enabled && g_combiner_state.tex_mode[i] != NV2A_TEXMODE_NONE &&
+                       d3d8_format_is_depth(f)) ? 1 : 0;
+
+            if (sh != g_combiner_state.shadow[i]) {
+                g_combiner_state.shadow[i] = sh;
+                g_last_shader = NULL;
+            }
+        }
+    }
+
     /* Get or compile the pixel shader for this combiner state */
     if (!g_last_shader)
         g_last_shader = d3d8_combiners_get_shader(&g_combiner_state);
@@ -1268,6 +1359,45 @@ BOOL d3d8_combiners_prepare_draw(void)
             if (tex && d3d8_format_is_linear(format) && d3d8_base_size(tex, &w, &h) && w && h) {
                 cb->tex_scale[i][0] = 1.0f / (float)w;
                 cb->tex_scale[i][1] = 1.0f / (float)h;
+            }
+            /* The host holds depth 0..1; the title's r/q is in the format's
+             * own range, as the NV2A compares. */
+            switch (format) {
+            case D3DFMT_D24S8: case D3DFMT_LIN_D24S8:
+                cb->shadow_max[i] = 16777215.0f; break;
+            case D3DFMT_D16: case D3DFMT_LIN_D16:
+                cb->shadow_max[i] = 65535.0f; break;
+            default:
+                cb->shadow_max[i] = 1.0f; break;
+            }
+        }
+        {
+            static int swap = -1;
+
+            if (swap < 0) {
+                const char *v = getenv("RECOMP_D3D8_SHADOW_SWAP");
+                swap = (v && v[0] == '1') ? 1 : 0;
+            }
+            static int view = -1;
+
+            if (view < 0) {
+                const char *v = getenv("RECOMP_D3D8_SHADOW_VIEW");
+                view = v ? atoi(v) : 0;
+            }
+            cb->shadow_func = rs[D3DRS_SHADOWFUNC];
+            cb->shadow_swap = (UINT)swap;
+            cb->shadow_pad[0] = (UINT)view;     /* shadow_func.z in the HLSL */
+            /* Say once what the first shadow-map draw compares with. */
+            for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+                static int said;
+                if (g_combiner_state.shadow[i] && !said) {
+                    said = 1;
+                    fprintf(stderr, "NV2A combiners: shadow map on stage %d, mode %d, "
+                            "SHADOWFUNC %lu (0 = unset)%s\n", i,
+                            (int)g_combiner_state.tex_mode[i], (unsigned long)rs[D3DRS_SHADOWFUNC],
+                            swap ? ", compare reversed" : "");
+                    fflush(stderr);
+                }
             }
         }
 

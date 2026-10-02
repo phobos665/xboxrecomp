@@ -9,6 +9,7 @@ if(WIN32)
     set(D3D8_SMOKE_RHI
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi.c
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi_d3d11.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi_shader_cache.c
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_compile.c
     )
 
@@ -19,8 +20,9 @@ if(WIN32)
     )
     target_include_directories(d3d8_smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/config
     )
-    target_link_libraries(d3d8_smoke PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    target_link_libraries(d3d8_smoke PRIVATE platform d3d11 dxgi dxguid d3dcompiler xbox_config)
     if(MSVC)
         target_compile_options(d3d8_smoke PRIVATE /W3)
     endif()
@@ -45,8 +47,8 @@ if(WIN32)
         ../../src/d3d/d3d8_combiners.c
         ${D3D8_SMOKE_RHI}
     )
-    target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
-    target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    target_include_directories(d3d8_a8 PRIVATE ../../src/d3d ../../src/config)
+    target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler xbox_config)
 endif()
 
 if(WIN32)
@@ -60,8 +62,8 @@ if(WIN32)
         ../../src/d3d/d3d8_combiners.c
         ${D3D8_SMOKE_RHI}
     )
-    target_include_directories(d3d8_final_default PRIVATE ../../src/d3d)
-    target_link_libraries(d3d8_final_default PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    target_include_directories(d3d8_final_default PRIVATE ../../src/d3d ../../src/config)
+    target_link_libraries(d3d8_final_default PRIVATE platform d3d11 dxgi dxguid d3dcompiler xbox_config)
     # Registered with ctest from the root CMakeLists: this directory is
     # entered from src/d3d, before the root calls enable_testing().
 endif()

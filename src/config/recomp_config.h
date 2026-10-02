@@ -36,6 +36,11 @@
  * name. Called during start-up before anything reads a setting; without
  * it the lookups below still work and simply find no file. */
 void recomp_config_set_title(uint32_t title_id);
+/* The title id given above, 0 before it is known. */
+uint32_t recomp_config_title_id(void);
+/* The per-user directory settings live in (%APPDATA%\xboxrecomp on
+ * Windows); 0 if there is none. Caches go beneath it. */
+int recomp_config_user_dir(char *out, size_t n);
 
 /* The value for a setting: the environment variable if it is set and not
  * empty, then the config file, then NULL. Either name may be NULL to skip

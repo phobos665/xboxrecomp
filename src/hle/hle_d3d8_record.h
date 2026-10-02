@@ -180,6 +180,12 @@ HRESULT host_CreateTexture(IDirect3DDevice8 *dev, UINT width, UINT height,
 HRESULT host_CreateCubeTexture(IDirect3DDevice8 *dev, UINT edge, UINT levels,
                                DWORD usage, D3DFORMAT format, D3DPOOL pool,
                                IDirect3DCubeTexture8 **texture);
+/* One face level of a cube the title fills from memory. Not captured: a
+ * replay shows a static cube empty. */
+HRESULT host_CubeLockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
+                          UINT level, D3DLOCKED_RECT *locked);
+HRESULT host_CubeUnlockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
+                            UINT level);
 HRESULT host_LockRect(IDirect3DTexture8 *texture, UINT level,
                       D3DLOCKED_RECT *locked, const RECT *rect, DWORD flags);
 HRESULT host_UnlockRect(IDirect3DTexture8 *texture, UINT level);
