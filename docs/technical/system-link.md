@@ -10,18 +10,43 @@ plan, including XLink Kai and Insignia, are in
 This page records what exists and what was measured. TimeSplitters 2 is the
 reference title.
 
+**Status (2 Oct 2026):** two copies of TimeSplitters 2 on one PC find each
+other's System Link game, join, and play a Deathmatch, also with 100 ms
+added each way, and with 50 ms and 5% loss. Next is playing against xemu
+(which needs the player's own `XboxLANKey`, below) and XLink Kai.
+
 ## What exists
 
 | Piece | Where | Switch |
 | --- | --- | --- |
+| The network card | `src/kernel/xbox_nic.c`, routed from `route_device_fault` in the title's `main.c`; interrupt from the kernel's timer thread | `RECOMP_SYSLINK=udp` |
+| A UDP tunnel in xemu's format | `src/kernel/xbox_net_udp.c` | `RECOMP_SYSLINK_REMOTE=host:port`, `RECOMP_SYSLINK_LOCAL=port`, `RECOMP_SYSLINK_DELAY_MS`, `RECOMP_SYSLINK_LOSS` |
+| Real Diffie-Hellman and triple DES in the kernel | `src/kernel/xbox_crypto_soft.c`, behind `XcModExp`, `XcKeyTable`, `XcBlockCrypt(CBC)`, `XcDESKeyParity`; checked by `tests/crypto_soft` | |
+| `XboxLANKey` from the player | `xbox_NetLanKey` in `xbox_nic.c` | `%APPDATA%\xboxrecomp\keys.ini` `lan_key = ...`, or `RECOMP_XBOX_LAN_KEY` |
 | A unique Ethernet address per save folder | `src/kernel/xbox_nic.c`, answered through `ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR)` in `kernel_xbox.c` | `RECOMP_SYSLINK_MAC=00:50:F2:12:34:56` overrides it |
-| A register log of the card at 0xFEF00000 | `src/kernel/xbox_nic.c`, routed from `route_device_fault` in the title's `main.c` | `RECOMP_NIC_TRACE=1`, `RECOMP_NIC_TRACE_BUDGET=<lines>` |
+| A register log of the card at 0xFEF00000 | `src/kernel/xbox_nic.c` | `RECOMP_NIC_TRACE=1`, `RECOMP_NIC_TRACE_BUDGET=<lines>` |
+| A line per frame carried | `xbox_nic.c` | `RECOMP_SYSLINK_FRAMES=<n>` |
 
-There is no card model yet. Without `RECOMP_NIC_TRACE` the register page is
-the plain memory it always was, and with it the page traps but every access
-is answered from a copy of what the guest wrote, so the title sees the same
-plain memory either way. A title on a dead network shows exactly what it
-should: TimeSplitters 2 searches, then says "No System Link Games Found".
+Everything is off by default: without `RECOMP_SYSLINK` or `RECOMP_NIC_TRACE`
+the register page is the plain memory it always was, and a title on no
+network shows what it should: TimeSplitters 2 searches, then says "No System
+Link Games Found".
+
+### Two copies on one PC
+
+Give each its own save folder (so its own Ethernet address) and point their
+tunnels at each other:
+
+```
+copy A: RECOMP_SAVE_DIR=<a> RECOMP_SYSLINK=udp RECOMP_SYSLINK_LOCAL=9001 RECOMP_SYSLINK_REMOTE=127.0.0.1:9002
+copy B: RECOMP_SAVE_DIR=<b> RECOMP_SYSLINK=udp RECOMP_SYSLINK_LOCAL=9002 RECOMP_SYSLINK_REMOTE=127.0.0.1:9001
+```
+
+For a scripted pair: host with the Join Game sequence below but Start Game
+instead of Join, then Deathmatch, map, options, character and the game name
+(six more A presses, about 6 s apart, the last landing in the lobby), and a
+final A to start once the joiner is in; the joiner presses Join Game after
+the host's lobby is up, then A for the server, A for the character.
 
 ### The Ethernet address
 
@@ -91,14 +116,14 @@ CRLF line endings; it was put back to LF.)
 
 From `RECOMP_NIC_TRACE=1` through Join Game. Nothing touches the card before
 that point. The driver is five functions at 0x0020F578 to 0x0020FD1E, and its
-interrupt routine (0x0020F742) connects on **vector 0**, not the IRQ 4 that
-xemu's PCI model uses.
+interrupt routine (0x0020F742) connects on bus level 4, as on the console.
+(The first logs said vector 0: that was a kernel bug, below.)
 
 **Reset.** `LinkSpeed`, `ReceiverControl`, `TransmitterControl` cleared, then
 `ReceiverStatus` and `TransmitterStatus` read for bit 0 (busy, clear on plain
 memory, so fine). Then `TxRxControl = 4` (reset) and a wait of up to 500
 reads for **bit 3 of `TxRxControl`**, forcedeth's IDLE. Plain memory never
-sets it, so today the wait times out. **The model has to report IDLE.**
+sets it, so the wait timed out; the card reports it.
 
 **Set-up.** In order: `MIIMask`, `IrqMask = 0`, `+0x200`, `UnknownSetupReg6`,
 `TransmitPoll`, `LinkSpeed`; status registers read and written back
@@ -123,9 +148,17 @@ sets it, so today the wait times out. **The model has to report IDLE.**
 | `IrqMask` | `0x5F` | |
 
 **Sending.** XNet writes `TxRxControl = 1` (kick) every time it queues a
-frame, about 500 times a second while searching, from `sub_0020F96F`,
-`sub_0020FA9C` and `sub_0020FACA`. Nothing ever completes, so the ring stays
-full: 7 of 11 descriptors queued.
+frame, from `sub_0020F96F`, `sub_0020FA9C` and `sub_0020FACA`. With no card
+behind the registers nothing ever completed, the ring stayed full (7 of 11
+queued) and XNet kicked about 500 times a second. Its completion path
+(`sub_0020F8A2`) checks only that bit 15 of a descriptor has been cleared.
+
+**Receiving** (`sub_0020F74E`, from the DPC `sub_0020FCB6`) reads a
+descriptor's length as the frame's own length -- it subtracts one only for an
+error-flag combination -- skips one without bit 0 (valid), re-arms each one
+itself with `0x800007FD`, and filters on its own address or broadcast in
+software. The DPC acknowledges `MIIStatus` and `IrqStatus` by writing back
+what it read, and restarts the receiver (`TxRxControl = 2`) on "no buffer".
 
 **Descriptors** are 8 bytes: a 32-bit buffer physical address, a 16-bit
 length minus one, and 16 bits of flags.
@@ -146,12 +179,11 @@ dst FF:FF:FF:FF:FF:FF src 00:50:F2:57:AD:18 type 0800: 45 00 00 34 ... 40 11 ...
 
 ## Physical addresses: two storages
 
-This matters for the model more than anything above. In this runtime, low
-RAM and the contiguous window at 0x80000000 are **separate storage**
-(`xbox_memory_layout.c`, kept apart on purpose so pinned pools do not land on
-the XBE image), and `MmGetPhysicalAddress` answers a low VA with itself and a
-window VA with VA - 0x80000000. So a physical address alone does not say
-which storage it came from.
+In this runtime, low RAM and the contiguous window at 0x80000000 are
+**separate storage** (`xbox_memory_layout.c`, kept apart on purpose so pinned
+pools do not land on the XBE image), and `MmGetPhysicalAddress` answers a low
+VA with itself and a window VA with VA - 0x80000000. So a physical address
+alone does not say which storage it came from.
 
 XNet uses both. The rings come from `MmAllocateContiguousMemory` and read
 correctly through the window. The **frame buffers are in low RAM**
@@ -160,20 +192,53 @@ allocator's `mem_mark` fill, read through low RAM they are the frames above.
 The APU reads every physical address through the window, which is right for
 its buffers and would be wrong here.
 
-The rule the card model needs: a physical address inside a live contiguous
-allocation is the window, anything else is low RAM. The contiguous arena
-already tracks its live blocks (`xbox_ContiguousFree` knows them), so this is
-a query on the arena, not a new table.
+"Inside a live contiguous block means the window" does not work: the window
+held another allocator's data at the same physical address as the frame
+buffer, so both storages are in use there. What does work is asking the one
+place that knows: `MmGetPhysicalAddress` now notes, per 4 KB page, which
+storage it answered for, and `xbox_PhysToGuest` resolves through that (the
+window, as before, for a page never handed out). Over a 150 s match every
+send buffer resolved to low RAM, as it should.
 
-## What the card model needs, from this
+## What it took, beyond the card
 
-- `TxRxControl` bit 3 (IDLE) set after reset.
-- On a kick: walk the send ring from where it last stopped, take each
-  descriptor with bit 15 set, copy `length + 1` bytes from the buffer, give
-  the frame to the tunnel, clear bit 15, and raise the send interrupt.
-- On a received frame: copy it into the next receive descriptor with bit 15
-  set, write the length, clear bit 15, and raise the receive interrupt.
-- Interrupt status bits that the guest clears by writing 1, and the line
-  raised on vector 0 through `kernel_raise_interrupt`, from the timer thread
-  as the APU's is.
-- Physical addresses resolved by the rule above.
+**A kernel bug that moved the interrupt.** `KeInitializeDpc` cleared 32 bytes,
+but an Xbox KDPC is 0x1C. XNet keeps its interrupt vector in the field right
+after its DPC, so the vector `HalGetInterruptVector(4)` returned was wiped
+before `KeInitializeInterrupt` read it, and the ISR connected on vector 0.
+Any title with a field after an embedded DPC lost it the same way.
+
+**Real crypto.** Two copies found each other's game, then the joiner sent its
+key-exchange packet, the host answered, and the host rejected every packet
+after that. XNet's key exchange is Diffie-Hellman (`XcModExp`) and its
+traffic triple DES in CBC (`XcKeyTable`, `XcBlockCryptCBC`); all were stubs,
+so each side computed a different shared secret. They are the standard
+algorithms now, checked against FIPS 46, FIPS 81, SP 800-67 and Python's
+`pow()` (`tests/crypto_soft`).
+
+**`XboxLANKey`.** XNet derives a title's System Link keys as
+HMAC(`XboxLANKey`, 0 || the certificate's LAN key) ([xboxdevwiki][sl]).
+`XboxLANKey` is one fixed key in every retail kernel and Microsoft's, so it is
+not in this repository. Two recompiled builds agree on zeros, which is why
+the pair works; playing xemu or a console needs the player's own key from
+their own BIOS in `keys.ini`. Unverified until the xemu check.
+
+[sl]: https://xboxdevwiki.net/System_Link
+
+## Measured: two copies on one PC
+
+| Run | Join | Match | Frames (host out / in) |
+| --- | --- | --- | --- |
+| No added delay, 150 s in the level | yes | held to the end | 1654 / 1506 |
+| 100 ms added each way | yes | held to the end | 1336 / 1233 |
+| 50 ms each way, 5% loss | yes | held to the end | 1324 / 1157, 130 dropped in all |
+
+In a match TimeSplitters 2 sends about 11 frames a second each way. Frame
+sizes were logged only through the join (the largest there was 298 bytes);
+whether match traffic ever approaches 1514 bytes, and so the 1500-byte
+internet packet, is still to be measured. Received frames reach the guest on the next timer
+tick, which can add up to about 16 ms; worth measuring against a real
+round trip before changing the kernel's pacing for it.
+
+Whether a match *feels* playable at a given delay is a person's judgement,
+not something these runs show.
