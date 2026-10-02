@@ -22,6 +22,7 @@ set(KERNEL_SOURCES
     xbox_memory_layout.c
     xbox_watchpoint.c
     xbox_nic.c
+    xbox_crypto_soft.c
     icall_feedback.c
     exit_trace.c
     recomp_trace.c
@@ -68,3 +69,8 @@ else()
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+
+# DES and modular exponentiation against published answers; System Link
+# only works if both consoles compute exactly what the Xbox kernel does.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/crypto_soft
+                 ${CMAKE_CURRENT_BINARY_DIR}/crypto_soft)

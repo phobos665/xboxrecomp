@@ -17,6 +17,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_crypto_soft.h"
 #include <string.h>
 
 /* SHA-1 / RC4 / HMAC below are portable software implementations, so the
@@ -351,56 +352,56 @@ BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Hash, PVOID PublicKey, PVOID
     return TRUE;
 }
 
+/* A = B ^ C mod D over dwN 32-bit words: the Diffie-Hellman behind XNet's
+ * key exchange. Both ends of a System Link session have to compute exactly
+ * this, so it is the real thing (xbox_crypto_soft.c), not a stand-in. */
 ULONG __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULONG Modulus, ULONG ModulusLength)
 {
-    (void)Result;
-    (void)Base;
-    (void)Exponent;
-    (void)Modulus;
-    (void)ModulusLength;
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_CRYPTO, "XcModExp: stubbed");
-    return 0;
+    if (!Result || !Base || !Exponent || !Modulus)
+        return 0;
+    return (ULONG)xc_modexp((uint32_t *)Result, (const uint32_t *)Base,
+                            (const uint32_t *)Exponent,
+                            (const uint32_t *)Modulus, ModulusLength);
 }
 
 /* ============================================================================
- * DES / Block Cipher Operations
+ * DES / Triple DES
  *
- * Used for EEPROM and hard drive key derivation. Not needed for PC.
+ * XNet encrypts System Link traffic with triple DES in CBC, so these are the
+ * standard ciphers (xbox_crypto_soft.c). CipherSelect 0 is DES, 1 triple
+ * DES; Operation 1 encrypts and 0 decrypts, as in Microsoft's crypto
+ * library. The key table is ours to lay out: 128 bytes for DES and 384 for
+ * triple DES, the sizes of the Xbox's own tables, so it fits whatever the
+ * title allocated for one.
  * ============================================================================ */
 
 VOID __stdcall xbox_XcDESKeyParity(PUCHAR Key, ULONG KeyLength)
 {
-    (void)Key;
-    (void)KeyLength;
+    if (Key)
+        xc_des_parity(Key, KeyLength);
 }
 
 VOID __stdcall xbox_XcKeyTable(ULONG CipherSelect, PVOID KeyTable, const UCHAR* Key)
 {
-    (void)CipherSelect;
-    (void)KeyTable;
-    (void)Key;
+    if (KeyTable && Key)
+        xc_des_key_table(CipherSelect != 0, (uint8_t *)KeyTable, Key);
 }
 
 VOID __stdcall xbox_XcBlockCrypt(ULONG CipherSelect, PVOID Output, PVOID Input, PVOID KeyTable, ULONG Operation)
 {
-    (void)CipherSelect;
-    (void)Output;
-    (void)Input;
-    (void)KeyTable;
-    (void)Operation;
+    if (Output && Input && KeyTable)
+        xc_des_block(CipherSelect != 0, (uint8_t *)Output, (const uint8_t *)Input,
+                     (const uint8_t *)KeyTable, Operation != 0);
 }
 
 VOID __stdcall xbox_XcBlockCryptCBC(
     ULONG CipherSelect, ULONG OutputLength, PVOID Output, PVOID Input,
     PVOID KeyTable, ULONG Operation, PVOID FeedbackVector)
 {
-    (void)CipherSelect;
-    (void)OutputLength;
-    (void)Output;
-    (void)Input;
-    (void)KeyTable;
-    (void)Operation;
-    (void)FeedbackVector;
+    if (Output && Input && KeyTable && FeedbackVector)
+        xc_des_cbc(CipherSelect != 0, OutputLength, (uint8_t *)Output,
+                   (const uint8_t *)Input, (const uint8_t *)KeyTable,
+                   Operation != 0, (uint8_t *)FeedbackVector);
 }
 
 VOID __stdcall xbox_XcCryptService(ULONG Operation, PVOID Param)
