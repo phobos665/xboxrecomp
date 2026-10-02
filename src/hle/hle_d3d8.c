@@ -117,6 +117,15 @@ static UINT               g_shadow_width, g_shadow_height;
  * screen-space undo are relative to it. */
 static UINT               g_target_width, g_target_height;
 static unsigned long      g_target_sets, g_target_scratch, g_target_failed;
+/* Shadow maps (depth_texture_surface): whether draws now go to one, how many
+ * times one was made the target, and how many draws it then received --
+ * every draw the title makes, before anything is skipped. */
+static int                g_target_shadow_map;
+static unsigned long      g_shadow_map_sets, g_shadow_map_draws;
+static unsigned long      g_shadow_map_big_sets, g_shadow_map_big_draws;   /* 256 wide and up */
+/* D3DDevice_EndPush: pushes seen, draws replayed from them, and pushes left
+ * alone (another method, or no vertex size). */
+static unsigned long      g_push_count, g_push_draws, g_push_other, g_push_nostride;
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
 static HWND               g_shadow_hwnd;
 static DWORD              g_shadow_create_thread;
@@ -1192,6 +1201,21 @@ static int ff_from_declaration(uint32_t handle, uint32_t stride)
 static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
     g_ff_active = 0;
+    if (g_target_shadow_map) {
+        g_shadow_map_draws++;
+        if (g_target_width >= 256) {
+            static unsigned long said, last_swap = (unsigned long)-1;
+
+            g_shadow_map_big_draws++;
+            /* Which frames draw casters: the first twenty, once each. */
+            if (said < 20 && last_swap != g_shadow_swaps) {
+                said++;
+                last_swap = g_shadow_swaps;
+                fprintf(stderr, "[HLE-D3D8] shadow map %ux%u drawn into at swap %lu\n",
+                        g_target_width, g_target_height, g_shadow_swaps);
+            }
+        }
+    }
     if (g_shadow_swap_thread && GetCurrentThreadId() != g_shadow_swap_thread)
         g_draws_off_thread++;
     note_draw_format(xpt, stride);
@@ -2119,6 +2143,14 @@ static void frame_end_shadow(void)
                 fprintf(stderr, "[HLE-D3D8] shadow render targets: %lu set, %lu to a "
                         "scratch target, %lu failed\n", g_target_sets,
                         g_target_scratch, g_target_failed);
+            if (g_shadow_map_sets)
+                fprintf(stderr, "[HLE-D3D8] shadow maps: targeted %lu time(s), %lu draw(s) "
+                        "into them; 256 wide and up: %lu, %lu draw(s)\n", g_shadow_map_sets,
+                        g_shadow_map_draws, g_shadow_map_big_sets, g_shadow_map_big_draws);
+            if (g_push_count)
+                fprintf(stderr, "[HLE-D3D8] push buffer: %lu push(es), %lu draw(s) replayed, "
+                        "%lu stopped at another method, %lu with no vertex size\n",
+                        g_push_count, g_push_draws, g_push_other, g_push_nostride);
             fflush(stderr);
             g_shadow_last_report = now;
         }
@@ -3039,6 +3071,160 @@ HLE_EXPORT(D3DDevice_End)
 #endif
 }
 
+/* ------------------------------------------------------------------------
+ * Draws a title writes into the push buffer itself.
+ *
+ * D3DDevice_BeginPush hands the title a pointer into the push buffer and
+ * EndPush takes back where it stopped; between the two the title writes NV2A
+ * methods with no D3D call at all. Nothing executes the push buffer here, so
+ * whatever is drawn that way never reached the host. OutRun 2 does it at
+ * seven sites (0x00084CDF, 0x00086F3B, 0x0009DB08, 0x000D2361, 0x000D43E1,
+ * 0x000D4A2F, 0x000D4D9D), each the same shape: SET_BEGIN_END (0x17FC) with a
+ * primitive, INLINE_ARRAY (0x1818, non-incrementing) carrying the vertices,
+ * SET_BEGIN_END 0. Its 512x512 shadow map was cleared every frame and never
+ * drawn into.
+ *
+ * So EndPush walks what was written since BeginPush and replays each
+ * begin/inline/end group as the draw DrawVerticesUP would have made: the
+ * NV2A primitive codes are the Xbox D3DPRIMITIVETYPE values, and the vertices
+ * are laid out as the current vertex shader's stream 0. Any other method
+ * stops the walk for that push and is counted, so a title that writes state
+ * this way is reported rather than half-drawn. RECOMP_HLE_D3D8_PUSH_DRAWS=0
+ * leaves pushes alone.
+ * ------------------------------------------------------------------------ */
+#define NV2A_PUSH_BEGIN_END    0x17FCu
+#define NV2A_PUSH_INLINE_ARRAY 0x1818u
+
+
+HLE_ORIGINAL(D3DDevice_EndPush);
+
+static int push_draws_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PUSH_DRAWS", 1);
+    return on;
+}
+
+
+#ifdef _WIN32
+/* Bytes of one vertex under the current vertex shader's stream 0. */
+static uint32_t push_vertex_stride(void)
+{
+    if (g_shadow_vs_is_program) {
+        if (g_shadow_vs_kind == SHADER_HOST_PROGRAM && g_shadow_vs_slot >= 0 &&
+            g_programs[g_shadow_vs_slot].has_declaration)
+            return (g_programs[g_shadow_vs_slot].extent + 3u) & ~3u;
+        return 0;
+    }
+    return fvf_stride(g_shadow_vs);
+}
+
+static void push_replay(uint32_t start, uint32_t end)
+{
+    static uint32_t *data;
+    static uint32_t cap;
+    uint32_t va = start, prim = 0, n = 0;
+
+    if (!start || end <= start || end - start > 4u * 1024u * 1024u)
+        return;
+    while (va + 4u <= end) {
+        uint32_t h = HLE_MEM32(va), method, count, k;
+
+        va += 4u;
+        if (h & 0xA0000003u) {           /* a jump, call or return: not ours */
+            g_push_other++;
+            return;
+        }
+        method = h & 0x1FFCu;
+        count = (h >> 18) & 0x7FFu;
+        if (va + 4u * count > end) {
+            g_push_other++;
+            return;
+        }
+        if (method == NV2A_PUSH_BEGIN_END && count == 1) {
+            uint32_t v = HLE_MEM32(va);
+
+            if (v) {
+                prim = v;
+                n = 0;
+            } else if (prim && n) {
+                uint32_t stride = push_vertex_stride();
+
+                if (!stride || (n * 4u) % stride) {
+                    g_push_nostride++;
+                } else {
+                    hle_d3d8_shadow_draw(prim, n * 4u / stride, data, stride, 0);
+                    g_push_draws++;
+                }
+                prim = 0;
+                n = 0;
+            }
+        } else if (method == NV2A_PUSH_INLINE_ARRAY && prim) {
+            if (n + count > cap) {
+                uint32_t want = (n + count) * 2u;
+                uint32_t *grown = (uint32_t *)realloc(data, want * 4u);
+
+                if (!grown)
+                    return;
+                data = grown;
+                cap = want;
+            }
+            for (k = 0; k < count; k++)
+                data[n + k] = HLE_MEM32(va + 4u * k);
+            n += count;
+        } else {
+            static uint32_t said[8];
+            int s;
+
+            for (s = 0; s < 8 && said[s] && said[s] != method; s++)
+                ;
+            if (s < 8 && !said[s]) {
+                said[s] = method;
+                fprintf(stderr, "[HLE-D3D8] push buffer: method 0x%04X (count %u) "
+                        "written by the title is not replayed; its push is skipped "
+                        "from there\n", method, count);
+            }
+            g_push_other++;
+            return;
+        }
+        va += 4u * count;
+    }
+}
+#endif
+
+/* void D3DDevice_EndPush(DWORD *pPush) -- stdcall.
+ *
+ * Where the push began is the device's own push pointer: BeginPush returns
+ * it without moving it (its tail, the XDK's MakeSpace, only makes room), and
+ * EndPush's whole body is storing the end there. So it is read before the
+ * original runs, and BeginPush -- which the lifter cannot wrap, it ends in a
+ * tail jump -- needs no hook. */
+HLE_EXPORT(D3DDevice_EndPush)
+{
+    static int seen;
+    uint32_t end = HLE_ARG(0), start = 0, device;
+
+    first_call(&seen, "D3DDevice_EndPush", end);
+    if (original_missing(hle_original_D3DDevice_EndPush, "D3DDevice_EndPush"))
+        return;
+#ifdef _WIN32
+    g_push_count++;
+    device = hle_var_D3D_g_pDevice ? HLE_MEM32(hle_var_D3D_g_pDevice) : 0;
+    if (device)
+        start = HLE_MEM32(device);       /* m_pPush, still where the push began */
+    if (push_draws_on() && g_shadow)
+        push_replay(start, end);
+    if (g_push_count == 1 || (g_push_count % 100000) == 0)
+        fprintf(stderr, "[HLE-D3D8] push buffer: %lu push(es), %lu draw(s) replayed, "
+                "%lu stopped at another method, %lu with no vertex size\n",
+                g_push_count, g_push_draws, g_push_other, g_push_nostride);
+#else
+    (void)start; (void)device;
+#endif
+    HLE_CALL_ORIGINAL(D3DDevice_EndPush);
+}
+
 /* void D3DDevice_SetVertexData4f(INT Register, float a, float b, float c,
  *     float d) -- one attribute of one inline vertex. */
 HLE_EXPORT(D3DDevice_SetVertexData4f)
@@ -3335,6 +3521,67 @@ static IDirect3DSurface8 *depth_surface(UINT w, UINT h)
     return NULL;
 }
 
+static int shadow_maps_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_SHADOW_MAPS", 1);
+    return on;
+}
+
+/* Depth formats a title can render into and then sample: a shadow map. */
+static int is_depth_format(uint32_t fmt)
+{
+    return fmt == 0x2A || fmt == 0x2E ||     /* D24S8, LIN_D24S8 */
+           fmt == 0x2C || fmt == 0x30;       /* D16, LIN_D16 */
+}
+
+/* The guest texture a surface belongs to, if it is a 2D depth-format
+ * texture whose level 0 the surface is; 0 otherwise. */
+static uint32_t depth_texture_of(uint32_t surface)
+{
+    uint32_t parent = surface ? HLE_MEM32(surface + SURFACE_PARENT) : 0;
+    uint32_t format;
+
+    if (!parent || HLE_MEM32(parent + 4) != HLE_MEM32(surface + 4))
+        return 0;
+    format = HLE_MEM32(parent + 12);
+    if ((format & 0x4) || ((format >> 4) & 0xF) != 2)
+        return 0;
+    return is_depth_format((format >> 8) & 0xFF) ? parent : 0;
+}
+
+/* The host depth surface for a guest depth texture: level 0 of the same
+ * host texture SetTexture binds when the title samples it
+ * (hle_d3d8_render_texture), so what a shadow pass writes is what the next
+ * pass reads. NULL if the host cannot hold it. */
+static IDirect3DSurface8 *depth_texture_surface(uint32_t texture_va)
+{
+    static struct { IDirect3DTexture8 *texture; IDirect3DSurface8 *surface; } cache[8];
+    IDirect3DTexture8 *t = hle_d3d8_render_texture(g_shadow, texture_va);
+    int i;
+
+    if (!t)
+        return NULL;
+    for (i = 0; i < 8; i++)
+        if (cache[i].texture == t)
+            return cache[i].surface;
+    for (i = 0; i < 8 && cache[i].texture; i++)
+        ;
+    if (i == 8)
+        i = 0;                           /* reuse the oldest; keeps its ref */
+    if (cache[i].surface)
+        cache[i].surface->lpVtbl->Release(cache[i].surface);
+    cache[i].texture = t;
+    cache[i].surface = NULL;
+    if (FAILED(t->lpVtbl->GetSurfaceLevel(t, 0, &cache[i].surface)))
+        cache[i].surface = NULL;
+    else
+        fprintf(stderr, "[HLE-D3D8] shadow map 0x%08X: depth renders into the "
+                "texture the title samples\n", texture_va);
+    return cache[i].surface;
+}
+
 static void shadow_set_render_target(uint32_t rt, uint32_t zs)
 {
     static struct { uint32_t va; int kind; } seen[32];
@@ -3381,6 +3628,15 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
              * a surface of texture 0x00563154, whose data is the frame
              * buffer 0x00204000, and none to either swap surface. */
             kind = 0;
+        } else if (depth_texture_of(rt)) {
+            /* A colour surface over a depth texture's memory. Xbox titles
+             * pair a shadow pass's depth target with a colour target that
+             * aliases it, colour writes off, to spend no memory on colour
+             * (OutRun 2's 512x512 LIN_D24S8 map). The host cannot render
+             * colour into a depth texture, and nothing is meant to land
+             * there: a scratch target of the same size, and the depth goes
+             * to the texture below. */
+            kind = 2;
         } else if (parent && HLE_MEM32(parent + 4) == HLE_MEM32(rt + 4)) {
             texture = hle_d3d8_render_texture(g_shadow, parent);   /* level 0 */
             target = (IDirect3DBaseTexture8 *)texture;
@@ -3473,11 +3729,30 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         int own;
 
         surface_measure(zs, &zw, &zh, &zfmt);
+        if (shadow_trace_on())
+            fprintf(stderr, "[TRACE swap %lu]   depth 0x%08X data 0x%08X parent 0x%08X "
+                    "%ux%u format 0x%02X\n", g_shadow_swaps, zs, HLE_MEM32(zs + 4),
+                    HLE_MEM32(zs + SURFACE_PARENT), zw, zh, zfmt);
         g_z_scale = xbox_depth_z_scale(zfmt);
         own = g_autodepth_va ? zs == g_autodepth_va : (zw == w && zh == h);
-        depth = (kind == 0 && own && g_device_depth) ? g_device_depth : depth_surface(w, h);
+        depth = (kind == 0 && own && g_device_depth) ? g_device_depth : NULL;
+        /* A depth texture the title will sample: render into its host copy
+         * (RECOMP_HLE_D3D8_SHADOW_MAPS=0 for the old scratch depth). */
+        if (!depth && zw == w && zh == h && depth_texture_of(zs) && shadow_maps_on()) {
+            depth = depth_texture_surface(depth_texture_of(zs));
+            if (depth) {
+                g_shadow_map_sets++;
+                if (w >= 256)
+                    g_shadow_map_big_sets++;
+            }
+        }
+        if (!depth)
+            depth = depth_surface(w, h);
+        g_target_shadow_map = depth && depth_texture_of(zs) && zw == w && zh == h &&
+                              shadow_maps_on() && kind != 0;
     } else {
         g_z_scale = 1.0f;
+        g_target_shadow_map = 0;
     }
 
     if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : target, level, face,

@@ -1562,6 +1562,17 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
         if (Usage & D3DUSAGE_DEPTHSTENCIL) td.bind |= RHI_BIND_DEPTH;
     } else {
         td.bind = RHI_BIND_DEPTH;
+        /* A shadow map is depth the title renders and then samples, so a
+         * depth texture is sampled as well where the backend can hold one
+         * that way (the D3D11 backend makes it typeless, see rhi_d3d11.c's
+         * depth_typeless). Only the formats that have a sampled
+         * equivalent; the rest stay depth-only, as before. */
+        if (tex->host_format == RHI_FORMAT_D24_UNORM_S8_UINT ||
+            tex->host_format == RHI_FORMAT_D16_UNORM ||
+            tex->host_format == RHI_FORMAT_D32_FLOAT) {
+            td.bind |= RHI_BIND_SAMPLED;
+            want_srv = 1;
+        }
     }
 
     tex->image = rhi_image_create(&td, NULL);
@@ -1580,7 +1591,14 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
         srvd.mip_count = tex->levels;
 
         tex->srv = rhi_view_create(tex->image, RHI_VIEW_SAMPLED, &srvd);
-        if (!tex->srv) {
+        if (!tex->srv && d3d8_format_is_depth(Format)) {
+            /* Not samplable on this backend after all: a depth-only
+             * texture, as before shadow maps were sampled. */
+            static int said;
+            if (!said++)
+                fprintf(stderr, "D3D8: depth texture format %d cannot be sampled "
+                        "here; shadow maps will read nothing\n", Format);
+        } else if (!tex->srv) {
             rhi_image_destroy(tex->image);
             free(tex->sys_mem);
             free(tex);

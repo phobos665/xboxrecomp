@@ -323,6 +323,9 @@ static const struct {
     { 145, D3DRS_STENCILFAIL,      STENCILOP },
     { 147, D3DRS_CULLMODE,         CULL },
     { 148, D3DRS_TEXTUREFACTOR,    AS_IS },
+    /* XDK 5849 numbering: SHADOWFUNC sits after MULTISAMPLERENDERTARGETMODE.
+     * The compare a shadow-map stage makes (d3d8_combiners.c). */
+    { 157, D3DRS_SHADOWFUNC,       CMP },
 };
 
 static DWORD rs_to_host(uint8_t kind, uint32_t v)
