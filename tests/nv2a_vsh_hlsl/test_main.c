@@ -29,6 +29,7 @@
 ID3D11Device        *d3d8_GetD3D11Device(void)  { return NULL; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return NULL; }
 DWORD                d3d8_GetCurrentFVF(void)   { return 0; }
+BOOL                 d3d8_target_is_screen(void) { return TRUE; }   /* camera zoom: d3d8_device.c */
 
 static int g_checks;
 static int g_failures;
