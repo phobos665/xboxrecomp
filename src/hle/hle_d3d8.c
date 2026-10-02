@@ -765,6 +765,13 @@ static int      g_shadow_vs_is_program;  /* bit 0 set: a shader object */
 static int      g_shadow_vs_kind;        /* its kind, or -1 if never created */
 static int      g_shadow_vs_slot = -1;   /* its g_programs entry, or -1 */
 
+/* The guest object of the vertex program selected now, its declaration at +20;
+ * 0 under an FVF. For hle_d3d8_vertex.c's draws from title-pushed arrays. */
+uint32_t hle_d3d8_shadow_program_object(void)
+{
+    return g_shadow_vs_is_program ? (g_shadow_vs & ~1u) : 0u;
+}
+
 /* The handle is the address of the title's shader object, so a shader
  * created after another was deleted can reuse its handle. Creation replaces
  * an entry, so each handle has at most one. */
@@ -848,11 +855,15 @@ static int slot_program_cached(DWORD host)
 }
 
 static void shadow_read_declaration(int slot, uint32_t handle);
+/* From hle_d3d8_vertex.c: vertex arrays the title pushed itself stop applying
+ * when the XDK writes its own again, which a new declaration makes it do. */
+void hle_d3d8_push_arrays_off(void);
 
 static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
     int i;
 
+    hle_d3d8_push_arrays_off();
     g_shadow_vs = handle;
     g_shadow_vs_is_program = (handle & 1) != 0;
     if (!g_shadow_vs_is_program) {
@@ -3231,13 +3242,24 @@ HLE_EXPORT(D3DDevice_End)
  * So EndPush walks what was written since BeginPush and replays each
  * begin/inline/end group as the draw DrawVerticesUP would have made: the
  * NV2A primitive codes are the Xbox D3DPRIMITIVETYPE values, and the vertices
- * are laid out as the current vertex shader's stream 0. Any other method
- * stops the walk for that push and is counted, so a title that writes state
- * this way is reported rather than half-drawn. RECOMP_HLE_D3D8_PUSH_DRAWS=0
- * leaves pushes alone.
+ * are laid out as the current vertex shader's stream 0. The vertex array
+ * methods (SET_VERTEX_DATA_ARRAY_OFFSET 0x1720 and _FORMAT 0x1760) are
+ * walked past: they draw nothing themselves, and hle_d3d8_vertex.c records
+ * them for the DrawVertices and DrawIndexedVertices calls that follow the
+ * push (TimeSplitters: Future Perfect points every attribute at an array of
+ * its own that way). Any other method stops the walk for that push and is
+ * counted, so a title that writes state this way is reported rather than
+ * half-drawn. RECOMP_HLE_D3D8_PUSH_DRAWS=0 leaves the draws alone; the
+ * arrays are recorded either way.
  * ------------------------------------------------------------------------ */
 #define NV2A_PUSH_BEGIN_END    0x17FCu
 #define NV2A_PUSH_INLINE_ARRAY 0x1818u
+/* SET_VERTEX_DATA_ARRAY_OFFSET (0x1720) and _FORMAT (0x1760), 16 of each. */
+#define NV2A_PUSH_ARRAYS_FIRST 0x1720u
+#define NV2A_PUSH_ARRAYS_END   0x17A0u
+
+/* hle_d3d8_vertex.c: the vertex arrays the title pushes itself. */
+void hle_d3d8_push_arrays_scan(uint32_t start, uint32_t end);
 
 
 HLE_ORIGINAL(D3DDevice_EndPush);
@@ -3317,6 +3339,8 @@ static void push_replay(uint32_t start, uint32_t end)
             for (k = 0; k < count; k++)
                 data[n + k] = HLE_MEM32(va + 4u * k);
             n += count;
+        } else if (method >= NV2A_PUSH_ARRAYS_FIRST && method < NV2A_PUSH_ARRAYS_END) {
+            /* The title's vertex arrays: hle_d3d8_push_arrays_scan has them. */
         } else {
             static uint32_t said[8];
             int s;
@@ -3357,6 +3381,8 @@ HLE_EXPORT(D3DDevice_EndPush)
     device = hle_var_D3D_g_pDevice ? HLE_MEM32(hle_var_D3D_g_pDevice) : 0;
     if (device)
         start = HLE_MEM32(device);       /* m_pPush, still where the push began */
+    if (g_shadow)
+        hle_d3d8_push_arrays_scan(start, end);
     if (push_draws_on() && g_shadow)
         push_replay(start, end);
     if (g_push_count == 1 || (g_push_count % 100000) == 0)
