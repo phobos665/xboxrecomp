@@ -23,6 +23,7 @@ set(KERNEL_SOURCES
     xbox_watchpoint.c
     xbox_fault_route.c
     xbox_nic.c
+    xbox_net_udp.c
     xbox_crypto_soft.c
     icall_feedback.c
     exit_trace.c
@@ -51,7 +52,8 @@ if(WIN32)
     # include path that "platform/xbox_winnt.h" resolves against.
     # winmm for timeBeginPeriod (the vblank clock's fallback timer), dbghelp
     # and psapi for the sampling profiler's symbol and module lookups.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt winmm dbghelp psapi)
+    # ws2_32 for the System Link tunnel's UDP socket (xbox_net_udp.c).
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt winmm dbghelp psapi ws2_32)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
