@@ -16,12 +16,14 @@
  *   D3D_g_DeferredTextureState  4 stages x 32 texture stage states.
  *
  * Which slot holds which state changed until XDK 4627 (Cxbx-Reloaded,
- * DxbxRenderStateInfo in XbConvert.cpp). This file knows the final layout
- * only: deferred states start at 92 and complex states at 136, and the one
- * state removed along the way, D3DRS_MULTISAMPLETYPE (154), leaves every
- * later state one slot down. The distances between the named arrays say
- * whether a title has that layout; if not, nothing is forwarded and the run
- * log says why. Texture stage states use the order from XDK 4039 on.
+ * DxbxRenderStateInfo in XbConvert.cpp). States are numbered here as in the
+ * final layout: deferred states start at 92 and complex states at 136, and
+ * the one state removed along the way, D3DRS_MULTISAMPLETYPE (154), leaves
+ * every later state one slot down. Two older layouts are known as well (see
+ * enum rs_layout). The distances between the named arrays say which layout a
+ * title has; for any other, nothing is forwarded and the run log says why.
+ * Texture stage states use the order from XDK 4039 on, except in the oldest
+ * layout.
  *
  * One gap in "the title writes the arrays": the XDK's own
  * D3DDevice_SetRenderState_Simple only writes the push buffer. Burnout 2
@@ -71,7 +73,9 @@ HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 #define STAGE_SIZE       32
 
 static int      g_state_ready = -1;  /* -1 not checked, 0 unusable, 1 ready */
-/* 1: the layout of XDK builds before 4034 (3424-3944; Halo and Max Payne are
+/* Which of the known render-state layouts the title's arrays have.
+ *
+ * LAYOUT_PRE4034: XDK builds before 4034 (3424-3944; Halo and Max Payne are
  * 3925). XbSymbolDatabase's per-version table (DxbxRenderStateInfo, in
  * third_party/XbSymbolDatabase/src/lib/manual_d3d8__ltcg.h) says which states
  * such a build lacks: DEPTHCLIPCONTROL (4432), STIPPLEENABLE and the eight
@@ -83,8 +87,22 @@ static int      g_state_ready = -1;  /* -1 not checked, 0 unusable, 1 ready */
  * enumeration Halo's own debug information records. The texture stage states
  * of those builds come in an older order too: the eight operation and argument
  * states, RESULTARG and TEXTURETRANSFORMFLAGS first (0-9), then ADDRESSU to
- * ALPHAKILL (10-21); from 22 on the order is the same. */
-static int      g_layout_pre4034;
+ * ALPHAKILL (10-21); from 22 on the order is the same.
+ *
+ * LAYOUT_4034: XDK 4034 to 4431 (Hunter: The Reckoning is 4361). From the
+ * same table: SWAPFILTER, MULTISAMPLEMODE and MULTISAMPLERENDERTARGETMODE
+ * arrive in 4034 and MULTISAMPLETYPE leaves; DEPTHCLIPCONTROL (4432) and
+ * STIPPLEENABLE, the unused slots, PRESENTATIONINTERVAL and SAMPLEALPHA
+ * (4627) are not there yet. That puts the deferred block at 82 and the complex
+ * block at 117, where Hunter's XDK symbols put them (and the database's own
+ * check of its table against the arrays it found passes for 4361). The texture
+ * stage states are in the 4039+ order already: Cxbx-Reloaded reorders them
+ * only for D3D8 3948 and older, and Hunter's stage arrays read as valid
+ * values in that order (see the note with this change).
+ *
+ * LAYOUT_4627: the final layout, deferred at 92 and complex at 136. */
+enum rs_layout { LAYOUT_4627, LAYOUT_PRE4034, LAYOUT_4034 };
+static enum rs_layout g_layout = LAYOUT_4627;
 static uint32_t g_prev_rs[XRS_COUNT];
 static uint32_t g_prev_tss[STAGES][STAGE_SIZE];
 static int      g_prev_valid;
@@ -128,12 +146,15 @@ static int state_ready(void)
     }
     if (hle_var_D3D_g_DeferredRenderState - rs == 4 * 82 &&
         hle_var_D3D_g_ComplexRenderState - rs == 4 * 116) {
-        g_layout_pre4034 = 1;
+        g_layout = LAYOUT_PRE4034;
+    } else if (hle_var_D3D_g_DeferredRenderState - rs == 4 * 82 &&
+               hle_var_D3D_g_ComplexRenderState - rs == 4 * 117) {
+        g_layout = LAYOUT_4034;
     } else if (hle_var_D3D_g_DeferredRenderState - rs != 4 * XRS_FOGENABLE ||
         hle_var_D3D_g_ComplexRenderState - rs != 4 * XRS_COMPLEX) {
         fprintf(stderr, "[HLE-D3D8] shadow states off: deferred states at slot %d and "
-                "complex at %d, where the XDK 4627+ layout has %d and %d and the "
-                "pre-4034 one 82 and 116\n",
+                "complex at %d, where the XDK 4627+ layout has %d and %d, the "
+                "4034-4431 one 82 and 117 and the pre-4034 one 82 and 116\n",
                 (int)(hle_var_D3D_g_DeferredRenderState - rs) / 4,
                 (int)(hle_var_D3D_g_ComplexRenderState - rs) / 4,
                 XRS_FOGENABLE, XRS_COMPLEX);
@@ -142,18 +163,31 @@ static int state_ready(void)
     fprintf(stderr, "[HLE-D3D8] shadow states: render states at 0x%08X, texture "
             "stage states at 0x%08X (%s layout)\n",
             rs, hle_var_D3D_g_DeferredTextureState,
-            g_layout_pre4034 ? "pre-4034 XDK" : "XDK 4627+");
+            g_layout == LAYOUT_PRE4034 ? "pre-4034 XDK" :
+            g_layout == LAYOUT_4034 ? "XDK 4034-4431" : "XDK 4627+");
     g_state_ready = 1;
     return 1;
 }
 
 /* Where a state (numbered as in the 4627+ enumeration, MULTISAMPLETYPE
  * included) sits in this title's array, or -1 when its XDK has no such state.
- * See g_layout_pre4034 for the older layout. */
+ * See g_layout for the older layouts. */
 static int rs_slot(uint32_t state)
 {
-    if (!g_layout_pre4034)
+    if (g_layout == LAYOUT_4627)
         return state > XRS_REMOVED ? (int)state - 1 : (int)state;
+    if (g_layout == LAYOUT_4034) {
+        if (state <= 81)  return (int)state;      /* pixel shader and simple */
+        if (state <= 91)  return -1;              /* DEPTHCLIPCONTROL..unused */
+        if (state <= 126) return (int)state - 10; /* FOGENABLE..SWAPFILTER */
+        if (state <= 135) return -1;              /* PRESENTATIONINTERVAL..unused */
+        if (state <= 153) return (int)state - 19; /* PSTEXTUREMODES..MULTISAMPLEMASK */
+        if (state == 154) return -1;              /* MULTISAMPLETYPE */
+        if (state <= 158) return (int)state - 20; /* MULTISAMPLEMODE..LINEWIDTH */
+        if (state == 159) return -1;              /* SAMPLEALPHA */
+        if (state <  XRS_COUNT) return (int)state - 21; /* DXT1NOISEENABLE.. */
+        return -1;
+    }
     if (state <= 81)  return (int)state;          /* pixel shader and simple */
     if (state <= 91)  return -1;                  /* DEPTHCLIPCONTROL..unused */
     if (state <= 125) return (int)state - 10;     /* FOGENABLE..PATCHSEGMENTS */
@@ -176,7 +210,7 @@ static uint32_t guest_rs(uint32_t state)
  * this title's per-stage array. */
 static uint32_t ts_slot(uint32_t x)
 {
-    if (!g_layout_pre4034)
+    if (g_layout != LAYOUT_PRE4034)
         return x;
     if (x <= 11) return x + 10;     /* ADDRESSU..ALPHAKILL */
     if (x <= 21) return x - 12;     /* COLOROP..TEXTURETRANSFORMFLAGS */

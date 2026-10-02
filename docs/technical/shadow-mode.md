@@ -164,5 +164,8 @@ push buffers through `BeginPush`, whose draws no replacement ever sees.
   the guest's memory, so a capture that samples one without drawing into it
   first shows nothing.
 - Lights and material are not forwarded, so lighting stays off.
-- Only the XDK 4627+ render state layout is read; anything else turns state
-  forwarding off and says so.
+- Three render state layouts are read: XDK 4627+ (deferred states at slot 92,
+  complex at 136), XDK 4034-4431 (82 and 117) and XDK builds before 4034 (82
+  and 116, with the older texture stage order); anything else turns state
+  forwarding off and says so. 4432-4626 (DEPTHCLIPCONTROL present: 83 and 118)
+  has no title to prove it and is not read.
