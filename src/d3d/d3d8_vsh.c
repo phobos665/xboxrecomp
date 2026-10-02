@@ -1435,6 +1435,36 @@ float xbox_D3D8ClaimHorPlus(void)
     return factor;
 }
 
+/* RECOMP_CAMERA_ZOOM (settings file: camera_zoom): narrow the field of
+ * view of what reaches the screen by scaling the projection register's x
+ * and y rows together, so nothing changes shape.
+ *
+ * For a title whose own widescreen mode widens the view a long way: OutRun
+ * 2's 16:9 camera keeps the 4:3 vertical angle and opens the horizontal one
+ * to about 96 degrees, and at that angle the car in the foreground stretches
+ * front to back. 1.15 brings it to about 88. Only draws to the screen are
+ * zoomed -- the same register projects the title's shadow map, environment
+ * cube and glare passes, which have to keep matching what they were made
+ * for -- and the title culls to its own, wider view, so nothing is missing
+ * at the edges. 1 (the default) leaves the register alone. */
+static float camera_zoom(void)
+{
+    static float zoom = -1.0f;
+
+    if (zoom < 0.0f) {
+        const char *v = recomp_config_lookup("RECOMP_CAMERA_ZOOM", "camera_zoom");
+
+        zoom = (v && *v) ? (float)atof(v) : 1.0f;
+        if (zoom < 0.5f || zoom > 3.0f)
+            zoom = 1.0f;
+        if (zoom != 1.0f)
+            fprintf(stderr, "D3D8 VSH: camera zoom %.3f on c[%d..%d] for draws to the "
+                    "screen\n", (double)zoom, d3d8_vsh_hor_plus_reg(),
+                    d3d8_vsh_hor_plus_reg() + 1);
+    }
+    return zoom;
+}
+
 int d3d8_vsh_hor_plus_reg(void)
 {
     static int reg = -1;
@@ -1694,14 +1724,34 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
         g_vsh_vdata_dirty = TRUE;
     }
 
-    /* Update constant buffer if dirty */
-    if (g_vsh_constants_dirty) {
-        mapped = rhi_buffer_map(g_vsh_cb, RHI_MAP_WRITE_DISCARD);
-        if (mapped) {
-            memcpy(mapped, &g_vsh_constants, sizeof(g_vsh_constants));
-            rhi_buffer_unmap(g_vsh_cb);
+    /* Update constant buffer if dirty, or if the camera zoom starts or stops
+     * applying (camera_zoom: screen draws only). */
+    {
+        static BOOL zoomed;
+        float zoom = camera_zoom();
+        BOOL want = zoom != 1.0f && d3d8_target_is_screen();
+
+        if (want != zoomed)
+            g_vsh_constants_dirty = TRUE;
+        if (g_vsh_constants_dirty) {
+            mapped = rhi_buffer_map(g_vsh_cb, RHI_MAP_WRITE_DISCARD);
+            if (mapped) {
+                memcpy(mapped, &g_vsh_constants, sizeof(g_vsh_constants));
+                if (want) {
+                    int reg = d3d8_vsh_hor_plus_reg(), k;
+                    float (*c)[4] = ((NV2AVSConstants *)mapped)->c;
+
+                    if (reg + 1 < NV2A_VS_MAX_CONSTANTS)
+                        for (k = 0; k < 4; k++) {
+                            c[reg][k] *= zoom;
+                            c[reg + 1][k] *= zoom;
+                        }
+                }
+                rhi_buffer_unmap(g_vsh_cb);
+            }
+            g_vsh_constants_dirty = FALSE;
+            zoomed = want;
         }
-        g_vsh_constants_dirty = FALSE;
     }
 
     /* Bind constant buffer to slot b1 */

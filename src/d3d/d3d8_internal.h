@@ -278,6 +278,8 @@ UINT        d3d8_row_pitch(D3DFORMAT fmt, UINT width);
 
 /* Is the Xbox format a depth/stencil format? */
 BOOL d3d8_format_is_depth(D3DFORMAT fmt);
+/* d3d8_device.c: draws go to the screen, not a render-target texture. */
+BOOL d3d8_target_is_screen(void);
 
 /* bpp of the data actually uploaded to D3D11 (post-conversion). */
 UINT d3d8_upload_bpp(D3DFORMAT fmt);

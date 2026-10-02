@@ -100,6 +100,12 @@ static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 /* Bound offscreen render target / depth stencil (NULL = default) */
 static D3D8Surface *g_cur_rt = NULL;
 
+/* Whether draws go to the screen (the device's own back buffer) rather than
+ * a texture the title renders into. */
+BOOL d3d8_target_is_screen(void)
+{
+    return g_cur_rt == NULL;
+}
 static D3D8Surface *g_cur_ds = NULL;
 /* The device's own depth buffer as a surface object, so SetRenderTarget can
  * name it: a NULL depth surface means no depth, as in D3D8. */
