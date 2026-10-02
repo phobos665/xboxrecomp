@@ -17,6 +17,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_display.h"
+#include "d3d8_fvf.h"         /* d3d8_fvf_transformed: draw_extent */
 #include "recomp_config.h"   /* RECOMP_VRR */
 #include <stdio.h>
 #include <string.h>
@@ -98,6 +99,7 @@ static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 
 /* Bound offscreen render target / depth stencil (NULL = default) */
 static D3D8Surface *g_cur_rt = NULL;
+
 static D3D8Surface *g_cur_ds = NULL;
 /* The device's own depth buffer as a surface object, so SetRenderTarget can
  * name it: a NULL depth surface means no depth, as in D3D8. */
@@ -1694,18 +1696,38 @@ BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
  * a vertex buffer -- the HLE reads those itself and passes the bytes.
  * Position sits at the offset the program's own declaration gives for
  * the register it copies oPos from. */
+/* Whether the last draw_extent measured a fixed-function draw. */
+static BOOL g_extent_fixed_function;
+
 static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
                         float *lo_out, float *hi_out)
 {
     const unsigned char *p = (const unsigned char *)vertices;
     UINT offset = 0, i;
-    int reg = d3d8_vsh_bound_pos_input();
+    DWORD handle = g_device_state.vertex_shader;
     float lo = 3.4e38f, hi = -3.4e38f;
 
-    if (reg < 0 || !p || !stride || !count)
+    g_extent_fixed_function = FALSE;
+    if (!p || !stride || !count)
         return FALSE;
-    if (!d3d8_vsh_bound_input_offset(reg, &offset))
+    if (d3d8_vsh_is_programmable(handle)) {
+        int reg = d3d8_vsh_bound_pos_input();
+
+        if (reg < 0 || !d3d8_vsh_bound_input_offset(reg, &offset))
+            return FALSE;
+    } else if (d3d8_fvf_transformed(handle)) {
+        /* Fixed function: the handle is the FVF, and a pre-transformed
+         * vertex starts with its screen position. Asking the program
+         * helpers instead answered for whichever program was bound last,
+         * and usually not at all -- so a fixed-function backdrop never
+         * escaped the squeeze: OutRun 2's menus came out as a 4:3 box with
+         * the clear colour at the sides once its user-pointer 2D was
+         * squeezed (49da008). */
+        offset = 0;
+        g_extent_fixed_function = TRUE;
+    } else {
         return FALSE;
+    }
     if (offset + sizeof(float) > stride)
         return FALSE;
 
@@ -1821,6 +1843,13 @@ BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
     if (d3d8_display_policy()->centre_2d)
         return ((hi - lo) >= (float)guest_w * 0.98f && draw_is_screen_pass())
                ? TRUE : FALSE;
+    /* A fixed-function draw escapes only if it covers the whole width. The
+     * 75% gap above was measured on program draws; OutRun 2 batches HUD
+     * pieces into fixed-function draws, and one holding part of the score
+     * spans more than 75% -- at that threshold it escaped and split the
+     * score's digits across the screen. Its menu backdrop covers it all. */
+    if (g_extent_fixed_function)
+        return ((hi - lo) >= (float)guest_w * 0.98f) ? TRUE : FALSE;
     return ((hi - lo) >= (float)guest_w * 0.75f) ? TRUE : FALSE;
 }
 
