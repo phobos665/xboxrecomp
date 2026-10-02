@@ -684,8 +684,8 @@ static void host_stage_palette(IDirect3DDevice8 *dev, uint32_t stage, uint32_t s
     if (g_pal_sum[stage] == sum)
         return;
     host_SetTexture(dev, stage, NULL);
-    dev->lpVtbl->SetPalette(dev, stage, g_pal_data[stage]
-        ? (const void *)HLE_PTR(CONTIG_BASE + g_pal_data[stage]) : NULL);
+    host_SetPalette(dev, stage, g_pal_data[stage]
+        ? (const DWORD *)HLE_PTR(CONTIG_BASE + g_pal_data[stage]) : NULL);
     g_pal_sum[stage] = sum;
 }
 
@@ -1427,11 +1427,9 @@ HLE_ORIGINAL(D3DDevice_SetPalette);
  * sync_palette reads it there too and picks the host texture baked with it.
  * A null palette means the device's grey ramp, not whatever was there last.
  *
- * Not recorded into captures: there is no host_SetPalette wrapper, so a
- * replayed frame expands P8 through whatever palette the replay device has
- * rather than the one the title set. Live output is right; a capture of P8
- * content is not, and that wants a recorded wrapper before anyone bisects a
- * palettised frame.
+ * The host's palettes go through host_SetPalette (host_stage_palette), so a
+ * capture records them (D3D8CAP_PALETTE, format 7) and a replayed frame
+ * expands its P8 textures through the palettes the title set.
  */
 HLE_EXPORT(D3DDevice_SetPalette)
 {

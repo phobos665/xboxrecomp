@@ -2002,6 +2002,22 @@ BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info)
     return TRUE;
 }
 
+BOOL d3d8_cube_level(IDirect3DBaseTexture8 *texture, UINT face, UINT level,
+                     const BYTE **bits, UINT *pitch, UINT *rows)
+{
+    const D3D8CubeTexture *cube = (const D3D8CubeTexture *)texture;
+    UINT w;
+
+    if (!cube || cube->iface.lpVtbl != &g_cube_vtbl || !cube->sys_mem ||
+        face >= 6 || level >= cube->levels || !bits || !pitch || !rows)
+        return FALSE;
+    w = cube_level_width(cube, level);
+    *bits  = cube_level_ptr(cube, face, level);
+    *pitch = d3d8_row_pitch(cube->d3d8_format, w);
+    *rows  = d3d8_format_is_compressed(cube->d3d8_format) ? (w + 3) / 4 : w;
+    return TRUE;
+}
+
 HRESULT d3d8_CreateCubeTextureImpl(UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, IDirect3DCubeTexture8 **ppTex)
 {
     D3D8CubeTexture *cube;

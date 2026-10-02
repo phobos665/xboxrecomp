@@ -26,8 +26,8 @@
  * is what the device actually had.
  *
  * Not handled:
- *   - a stage bound to a cube or volume texture is recorded as nothing bound,
- *     and counted. src/hle creates neither, so this does not happen today.
+ *   - a stage bound to a volume texture is recorded as nothing bound, and
+ *     counted. src/hle does not create them, so this does not happen today.
  *   - more than CAPTURE_MAX_TEXTURES distinct textures in one frame: the rest
  *     are recorded as nothing bound, and counted.
  *   - calls made while the capture file is being closed on another thread;
@@ -124,8 +124,31 @@ static int texture_find(IDirect3DBaseTexture8 *object)
     return -1;
 }
 
-/* A cube texture's creation, with no contents. d3d8_cube_info is also the
- * type test: it answers only for a cube. */
+/* One face and level of a cube's texels, as the host holds them. */
+static void cube_level_write(IDirect3DBaseTexture8 *object, uint32_t id,
+                             UINT face, UINT level)
+{
+    D3D8CapCubeLevel c;
+    const BYTE *bits;
+    UINT pitch, rows;
+
+    if (!d3d8_cube_level(object, face, level, &bits, &pitch, &rows))
+        return;
+    c.id    = id;
+    c.face  = face;
+    c.level = level;
+    c.pitch = pitch;
+    c.rows  = rows;
+    c.bytes = pitch * rows;
+    chunk(D3D8CAP_CUBE_LEVEL, &c, sizeof c, bits, c.bytes, NULL, 0);
+    g_texture_bytes += c.bytes;
+}
+
+/* A cube texture's creation, then its texels unless the title renders into
+ * it: a cube filled from memory (hle_d3d8_texture.c, static_cube) would
+ * otherwise replay empty, and every surface lit through it -- a
+ * normalisation cube's dot product, an environment map -- with it.
+ * d3d8_cube_info is also the type test: it answers only for a cube. */
 static int cube_write(IDirect3DBaseTexture8 *object, uint32_t id)
 {
     D3D8CubeInfo info;
@@ -140,6 +163,13 @@ static int cube_write(IDirect3DBaseTexture8 *object, uint32_t id)
     head.usage  = info.usage;
     chunk(D3D8CAP_CUBE_TEXTURE, &head, sizeof head, NULL, 0, NULL, 0);
     g_texture_writes++;
+    if (!(info.usage & D3DUSAGE_RENDERTARGET)) {
+        UINT f, l;
+
+        for (f = 0; f < 6; f++)
+            for (l = 0; l < info.levels; l++)
+                cube_level_write(object, id, f, l);
+    }
     return 1;
 }
 
@@ -309,6 +339,15 @@ static void rec_set_texture(DWORD stage, IDirect3DBaseTexture8 *texture)
     c.stage      = stage;
     c.texture_id = texture_id(texture);
     chunk(D3D8CAP_SET_TEXTURE, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+static void rec_palette(DWORD stage, const DWORD *entries)
+{
+    D3D8CapPalette c;
+
+    c.stage = stage;
+    memcpy(c.entries, entries, sizeof c.entries);
+    chunk(D3D8CAP_PALETTE, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
 static void rec_set_vertex_shader(DWORD handle)
@@ -486,6 +525,10 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
 
     dev->lpVtbl->GetVertexShader(dev, &vs);
     rec_set_vertex_shader(vs);
+    /* The palettes before the textures: a P8 texture is expanded through one
+     * when replay uploads it. */
+    for (s = 0; s < CAPTURE_STAGES; s++)
+        rec_palette(s, d3d8_GetPalette(s));
     for (s = 0; s < CAPTURE_STAGES; s++)
         rec_set_texture(s, d3d8_GetStageTexture(s));
     rec_set_render_target(g_target_texture, g_target_level, g_target_face,
@@ -1408,7 +1451,50 @@ HRESULT host_CubeLockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
 HRESULT host_CubeUnlockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
                             UINT level)
 {
-    return cube->lpVtbl->UnlockRect(cube, face, level);
+    HRESULT hr = cube->lpVtbl->UnlockRect(cube, face, level);
+    IDirect3DBaseTexture8 *object = (IDirect3DBaseTexture8 *)cube;
+    int i;
+
+    /* As host_UnlockRect: a cube the capture holds already gets the level
+     * again; one it does not hold is written whole when first bound. */
+    if (g_cap && SUCCEEDED(hr) && (i = texture_find(object)) >= 0) {
+        cube_level_write(object, g_textures[i].id, (UINT)face, level);
+        g_level_writes++;
+    }
+    return hr;
+}
+
+typedef struct { DWORD stage; int null_entries; DWORD entries[256]; } dq_set_palette;
+
+static void op_set_palette(const void *arg)
+{
+    const dq_set_palette *p = (const dq_set_palette *)arg;
+    host_SetPalette(hle_d3d8_shadow_device(), p->stage,
+                    p->null_entries ? NULL : p->entries);
+}
+
+HRESULT host_SetPalette(IDirect3DDevice8 *dev, DWORD stage, const DWORD *entries)
+{
+    HRESULT hr;
+
+    if (hle_d3d8_defer_recording()) {
+        dq_set_palette p;
+
+        p.stage = stage;
+        p.null_entries = entries == NULL;
+        if (entries)
+            memcpy(p.entries, entries, sizeof p.entries);
+        else
+            memset(p.entries, 0, sizeof p.entries);
+        hle_d3d8_defer_op(op_set_palette, &p, sizeof p);
+        return S_OK;
+    }
+    hr = dev->lpVtbl->SetPalette(dev, stage, entries);
+    /* What the device holds now -- its grey ramp for NULL -- rather than the
+     * argument, so replay needs no knowledge of the default. */
+    if (g_cap && SUCCEEDED(hr) && stage < CAPTURE_STAGES)
+        rec_palette(stage, d3d8_GetPalette(stage));
+    return hr;
 }
 
 HRESULT host_LockRect(IDirect3DTexture8 *texture, UINT level,

@@ -406,6 +406,13 @@ static void dump_bmp(IDirect3DDevice8 *dev, const char *path)
 typedef struct {
     IDirect3DBaseTexture8 *tex;
     int                    is_cube;
+    /* A P8 texture is expanded through a stage palette when it is uploaded
+     * (d3d8_resources.c). Which stage's, and that palette's checksum, so a
+     * bind under a different palette expands it again, as the live run's
+     * per-palette textures already were. */
+    int                    p8;
+    int                    pal_stage;
+    uint32_t               pal_sum;
 } ReplayTexture;
 
 typedef struct {
@@ -429,6 +436,8 @@ typedef struct {
 
     unsigned long       kinds[D3D8CAP_CHUNK_KINDS];
     unsigned long       unknown, malformed, failed, unmapped;
+    uint32_t            bound[REPLAY_STAGES];   /* texture id per stage */
+    unsigned long       rebakes;                /* P8 re-expansions */
 } Replay;
 
 static void release_slot(ReplayTexture *slot)
@@ -437,7 +446,36 @@ static void release_slot(ReplayTexture *slot)
         slot->tex->lpVtbl->Release(slot->tex);
         slot->tex = NULL;
         slot->is_cube = 0;
+        slot->p8 = 0;
     }
+}
+
+/* Checksum of the device's palette for a stage (never 0). */
+static uint32_t palette_sum(DWORD stage)
+{
+    const uint8_t *p = (const uint8_t *)d3d8_GetPalette(stage);
+    uint32_t h = 2166136261u, i;
+
+    for (i = 0; i < 1024u; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+/* A P8 texture bound to `stage`: expand it again through that stage's
+ * palette unless that is the one it already holds. */
+static void p8_bind(Replay *r, ReplayTexture *slot, DWORD stage)
+{
+    uint32_t sum = palette_sum(stage);
+
+    if (slot->pal_stage == (int)stage && slot->pal_sum == sum)
+        return;
+    d3d8_base_set_palette(slot->tex, stage);
+    d3d8_refresh_palette(slot->tex);
+    slot->pal_stage = (int)stage;
+    slot->pal_sum = sum;
+    r->rebakes++;
 }
 
 static ReplayTexture *texture_slot(Replay *r, uint32_t id, int grow)
@@ -547,6 +585,10 @@ static void do_texture(Replay *r, const D3D8CapChunk *c)
     }
     slot->tex = (IDirect3DBaseTexture8 *)tex;
     slot->is_cube = 0;
+    /* A new texture's palette is stage 0's, which the fill just used. */
+    slot->p8 = d3d8_format_is_palettized((D3DFORMAT)t->format);
+    slot->pal_stage = 0;
+    slot->pal_sum = slot->p8 ? palette_sum(0) : 0;
 }
 
 static void do_texture_level(Replay *r, const D3D8CapChunk *c)
@@ -566,6 +608,62 @@ static void do_texture_level(Replay *r, const D3D8CapChunk *c)
         return;
     }
     fill_level(r, (IDirect3DTexture8 *)slot->tex, t->level, bytes, t->pitch, t->rows);
+    if (slot->p8)
+        slot->pal_sum = palette_sum((DWORD)slot->pal_stage);
+}
+
+/* One face and level of a cube filled from memory: written back through
+ * LockRect, whose unlock uploads it as the live run's did. */
+static void do_cube_level(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapCubeLevel *t = c->data;
+    IDirect3DCubeTexture8 *cube;
+    ReplayTexture *slot;
+    const uint8_t *bytes;
+    D3DLOCKED_RECT lr;
+    uint32_t y, row;
+
+    if (c->bytes < sizeof *t || t->face >= 6 || (uint64_t)t->pitch * t->rows != t->bytes ||
+        !(bytes = d3d8cap_tail(c, sizeof *t, t->bytes))) {
+        r->malformed++;
+        return;
+    }
+    slot = texture_slot(r, t->id, 0);
+    if (!slot || !slot->tex || !slot->is_cube) {
+        r->unmapped++;
+        return;
+    }
+    cube = (IDirect3DCubeTexture8 *)slot->tex;
+    if (FAILED(cube->lpVtbl->LockRect(cube, (D3DCUBEMAP_FACES)t->face, t->level, &lr,
+                                      NULL, 0))) {
+        r->failed++;
+        return;
+    }
+    row = t->pitch < (uint32_t)lr.Pitch ? t->pitch : (uint32_t)lr.Pitch;
+    for (y = 0; y < t->rows; y++)
+        memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch,
+               bytes + (size_t)y * t->pitch, row);
+    cube->lpVtbl->UnlockRect(cube, (D3DCUBEMAP_FACES)t->face, t->level);
+}
+
+/* SetPalette, as the live run called it. The host expands the P8 texture
+ * bound to that stage again (dev_SetPalette), so its palette is now this. */
+static void do_palette(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapPalette *p = c->data;
+    ReplayTexture *slot;
+
+    if (c->bytes < sizeof *p || p->stage >= REPLAY_STAGES) {
+        r->malformed++;
+        return;
+    }
+    if (FAILED(r->dev->lpVtbl->SetPalette(r->dev, p->stage, p->entries)))
+        r->failed++;
+    slot = texture_slot(r, r->bound[p->stage], 0);
+    if (slot && slot->tex && slot->p8) {
+        slot->pal_stage = (int)p->stage;
+        slot->pal_sum = palette_sum(p->stage);
+    }
 }
 
 static void do_texture_release(Replay *r, const D3D8CapChunk *c)
@@ -585,9 +683,9 @@ static void do_texture_release(Replay *r, const D3D8CapChunk *c)
     release_slot(slot);
 }
 
-/* A cube texture, created empty: the capture records only its shape, because
- * shadow mode mirrors a cube only when the title renders into it, and those
- * draws are in the capture too. */
+/* A cube texture, created empty. Its texels follow as CUBE_LEVEL chunks when
+ * the live cube was filled from memory; a cube the title renders into gets
+ * none, because those draws are in the capture too. */
 static void do_cube_texture(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapCubeTexture *t = c->data;
@@ -1077,6 +1175,10 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         slot = texture_slot(r, p->texture_id, 0);
         if (p->texture_id && (!slot || !slot->tex))
             r->unmapped++;               /* its TEXTURE chunk failed: bind nothing */
+        if (p->stage < REPLAY_STAGES)
+            r->bound[p->stage] = p->texture_id;
+        if (slot && slot->tex && slot->p8 && p->stage < REPLAY_STAGES)
+            p8_bind(r, slot, p->stage);
         r->dev->lpVtbl->SetTexture(r->dev, p->stage, slot ? slot->tex : NULL);
         break;
     }
@@ -1161,6 +1263,12 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
     case D3D8CAP_CUBE_TEXTURE:
         do_cube_texture(r, c);
         break;
+    case D3D8CAP_CUBE_LEVEL:
+        do_cube_level(r, c);
+        break;
+    case D3D8CAP_PALETTE:
+        do_palette(r, c);
+        break;
     case D3D8CAP_DEPTH_SURFACE:
         do_depth_surface(r, c);
         break;
@@ -1222,6 +1330,9 @@ static void report_loop(const Replay *r, int loop)
         fprintf(stderr, "[replay] loop %d: %lu host calls failed, %lu malformed chunks, "
                 "%lu unmapped handles, %lu unknown chunks\n", loop, r->failed,
                 r->malformed, r->unmapped, r->unknown);
+    if (r->rebakes)
+        note("[replay] loop %d: %lu P8 texture(s) expanded again for the palette "
+             "they were bound under\n", loop, r->rebakes);
 }
 
 /* One walk of the capture from its snapshot, drawing into the back buffer. */
@@ -1231,6 +1342,7 @@ static void replay_pass(Replay *r, D3D8CapReader *cap, int loop)
 
     memset(r->kinds, 0, sizeof r->kinds);
     r->unknown = r->malformed = r->failed = r->unmapped = 0;
+    r->rebakes = 0;
     d3d8cap_rewind(cap);
     g_draw_index = 0;
     g_cur_tag = 0;
