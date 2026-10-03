@@ -346,6 +346,13 @@ def main():
     titles = cm.discover(wanted)
     for t in titles:                       # game data lives in the main checkout
         t["game_dir"] = GAMES / t["game"] if t["game"] else None
+        if t["game_dir"] and not t["game_dir"].is_dir():
+            # main.c records the folder of whoever brought the title up, and
+            # a region suffix is the usual difference: Future Perfect's says
+            # "Timesplitters - Future Perfect (USA)".
+            bare = GAMES / re.sub(r"\s*\([^)]*\)\s*$", "", t["game"])
+            if bare.is_dir():
+                t["game_dir"] = bare
     titles = [t for t in titles if t["game_dir"] and t["game_dir"].is_dir()]
     missing = sorted(set(wanted) - {t["name"] for t in titles})
     if missing:
