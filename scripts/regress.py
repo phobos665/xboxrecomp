@@ -379,7 +379,7 @@ def main():
     changed = git("diff", "--name-only", shas["base"], shas["change"])
     log(f"{len(changed.splitlines())} files differ between the sides")
 
-    timings = {}
+    timings, broken = {}, []
     for t in titles:
         for side in SIDES:
             wt, sha = sides[side], shas[side]
@@ -390,12 +390,22 @@ def main():
                 if rc:
                     log(f"{side} {t['name']}: lift from {stage} FAILED "
                         f"(see {work_dir(wt, t['name']) / 'lift.log'})")
+                    broken.append(f"{side} {t['name']} (lift)")
                     continue
             rc, bt = build(wt, t["name"])
             timings[(side, t["name"])] = (stage, lt, bt, rc)
             log(f"{side} {t['name']}: lift {'from ' + stage if stage else 'none'}"
                 f" {lt:.0f}s, build {bt:.0f}s{' FAILED' if rc else ''}")
-    if args.no_run:
+            if rc:
+                broken.append(f"{side} {t['name']} (build, see "
+                              f"{work_dir(wt, t['name']) / 'build.log'})")
+    # A failed build leaves the previous executable in place; running it would
+    # compare an old build against whatever the other side made.
+    bad = {b.split()[1] for b in broken}
+    if bad:
+        log("not running (lift or build failed): " + "; ".join(broken))
+        titles = [t for t in titles if t["name"] not in bad]
+    if args.no_run or not titles:
         return
 
     if title_running():
