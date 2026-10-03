@@ -135,6 +135,12 @@ def _incoming_flag_state(sources, known, is_entry):
 _REG_TOKEN = None
 
 
+def _reads_carry(cond):
+    """True when an edge's condition reads the `_cf` carry variable."""
+    import re
+    return re.search(r"\b_cf\b", cond) is not None
+
+
 def _edge_flag_plan(bb, sources, known):
     """Evaluate a join's flag condition on each incoming edge instead.
 
@@ -1061,7 +1067,27 @@ class FunctionTranslator:
         """
         Translate a single function to C code.
         Returns a string of C source code, or None on failure.
+
+        Whether a function declares and computes `_cf` is decided before its
+        blocks are lifted, by scanning for carry readers in address order.
+        A join whose edges evaluate the condition themselves (the per-edge
+        plan below) can need the carry of a setter that scan never paired
+        with a reader -- `sub` on one edge, `cmp` on the other, then `jb` --
+        and the edge then read an undeclared `_cf`, which does not compile.
+        Such a function is translated once more with carry tracking on.
         """
+        saved = {k: list(v) for k, v in self.lifter.unimplemented.items()}
+        self._edge_needs_cf = False
+        code = self._translate_function_once(func_addr, func_info)
+        if self._edge_needs_cf:
+            self.lifter.unimplemented.clear()
+            self.lifter.unimplemented.update(saved)
+            self._edge_needs_cf = False
+            code = self._translate_function_once(func_addr, func_info,
+                                                 force_cf=True)
+        return code
+
+    def _translate_function_once(self, func_addr, func_info, force_cf=False):
         start = func_addr
         recovered = self._recovered_cfg.get(start)
         end = recovered["end"] if recovered else func_info.get("end")
@@ -1420,7 +1446,7 @@ class FunctionTranslator:
         # reads is the lifter's tracking rule, mirrored here so only the
         # functions that consume CF declare it: computing it beside every add
         # in the image would be a line per add in 48,000 functions.
-        has_carry = self._function_needs_cf(instructions)
+        has_carry = force_cf or self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
         # Only functions that consume CF pay for producing it: an adc/sbb
@@ -1627,6 +1653,12 @@ class FunctionTranslator:
             # holding another edge's answer.
             if incoming is None and bb.start != start and bb.start not in unseen_entries:
                 plan = _edge_flag_plan(bb, preds[bb.start], settled_state)
+                if plan and not self.lifter.needs_cf and any(
+                        _reads_carry(c) for c in plan[1].values()):
+                    # An edge needs a carry this function does not compute:
+                    # see translate_function, which retries with it on.
+                    self._edge_needs_cf = True
+                    plan = None
                 if plan:
                     m, conds = plan
                     var = f"_jf_{bb.start:08X}"
