@@ -61,6 +61,18 @@ class Disassembler:
         self.func_detector: Optional[FunctionDetector] = None
         self.strings: List[dict] = []
 
+    def _trust_mid_instruction_seed(self, addr: int) -> bool:
+        """A seed inside an instruction the sweep decoded: keep it anyway?
+
+        Yes when a run reached it (observed_seeds), or when it decodes as a
+        prologue or follows the linker's padding, which means the sweep is
+        the one out of phase. See the seeding loop in run() for the cases
+        behind each.
+        """
+        return (addr in self.observed_seeds
+                or self.engine.probes_as_prologue(addr)
+                or self.engine.follows_padding(addr))
+
     def run(self) -> bool:
         """
         Execute the full disassembly pipeline.
@@ -221,14 +233,14 @@ class Disassembler:
                     # Or unless a run actually got there. A seed from
                     # tools.seed_from_log is an address the CPU called, or a
                     # thread the title started -- where execution went, not
-                    # an inference from a table. Halo's XPP has an init
-                    # function at 0x001CF6AC that opens `cmp [flag], 0` right
-                    # after a pointer table the sweep walked as code; rejecting
-                    # its observed seed left XInitDevices' indirect call to it
-                    # unresolved. (Upstream xboxrecomp 1409a7d, #164.)
-                    if (addr in self.observed_seeds
-                            or self.engine.probes_as_prologue(addr)
-                            or self.engine.follows_padding(addr)):
+                    # an inference from a table -- and seed_from_log only
+                    # writes one that decodes as a function body. The guard
+                    # above exists for RTTI vtable slots, which are guesses.
+                    # Halo's XPP has an init function at 0x001CF6AC that
+                    # opens `cmp [flag], 0` right after a pointer table the
+                    # sweep walked as code; rejecting its observed seed left
+                    # the USB driver's indirect call to it unresolved.
+                    if self._trust_mid_instruction_seed(addr):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(

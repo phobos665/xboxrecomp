@@ -113,6 +113,33 @@ def test_ucomiss_ah_semantics_evaluated():
         assert got == want, (a, b, hex(got), hex(want), expr)
 
 
+def test_fpu_unordered_reads_below_equal_and_parity():
+    # fcomi/fucomi/sahf set ZF, PF and CF on an unordered compare; g_fp_cmp
+    # is 2 then, which must not read as "greater".
+    from tools.recomp.lifter import _make_condition
+    ja = _make_condition("ja", "fucomip", [])[0]
+    jb = _make_condition("jb", "fucomip", [])[0]
+    jp = _make_condition("jp", "sahf", [])[0]
+    assert "g_fp_cmp == 1" in ja and ">" not in ja, ja
+    assert "g_fp_cmp == 2" in jb, jb
+    assert "g_fp_cmp == 2" in jp, jp
+
+
+def test_comiss_unordered_sets_zf_pf_cf():
+    # Same rule after comiss/ucomiss: jb, je and jp are taken on NaN, ja is not.
+    from tools.recomp.lifter import _make_condition
+    import math
+    def ev(jcc, a, b):
+        e = _make_condition(jcc, "ucomiss", [_Op("xmm0"), _Op("xmm1")])[0]
+        e = e.replace("||", " or ").replace("&&", " and ").replace("!(", "not (")
+        return bool(eval(e, {"_fca": a, "_fcb": b}))
+    for jcc, want in (("ja", False), ("jae", False), ("jb", True),
+                      ("jbe", True), ("je", True), ("jne", False),
+                      ("jp", True), ("jnp", False)):
+        assert ev(jcc, math.nan, 1.0) == want, jcc
+    assert ev("jne", 1.0, 2.0) and not ev("jp", 1.0, 2.0)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
