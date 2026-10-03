@@ -212,6 +212,75 @@ def lift(wt, sha, t, stage):
     return rc, time.time() - t0
 
 
+# ── build backends ─────────────────────────────────────────────────────────
+#
+# With Ninja and sccache available, builds go through a compiler cache. Base
+# and change share almost every generated chunk byte for byte, and the same
+# commit is built again and again across passes, so after the first build of
+# anything most compiles are cache hits: a from-scratch Medal of Honor build
+# took 36 s with a warm cache against 314 s cold (3 Oct 2026). MSBuild cannot
+# use a compiler launcher, hence Ninja, which needs the MSVC environment that
+# vcvars64.bat sets up. Without either tool this falls back to the Visual
+# Studio generator, as before.
+
+def _find_sccache():
+    p = shutil.which("sccache")
+    if p:
+        return p
+    import glob as _glob
+    hits = _glob.glob(os.path.expandvars(
+        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Mozilla.sccache*\*\sccache.exe"))
+    return hits[0] if hits else None
+
+
+def _find_ninja():
+    p = shutil.which("ninja")
+    if p:
+        return p
+    cmake = Path(cm.find_cmake())
+    # VS Build Tools ship it beside their CMake: .../CMake/CMake/bin/cmake.exe
+    # -> .../CMake/Ninja/ninja.exe
+    cand = cmake.parent.parent.parent / "Ninja" / "ninja.exe"
+    return str(cand) if cand.is_file() else None
+
+
+_MSVC_ENV = None
+
+
+def _msvc_env():
+    """The environment vcvars64.bat produces, captured once."""
+    global _MSVC_ENV
+    if _MSVC_ENV is None:
+        cmake = Path(cm.find_cmake())
+        root = next((p for p in cmake.parents if (p / "VC").is_dir()), None)
+        vcvars = root / "VC" / "Auxiliary" / "Build" / "vcvars64.bat" if root else None
+        if not vcvars or not vcvars.is_file():
+            return None
+        out = subprocess.run(f'cmd /s /c ""{vcvars}" >nul && set"', shell=True,
+                             capture_output=True, text=True).stdout
+        _MSVC_ENV = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    return _MSVC_ENV
+
+
+def cached_backend(disabled=False):
+    """(ninja, sccache, env) when a cached build is possible, else None."""
+    if disabled or os.name != "nt":
+        return None
+    ninja, sccache = _find_ninja(), _find_sccache()
+    env = _msvc_env() if ninja and sccache else None
+    return (ninja, sccache, env) if env else None
+
+
+BACKEND = None          # set in main()
+
+
+def exe_path(wt, name):
+    project = wt / "titles" / name
+    if BACKEND:
+        return project / "build-regress" / f"{name}_recomp.exe"
+    return project / "build" / "Release" / f"{name}_recomp.exe"
+
+
 def build(wt, name):
     """Incremental build. Configures the first time, and again whenever the
     set of generated files changed since the last build.
@@ -223,25 +292,41 @@ def build(wt, name):
     one, which shows as unresolved externals for every function they hold.
     """
     project = wt / "titles" / name
-    bdir = project / "build"
     logs = work_dir(wt, name)
     logs.mkdir(parents=True, exist_ok=True)
     cmake = cm.find_cmake()
     gen = sorted(p.name for p in (project / "src" / "recomp" / "gen").glob("*.c"))
-    seen_path = logs / "gen_files.json"
+    if BACKEND:
+        ninja, sccache, env = BACKEND
+        bdir = project / "build-regress"
+        generator = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+                     f"-DCMAKE_MAKE_PROGRAM={ninja}",
+                     "-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl",
+                     f"-DCMAKE_C_COMPILER_LAUNCHER={sccache}",
+                     f"-DCMAKE_CXX_COMPILER_LAUNCHER={sccache}",
+                     # /Zi's shared PDB is neither cacheable nor safe under Ninja.
+                     "-DXBOXRECOMP_DEBUG_INFO=/Z7",
+                     # SDL builds with precompiled headers, which sccache
+                     # cannot cache (/Yc, /Fp): 263 compiles a title.
+                     "-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON"]
+        extra = []
+    else:
+        env = None
+        bdir = project / "build"
+        generator = ["-G", "Visual Studio 16 2019", "-A", "x64"] if os.name == "nt" else []
+        extra = ["--", "-m", "-v:m"] if os.name == "nt" else ["--parallel"]
+    seen_path = logs / ("gen_files_ninja.json" if BACKEND else "gen_files.json")
     seen = json.loads(seen_path.read_text()) if seen_path.is_file() else None
     t0 = time.time()
     with open(logs / "build.log", "w", encoding="utf-8", errors="replace") as f:
         if not (bdir / "CMakeCache.txt").is_file() or seen != gen:
-            generator = ["-G", "Visual Studio 16 2019", "-A", "x64"] if os.name == "nt" else []
             rc = subprocess.run([cmake, "-S", str(project), "-B", str(bdir), *generator],
-                                stdout=f, stderr=subprocess.STDOUT).returncode
+                                stdout=f, stderr=subprocess.STDOUT, env=env).returncode
             if rc:
                 return rc, time.time() - t0
-        extra = ["--", "-m", "-v:m"] if os.name == "nt" else ["--parallel"]
         rc = subprocess.run([cmake, "--build", str(bdir), "--config", "Release",
                              "--target", f"{name}_recomp", *extra],
-                            stdout=f, stderr=subprocess.STDOUT).returncode
+                            stdout=f, stderr=subprocess.STDOUT, env=env).returncode
     if rc == 0:
         seen_path.write_text(json.dumps(gen))
     return rc, time.time() - t0
@@ -297,7 +382,7 @@ def run_once(side, wt, t, mode, seconds, out_root):
     env = dict(PIN_ENV, RECOMP_GAME_DIR=str(MIRROR / t["game_dir"].name),
                RECOMP_SAVE_DIR=str(save), **TITLE_ENV.get(name, {}))
     spec = {"name": name, "project": wt / "titles" / name,
-            "exe": wt / "titles" / name / "build" / "Release" / f"{name}_recomp.exe",
+            "exe": exe_path(wt, name),
             "game_dir": MIRROR / t["game_dir"].name, "fresh_saves": False,
             "input_seq": cm.default_input_seq(seconds) if mode == "driven" else None}
     s = cm.run_title(spec, seconds, out_dir, env)
@@ -350,10 +435,36 @@ def main():
     ap.add_argument("--force-lift", action="store_true",
                     help="full lift on both sides, ignoring the stamps")
     ap.add_argument("--no-run", action="store_true", help="lift and build only")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="build with the Visual Studio generator, not Ninja + sccache")
     args = ap.parse_args()
+
+    global BACKEND
+    BACKEND = cached_backend(disabled=args.no_cache)
+    log("build: " + ("Ninja + sccache (" + BACKEND[1] + ")" if BACKEND else
+                     "Visual Studio generator (no Ninja + sccache found; "
+                     "`winget install Mozilla.sccache` enables the cached build)"))
 
     if title_running():
         sys.exit("A title is running -- someone is playing. Not starting.")
+    # One pass at a time: a second would move the shared worktrees under the
+    # first one's builds and runs.
+    REGRESS.mkdir(parents=True, exist_ok=True)
+    lock = REGRESS / "regress.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        sys.exit(f"Another regress.py pass holds {lock} ({lock.read_text().strip()}). "
+                 "If none is running, delete the file.")
+    os.write(fd, f"pid {os.getpid()} since {time.strftime('%H:%M:%S')}".encode())
+    os.close(fd)
+    try:
+        run(args)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def run(args):
     wanted = [n.strip() for n in args.titles.split(",") if n.strip()]
     titles = cm.discover(wanted)
     for t in titles:                       # game data lives in the main checkout
