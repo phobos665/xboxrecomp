@@ -206,8 +206,14 @@ def main() -> int:
     ap.add_argument("--all", action="store_true",
                     help="Lift everything, including CRT and XDK code "
                          "(default: --game-only)")
-    ap.add_argument("--split", type=int, default=1000, metavar="N",
-                    help="Functions per generated .c file (default: 1000)")
+    # 250, not 1000. Each chunk compiles single-threaded at /O2, so the
+    # biggest one sets a cold build's wall time and a one-function change
+    # recompiles its whole chunk. Measured on TimeSplitters 2 (3 Oct 2026):
+    # 8 chunks of up to 9.2 MB at 1000, 29 of up to 2.9 MB at 250; cold build
+    # 221 s -> 198 s, one changed chunk 47 s -> 22-33 s, and no measurable
+    # frame-time cost in-level (uncapped, P-cores: 6.5 ms either way).
+    ap.add_argument("--split", type=int, default=250, metavar="N",
+                    help="Functions per generated .c file (default: 250)")
     ap.add_argument("--gen-dir", metavar="DIR",
                     help="Output directory for generated sources")
     ap.add_argument("--work-dir", metavar="DIR",

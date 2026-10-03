@@ -64,7 +64,7 @@ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 # Collect generated recompiled code.
 # The recomp pipeline outputs files into src/recomp/gen/.
-# With --split 1000, you get gen_0000.c, gen_0001.c, etc.
+# With --split 250 (scripts/recompile.py's default), you get recomp_0000.c, recomp_0001.c, etc.
 # CONFIGURE_DEPENDS so re-running the recompiler picks up added/removed files
 # without a manual re-configure. A plain GLOB is evaluated once at configure
 # time, so a newly generated file (an extra chunk, recomp_stubs_unresolved.c)
