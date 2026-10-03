@@ -16,6 +16,14 @@ project(xboxrecomp VERSION 0.9.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Debug information for the runtime libraries (MSVC). /Zi writes one shared
+# PDB per library, which a compiler cache cannot cache and which parallel
+# compiles under Ninja collide on (C1041). scripts/regress.py builds with
+# Ninja and sccache and passes /Z7, which keeps the same information in each
+# object; the title's /DEBUG link still produces a full PDB either way.
+set(XBOXRECOMP_DEBUG_INFO "/Zi" CACHE STRING
+    "MSVC debug-information flag for the runtime libraries (/Zi or /Z7)")
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
