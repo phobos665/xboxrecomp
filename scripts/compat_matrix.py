@@ -97,7 +97,7 @@ def refresh_thunks(t, verbose=False):
     if not (funcs.is_file() and xbe.is_file() and gen.is_dir()):
         return "no pipeline output"
     cmd = [sys.executable, "-m", "tools.recomp", str(xbe), "--game-only",
-           "--split", "1000", "--functions", str(funcs),
+           "--split", "250", "--functions", str(funcs),
            "--gen-dir", str(gen), "--only-hle-thunks"]
     if ident.is_file():
         cmd += ["--identified", str(ident)]
@@ -481,7 +481,10 @@ def run_title(t, seconds, out_dir, extra_env=None):
     # so is the whole reason this column exists.
     if s["verdict"] == "renders" and s["lit"] == 0.0:
         s["verdict"] = "black screen"
-    s["log"] = str(err_path.relative_to(ROOT))
+    try:
+        s["log"] = str(err_path.relative_to(ROOT))
+    except ValueError:              # outside this checkout (scripts/regress.py)
+        s["log"] = str(err_path)
     return s
 
 
