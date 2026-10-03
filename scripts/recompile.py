@@ -81,7 +81,14 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     #
     # The extra sections are a few hundred KB against a 2 MB .text, so the
     # scan costs little; --text-only trades correctness for a few seconds.
-    disasm = [sys.executable, "-m", "tools.disasm", str(xbe)]
+    # The section layout the parse stage just wrote. Without this the
+    # disassembler looks for <xbe stem>_analysis.json beside the XBE, so a
+    # --json pointing anywhere else was written and never read: a title with
+    # no such file beside it failed (Medal of Honor: Rising Sun ships
+    # DEFAULT.XBE, so the lookup was DEFAULT_analysis.json), and one with an
+    # old file there read that instead.
+    disasm = [sys.executable, "-m", "tools.disasm", str(xbe),
+              "--analysis-json", str(analysis_json)]
     if args.text_only:
         disasm.append("--text-only")
     # Every stage defaults to one shared tools/*/output directory, and the
