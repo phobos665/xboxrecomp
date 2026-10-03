@@ -275,7 +275,7 @@ static const char g_ps_body[] =
     "    float4 FogParams;\n"      /* x=start, y=end, z=density, w=table fog mode (D3DFOGMODE) */
     "    float  AlphaRef;\n"
     "    uint   AlphaFunc;\n"
-    "    uint   PSFlags;\n"        /* bit 0: alpha test, bit 1: vertex fog, bit 2: specular add, bit 3: table fog, bit 4: range fog */
+    "    uint   PSFlags;\n"        /* bit 0: alpha test, bit 1: vertex fog, bit 2: specular add, bit 3: table fog, bit 4: range fog, bit 5: program fog coordinate */
     "    uint   _pad0;\n"
     "    // Per-stage: x=colorop, y=colorarg1, z=colorarg2, w=alphaop\n"
     "    uint4  StageColor[4];\n"
@@ -310,6 +310,22 @@ static const char g_ps_body[] =
     "        return saturate((FogParams.y - dist) / max(FogParams.y - FogParams.x, 1e-6));\n"
     "    }\n"
     "    return 1.0;\n"
+    "}\n"
+    "\n"
+    /* Vertex fog under a vertex program. The NV2A does not take a program's
+     * oFog as the fog factor: it is a fog coordinate, which the fog unit maps
+     * to a factor with the fog range -- for D3DFOG_NONE, linearly between
+     * FOGSTART and FOGEND (xemu, pgraph/glsl/vsh.c: fogParam from start and
+     * end; an infinite distance or a NaN factor reads as no fog). Taking it
+     * as the factor painted Marvel vs Capcom 2's character select in its fog
+     * colour: it draws there with fog on, black fog and start = end = -1e7,
+     * a range the hardware evaluates as no fog at all. */
+    "float program_fog(float d) {\n"
+    "    float span = FogParams.y - FogParams.x;\n"
+    "    if (span == 0.0 || isinf(d)) return 1.0;\n"
+    "    float f = (FogParams.y - d) / span;\n"
+    "    if (isnan(f)) return 1.0;\n"
+    "    return saturate(f);\n"
     "}\n"
     "\n"
     /* Resolve a texture argument value */
@@ -408,7 +424,9 @@ static const char g_ps_tail[] =
     "        current.rgb = saturate(current.rgb + input.specular.rgb);\n"
     "\n"
     "    // Fog blending\n"
-    "    if (PSFlags & 2u)\n"  /* vertex fog: input.fog is the fog factor */
+    "    if (PSFlags & 32u)\n"  /* vertex fog under a program: input.fog is its fog coordinate */
+    "        current.rgb = lerp(FogColor.rgb, current.rgb, program_fog(input.fog));\n"
+    "    else if (PSFlags & 2u)\n"  /* vertex fog: input.fog is the fog factor */
     "        current.rgb = lerp(FogColor.rgb, current.rgb, input.fog);\n"
     "\n"
     "    if (PSFlags & 8u) {\n"  /* table fog: compute fog per-pixel from view-space depth */
@@ -613,7 +631,7 @@ typedef struct {
     float fog_params[4];         /* start, end, density, table fog mode (D3DFOGMODE) */
     float alpha_ref;
     UINT  alpha_func;
-    UINT  ps_flags;              /* bit 0: alpha test, bit 1: vertex fog, bit 2: specular add, bit 3: table fog, bit 4: range fog */
+    UINT  ps_flags;              /* bit 0: alpha test, bit 1: vertex fog, bit 2: specular add, bit 3: table fog, bit 4: range fog, bit 5: program fog coordinate */
     UINT  _pad0;
     UINT  stage_color[4][4];     /* [stage][x=colorop, y=arg1, z=arg2, w=alphaop] */
     UINT  stage_alpha[4][4];     /* [stage][x=alphaarg1, y=alphaarg2, z=0, w=0] */
@@ -1084,6 +1102,10 @@ static void ff_vs_prepare_draw(DWORD fvf)
     }
 }
 
+/* Whether the draw being prepared runs a vertex program, whose fog output is
+ * a fog coordinate rather than a factor (program_fog above). */
+static int g_draw_is_program;
+
 void d3d8_shaders_prepare_draw(DWORD handle)
 {
     RhiShader *ps;
@@ -1091,7 +1113,9 @@ void d3d8_shaders_prepare_draw(DWORD handle)
     const DWORD *rs;
 
     if (!rhi_device_ready()) return;
+    g_draw_is_program = 0;
     if (d3d8_vsh_prepare_draw(handle)) {
+        g_draw_is_program = 1;
         /* A program that never reads the projection's first column is
          * placing vertices in screen coordinates it worked out itself; one
          * that reads it but with an orthographic matrix in it is doing the
@@ -1159,6 +1183,15 @@ void d3d8_shaders_prepare_draw(DWORD handle)
                 pc->fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
                 pc->ps_flags |= 8; /* table fog */
                 if (rs[D3DRS_RANGEFOGENABLE]) pc->ps_flags |= 16; /* range fog */
+            } else if (g_draw_is_program) {
+                /* The program's oFog is a fog coordinate, mapped linearly
+                 * through FOGSTART..FOGEND in the pixel shader. */
+                float fog_start, fog_end;
+                memcpy(&fog_start, &rs[D3DRS_FOGSTART], sizeof(float));
+                memcpy(&fog_end, &rs[D3DRS_FOGEND], sizeof(float));
+                pc->fog_params[0] = fog_start;
+                pc->fog_params[1] = fog_end;
+                pc->ps_flags |= 32; /* program fog coordinate */
             } else {
                 pc->ps_flags |= 2; /* vertex fog (factor computed in the VS) */
             }
