@@ -10,7 +10,7 @@
 if(MSVC)
     # /Zi so the PDB names this library's static functions in a sampled
     # profile (RECOMP_SAMPLE); see src/kernel/CMakeLists.txt.
-    add_compile_options(/Zi)
+    add_compile_options(${XBOXRECOMP_DEBUG_INFO})
 endif()
 
 add_library(xbox_hle STATIC
