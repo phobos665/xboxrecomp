@@ -25,7 +25,7 @@ import sys
 import time
 
 from . import config
-from .translator import BatchTranslator
+from .translator import BatchTranslator, write_if_changed
 from .output import write_summary, print_stats, generate_header
 
 
@@ -679,8 +679,8 @@ def main():
                     hle_originals[name] = addr
             from .hle import render_thunks
             out = out_path
-            with open(out, "w", encoding="utf-8") as fh:
-                fh.write(render_thunks(hle_replace, hle_variables, hle_originals))
+            write_if_changed(out, render_thunks(hle_replace, hle_variables,
+                                                hle_originals))
             # The runtime header travels with the generated code, and a real
             # lift refreshes it every run for the reason translator.py spells
             # out at length: the lifter and this header are two halves of one
@@ -755,11 +755,11 @@ def main():
 
         # Written after translation, which clears stale files from gen_dir, and
         # written even when empty, so a stale thunk file from an earlier lift
-        # can never define a function this lift generated.
+        # can never define a function this lift generated. Only when it
+        # differs, like the chunks, so an unchanged lift recompiles nothing.
         from .hle import render_thunks
-        with open(os.path.join(gen_dir, "recomp_hle.c"), "w",
-                  encoding="utf-8") as fh:
-            fh.write(render_thunks(hle_replace, hle_variables, hle_originals))
+        write_if_changed(os.path.join(gen_dir, "recomp_hle.c"),
+                         render_thunks(hle_replace, hle_variables, hle_originals))
 
         t_translate = time.time() - t0
         print(f"\n=== Split Translation Complete ({t_translate:.1f}s) ===",
