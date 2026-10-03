@@ -40,6 +40,7 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "xbox_watchpoint.h"
+#include "xbox_nic.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -93,6 +94,7 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* Defined in recomp_trace.c. Declared here rather than pulled from
  * the generated headers, which this file does not include. */
 void recomp_profile_dump(void);
+void recomp_exit_trace_init(void);      /* src/kernel/exit_trace.c */
 
 /* Defined in kernel_bridge.c: the APU is a separate library the kernel must
  * not need to link, so the kernel takes its interrupt line as a callback. */
@@ -243,7 +245,7 @@ static void print_guest_context(void *rip)
          * loaded out of is usually sitting in the frame -- invisible in
          * the filtered list above, which keeps only code addresses. */
         fprintf(stderr, "  guest stack (raw):\n");
-        for (i = 0; i < 16; i += 4)
+        for (i = 0; i < 48; i += 4)
             fprintf(stderr, "    [esp+%-3d] %08X %08X %08X %08X\n",
                     i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
     }
@@ -254,8 +256,8 @@ static void print_guest_context(void *rip)
  * Each has a handler in the runtime that decodes the faulting instruction,
  * performs the access and moves RIP past it; this handler's job is only to
  * route the fault to the right one. The pages are trapped only when the
- * matching switch is set (RECOMP_VBLANK, RECOMP_AC97_READY), so without it
- * these ranges never fault and this code is never reached. */
+ * matching switch is set (RECOMP_VBLANK, RECOMP_AC97_READY, RECOMP_NIC_TRACE),
+ * so without it these ranges never fault and this code is never reached. */
 #define GUEST_NV2A_BASE        0xFD000000u
 #define GUEST_NV2A_PCRTC_PAGE  0xFD600000u   /* interrupt status: write-trapped */
 #define GUEST_APU_REGS_BASE    0xFE800000u   /* APU registers: PAGE_NOACCESS   */
@@ -280,6 +282,10 @@ static LONG route_device_fault(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     if (is_write && va >= GUEST_AC97_PAGE && va < GUEST_AC97_PAGE + 0x1000u) {
         if (mcpx_ac97_handle_write(ep->ContextRecord, fault_addr,
                                    va - GUEST_APU_REGS_BASE))
+            return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (va >= XBOX_NIC_BASE && va < XBOX_NIC_BASE + XBOX_NIC_SIZE) {
+        if (xbox_NicHandleMmio(ep->ContextRecord, va, is_write))
             return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -521,6 +527,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    /* And the other way a run ends: an exit nobody logged. Prints [EXIT]
+     * with the code and both stacks before the process goes (exit_trace.c). */
+    recomp_exit_trace_init();
 
     /* Step 1: Find and load the XBE */
     {

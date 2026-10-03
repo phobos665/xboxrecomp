@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "xbox_nic.h"
 #ifdef _WIN32
 #include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
 #endif
@@ -264,8 +265,16 @@ static void kernel_data_init(void)
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
 
-    /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
+    /* XboxLANKey (ordinal 353): the player's own if they gave it, else zeros.
+     * XNet derives every System Link key from it, so zeros talk only to other
+     * recompiled builds (xbox_nic.c, xbox_NetLanKey). */
+    {
+        uint8_t lan_key[16];
+        xbox_NetLanKey(lan_key);
+        memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset),
+               lan_key, 16);
+        memcpy(xbox_LANKey, lan_key, 16);
+    }
 
     /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
@@ -2180,10 +2189,15 @@ static void bridge_MmGetPhysicalAddress(void)
      * calls and then stopped advancing DMA_PUT at all.
      */
     if (addr >= XBOX_CONTIG_BASE
-        && (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        && (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
         g_eax = addr - XBOX_CONTIG_BASE;
-    else
+        xbox_PhysNoteSource(g_eax, 0);
+    } else {
         g_eax = addr;
+        /* The two storages share physical numbers here, so say which one
+         * this answer was for (xbox_PhysToGuest). */
+        xbox_PhysNoteSource(g_eax, 1);
+    }
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -2733,6 +2747,32 @@ static void kernel_apu_tick(void)
     }
 }
 
+/* The network card's interrupt, delivered (xbox_nic.c).
+ *
+ * Bus level 4, as on the console: XNet asks HalGetInterruptVector(4) and
+ * connects its ISR there. Level-triggered like the APU's: raised on every tick
+ * while (IrqStatus & IrqMask) is non-zero, and the ISR masks it and queues the
+ * DPC that acknowledges it, which runs in the drain straight after. The card
+ * takes received frames on the same tick, just before. */
+#define NIC_VECTOR 4u
+
+static void kernel_nic_tick(void)
+{
+    static unsigned n;
+    int claimed;
+
+    xbox_NicTick();
+    if (!xbox_NicIrqPending() || !xbox_GetConnectedInterrupt(NIC_VECTOR))
+        return;
+    claimed = kernel_raise_interrupt(NIC_VECTOR);
+    if (n++ < 3) {
+        fprintf(stderr, "  [NIC] interrupt -> ISR %s\n",
+                claimed < 0 ? "not callable" :
+                claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
@@ -2758,8 +2798,12 @@ static void bridge_KeInitializeDpc(void)
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
+    /* Zero the structure: an Xbox KDPC is 0x1C bytes -- Type, Inserted and
+     * padding, the list entry, the routine, its context and two system
+     * arguments. This used to clear 32, which wiped the next field of
+     * whatever embeds the DPC: XNet keeps its interrupt vector right after
+     * its DPC, so the card's ISR was connected on vector 0 instead of 4. */
+    memset(XBOX_TO_NATIVE(dpc_va), 0, 0x1C);
 
     /* Set Type (0x13 = DpcObject) and fields */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
@@ -2811,6 +2855,12 @@ static void bridge_KeInitializeInterrupt(void)
     BRIDGE_MEM32(interrupt_va + 0)  = routine;
     BRIDGE_MEM32(interrupt_va + 4)  = context;
     BRIDGE_MEM32(interrupt_va + 8)  = vector;
+    /* A title calls this a handful of times, and the vector it passes is
+     * the one a device model must raise -- worth a line each. */
+    fprintf(stderr, "  [KERNEL] KeInitializeInterrupt: object 0x%08X vector %u "
+                    "irql %u routine 0x%08X\n",
+            interrupt_va, vector, STACK_ARG(4), routine);
+    fflush(stderr);
     g_eax = 0;
 }
 
@@ -3026,6 +3076,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_apu_tick();     /* the APU's interrupt line */
+        kernel_nic_tick();     /* the network card's frames and interrupt */
         {
             /* DPCs run at DISPATCH_LEVEL, so not while a guest thread is
              * there (kernel_hal.c, RECOMP_DISPATCH_LOCK). */
@@ -5706,11 +5757,13 @@ static void bridge_MmDeleteKernelStack(void)
 
 /* ── Xc* remaining crypto (ordinals 341-345, 347-351)
  *
- * Split into two kinds, both of which clear the memory-model bar:
- *  - the public-key / DES / ModExp entries are documented stubs that ignore
- *    their arguments (no Xbox Live, no on-console key derivation), so the
- *    pointers pass through without being dereferenced;
- *  - XcBlockCrypt/XcKeyTable/XcCryptService/XcUpdateCrypto are the same shape.
+ * All of them clear the memory-model bar: every pointer is a caller-supplied
+ * guest buffer, translated here, and nothing is handed back.
+ *  - XcModExp and the DES entries (XcKeyTable, XcBlockCrypt, XcBlockCryptCBC,
+ *    and XcDESKeyParity above) are real: XNet's System Link key exchange and
+ *    traffic run through them (xbox_crypto_soft.c);
+ *  - the public-key entries are documented stubs that ignore their
+ *    arguments, and XcCryptService/XcUpdateCrypto the same shape.
  * XcVerifyPKCS1Signature is worth singling out: it returns TRUE so that
  * signature checks succeed instead of rebooting the dashboard. */
 static void bridge_XcPKGetKeyLen(void)

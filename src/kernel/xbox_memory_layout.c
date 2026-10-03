@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "recomp_config.h"
 #include "xbox_watchpoint.h"
+#include "xbox_nic.h"
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
  *
@@ -2749,6 +2750,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
                     XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
+
+            /* The network card's page, trapped only when something asks
+             * for it (xbox_nic.c); otherwise plain memory like the rest. */
+            xbox_NicInit((char *)g_mcpx_memory
+                         + (XBOX_NIC_BASE - XBOX_MCPX_BASE));
         } else {
             fprintf(stderr, "  WARNING: MCPX aperture at 0x%08X failed "
                     "(error %lu); USB/audio register access will fault\n",
@@ -3485,6 +3491,41 @@ int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+/* One bit per 4 KB physical page of the 64 MB window: set when the last
+ * MmGetPhysicalAddress for that page was answered for a low-RAM VA.
+ *
+ * XNet is why. It hands the network card both kinds in one ring: its
+ * descriptor rings come from MmAllocateContiguousMemory (the window), its
+ * frame buffers from its own pool in low RAM, and the card is told only
+ * physical addresses. Read through the window, a frame buffer at physical
+ * 0x011FE8F2 was another allocator's fill; read through low RAM it was the
+ * frame. The window cannot be ruled out by "is this a live contiguous
+ * block" either, because both storages are in use at the same physical
+ * addresses. MmGetPhysicalAddress is the one place that knows. */
+static uint32_t g_phys_low[(XBOX_CONTIG_SIZE / 4096u) / 32u];
+
+void xbox_PhysNoteSource(uint32_t phys, int low_ram)
+{
+    uint32_t page = phys / 4096u;
+
+    if (phys >= XBOX_CONTIG_SIZE)
+        return;
+    if (low_ram)
+        g_phys_low[page / 32u] |= 1u << (page % 32u);
+    else
+        g_phys_low[page / 32u] &= ~(1u << (page % 32u));
+}
+
+uint32_t xbox_PhysToGuest(uint32_t phys)
+{
+    uint32_t page = phys / 4096u;
+
+    if (phys < XBOX_CONTIG_SIZE &&
+        (g_phys_low[page / 32u] & (1u << (page % 32u))))
+        return phys;
+    return XBOX_CONTIG_BASE + phys;
 }
 
 
