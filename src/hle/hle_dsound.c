@@ -20,8 +20,10 @@
  *  - keyed by XDK function name through tools.xdk_symbols, not by one title's
  *    addresses, so any title on a covered XDK gets it;
  *  - the public IDirectSoundBuffer_* entry points are replaced; creation,
- *    SetBufferData, SetVolume and the rest still run the game's own code,
- *    which keeps the settings object this reads current;
+ *    SetVolume and the rest still run the game's own code, which keeps the
+ *    settings object this reads current. SetFormat and SetBufferData are
+ *    replaced too, but only for a buffer whose settings this file can read
+ *    (settings_in_layout); any other buffer gets the game's own code;
  *  - a buffer whose format cannot be played still gets a clock, so status and
  *    position always advance: doaxbv-re fell back to the original function,
  *    which here is the path that hangs;
@@ -705,6 +707,49 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
     HLE_RETURN(result);
 }
 
+/* Whether the buffer's settings are in the layout this file reads: a rate
+ * and an alignment worth trusting, the test model_for applies before it
+ * models a buffer. Not every XDK keeps them there. Halo's DSOUND (XDK 3936)
+ * has a guest pointer where the rate should be (its Play log line says
+ * "rate=18895392 ... not modelled"), so none of its buffers is modelled --
+ * and the two replacements below must not write this layout into its
+ * objects either. They hand such a buffer to the game's own code, which is
+ * what ran before they existed and what Halo needs: with the replacement,
+ * its SetBufferData wrote 0xB8..0xCC of the wrong object and its Bink intro
+ * movie waited on its audio for ever, 22 s in. */
+static int settings_in_layout(uint32_t iface)
+{
+    uint32_t rate = setting(iface, SET_RATE), align = setting(iface, SET_ALIGN);
+
+    return align != 0u && rate >= 1000u && rate <= 200000u;
+}
+
+/* The game's own body, for a buffer settings_in_layout() rejects. */
+static void original_body(void (*const body)(void), const char *name)
+{
+    static unsigned said;
+
+    if (!body) {
+        fprintf(stderr, "[DSOUND] %s: the buffer is not in the layout this file "
+                        "reads and the original body was not kept -- lift again\n", name);
+        fflush(stderr);
+        g_eax = 0x80004005u;            /* E_FAIL */
+        return;
+    }
+    if (said < 4) {
+        said++;
+        fprintf(stderr, "[DSOUND] %s: buffer settings not in the layout this file "
+                        "reads; the game's own code runs\n", name);
+        fflush(stderr);
+    }
+    {
+        uint32_t esp = g_esp;
+
+        body();
+        g_esp = esp;
+    }
+}
+
 /* HRESULT IDirectSoundBuffer_SetFormat(this, LPCWAVEFORMATEX format)
  *
  * The game's own SetFormat ends in CMcpxBuffer_SetBufferData, which first
@@ -715,7 +760,9 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
  *
  * So the format goes where the game's packer would put it, the voice
  * settings this file reads (tag | channels << 16 | bits << 24, rate, block
- * alignment), and the model notices the change and rebuilds. */
+ * alignment), and the model notices the change and rebuilds -- for a buffer
+ * in that layout (settings_in_layout). */
+HLE_ORIGINAL(IDirectSoundBuffer_SetFormat);
 HLE_EXPORT(IDirectSoundBuffer_SetFormat)
 {
     g_ds_calls[DS_CALL_BUF_SETFORMAT]++;
@@ -724,6 +771,11 @@ HLE_EXPORT(IDirectSoundBuffer_SetFormat)
     uint32_t holder = iface - 0x0Cu, object;
     static unsigned said;
 
+    if (!settings_in_layout(iface)) {
+        original_body(hle_original_IDirectSoundBuffer_SetFormat,
+                      "IDirectSoundBuffer_SetFormat");
+        return;
+    }
     if (!wfx || !guest_readable(wfx, 16u) || !guest_readable(holder, 4u)
             || !guest_readable(HLE_MEM32(holder) + SET_ALIGN, 4u))
         HLE_RETURN(RECOMP_DSOUND_INVALID_PARAM);
@@ -761,7 +813,9 @@ HLE_EXPORT(IDirectSoundBuffer_SetFormat)
  *
  * So: stop the modelled buffer, as the replaced Stop does, and write what the
  * game's settings code would -- the data and size, and play and loop regions
- * back to the whole buffer (zero). The model rebuilds from them. */
+ * back to the whole buffer (zero). The model rebuilds from them. Only for a
+ * buffer in that layout (settings_in_layout). */
+HLE_ORIGINAL(IDirectSoundBuffer_SetBufferData);
 HLE_EXPORT(IDirectSoundBuffer_SetBufferData)
 {
     g_ds_calls[DS_CALL_BUF_SETBUFFERDATA]++;
@@ -770,6 +824,11 @@ HLE_EXPORT(IDirectSoundBuffer_SetBufferData)
     uint32_t object;
     static unsigned said;
 
+    if (!settings_in_layout(iface)) {
+        original_body(hle_original_IDirectSoundBuffer_SetBufferData,
+                      "IDirectSoundBuffer_SetBufferData");
+        return;
+    }
     if (!guest_readable(iface, 4u) || !guest_readable(HLE_MEM32(iface) + SET_LOOP_LEN, 4u))
         HLE_RETURN(RECOMP_DSOUND_INVALID_PARAM);
     if (said < 8) {

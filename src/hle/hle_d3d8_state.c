@@ -16,12 +16,14 @@
  *   D3D_g_DeferredTextureState  4 stages x 32 texture stage states.
  *
  * Which slot holds which state changed until XDK 4627 (Cxbx-Reloaded,
- * DxbxRenderStateInfo in XbConvert.cpp). This file knows the final layout
- * only: deferred states start at 92 and complex states at 136, and the one
- * state removed along the way, D3DRS_MULTISAMPLETYPE (154), leaves every
- * later state one slot down. The distances between the named arrays say
- * whether a title has that layout; if not, nothing is forwarded and the run
- * log says why. Texture stage states use the order from XDK 4039 on.
+ * DxbxRenderStateInfo in XbConvert.cpp). States are numbered here as in the
+ * final layout: deferred states start at 92 and complex states at 136, and
+ * the one state removed along the way, D3DRS_MULTISAMPLETYPE (154), leaves
+ * every later state one slot down. Two older layouts are known as well (see
+ * enum rs_layout). The distances between the named arrays say which layout a
+ * title has; for any other, nothing is forwarded and the run log says why.
+ * Texture stage states use the order from XDK 4039 on, except in the oldest
+ * layout.
  *
  * One gap in "the title writes the arrays": the XDK's own
  * D3DDevice_SetRenderState_Simple only writes the push buffer. Burnout 2
@@ -71,6 +73,36 @@ HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 #define STAGE_SIZE       32
 
 static int      g_state_ready = -1;  /* -1 not checked, 0 unusable, 1 ready */
+/* Which of the known render-state layouts the title's arrays have.
+ *
+ * LAYOUT_PRE4034: XDK builds before 4034 (3424-3944; Halo and Max Payne are
+ * 3925). XbSymbolDatabase's per-version table (DxbxRenderStateInfo, in
+ * third_party/XbSymbolDatabase/src/lib/manual_d3d8__ltcg.h) says which states
+ * such a build lacks: DEPTHCLIPCONTROL (4432), STIPPLEENABLE and the eight
+ * simple and eight deferred unused slots (4627), SWAPFILTER (4034),
+ * PRESENTATIONINTERVAL (4627), MULTISAMPLEMODE and MULTISAMPLERENDERTARGETMODE
+ * (4034) and SAMPLEALPHA (4627); MULTISAMPLETYPE is still there (removed in
+ * 4034). That puts the deferred block at slot 82 and the complex block at 116,
+ * which is exactly where such a title's XDK symbols put them, and it is the
+ * enumeration Halo's own debug information records. The texture stage states
+ * of those builds come in an older order too: the eight operation and argument
+ * states, RESULTARG and TEXTURETRANSFORMFLAGS first (0-9), then ADDRESSU to
+ * ALPHAKILL (10-21); from 22 on the order is the same.
+ *
+ * LAYOUT_4034: XDK 4034 to 4431 (Hunter: The Reckoning is 4361). From the
+ * same table: SWAPFILTER, MULTISAMPLEMODE and MULTISAMPLERENDERTARGETMODE
+ * arrive in 4034 and MULTISAMPLETYPE leaves; DEPTHCLIPCONTROL (4432) and
+ * STIPPLEENABLE, the unused slots, PRESENTATIONINTERVAL and SAMPLEALPHA
+ * (4627) are not there yet. That puts the deferred block at 82 and the complex
+ * block at 117, where Hunter's XDK symbols put them (and the database's own
+ * check of its table against the arrays it found passes for 4361). The texture
+ * stage states are in the 4039+ order already: Cxbx-Reloaded reorders them
+ * only for D3D8 3948 and older, and Hunter's stage arrays read as valid
+ * values in that order (see the note with this change).
+ *
+ * LAYOUT_4627: the final layout, deferred at 92 and complex at 136. */
+enum rs_layout { LAYOUT_4627, LAYOUT_PRE4034, LAYOUT_4034 };
+static enum rs_layout g_layout = LAYOUT_4627;
 static uint32_t g_prev_rs[XRS_COUNT];
 static uint32_t g_prev_tss[STAGES][STAGE_SIZE];
 static int      g_prev_valid;
@@ -112,26 +144,77 @@ static int state_ready(void)
                 "D3D_g_ComplexRenderState and D3D_g_DeferredTextureState\n");
         return 0;
     }
-    if (hle_var_D3D_g_DeferredRenderState - rs != 4 * XRS_FOGENABLE ||
+    if (hle_var_D3D_g_DeferredRenderState - rs == 4 * 82 &&
+        hle_var_D3D_g_ComplexRenderState - rs == 4 * 116) {
+        g_layout = LAYOUT_PRE4034;
+    } else if (hle_var_D3D_g_DeferredRenderState - rs == 4 * 82 &&
+               hle_var_D3D_g_ComplexRenderState - rs == 4 * 117) {
+        g_layout = LAYOUT_4034;
+    } else if (hle_var_D3D_g_DeferredRenderState - rs != 4 * XRS_FOGENABLE ||
         hle_var_D3D_g_ComplexRenderState - rs != 4 * XRS_COMPLEX) {
         fprintf(stderr, "[HLE-D3D8] shadow states off: deferred states at slot %d and "
-                "complex at %d, where the XDK 4627+ layout has %d and %d\n",
+                "complex at %d, where the XDK 4627+ layout has %d and %d, the "
+                "4034-4431 one 82 and 117 and the pre-4034 one 82 and 116\n",
                 (int)(hle_var_D3D_g_DeferredRenderState - rs) / 4,
                 (int)(hle_var_D3D_g_ComplexRenderState - rs) / 4,
                 XRS_FOGENABLE, XRS_COMPLEX);
         return 0;
     }
     fprintf(stderr, "[HLE-D3D8] shadow states: render states at 0x%08X, texture "
-            "stage states at 0x%08X (XDK 4627+ layout)\n",
-            rs, hle_var_D3D_g_DeferredTextureState);
+            "stage states at 0x%08X (%s layout)\n",
+            rs, hle_var_D3D_g_DeferredTextureState,
+            g_layout == LAYOUT_PRE4034 ? "pre-4034 XDK" :
+            g_layout == LAYOUT_4034 ? "XDK 4034-4431" : "XDK 4627+");
     g_state_ready = 1;
     return 1;
 }
 
+/* Where a state (numbered as in the 4627+ enumeration, MULTISAMPLETYPE
+ * included) sits in this title's array, or -1 when its XDK has no such state.
+ * See g_layout for the older layouts. */
+static int rs_slot(uint32_t state)
+{
+    if (g_layout == LAYOUT_4627)
+        return state > XRS_REMOVED ? (int)state - 1 : (int)state;
+    if (g_layout == LAYOUT_4034) {
+        if (state <= 81)  return (int)state;      /* pixel shader and simple */
+        if (state <= 91)  return -1;              /* DEPTHCLIPCONTROL..unused */
+        if (state <= 126) return (int)state - 10; /* FOGENABLE..SWAPFILTER */
+        if (state <= 135) return -1;              /* PRESENTATIONINTERVAL..unused */
+        if (state <= 153) return (int)state - 19; /* PSTEXTUREMODES..MULTISAMPLEMASK */
+        if (state == 154) return -1;              /* MULTISAMPLETYPE */
+        if (state <= 158) return (int)state - 20; /* MULTISAMPLEMODE..LINEWIDTH */
+        if (state == 159) return -1;              /* SAMPLEALPHA */
+        if (state <  XRS_COUNT) return (int)state - 21; /* DXT1NOISEENABLE.. */
+        return -1;
+    }
+    if (state <= 81)  return (int)state;          /* pixel shader and simple */
+    if (state <= 91)  return -1;                  /* DEPTHCLIPCONTROL..unused */
+    if (state <= 125) return (int)state - 10;     /* FOGENABLE..PATCHSEGMENTS */
+    if (state <= 135) return -1;                  /* SWAPFILTER..unused */
+    if (state <= 154) return (int)state - 20;     /* PSTEXTUREMODES..MULTISAMPLETYPE */
+    if (state <= 156) return -1;                  /* MULTISAMPLEMODE, ..RTMODE */
+    if (state <= 158) return (int)state - 22;     /* SHADOWFUNC, LINEWIDTH */
+    if (state == 159) return -1;                  /* SAMPLEALPHA */
+    if (state <  XRS_COUNT) return (int)state - 23; /* DXT1NOISEENABLE.. */
+    return -1;
+}
+
 static uint32_t guest_rs(uint32_t state)
 {
-    uint32_t slot = state > XRS_REMOVED ? state - 1 : state;
-    return HLE_MEM32(hle_var_D3D_g_RenderState + 4 * slot);
+    int slot = rs_slot(state);
+    return slot < 0 ? 0u : HLE_MEM32(hle_var_D3D_g_RenderState + 4u * (uint32_t)slot);
+}
+
+/* A texture stage state's slot (4039+ numbering, as g_ts_map has them) in
+ * this title's per-stage array. */
+static uint32_t ts_slot(uint32_t x)
+{
+    if (g_layout != LAYOUT_PRE4034)
+        return x;
+    if (x <= 11) return x + 10;     /* ADDRESSU..ALPHAKILL */
+    if (x <= 21) return x - 12;     /* COLOROP..TEXTURETRANSFORMFLAGS */
+    return x;
 }
 
 /* ------------------------------------------------------------ conversions */
@@ -416,8 +499,9 @@ static DWORD ts_to_host(uint8_t kind, uint32_t v)
  * which is what Burnout 2's road does.
  *
  * The two numberings run in different orders, hence the groups. Xbox
- * PSCOMPAREMODE (42) and PSFINALCOMBINERCONSTANT0/1 (43, 44) have no host
- * state and are not forwarded. */
+ * PSCOMPAREMODE (42) has no host state and is not forwarded;
+ * PSFINALCOMBINERCONSTANT0/1 (43, 44) go to the host's 198/199, which the
+ * final combiner's C0 and C1 read. */
 static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = {
     {  0, 200, 8 },      /* PSALPHAINPUTS0-7                   */
     {  8, 208, 2 },      /* PSFINALCOMBINERINPUTSABCD, ...EFG  */
@@ -427,6 +511,7 @@ static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = 
     { 34, 210, 8 },      /* PSRGBINPUTS0-7                     */
     { 45, 218, 8 },      /* PSRGBOUTPUTS0-7                    */
     { 53, 234, 1 },      /* PSCOMBINERCOUNT                    */
+    { 43, 198, 2 },      /* PSFINALCOMBINERCONSTANT0, 1        */
     { 55, 252, 2 },      /* PSDOTMAPPING, PSINPUTTEXTURE       */
 };
 
@@ -435,31 +520,26 @@ static const struct { uint8_t xbox; uint8_t host; uint8_t count; } g_ps_map[] = 
  * checked against ~0x000FFFFF). The values are the NV2A's, 0x00 to 0x12
  * (xboxdevwiki, NV2A/Pixel Combiner).
  *
- * The host does not model the NV2A's addressing modes. It keeps only which
- * kind of texture a stage samples -- 0 2D, 1 volume, 2 cube, 3 none
- * (d3d8_combiners.h, NV2ATextureMode) -- packed 4 bits per stage in its own
- * PSTEXTUREMODES. So each mode is reduced to the kind it samples, and the
- * addressing itself (bump mapping, dot product and dependent reads) is not
- * reproduced yet; anything past the four plain modes is logged once. */
+ * They go to the host as they are, marked D3D8_PSTEXTUREMODES_XBOX, and
+ * d3d8_combiners.c implements them (emit_xbox_textures): the dot-product,
+ * reflection and dependent-read modes take PSDOTMAPPING and PSINPUTTEXTURE,
+ * forwarded beside them. This used to reduce each mode to the kind of
+ * texture it samples, which turned a dot-product stage into a plain lookup
+ * of whatever was bound: Halo's bumped cube-map reflections (DOTPRODUCT,
+ * DOT_RFLCT_DIFF, DOT_RFLCT_SPEC) never reached its surfaces. The modes the
+ * host only approximates are logged once. */
 static uint32_t host_texture_modes(uint32_t xbox_modes)
 {
-    static const uint8_t kind[0x13] = {
-        3, 0, 1, 2,      /* NONE, PROJECT2D, PROJECT3D, CUBEMAP            */
-        0, 0, 0, 0,      /* PASSTHRU, CLIPPLANE, BUMPENVMAP, ..._LUM       */
-        1, 0, 0, 2,      /* BRDF, DOT_ST, DOT_ZW, DOT_RFLCT_DIFF           */
-        2, 1, 2, 0,      /* DOT_RFLCT_SPEC, DOT_STR_3D, DOT_STR_CUBE, DPNDNT_AR */
-        0, 0, 2          /* DPNDNT_GB, DOTPRODUCT, DOT_RFLCT_SPEC_CONST    */
-    };
-    uint32_t host = 0, i;
+    uint32_t i;
 
     for (i = 0; i < 4u; i++) {
         uint32_t mode = (xbox_modes >> (i * 5u)) & 0x1Fu;
 
-        if (mode > 0x04u)
+        if (mode > 0x12u || mode == 0x05u || mode == 0x06u || mode == 0x07u ||
+            mode == 0x08u || mode == 0x0Au || mode == 0x12u)
             unmapped("PS texture mode", mode);
-        host |= (uint32_t)(mode < 0x13u ? kind[mode] : 3u) << (i * 4u);
     }
-    return host;
+    return D3D8_PSTEXTUREMODES_XBOX | (xbox_modes & 0x000FFFFFu);
 }
 
 /* The pixel shader the title selected, as a D3DPIXELSHADERDEF.
@@ -720,10 +800,10 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
             last_modes = modes;
             lines++;
             fprintf(stderr, "[HLE-D3D8] shadow pixel shader: combiner count 0x%X, "
-                    "texture modes 0x%05X -> host 0x%04X, stage 0 rgb inputs "
-                    "0x%08X outputs 0x%08X, final ABCD 0x%08X EFG 0x%08X\n",
-                    count, modes, host_texture_modes(modes), ps_state(34),
-                    ps_state(45), ps_state(8), ps_state(9));
+                    "texture modes 0x%05X, dot mapping 0x%X, input texture 0x%X, "
+                    "stage 0 rgb inputs 0x%08X outputs 0x%08X, final ABCD 0x%08X "
+                    "EFG 0x%08X\n", count, modes, ps_state(55), ps_state(56),
+                    ps_state(34), ps_state(45), ps_state(8), ps_state(9));
         }
     }
 }
@@ -753,7 +833,7 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
 
         for (i = 0; i < sizeof g_ts_map / sizeof g_ts_map[0]; i++) {
             uint32_t x = g_ts_map[i].xbox;
-            uint32_t v = HLE_MEM32(base + 4 * x);
+            uint32_t v = HLE_MEM32(base + 4 * ts_slot(x));
             DWORD host_value;
 
             /* The host's SetTexture rewrites COLOROP whenever a texture is
@@ -800,7 +880,7 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
             fprintf(stderr, "    stage %d:", s);
             for (i = 0; i < sizeof g_ts_map / sizeof g_ts_map[0]; i++)
                 fprintf(stderr, " ts[%u]=0x%X", g_ts_map[i].xbox,
-                        HLE_MEM32(base + 4 * g_ts_map[i].xbox));
+                        HLE_MEM32(base + 4 * ts_slot(g_ts_map[i].xbox)));
             fprintf(stderr, "\n");
         }
         fflush(stderr);

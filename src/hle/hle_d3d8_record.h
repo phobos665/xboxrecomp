@@ -174,14 +174,16 @@ HRESULT host_DrawIndexedPrimitiveUP(IDirect3DDevice8 *dev, D3DPRIMITIVETYPE type
 HRESULT host_CreateTexture(IDirect3DDevice8 *dev, UINT width, UINT height,
                            UINT levels, DWORD usage, D3DFORMAT format,
                            D3DPOOL pool, IDirect3DTexture8 **texture);
-/* A cube texture. Only the cubes a title renders into are mirrored, so a
- * capture records the creation and not the contents: what is drawn into a
- * face is drawn again on replay. */
+/* A cube texture: one the title renders into, or one it fills from memory
+ * (static_cube). A capture records the creation, and the contents of a cube
+ * that is not a render target (host_CubeUnlockRect); what is drawn into a
+ * render-target cube's face is drawn again on replay. */
 HRESULT host_CreateCubeTexture(IDirect3DDevice8 *dev, UINT edge, UINT levels,
                                DWORD usage, D3DFORMAT format, D3DPOOL pool,
                                IDirect3DCubeTexture8 **texture);
-/* One face level of a cube the title fills from memory. Not captured: a
- * replay shows a static cube empty. */
+/* One face level of a cube the title fills from memory (hle_d3d8_texture.c,
+ * static_cube). The capture records the texels with the cube
+ * (D3D8CAP_CUBE_LEVEL), so a frame sampling such a cube replays with them. */
 HRESULT host_CubeLockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
                           UINT level, D3DLOCKED_RECT *locked);
 HRESULT host_CubeUnlockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
@@ -189,6 +191,10 @@ HRESULT host_CubeUnlockRect(IDirect3DCubeTexture8 *cube, D3DCUBEMAP_FACES face,
 HRESULT host_LockRect(IDirect3DTexture8 *texture, UINT level,
                       D3DLOCKED_RECT *locked, const RECT *rect, DWORD flags);
 HRESULT host_UnlockRect(IDirect3DTexture8 *texture, UINT level);
+/* SetPalette: the palette P8 textures bound to the stage are expanded through
+ * when uploaded (d3d8_resources.c). Recorded, so a replayed frame expands its
+ * P8 textures the way the live one did. */
+HRESULT host_SetPalette(IDirect3DDevice8 *dev, DWORD stage, const DWORD *entries);
 ULONG   host_ReleaseTexture(IDirect3DTexture8 *texture);
 
 /* Render targets. texture NULL is the back buffer; otherwise level `level` of

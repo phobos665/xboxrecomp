@@ -26,5 +26,13 @@
  {
   "start": "0x001C4DC0",
   "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0005FCF0",
+  "note": "Object callback (slot 2) pushed for sub_000A5CE0 at 0x000D35F7; observed at runtime as an unresolved indirect call from 0x000A0CB2 during the 2401 intro cutscene, after which the title faulted in sub_0003C440; decodes as a function body."
+ },
+ {
+  "start": "0x0020D810",
+  "note": "Object callback (slot 3) pushed for sub_000A5CE0 at 0x002100E4, found statically; decodes as a function body."
  }
 ]

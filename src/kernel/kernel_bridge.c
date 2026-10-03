@@ -737,6 +737,8 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        /* And the arena must not hand these pages out again. */
+        xbox_ContiguousPin(xbox_va, size);
 
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
@@ -3353,6 +3355,15 @@ static HANDLE bridge_take_handle(uint32_t token)
         }
     }
     return NULL;   /* untagged -> not a table handle, do not close */
+}
+
+/* The host handle behind a guest handle token, for runtime code outside this
+ * file that is handed a guest HANDLE: a DirectSound stream packet's completion
+ * event (src/hle/hle_dsound_stream.c). Same rule as the bridges: a tagged token
+ * goes through the table, anything else passes through unchanged. */
+void *xbox_bridge_resolve_handle(uint32_t token)
+{
+    return (void *)bridge_resolve_handle(token);
 }
 
 /* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */

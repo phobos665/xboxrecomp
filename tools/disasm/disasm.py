@@ -38,7 +38,8 @@ class Disassembler:
                  verbose: bool = False,
                  force: bool = False,
                  extra_sections: Optional[list] = None,
-                 seed_functions: Optional[list] = None):
+                 seed_functions: Optional[list] = None,
+                 observed_seeds: Optional[set] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -48,6 +49,9 @@ class Disassembler:
         self.force = force
         self.extra_sections = extra_sections or []
         self.seed_functions = seed_functions or []
+        # Seeds a run actually reached (see _load_seed_functions). They are
+        # not guesses, so the mid-instruction guard below does not apply.
+        self.observed_seeds = observed_seeds or set()
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -213,7 +217,17 @@ class Disassembler:
                     # ...or sits right after the linker's 0xCC / 0x90 padding,
                     # which is where a function starts whether or not it has
                     # a prologue (engine.follows_padding has the case).
-                    if (self.engine.probes_as_prologue(addr)
+                    #
+                    # Or unless a run actually got there. A seed from
+                    # tools.seed_from_log is an address the CPU called, or a
+                    # thread the title started -- where execution went, not
+                    # an inference from a table. Halo's XPP has an init
+                    # function at 0x001CF6AC that opens `cmp [flag], 0` right
+                    # after a pointer table the sweep walked as code; rejecting
+                    # its observed seed left XInitDevices' indirect call to it
+                    # unresolved. (Upstream xboxrecomp 1409a7d, #164.)
+                    if (addr in self.observed_seeds
+                            or self.engine.probes_as_prologue(addr)
                             or self.engine.follows_padding(addr)):
                         if self.engine.decode_at(addr):
                             realigned += 1

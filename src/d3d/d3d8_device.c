@@ -876,7 +876,7 @@ static HRESULT __stdcall dev_SetRenderState(IDirect3DDevice8 *self, D3DRENDERSTA
         g_device_state.render_states[(DWORD)State] = Value;
     }
     /* Mark combiner state dirty if any PS register combiner state changed */
-    if ((DWORD)State >= D3DRS_PSALPHAINPUTS0 && (DWORD)State <= D3DRS_PSINPUTTEXTURE) {
+    if ((DWORD)State >= D3DRS_PSFINALCOMBINERCONSTANT0 && (DWORD)State <= D3DRS_PSINPUTTEXTURE) {
         d3d8_combiners_mark_dirty();
     }
     return S_OK;
