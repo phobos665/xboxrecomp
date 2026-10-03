@@ -213,16 +213,26 @@ def lift(wt, sha, t, stage):
 
 
 def build(wt, name):
-    """Incremental build; configures only the first time (the projects glob
-    their generated sources with CONFIGURE_DEPENDS)."""
+    """Incremental build. Configures the first time, and again whenever the
+    set of generated files changed since the last build.
+
+    The projects glob gen/*.c with CONFIGURE_DEPENDS, but under the Visual
+    Studio generator that re-glob runs inside a build MSBuild has already
+    planned from the old project: files added since (a lift that now writes
+    more chunks) are left out of this build and only compiled by the next
+    one, which shows as unresolved externals for every function they hold.
+    """
     project = wt / "titles" / name
     bdir = project / "build"
     logs = work_dir(wt, name)
     logs.mkdir(parents=True, exist_ok=True)
     cmake = cm.find_cmake()
+    gen = sorted(p.name for p in (project / "src" / "recomp" / "gen").glob("*.c"))
+    seen_path = logs / "gen_files.json"
+    seen = json.loads(seen_path.read_text()) if seen_path.is_file() else None
     t0 = time.time()
     with open(logs / "build.log", "w", encoding="utf-8", errors="replace") as f:
-        if not (bdir / "CMakeCache.txt").is_file():
+        if not (bdir / "CMakeCache.txt").is_file() or seen != gen:
             gen = ["-G", "Visual Studio 16 2019", "-A", "x64"] if os.name == "nt" else []
             rc = subprocess.run([cmake, "-S", str(project), "-B", str(bdir), *gen],
                                 stdout=f, stderr=subprocess.STDOUT).returncode
@@ -232,6 +242,8 @@ def build(wt, name):
         rc = subprocess.run([cmake, "--build", str(bdir), "--config", "Release",
                              "--target", f"{name}_recomp", *extra],
                             stdout=f, stderr=subprocess.STDOUT).returncode
+    if rc == 0:
+        seen_path.write_text(json.dumps(gen))
     return rc, time.time() - t0
 
 

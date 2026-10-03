@@ -69,6 +69,10 @@ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 # without a manual re-configure. A plain GLOB is evaluated once at configure
 # time, so a newly generated file (an extra chunk, recomp_stubs_unresolved.c)
 # is silently left out of the build and shows up as unresolved externals.
+# Under the Visual Studio generator the re-glob happens inside a build that
+# MSBuild has already planned, so after a lift that ADDS chunk files the
+# first build still fails to link and the next one succeeds -- re-run
+# `cmake -S . -B build` after such a lift (scripts/regress.py does).
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
 # Core game sources
