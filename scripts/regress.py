@@ -233,8 +233,8 @@ def build(wt, name):
     t0 = time.time()
     with open(logs / "build.log", "w", encoding="utf-8", errors="replace") as f:
         if not (bdir / "CMakeCache.txt").is_file() or seen != gen:
-            gen = ["-G", "Visual Studio 16 2019", "-A", "x64"] if os.name == "nt" else []
-            rc = subprocess.run([cmake, "-S", str(project), "-B", str(bdir), *gen],
+            generator = ["-G", "Visual Studio 16 2019", "-A", "x64"] if os.name == "nt" else []
+            rc = subprocess.run([cmake, "-S", str(project), "-B", str(bdir), *generator],
                                 stdout=f, stderr=subprocess.STDOUT).returncode
             if rc:
                 return rc, time.time() - t0
