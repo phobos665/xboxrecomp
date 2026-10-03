@@ -189,6 +189,9 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 /* Give a block back; 0 when xbox_va is not a live block this arena made. */
 int      xbox_ContiguousFree(uint32_t xbox_va);
+/* A caller was handed this exact range by physical address (a pinned
+ * MmAllocateContiguousMemoryEx): keep the arena from handing it out again. */
+void     xbox_ContiguousPin(uint32_t xbox_va, uint32_t size);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,

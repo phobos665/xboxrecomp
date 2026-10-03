@@ -204,6 +204,19 @@ class Disassembler:
         straddled it. The garbage decoded from the table itself is left alone:
         it is unreachable, because the block before it ends at the indirect
         jump.
+
+        So is every out-of-phase decode the restarted stream covers, up to where
+        the two streams meet again -- not only the one straddling the restart.
+        Basic blocks are built in address order, so a junk instruction left
+        between two real ones is emitted between them and runs. MSVC's memcpy
+        keeps its trailing-bytes table right before the case for zero trailing
+        bytes (`mov eax, [ebp+8]; pop esi; pop edi; leave; ret`); in Hunter: The
+        Reckoning the sweep came out of that table at the mov's last byte and
+        decoded `or byte ptr [esi+0x5F], bl` there. Kept, it ran after every copy
+        ending in that case and OR-ed a byte into whatever lay 0x5F past the
+        source -- the next heap block's header or the next object's fields --
+        until the title's heap failed coalescing on corrupted links. Another
+        restart point inside the stream is a real boundary too and is kept.
         """
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
@@ -223,6 +236,10 @@ class Disassembler:
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
+                for inside in range(cs_insn.address + 1,
+                                    cs_insn.address + cs_insn.size):
+                    if inside in decoded and inside not in resync:
+                        del decoded[inside]   # out of phase: covered by this one
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]

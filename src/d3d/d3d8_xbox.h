@@ -345,6 +345,13 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_MULTISAMPLEMASK          = 162,
     D3DRS_COLORWRITEENABLE         = 168,
     D3DRS_BLENDOP                  = 171,
+    /* The final combiner's own two constants (NV2A SPECULAR_FOG_FACTOR 0/1),
+     * Xbox D3DRS_PSFINALCOMBINERCONSTANT0/1. Not the last stage's C0/C1.
+     * Just below the pixel-shader block, so one range (198-253) is every
+     * state the combiners read; 254 is SHADOWFUNC and the device keeps 256
+     * states. Nothing else uses 172-199: the D3D8 states above end at 173. */
+    D3DRS_PSFINALCOMBINERCONSTANT0 = 198,
+    D3DRS_PSFINALCOMBINERCONSTANT1 = 199,
     /* Xbox-specific render states (200+) */
     D3DRS_PSALPHAINPUTS0           = 200,
     D3DRS_PSALPHAINPUTS1           = 201,
@@ -397,6 +404,10 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_PSCONSTANT1_5            = 248,
     D3DRS_PSCONSTANT1_6            = 249,
     D3DRS_PSCONSTANT1_7            = 250,
+    /* Four 4-bit sampler kinds (NV2ATextureMode), or, with
+     * D3D8_PSTEXTUREMODES_XBOX set, the title's own PS_TEXTUREMODES: 5 bits
+     * per stage, 0x00-0x12, which d3d8_combiners.c implements (dot products,
+     * dependent reads, pass-through). */
     D3DRS_PSTEXTUREMODES           = 251,
     D3DRS_PSDOTMAPPING             = 252,
     D3DRS_PSINPUTTEXTURE           = 253,
@@ -405,6 +416,8 @@ typedef enum D3DRENDERSTATETYPE {
      * while the title has not set it. */
     D3DRS_SHADOWFUNC               = 254,
 } D3DRENDERSTATETYPE;
+
+#define D3D8_PSTEXTUREMODES_XBOX 0x80000000u
 
 typedef enum D3DTEXTURESTAGESTATETYPE {
     D3DTSS_COLOROP      = 1,

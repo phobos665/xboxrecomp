@@ -422,7 +422,7 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 6 && D3D8CAP_VERSION == 6, "the version is 6");
+    check(h->version == 7 && D3D8CAP_VERSION == 7, "the version is 7");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 

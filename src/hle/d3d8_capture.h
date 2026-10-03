@@ -70,15 +70,19 @@
  *     BeginPush (Burnout 2 does, at two call sites -- see hle_d3d8.c)
  *     bypasses every replacement, so shadow mode never draws those, and
  *     neither does a replay.
- *   - host state src/hle never sets: lights, material, palettes, stream
- *     sources, the device's own pixel shader handle. A replay leaves them at
- *     the device's defaults, as the live run does.
+ *   - host state src/hle never sets: lights, material, stream sources,
+ *     the device's own pixel shader handle. A replay leaves them at the
+ *     device's defaults, as the live run does. (Stage palettes are recorded
+ *     since version 7: src/hle sets them to expand P8 textures.)
  *   - what a render target held before the frame. Its TEXTURE chunk carries
  *     the host's system-memory copy, which rendering never writes, so a
  *     target drawn in an earlier frame and only sampled in this one replays
  *     as zeros.
- *   - cube and volume textures, which shadow mode does not create. One bound
- *     on a stage would be recorded as nothing bound.
+ *   - volume textures, which shadow mode does not create. One bound on a
+ *     stage would be recorded as nothing bound.
+ *   - the contents of a cube a title renders into (they live on the GPU and
+ *     are drawn again on replay). A cube filled from memory has its texels
+ *     recorded (CUBE_LEVEL, version 7).
  *   - anything time-varying: no timestamps, no frame pacing.
  */
 #ifndef XBOXRECOMP_D3D8_CAPTURE_H
@@ -100,8 +104,9 @@ extern "C" {
  * Version 1 was the title-level format; its chunk numbers mean different
  * things here. Version 3 added render targets and input current values,
  * version 4 cube textures and the face a render target names, version 6
- * fixed-function lights and the material. */
-#define D3D8CAP_VERSION      6u
+ * fixed-function lights and the material, version 7 the texels of cubes
+ * filled from memory and the stage palettes P8 textures are expanded with. */
+#define D3D8CAP_VERSION      7u
 /* The oldest version the reader still accepts. A bump that only adds chunk
  * kinds leaves an older file a valid newer one that happens not to contain
  * them (version 6 added three; version 5 one), so it leaves this alone. A
@@ -146,7 +151,9 @@ enum {
     D3D8CAP_LIGHT               = 26, /* D3D8CapLight */
     D3D8CAP_LIGHT_ENABLE        = 27, /* D3D8CapLightEnable */
     D3D8CAP_TWOD_PLACEMENT      = 28, /* D3D8CapTwoDPlacement (version 6) */
-    D3D8CAP_CHUNK_KINDS         = 29  /* one past the last, for per-kind counters */
+    D3D8CAP_CUBE_LEVEL          = 29, /* D3D8CapCubeLevel + bytes (version 7) */
+    D3D8CAP_PALETTE             = 30, /* D3D8CapPalette (version 7) */
+    D3D8CAP_CHUNK_KINDS         = 31  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -259,10 +266,24 @@ typedef struct { uint32_t token; } D3D8CapPsToken;
  * time a SET_RENDER_TARGET names the surface. */
 typedef struct { uint32_t id, width, height, format; } D3D8CapDepthSurface;
 
-/* A cube texture's creation: CreateCubeTexture with these arguments. No
- * contents -- shadow mode mirrors only the cubes a title renders into, and
- * what it draws there is drawn again on replay. */
+/* A cube texture's creation: CreateCubeTexture with these arguments. The
+ * contents follow as CUBE_LEVEL chunks for a cube filled from memory; a cube
+ * the title renders into has none -- what it draws there is drawn again on
+ * replay. */
 typedef struct { uint32_t id, format, edge, levels, usage; } D3D8CapCubeTexture;
+
+/* One face and level of a cube's texels, as the host holds them (the
+ * system-memory copy, in the Xbox packing its upload takes; d3d8_cube_level).
+ * Written after the CUBE_TEXTURE chunk of a cube that is not a render target
+ * -- a normalisation or environment cube the title keeps in memory -- and
+ * again when such a cube is refilled. Replay writes the bytes back through
+ * LockRect, which uploads them the way the live run did. */
+typedef struct { uint32_t id, face, level, pitch, rows, bytes; } D3D8CapCubeLevel;
+
+/* SetPalette(stage, entries): the 256 D3DCOLOR entries a P8 texture bound to
+ * that stage is expanded through when it is uploaded. The snapshot carries
+ * all four stages, before the textures. */
+typedef struct { uint32_t stage; uint32_t entries[256]; } D3D8CapPalette;
 
 /* SetRenderTarget. texture_id 0 is the back buffer; otherwise level `level`
  * of that texture, which was created with D3DUSAGE_RENDERTARGET. `face` is

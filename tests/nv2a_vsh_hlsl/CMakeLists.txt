@@ -1,7 +1,7 @@
 # nv2a_vsh_hlsl -- compile the HLSL the vertex-program translator generates.
 #
 # Windows only: it needs D3DCompile. Builds d3d8_vsh.c and nv2a_vsh.c with
-# stubs for the three device accessors d3d8_vsh.c links against, the same way
+# stubs for the four device accessors d3d8_vsh.c links against, the same way
 # tests/d3d8_smoke builds its targets. No device, window or game files.
 
 add_executable(nv2a_vsh_hlsl_test

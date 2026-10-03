@@ -122,6 +122,12 @@ typedef struct D3D8CubeInfo {
 BOOL d3d8_cube_info(IDirect3DBaseTexture8 *texture, D3D8CubeInfo *info);
 BOOL d3d8_texture_level(IDirect3DBaseTexture8 *texture, UINT level,
                         const BYTE **bits, UINT *pitch, UINT *rows);
+/* One face and level of a cube's system-memory copy, the bytes its LockRect
+ * hands out and its upload reads (Xbox packing). FALSE for anything that is
+ * not a cube. For a cube the title renders into the copy is never written,
+ * since those texels live on the GPU. */
+BOOL d3d8_cube_level(IDirect3DBaseTexture8 *texture, UINT face, UINT level,
+                     const BYTE **bits, UINT *pitch, UINT *rows);
 
 /* ================================================================
  * Resource wrapper structures

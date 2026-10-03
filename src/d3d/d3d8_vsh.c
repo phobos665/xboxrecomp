@@ -715,12 +715,19 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
     }
     sb_append(&sb, "};\n\n");
 
-    /* Output structure. D3D11 matches a pixel shader's inputs to these by
-     * semantic name and index, so the names are the ones the pixel shaders
-     * ask for (d3d8_shaders.c and d3d8_combiners.c, PS_IN): fog at TEXCOORD4
-     * and a view-space position for table fog at TEXCOORD5. An earlier
-     * version wrote fog to FOG, which no pixel shader here reads, so fog
-     * never reached them. The order is only for reading. */
+    /* Output structure. The names are the ones the pixel shaders ask for
+     * (d3d8_shaders.c and d3d8_combiners.c, PS_IN): fog at TEXCOORD4 and a
+     * view-space position for table fog at TEXCOORD5. An earlier version
+     * wrote fog to FOG, which no pixel shader here reads, so fog never
+     * reached them.
+     *
+     * The names are not the whole contract: the stages are linked by
+     * register and component as each compiler packed them, so the types and
+     * the order have to match the pixel shaders' too. Every stage declares
+     * four float4 texture coordinates, then fog, then the view position.
+     * The pixel shaders used to declare float3 coordinates, which packed
+     * their `fog` into TEXCOORD3's spare w, so under a program every one of
+     * them read oT3.w as its fog factor. */
     sb_append(&sb,
         "struct VS_OUT {\n"
         "    float4 oPos : SV_POSITION;\n"
