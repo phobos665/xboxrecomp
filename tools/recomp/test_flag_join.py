@@ -101,3 +101,16 @@ def test_a_join_with_an_unknown_predecessor_is_not_guessed():
     from tools.recomp.translator import _edge_flag_plan
     assert _edge_flag_plan(None, set(), {}) is None
     assert _edge_flag_plan(None, {1, 2}, {1: ('cmp', []), 2: None}) is None
+
+
+def test_an_edge_that_needs_carry_gets_it_declared():
+    # test ecx,ecx; jz alt; sub eax,1; jmp join; alt: cmp ebx,esi;
+    # join: jb skip; nop; skip: ret. The address-order scan pairs jb with the
+    # cmp, which needs no _cf, but the sub edge's condition is the carry: the
+    # function must declare and compute _cf or its C does not compile. With
+    # carry tracked, both edges write _cf and the jb reads it directly.
+    code = translate(bytes.fromhex('85c9740583e801eb0239f3720190c3'))
+    assert 'int _cf = 0;' in code, code
+    assert '_cf = (int)((uint32_t)(eax) < (uint32_t)(1));' in code, code
+    assert '_cf = (int)(_fa < _fb);' in code, code
+    assert 'if (_cf /* jb' in code, code
