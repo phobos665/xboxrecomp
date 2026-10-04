@@ -138,6 +138,19 @@ hold its projection and affine matrices with `xbox_D3D8SetInterpRegisters`; with
 the projection blends. The `[INTERP]` five-second line says what was shown and why a frame was
 held. See `docs/technical/frame-interpolation.md`.
 
+**Post-process shaders (Oct 2026):** `RECOMP_POSTFX=cel` (launcher row "Cel shading", F8
+in game) or a path to an `.hlsl` file runs a pass over the scene with its colour and depth
+(`src/d3d/d3d8_postfx.c`, contract at the top). A title marks where its 3D ends with
+`host_PostFxScene` and the pass runs at the next 2D after 3D; later 3D gets a run over the
+pixels whose depth changed. Depth images are `DEPTH | SAMPLED` now (typeless on D3D11).
+`RECOMP_POSTFX_TRACE=1` prints when it runs, which with `d3d8_replay --list-draws` names the
+draw that set it off. Two things learned on the way: frame captures did not record a title's
+screen copies, so a replay's glow pass read stale texels and TimeSplitters 2 replayed far
+darker than it plays (they are recorded now, `screen_copy`, format 7); and the machine's own
+load moves frame times a lot -- an unchanged Oct 2 build ran TS2's menus at 7 ms one
+morning and 14-23 ms that evening, so time an old build beside a new one before blaming a
+change.
+
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
 `%APPDATA%\xboxrecomp\input_bindings.json`, else one beside the executable — and falls

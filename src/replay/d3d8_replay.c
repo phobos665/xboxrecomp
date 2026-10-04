@@ -1159,6 +1159,43 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         d3d8_combiners_set_pixel_shader(g_no_combiners ? 0 : p->token);
         break;
     }
+    case D3D8CAP_SCREEN_COPY: {
+        const D3D8CapScreenCopy *p = c->data;
+        ReplayTexture *slot;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        slot = texture_slot(r, p->texture_id, 0);
+        if (!slot || !slot->tex || slot->is_cube) {
+            r->unmapped++;
+            break;
+        }
+        if (g_list_draws)
+            fprintf(stderr, "[screen copy] into texture %lu%s\n",
+                    (unsigned long)p->texture_id, p->has_rect ? " (a rectangle)" : "");
+        if (p->has_rect) {
+            RECT src;
+            POINT at;
+
+            src.left = p->src.x1;
+            src.top = p->src.y1;
+            src.right = p->src.x2;
+            src.bottom = p->src.y2;
+            at.x = p->at_x;
+            at.y = p->at_y;
+            xbox_D3D8CopyBackBufferRectToTexture((IDirect3DTexture8 *)slot->tex, &src, &at);
+        } else {
+            xbox_D3D8CopyBackBufferToTexture((IDirect3DTexture8 *)slot->tex);
+        }
+        break;
+    }
+    case D3D8CAP_POSTFX_SCENE:
+        if (g_list_draws)
+            fprintf(stderr, "[postfx] scene\n");
+        xbox_D3D8PostFxScene();
+        break;
     default:
         r->unknown++;
         break;
@@ -1218,6 +1255,9 @@ static void replay_pass(Replay *r, D3D8CapReader *cap, int loop)
     g_patch_next = 0;
     while (d3d8cap_next(cap, &c))
         replay_chunk(r, &c);
+    /* As the running title does at its swap: the post-process pass for a
+     * frame that did not mark its scene (RECOMP_POSTFX). */
+    xbox_D3D8PostFxFrameEnd();
     if (!r->kinds[D3D8CAP_FRAME_START])
         fprintf(stderr, "[replay] loop %d: no frame_start chunk -- the capture is "
                 "truncated inside its snapshot\n", loop);

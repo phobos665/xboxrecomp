@@ -100,8 +100,9 @@ extern "C" {
  * Version 1 was the title-level format; its chunk numbers mean different
  * things here. Version 3 added render targets and input current values,
  * version 4 cube textures and the face a render target names, version 6
- * fixed-function lights and the material. */
-#define D3D8CAP_VERSION      6u
+ * fixed-function lights and the material, version 7 the post-process
+ * point and the screen copies. */
+#define D3D8CAP_VERSION      7u
 /* The oldest version the reader still accepts. A bump that only adds chunk
  * kinds leaves an older file a valid newer one that happens not to contain
  * them (version 6 added three; version 5 one), so it leaves this alone. A
@@ -146,7 +147,9 @@ enum {
     D3D8CAP_LIGHT               = 26, /* D3D8CapLight */
     D3D8CAP_LIGHT_ENABLE        = 27, /* D3D8CapLightEnable */
     D3D8CAP_TWOD_PLACEMENT      = 28, /* D3D8CapTwoDPlacement (version 6) */
-    D3D8CAP_CHUNK_KINDS         = 29  /* one past the last, for per-kind counters */
+    D3D8CAP_POSTFX_SCENE        = 29, /* no payload: xbox_D3D8PostFxScene (version 7) */
+    D3D8CAP_SCREEN_COPY         = 30, /* D3D8CapScreenCopy (version 7) */
+    D3D8CAP_CHUNK_KINDS         = 31  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -192,6 +195,16 @@ typedef struct { uint32_t index, enable; } D3D8CapLightEnable;
 /* xbox_D3D8SetTwoDPlacement: where the next screen-space draws go in
  * widescreen (XBOX_D3D8_2D_*), and the title's tag for the call site. */
 typedef struct { uint32_t placement, tag; } D3D8CapTwoDPlacement;
+/* The host repeating a title's copy of its screen into a texture
+ * (xbox_D3D8CopyBackBufferToTexture / ...RectToTexture). Without it a
+ * replay's glow or soften pass reads the texture as the capture's
+ * snapshot left it: TimeSplitters 2 replayed far darker than it plays.
+ * has_rect 0: the whole screen, scaled to the texture. */
+typedef struct {
+    uint32_t    texture_id, has_rect;
+    D3D8CapRect src;
+    int32_t     at_x, at_y;
+} D3D8CapScreenCopy;
 
 /* texture_id 0 is SetTexture(stage, NULL). */
 typedef struct { uint32_t stage, texture_id; } D3D8CapSetTexture;

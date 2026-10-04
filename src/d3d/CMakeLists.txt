@@ -14,6 +14,7 @@ if(WIN32)
         d3d8_movie.c
         d3d8_screencopy.c
         d3d8_display.c
+        d3d8_postfx.c
         d3d8_compile.c
         rhi.c
         rhi_d3d11.c

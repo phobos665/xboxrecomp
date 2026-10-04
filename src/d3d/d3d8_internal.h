@@ -382,6 +382,21 @@ void    d3d8_states_apply(void);
 /* Create sampler state from TSS and apply to slot */
 void    d3d8_states_apply_sampler(DWORD stage);
 
+/* The post-process chain's view of the device (d3d8_postfx.c): the image
+ * every draw to "the screen" goes to, and the depth image bound now -- NULL
+ * when none is, when it is not the scene's size, is multisampled, or was
+ * not made to be sampled. FALSE before there is a scene. */
+typedef struct {
+    RhiView  *rtv, *srv;
+    RhiImage *depth;
+    UINT      width, height;
+    UINT      scale;                /* RECOMP_RES_SCALE */
+} D3D8SceneTargets;
+BOOL    d3d8_scene_targets(D3D8SceneTargets *t);
+/* Each draw, once prepared: whether it goes to the scene and whether it
+ * is screen-space. TRUE when the armed post-process pass ran just now. */
+BOOL    d3d8_postfx_before_draw(BOOL to_scene, BOOL screen_space);
+
 #endif /* _WIN32 -- end of D3D11 backend section */
 
 #endif /* BURNOUT3_D3D8_INTERNAL_H */

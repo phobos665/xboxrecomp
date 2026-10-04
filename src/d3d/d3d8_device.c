@@ -251,6 +251,7 @@ static void keep_presented(void)
 }
 
 static void present_scene(void);
+static BOOL postfx_at_draw(void);
 
 /* Every way a frame reaches the screen comes through here: put the scene
  * on it, at the shape d3d8_display_wide_now gives for this frame, then
@@ -567,7 +568,8 @@ static HRESULT create_render_targets(D3D8DeviceState *state)
     depth_desc.format = RHI_FORMAT_D24_UNORM_S8_UINT;
     depth_desc.samples = 1;
     depth_desc.usage = RHI_USAGE_DEFAULT;
-    depth_desc.bind = RHI_BIND_DEPTH;
+    /* Sampled as well: the post-process chain reads it (d3d8_postfx.c). */
+    depth_desc.bind = RHI_BIND_DEPTH | RHI_BIND_SAMPLED;
 
     state->depth_image = rhi_image_create(&depth_desc, NULL);
     if (!state->depth_image) return E_FAIL;
@@ -668,6 +670,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         d3d8_overlay_shutdown();
         d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
+        xbox_D3D8PostFxShutdown();
         d3d8_display_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
@@ -1208,6 +1211,10 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
+    if (postfx_at_draw()) {
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+        d3d8_states_apply();
+    }
 
     rhi_set_topology(topology);
     stage0_probe();
@@ -1228,6 +1235,10 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);  /* VS, then the combiner PS or the fixed-function one */
     d3d8_states_apply();
+    if (postfx_at_draw()) {
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+        d3d8_states_apply();
+    }
 
     rhi_set_topology(topology);
     stage0_probe();
@@ -1305,6 +1316,11 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
      * draw at all. */
     d3d8_place_2d_draw(pVertexData, VertexStreamZeroStride, vertex_count);
     d3d8_states_apply();
+    if (postfx_at_draw()) {
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+        d3d8_place_2d_draw(pVertexData, VertexStreamZeroStride, vertex_count);
+        d3d8_states_apply();
+    }
 
     rhi_set_topology(topology);
     stage0_probe();
@@ -1357,6 +1373,11 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
      * draw at all. */
     d3d8_place_2d_draw(pVertexData, VertexStreamZeroStride, NumVertices);
     d3d8_states_apply();
+    if (postfx_at_draw()) {
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+        d3d8_place_2d_draw(pVertexData, VertexStreamZeroStride, NumVertices);
+        d3d8_states_apply();
+    }
 
     rhi_set_topology(topology);
     stage0_probe();
@@ -1519,6 +1540,12 @@ static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *self, U
     td.sample_quality = 0;
     td.usage = RHI_USAGE_DEFAULT;
     td.bind = RHI_BIND_DEPTH;
+    /* A title that draws its world against a depth surface of its own
+     * still gets ink lines from it (d3d8_postfx.c). The three formats the
+     * backends know a sampled form of; single-sampled only. */
+    if (sample_count <= 1 && (host == RHI_FORMAT_D24_UNORM_S8_UINT ||
+                              host == RHI_FORMAT_D32_FLOAT || host == RHI_FORMAT_D16_UNORM))
+        td.bind |= RHI_BIND_SAMPLED;
 
     img = rhi_image_create(&td, NULL);
     if (!img) {
@@ -1675,6 +1702,16 @@ void d3d8_SetTwoDSqueeze(BOOL on)
 }
 
 BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
+
+/* The post-process pass a title armed runs before the first screen-space
+ * draw to the scene that follows its 3D (d3d8_postfx_before_draw). Called
+ * once a draw is prepared, which is when the draw is known to be
+ * screen-space. TRUE: the pass ran, and the draw must be prepared again
+ * (rhi.h: a pass may leave shaders, layouts and states changed). */
+static BOOL postfx_at_draw(void)
+{
+    return d3d8_postfx_before_draw(!g_cur_rt, g_2d_screen_space);
+}
 
 /* The horizontal extent a screen-space draw can reach, in the title's own
  * screen pixels: its vertices, clipped by the scissor. FALSE when the
@@ -2154,6 +2191,28 @@ static HRESULT __stdcall dev_Swap(IDirect3DDevice8 *self, DWORD Flags)
     return (HRESULT)rhi_present(g_present_interval);
 }
 
+BOOL d3d8_scene_targets(D3D8SceneTargets *t)
+{
+    D3D8DeviceState *s = &g_device_state;
+    RhiImageDesc d;
+
+    if (!t || !rhi_device_ready() || !s->rhi_scene_srv || !s->rhi_default_rtv)
+        return FALSE;
+    t->rtv = s->rhi_default_rtv;
+    t->srv = s->rhi_scene_srv;
+    t->width = s->width;
+    t->height = s->height;
+    t->scale = d3d8_display_policy()->scale;
+    t->depth = NULL;
+    if (g_cur_ds && g_cur_ds->image) {
+        rhi_image_get_desc(g_cur_ds->image, &d);
+        if (d.width == s->width && d.height == s->height && d.samples <= 1 &&
+            (d.bind & RHI_BIND_SAMPLED))
+            t->depth = g_cur_ds->image;
+    }
+    return TRUE;
+}
+
 /* ================================================================
  * Frame interpolation's target (src/hle/hle_d3d8_interp.c)
  *
@@ -2241,6 +2300,7 @@ void xbox_D3D8InterpPresent(void)
     if (!g_interp_on)
         return;
     follow_vrr();
+    xbox_D3D8PostFxFrameEnd();
     present_scene();
     rhi_present(g_present_interval);
 }

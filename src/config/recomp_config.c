@@ -186,6 +186,7 @@ void recomp_settings_defaults(RecompSettings *s)
     s->vrr               = 1;
     s->frame_interp      = 1;
     snprintf(s->frame_cap, sizeof s->frame_cap, "adaptive");
+    snprintf(s->postfx, sizeof s->postfx, "off");
 }
 
 static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -237,6 +238,10 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->vrr = !off_word(v);
         if ((v = from_table("frame_interp")) != NULL)
             s->frame_interp = clamp_int(atoi(v), 1, 4);
+        if ((v = from_table("postfx")) != NULL)
+            snprintf(s->postfx, sizeof s->postfx, "%s", v);
+        if ((v = from_table("postfx_params")) != NULL)
+            snprintf(s->postfx_params, sizeof s->postfx_params, "%s", v);
         if ((v = from_table("game_dir")) != NULL)
             snprintf(s->game_dir, sizeof s->game_dir, "%s", v);
     }
@@ -346,12 +351,23 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# variable refresh. 1 is off.                   [RECOMP_FRAME_INTERP]\n"
         "frame_interp = %d\n"
         "\n"
+        "# A shader over the game's 3D world: off, cel (ink outlines and flat\n"
+        "# shading, like a comic), or the path of an .hlsl file of your own.\n"
+        "# F8 switches it off and on while playing.            [RECOMP_POSTFX]\n"
+        "postfx = %s\n"
+        "\n"
+        "# Its numbers, as name=value pairs: for cel, bands, ink_width, detail,\n"
+        "# saturation, lift, hatch and more (xboxrecomp d3d8_postfx.c). Empty\n"
+        "# keeps the defaults.                          [RECOMP_POSTFX_PARAMS]\n"
+        "postfx_params = %s\n"
+        "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
         s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
         s->widescreen_2d[0] ? s->widescreen_2d : "auto",
         s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay,
-        s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp);
+        s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp,
+        s->postfx[0] ? s->postfx : "off", s->postfx_params);
 
     if (s->game_dir[0])
         fprintf(f, "game_dir = %s\n", s->game_dir);

@@ -157,6 +157,9 @@ void    host_SetScissors(UINT count, BOOL exclusive, const D3DRECT *rects);
 /* xbox_D3D8SetTwoDPlacement, recorded. A title project calls this rather
  * than the device's own, so a capture replays with the same placements. */
 void    host_SetTwoDPlacement(int placement, uint32_t tag);
+/* xbox_D3D8PostFxScene, recorded: the title's 3D world is finished, so the
+ * post-process pass runs here, and in a capture or a redrawn frame here too. */
+void    host_PostFxScene(void);
 HRESULT host_SetTexture(IDirect3DDevice8 *dev, DWORD stage,
                         IDirect3DBaseTexture8 *texture);
 HRESULT host_SetVertexShader(IDirect3DDevice8 *dev, DWORD handle);

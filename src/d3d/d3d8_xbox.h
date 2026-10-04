@@ -1267,6 +1267,24 @@ void xbox_D3D8InterpEnd(void);
    register and nothing is taken for affine. */
 void xbox_D3D8SetInterpRegisters(int projection, int affine_first, int affine_count);
 
+/* The post-process chain (d3d8_postfx.c, RECOMP_POSTFX). Scene: the 3D
+   world is finished and what follows is the title's 2D, so run the pass
+   now; at most once a frame. A title project calls host_PostFxScene
+   instead, which is recorded (captures, frame interpolation). MarksFrames:
+   the title calls Scene in every frame that should have the pass, and a
+   frame it does not is left alone; without it, an unmarked frame gets the
+   pass over everything at FrameEnd. FrameEnd: the frame is complete
+   (hle_d3d8.c, before the movie layer and the dump). Toggle: F8. */
+void xbox_D3D8PostFxScene(void);
+void xbox_D3D8PostFxMarksFrames(BOOL on);
+/* The title's own tuning of the built-in cel shader, as postfx_params text
+   ("bands=4,ink_width=2.5"): over the toolkit's defaults, under the
+   player's postfx_params. */
+void xbox_D3D8PostFxSetDefaults(const char *params);
+void xbox_D3D8PostFxFrameEnd(void);
+void xbox_D3D8PostFxToggle(void);
+void xbox_D3D8PostFxShutdown(void);
+
 /**
  * Present frame and pump window messages.
  * Called from recompiled game code (replaces RW driver Present path).

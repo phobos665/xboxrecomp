@@ -74,6 +74,8 @@ typedef struct RecompSettings {
     int  fullscreen;            /* 0 or 1: borderless, on the window's monitor */
     int  vrr;                   /* 0 or 1: present for variable refresh when fullscreen */
     int  frame_interp;          /* 1 (off) to 4: frames shown for each the game draws */
+    char postfx[512];           /* "off", "cel", or a shader file (d3d8_postfx.c) */
+    char postfx_params[512];    /* name=value pairs for it */
     char game_dir[512];         /* empty means beside the executable */
 } RecompSettings;
 

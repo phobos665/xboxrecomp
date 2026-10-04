@@ -289,6 +289,29 @@ static void rec_two_d_placement(int placement, uint32_t tag)
     chunk(D3D8CAP_TWOD_PLACEMENT, &c, sizeof c, NULL, 0, NULL, 0);
 }
 
+static void rec_screen_copy(IDirect3DTexture8 *dst, const RECT *src, const POINT *at)
+{
+    D3D8CapScreenCopy c;
+
+    memset(&c, 0, sizeof c);
+    c.texture_id = texture_id((IDirect3DBaseTexture8 *)dst);
+    if (src) {
+        c.has_rect = 1;
+        c.src.x1 = src->left;
+        c.src.y1 = src->top;
+        c.src.x2 = src->right;
+        c.src.y2 = src->bottom;
+        c.at_x = at ? at->x : src->left;
+        c.at_y = at ? at->y : src->top;
+    }
+    chunk(D3D8CAP_SCREEN_COPY, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
+static void rec_postfx_scene(void)
+{
+    chunk(D3D8CAP_POSTFX_SCENE, NULL, 0, NULL, 0, NULL, 0);
+}
+
 static void rec_viewport(const D3DVIEWPORT8 *vp)
 {
     D3D8CapViewport c;
@@ -1169,6 +1192,25 @@ void host_SetTwoDPlacement(int placement, uint32_t tag)
     xbox_D3D8SetTwoDPlacement(placement, tag);
 }
 
+static void op_postfx_scene(const void *arg)
+{
+    (void)arg;
+    host_PostFxScene();
+}
+
+void host_PostFxScene(void)
+{
+    if (hle_d3d8_defer_recording()) {
+        hle_d3d8_defer_op(op_postfx_scene, NULL, 0);
+        return;
+    }
+    if (hle_d3d8_interp_rec)
+        hle_d3d8_interp_op(op_postfx_scene, NULL, 0);
+    if (g_cap)
+        rec_postfx_scene();
+    xbox_D3D8PostFxScene();
+}
+
 static void op_viewport(const void *arg)
 {
     host_SetViewport(hle_d3d8_shadow_device(), (const D3DVIEWPORT8 *)arg);
@@ -1768,6 +1810,8 @@ HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst)
         p.dst = dst;
         hle_d3d8_interp_op(op_screen_copy, &p, sizeof p);
     }
+    if (g_cap)
+        rec_screen_copy(dst, NULL, NULL);
     return xbox_D3D8CopyBackBufferToTexture(dst);
 }
 
@@ -1788,6 +1832,8 @@ HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src
         }
         hle_d3d8_interp_op(op_screen_copy, &p, sizeof p);
     }
+    if (g_cap && src)
+        rec_screen_copy(dst, src, at);
     return xbox_D3D8CopyBackBufferRectToTexture(dst, src, at);
 }
 

@@ -1119,6 +1119,14 @@ void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag)
     (void)placement; (void)tag;
 }
 
+/* The post-process chain is D3D11 / Vulkan only (d3d8_postfx.c). */
+void xbox_D3D8PostFxScene(void) {}
+void xbox_D3D8PostFxMarksFrames(BOOL on) { (void)on; }
+void xbox_D3D8PostFxSetDefaults(const char *params) { (void)params; }
+void xbox_D3D8PostFxFrameEnd(void) {}
+void xbox_D3D8PostFxToggle(void) {}
+void xbox_D3D8PostFxShutdown(void) {}
+
 int xbox_D3D8GetTwoDPlacement(uint32_t *tag)
 {
     if (tag)

@@ -32,7 +32,7 @@
 #endif
 
 #define WINDOW_W 900
-#define WINDOW_H 862                    /* nine Video rows, their help, the footer */
+#define WINDOW_H 924                    /* ten Video rows, their help, the footer */
 
 /* The client area as it really is. On a display at 125% these are not
  * WINDOW_W/H: asking Windows not to scale us and then laying out
@@ -50,12 +50,17 @@ typedef struct Row {
     RowKind     kind;
     int         lo, hi;                 /* ROW_INT */
     const char *const *choices;         /* ROW_CHOICE, NULL terminated */
+    const char *(*choice_label)(int);   /* ROW_CHOICE: what each is called */
     int        *ival;                   /* ROW_INT / ROW_BOOL / ROW_CHOICE index */
     char       *text;                   /* ROW_TEXT */
     size_t      text_len;
 } Row;
 
 static const char *const k_frame_caps[] = { "adaptive", "60", "30", "0", NULL };
+/* The post-process shader: off, the built-in cel shader, and the file the
+ * settings name when they name one (settings_load fills slot 2). */
+static const char *k_postfx[] = { "off", "cel", NULL, NULL };
+static int         g_postfx_index;
 
 static RecompSettings g_settings;
 static int            g_frame_cap_index;   /* into k_frame_caps */
@@ -102,6 +107,15 @@ static const char *frame_cap_label(int i)
     }
 }
 
+static const char *postfx_label(int i)
+{
+    switch (i) {
+    case 0: return "Off";
+    case 1: return "Cel shading";
+    default: return "Your shader file";
+    }
+}
+
 static void build_rows(void)
 {
     Row *r = g_video_rows;
@@ -135,6 +149,7 @@ static void build_rows(void)
     r->help  = "Adaptive paces the game the way the console did. F10 changes it"
                " while playing.";
     r->kind  = ROW_CHOICE; r->choices = k_frame_caps; r->ival = &g_frame_cap_index;
+    r->choice_label = frame_cap_label;
     r++;
 
     r->label = "Show frame rate";
@@ -158,6 +173,13 @@ static void build_rows(void)
     r->kind  = ROW_INT; r->lo = 1; r->hi = 4; r->ival = &g_settings.frame_interp;
     r++;
 
+    r->label = "Cel shading";
+    r->help  = "Ink outlines and flat shading on the 3D world, like a comic. F8"
+               " switches it while playing; postfx_params in the file tunes it.";
+    r->kind  = ROW_CHOICE; r->choices = k_postfx; r->ival = &g_postfx_index;
+    r->choice_label = postfx_label;
+    r++;
+
     g_video_count = (int)(r - g_video_rows);
 }
 
@@ -179,7 +201,8 @@ static void row_value(const Row *r, char *out, size_t n)
             snprintf(out, n, "%dx", *r->ival);
         break;
     case ROW_CHOICE:
-        snprintf(out, n, "%s", frame_cap_label(*r->ival));
+        snprintf(out, n, "%s", r->choice_label ? r->choice_label(*r->ival)
+                                              : r->choices[*r->ival]);
         break;
     default:
         snprintf(out, n, "%s", r->text && r->text[0] ? r->text : "Beside the game");
@@ -435,6 +458,16 @@ static void settings_load(void)
         recomp_settings_read(path, &g_settings);
 
     g_wide_camera = g_settings.hor_plus > 0.01;
+    k_postfx[2] = NULL;
+    if (_stricmp(g_settings.postfx, "cel") == 0) {
+        g_postfx_index = 1;
+    } else if (g_settings.postfx[0] && _stricmp(g_settings.postfx, "off") != 0 &&
+               strcmp(g_settings.postfx, "0") != 0) {
+        k_postfx[2] = g_settings.postfx;
+        g_postfx_index = 2;
+    } else {
+        g_postfx_index = 0;
+    }
     g_frame_cap_index = 0;
     {
         int i;
@@ -482,6 +515,9 @@ static int settings_save(void)
 #endif
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
+    if (g_postfx_index < 2)
+        snprintf(g_settings.postfx, sizeof g_settings.postfx, "%s",
+                 k_postfx[g_postfx_index]);
 
     if (!recomp_settings_path(g_title_id, path, sizeof path))
         return 0;

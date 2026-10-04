@@ -508,6 +508,37 @@ static int is_block_compressed(RhiFormat f)
            f == RHI_FORMAT_BC3_UNORM || f == RHI_FORMAT_BC5_UNORM;
 }
 
+/* A depth image that is also sampled. D3D11 refuses a depth format with
+ * SHADER_RESOURCE, so the image is made in the typeless format of the same
+ * family and each view names the typed one: the depth format to draw with,
+ * the depth channel as a colour format to sample. Vulkan needs none of
+ * this (a depth-aspect view samples it), which is why rhi.h can promise
+ * that a DEPTH | SAMPLED image just works. */
+static int is_sampled_depth(const RhiImageDesc *d)
+{
+    return (d->bind & RHI_BIND_DEPTH) && (d->bind & RHI_BIND_SAMPLED);
+}
+
+static DXGI_FORMAT depth_typeless(RhiFormat f)
+{
+    switch (f) {
+    case RHI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+    case RHI_FORMAT_D32_FLOAT:         return DXGI_FORMAT_R32_TYPELESS;
+    case RHI_FORMAT_D16_UNORM:         return DXGI_FORMAT_R16_TYPELESS;
+    default:                           return (DXGI_FORMAT)f;
+    }
+}
+
+static DXGI_FORMAT depth_sampled(RhiFormat f)
+{
+    switch (f) {
+    case RHI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case RHI_FORMAT_D32_FLOAT:         return DXGI_FORMAT_R32_FLOAT;
+    case RHI_FORMAT_D16_UNORM:         return DXGI_FORMAT_R16_UNORM;
+    default:                           return (DXGI_FORMAT)f;
+    }
+}
+
 static RhiImage *d_image_create(const RhiImageDesc *d, const RhiSubresourceData *initial)
 {
     D3D11_SUBRESOURCE_DATA sd[16 * 6];
@@ -546,7 +577,7 @@ static RhiImage *d_image_create(const RhiImageDesc *d, const RhiSubresourceData 
         td.Height = d->height;
         td.MipLevels = d->mip_levels;
         td.ArraySize = d->depth ? d->depth : 1;
-        td.Format = (DXGI_FORMAT)d->format;
+        td.Format = is_sampled_depth(d) ? depth_typeless(d->format) : (DXGI_FORMAT)d->format;
         td.SampleDesc.Count = d->samples ? d->samples : 1;
         td.SampleDesc.Quality = d->sample_quality;
         td.Usage = (D3D11_USAGE)d->usage;
@@ -703,10 +734,25 @@ static int d_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst
 static RhiView *d_view_create(RhiImage *img, uint32_t kind, const RhiViewDesc *d)
 {
     RhiView *v = calloc(1, sizeof *v);
+    RhiViewDesc typed;
     HRESULT hr = E_FAIL;
 
     if (!v)
         return NULL;
+    /* A typeless depth image has no format of its own a view could take:
+     * name the typed one (is_sampled_depth). */
+    if (is_sampled_depth(&img->desc) && kind != RHI_VIEW_RENDER_TARGET) {
+        if (d) {
+            typed = *d;
+        } else {
+            memset(&typed, 0, sizeof typed);
+            typed.dim = img->desc.samples > 1 ? RHI_VIEW_DIM_2D_MS : RHI_VIEW_DIM_2D;
+            typed.mip_count = img->desc.mip_levels ? img->desc.mip_levels : 1;
+        }
+        typed.format = kind == RHI_VIEW_DEPTH ? img->desc.format
+                                              : (RhiFormat)depth_sampled(img->desc.format);
+        d = &typed;
+    }
     v->kind = kind;
     v->image = img;
     if (kind == RHI_VIEW_SAMPLED) {

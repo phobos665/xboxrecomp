@@ -22,7 +22,7 @@ tells the mechanism something only the game knows.
 | 2 | Native widescreen | Console flag and 16:9 presentation exist; Hor+ is experimental | The flag, 16:9 presentation, Hor+ mechanisms | Which register holds the projection, which draws are HUD, 4:3-authored 2D |
 | 3 | Internal resolution scaling | `RECOMP_RES_SCALE=1..8` exists | All of it | Fixes for passes that break at scale (post effects, read-backs) |
 | 4 | MSAA / supersampling | Supersampling exists (item 3); MSAA only when the title asks for it | Forced MSAA, resolve, SSAA via item 3 | Passes that must not be multisampled |
-| 5 | Filters / shaders | Anisotropic filtering (`RECOMP_ANISO`); no post-process chain | A post-process chain on the final frame | Game-tuned presets, if any |
+| 5 | Filters / shaders | Anisotropic filtering (`RECOMP_ANISO`); a post-process pass with a built-in cel shader and user `.hlsl` files (`postfx`) | A ReShade add-on hook at the same point; more built-in effects | Where the 3D world ends, game-tuned presets |
 | 6 | Online play replacing Xbox Live | Nothing yet; XNET/XONLINE code runs lifted | System link over a virtual LAN, a Live-shaped service stub | Matchmaking and session rules per game, server if needed |
 | 7 | Model / texture / audio replacement | Designed (`modding-models-textures.md`); dump exists only in the LLE executor | Overlay filesystem, hashed texture dump and replace, audio replace | Asset naming, model formats, anything that adds content |
 | 8 | FPS display | Done: F9, `RECOMP_FPS_OVERLAY=1` | All of it | Nothing |
@@ -112,15 +112,35 @@ per game.
 
 ## 5. Filters and shaders
 
-**Today.** Forced anisotropic filtering exists (`RECOMP_ANISO`). There is no
-post-processing chain.
+**Today (Oct 2026).** Forced anisotropic filtering (`RECOMP_ANISO`) and a
+post-process pass, `src/d3d/d3d8_postfx.c`: `postfx = off | cel | <file>.hlsl`
+(`RECOMP_POSTFX`, launcher row "Cel shading", F8 in game) and `postfx_params`. It runs
+at scene resolution, before the resolve, with the scene's colour and its depth buffer
+as inputs (a depth image is now `DEPTH | SAMPLED`; D3D11 makes it typeless). The
+built-in shader is a cel shader: ink from depth (silhouettes, creases, thin features
+spared) and banded light with the texture kept, plus vibrance and warmth. A user's
+`.hlsl` gets the same inputs; the contract is at the top of the file.
 
-**Toolkit part.** A post-process pass on the resolved frame, after the game and before
-the overlay: sharpening, FXAA/SMAA, CRT and scanline shaders, colour correction. It sits
-where the movie layer and the F9 counter already draw (`d3d8_movie.c`,
-`d3d8_overlay.c`), so the pattern exists. Loading user shaders is a toolkit feature too.
+**Where it runs** matters more than the shader. Ink and banding on a HUD make it
+unreadable, so a title marks where its world ends (`host_PostFxScene`, recorded, so
+captures and frame interpolation run it at the same point) and the pass runs at the
+next screen-space draw that follows 3D. 3D drawn after that (a first-person weapon)
+gets a second run over only the pixels whose depth it changed. A title that marks
+nothing gets the pass over its whole frame at Swap, which suits a colour grade or a
+CRT mask. Frame captures now also record the screen copies a title's glow reads
+(`screen_copy`): without them a replay's glow read stale texels, and TimeSplitters 2
+replayed far darker than it plays.
 
-**Title project part.** Presets tuned to a game's look, if wanted. Nothing required.
+**Established standards.** ReShade (BSD-3) is the strongest fit: its add-on API lets a
+host choose where effects run (`effect_runtime::render_effects`) and hand them depth
+(`update_texture_bindings("DEPTH", ...)`), which is the same "before the HUD" point
+this pass uses. Hooking it there is the next step for anyone who wants the ReShade
+library of effects. RetroArch slang presets (librashader, MPL-2.0/GPL-3) are colour
+only, which suits CRT and AA filters but not ink lines.
+
+**Title project part.** Where the title's 3D world ends, which 2D belongs to the world
+(projected sprites, glows), and its tuning (`xbox_D3D8PostFxSetDefaults`). See
+TimeSplitters 2's `docs/enhancements.md`.
 
 ## 6. Online play replacing Xbox Live
 

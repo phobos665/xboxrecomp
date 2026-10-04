@@ -1911,7 +1911,7 @@ void hle_d3d8_overlay_redraw(void)
 
 static void overlay_frame(void)
 {
-    static int configured, f9_was_down, f10_was_down, f11_was_down;
+    static int configured, f8_was_down, f9_was_down, f10_was_down, f11_was_down;
     static LARGE_INTEGER qpf, window_start;
     static unsigned window_frames;
     static unsigned long window_extra;
@@ -1919,7 +1919,7 @@ static void overlay_frame(void)
     char *line = g_overlay_line;
     const size_t line_size = sizeof g_overlay_line;
     LARGE_INTEGER now;
-    int front, f9, f10, f11;
+    int front, f8, f9, f10, f11;
 
     if (!configured) {
         const char *v = recomp_config_lookup("RECOMP_FPS_OVERLAY", "fps_overlay");
@@ -1929,12 +1929,14 @@ static void overlay_frame(void)
         QueryPerformanceFrequency(&qpf);
         QueryPerformanceCounter(&window_start);
         snprintf(line, line_size, "-- fps   cap %s", xbox_Nv2aFlipGateModeName());
-        fprintf(stderr, "[HLE-D3D8] F9 shows the frame rate on screen, F10 steps the "
-                "frame cap (now %s)\n", xbox_Nv2aFlipGateModeName());
+        fprintf(stderr, "[HLE-D3D8] F8 switches the post-process shader, F9 shows the "
+                "frame rate on screen, F10 steps the frame cap (now %s)\n",
+                xbox_Nv2aFlipGateModeName());
         fflush(stderr);
     }
 
     front = g_shadow_hwnd && GetForegroundWindow() == g_shadow_hwnd;
+    f8  = front && (GetAsyncKeyState(VK_F8)  & 0x8000) != 0;
     f9  = front && (GetAsyncKeyState(VK_F9)  & 0x8000) != 0;
     f10 = front && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     f11 = front && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
@@ -1946,6 +1948,9 @@ static void overlay_frame(void)
         shadow_dump_next_frame();
     }
     f11_was_down = f11;
+    if (f8 && !f8_was_down)
+        xbox_D3D8PostFxToggle();     /* the post-process chain, off and on */
+    f8_was_down = f8;
     if (f9 && !f9_was_down)
         enabled = !enabled;
     if (f10 && !f10_was_down) {
@@ -2032,6 +2037,11 @@ static void frame_end_shadow(void)
         /* Textures this frame drew with, checked again now that the frame
          * is finished (hle_d3d8_texture.c). */
         hle_d3d8_texture_frame_end();
+
+        /* The post-process pass, if the title did not run it before its
+         * 2D (d3d8_postfx.c). Before the movie layer, which is not part of
+         * the scene, and before the dump, so dumps show what is shown. */
+        xbox_D3D8PostFxFrameEnd();
 
         g_shadow_swaps++;
         /* The frame boundary for capture: closes the frame being recorded, or
