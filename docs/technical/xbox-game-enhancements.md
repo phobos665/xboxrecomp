@@ -24,7 +24,7 @@ tells the mechanism something only the game knows.
 | 4 | MSAA / supersampling | Supersampling exists (item 3); MSAA only when the title asks for it | Forced MSAA, resolve, SSAA via item 3 | Passes that must not be multisampled |
 | 5 | Filters / shaders | Anisotropic filtering (`RECOMP_ANISO`); no post-process chain | A post-process chain on the final frame | Game-tuned presets, if any |
 | 6 | Online play replacing Xbox Live | Nothing yet; XNET/XONLINE code runs lifted | System link over a virtual LAN, a Live-shaped service stub | Matchmaking and session rules per game, server if needed |
-| 7 | Model / texture / audio replacement | Designed (`modding-models-textures.md`); dump exists only in the LLE executor | Overlay filesystem, hashed texture dump and replace, audio replace | Asset naming, model formats, anything that adds content |
+| 7 | Model / texture / audio replacement | Mods folder overlays disc files and patch files change table values (`mods.md`); hashed texture dump designed (`modding-models-textures.md`), not built | Overlay filesystem, hashed texture dump and replace, audio replace | Asset naming, model formats, anything that adds content |
 | 8 | FPS display | Done: F9, `RECOMP_FPS_OVERLAY=1` | All of it | Nothing |
 | 9 | Native rendering (Vulkan) | Planned (`vulkan-backend.md`); D3D11 today | All of it | Nothing, unless the game draws through its own push buffers |
 | 10 | Skip cutscenes | Movies: `RECOMP_SKIP_VIDEO`, `RECOMP_XMV_PLAY=0`; in-engine: nothing | Skipping pre-rendered movies, a skip key | In-engine cutscenes: where they start and how to jump past safely |
@@ -150,14 +150,17 @@ every game that has it.
 
 ## 7. Model, texture and audio replacement
 
-**Today.** `modding-models-textures.md` designs this for TimeSplitters 2 and concludes
+**Today.** A mods folder overlays the disc file by file, and patch files in it
+change values in the title's tables at start-up (`mods.md`). Beyond that,
+`modding-models-textures.md` designs this for TimeSplitters 2 and concludes
 that for textures *the generalisable work is the majority*. Its first deliverable, a
 content-hash texture dump and a hash-keyed replacement folder, is not built on the
 shadow renderer; a dump exists only in the LLE push-buffer executor
 (`src/kernel/nv2a_pb_exec.c`).
 
 **Toolkit part.**
-- An overlay filesystem, so a mod folder shadows the game's files without editing them.
+- ~~An overlay filesystem, so a mod folder shadows the game's files without editing them.~~
+  Done (`mods.md`), with patch files for table values.
 - Texture dump and replace, keyed by content hash, at `host_texture()` in
   `src/hle/hle_d3d8_texture.c`. Works on any game on day one.
 - Audio replacement at the same kind of boundary: DirectSound buffers and streams, and

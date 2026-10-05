@@ -175,9 +175,9 @@ reverse engineering or tooling that transfers to no other game.
 
 | # | Work item | Route | Days | Kind |
 |---|---|---|---|---|
-| T1 | Overlay directory in `kernel_path.c`: try `<overlay>/<rel>` before `<game_dir>/<rel>`, behind an env switch | A | 1 | Toolkit |
-| T2 | `P8CK`/`P4CK` unpack + repack tool in `tools/` | A | 0.5 | TS2 (or use `tspak`/`Splitter`: 0) |
-| T3 | `.xbt` ↔ DDS converter, all four format codes | A | 1–2 | TS2 (or use `fmt_xbox.py` as a spec: 1) |
+| T1 | Overlay directory in `kernel_path.c`: try `<overlay>/<rel>` before `<game_dir>/<rel>`, behind an env switch. **Done** (`mods.md`, Oct 2026) | A | 1 | Toolkit |
+| T2 | `P8CK`/`P4CK` unpack + repack tool in `tools/`. **Done in split2-recomp** (`tools/ts2pak.py`), not yet run on the disc | A | 0.5 | TS2 (or use `tspak`/`Splitter`: 0) |
+| T3 | `.xbt` ↔ DDS converter, all four format codes. **Done in split2-recomp** (`tools/xbt.py`; format 3 unverified) | A | 1–2 | TS2 (or use `fmt_xbox.py` as a spec: 1) |
 | T4 | Unsampled content hash at cache-entry time, exposed; `RECOMP_TEX_DUMP` writes every bound texture as DDS named by hash | B | 1–2 | Toolkit |
 | T5 | Replacement loader: index a directory of `<hash>.dds`, build the host texture from it in `host_texture()` instead of from guest memory | B | 2–3 | Toolkit |
 | T6 | Offline indexer: hash every `.xbt` payload in every pak, emit `<hash> -> chr.pak:textures/0267.xbt` so dumps have human names | B | 0.5–1 | TS2 |

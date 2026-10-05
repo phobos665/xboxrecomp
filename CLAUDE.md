@@ -174,6 +174,13 @@ described by a declaration (no program) are drawn through an equivalent FVF inst
 skipped. `scripts/run_and_report.py` now counts `[ICALL] unresolved ... target` lines; it
 had matched only the old `Failed to resolve VA` wording and reported 0 for every title.
 
+**Mods (Oct 2026):** a file at `<mods>/<path>` replaces the disc file at the
+same path (`RECOMP_MODS_DIR`, else `mods` beside the executable; disc paths
+only, never saves), and `<mods>/patches/*.json` writes values into the title's
+tables before it starts, each guarded by the value it `expect`s. Overrides may
+live in a title's `src/overrides/` folder as well as `recomp_manual.c`;
+`--exclude-manual` scans both. `docs/technical/mods.md`.
+
 **Process exits are traced (22 Sep 2026):** `src/kernel/exit_trace.c` hooks
 ExitProcess/TerminateProcess/ExitThread and the ntdll funnel under them in every loaded
 module's import table and prints `[EXIT] <call>(code)` with host and guest stacks.
