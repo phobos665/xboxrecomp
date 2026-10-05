@@ -150,11 +150,19 @@ static int is_synth(uint32_t va) { return (va & 1u) != 0u; }
 
 static uint32_t synth_key(uint32_t data, uint32_t format)
 {
-    int i;
+    /* A direct-mapped memo in front of the scan: a title switches between
+     * the same few hundred textures thousands of times a frame. */
+    static int memo[1024];
+    uint32_t h = ((data >> 7) ^ (data >> 17) ^ (format * 0x9E3779B1u)) & 1023u;
+    int i = memo[h] - 1;
 
+    if (i >= 0 && i < g_synth_count && g_synth[i].data == data && g_synth[i].format == format)
+        return ((uint32_t)(i + 1) << 4) | 1u;
     for (i = 0; i < g_synth_count; i++)
-        if (g_synth[i].data == data && g_synth[i].format == format)
+        if (g_synth[i].data == data && g_synth[i].format == format) {
+            memo[h] = i + 1;
             return ((uint32_t)(i + 1) << 4) | 1u;
+        }
     if (g_synth_count < SYNTH_MAX) {
         i = g_synth_count++;
     } else {
@@ -163,6 +171,7 @@ static uint32_t synth_key(uint32_t data, uint32_t format)
     }
     g_synth[i].data = data;
     g_synth[i].format = format;
+    memo[h] = i + 1;
     return ((uint32_t)(i + 1) << 4) | 1u;
 }
 
