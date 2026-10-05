@@ -106,6 +106,32 @@ extern RECOMP_MANUAL_TLS uint32_t g_icall_saved_esp;
  * means this title was lifted before the macros published it. */
 extern RECOMP_MANUAL_TLS uint32_t g_icall_dispatch_form;
 
+/* ── WWE Raw 2: menu movies drawn by the title ─────────────── */
+
+/*
+ * The front end is UI drawn over a movie (Movie/Menu, YUY2 surfaces): the
+ * title decodes each picture into its surface, samples it into a 512x512
+ * target, draws the menu over it there, and composites the result. The
+ * runtime's default puts any YUY2 movie on the host's movie layer over the
+ * finished frame, which is right for Otogi and wrong here: the layer covered
+ * every menu, so the front end showed only the background movie (measured: a
+ * replay of a captured menu frame draws "Quick Start / Player Settings"; the
+ * live frame showed the movie alone). So the layer is only for a movie no
+ * draw sampled, unless the player has said otherwise: set before main, and
+ * only if the variable is not already set, so RECOMP_XMV_LAYER=1 still
+ * forces it.
+ */
+#if defined(_MSC_VER)
+static void __cdecl wweraw2_defaults(void)
+{
+    if (!getenv("RECOMP_XMV_LAYER"))
+        _putenv("RECOMP_XMV_LAYER=0");
+}
+#pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU")) void (__cdecl *wweraw2_defaults_init)(void) = wweraw2_defaults;
+#pragma comment(linker, "/include:wweraw2_defaults_init")
+#endif
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
