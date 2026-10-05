@@ -584,6 +584,9 @@ static int plausible_va(uint32_t va)
     return va >= 0x10000u && va < 0x08000000u && (va & 3u) == 0u;
 }
 
+int xbox_EnvSwitch(const char *name, int default_on);   /* xbox_memory_layout.c */
+static void ps_def_to_render_states(void);
+
 void hle_d3d8_pixel_shader_selected(uint32_t handle)
 {
     uint32_t def = 0;
@@ -632,6 +635,69 @@ void hle_d3d8_pixel_shader_selected(uint32_t handle)
     g_ps_def = def;
     g_ps_def_ok = 1;
     g_ps_dirty = 1;                  /* re-forward this shader's own states */
+    if (def)
+        ps_def_to_render_states();
+}
+
+/* Where pixel shader state `xbox` sits in a D3DPIXELSHADERDEF, or -1 for the
+ * states that always come from the render states (the constants, 10-25). The
+ * field order is the render state order, apart from PSTextureModes (54 here,
+ * the complex state 136 in the array). */
+static int ps_def_offset(uint32_t xbox)
+{
+    if (xbox >= 10 && xbox <= 25) return -1;
+    if (xbox <= 7)   return (int)(0x00 + 4 * xbox);
+    if (xbox <= 9)   return (int)(0x20 + 4 * (xbox - 8));
+    if (xbox <= 33)  return (int)(0x68 + 4 * (xbox - 26));
+    if (xbox <= 41)  return (int)(0x88 + 4 * (xbox - 34));
+    if (xbox <= 44)  return (int)(0xA8 + 4 * (xbox - 42));
+    if (xbox <= 52)  return (int)(0xB4 + 4 * (xbox - 45));
+    if (xbox == 53)  return 0xD4;
+    if (xbox == 54)  return PSDEF_MODES;
+    if (xbox == 55)  return 0xDC;
+    if (xbox == 56)  return 0xE0;
+    return -1;
+}
+
+/* The combiner setup is the last thing written to the NV2A, whichever way it
+ * was written: SetPixelShader loads a whole definition, and a render state
+ * write (D3DRS_PSRGBINPUTS0 and the rest, which titles inline: the value
+ * goes into the push buffer and into D3D_g_RenderState) changes one register
+ * of it afterwards. So, as Cxbx-Reloaded does (D3DDevice_SetPixelShaderCommon
+ * and its use of the render state array as the definition), selecting a
+ * shader copies its definition into the array, and draws read the array.
+ *
+ * Measured on Need for Speed Underground 2: it selects one shader object
+ * whose definition is a pass-through of r0 (all stages zero) and then writes
+ * each material's combiners as render states -- stage 0 t0 x v0, through
+ * the title's own sub_00099650 (RECOMP_WATCH_WRITE on PSRGBINPUTS0's slot).
+ * Read from the definition, every draw was r0, i.e. black. Burnout 2's case
+ * (the array holding a stale shader, the draws the selected one) still comes
+ * out the selected one, because selecting it now refreshes the array.
+ *
+ * RECOMP_HLE_D3D8_PS_ARRAY=0 reads the definition directly, as before. */
+static int ps_array_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PS_ARRAY", 1);
+    return on;
+}
+
+static void ps_def_to_render_states(void)
+{
+    uint32_t x;
+
+    if (!g_ps_def || !ps_array_on() || state_ready() != 1)
+        return;
+    for (x = 0; x <= 56; x++) {
+        int off = ps_def_offset(x), slot = rs_slot(x == 54 ? XRS_COMPLEX : x);
+
+        if (off < 0 || slot < 0)
+            continue;
+        HLE_MEM32(hle_var_D3D_g_RenderState + 4u * (uint32_t)slot) =
+            HLE_MEM32(g_ps_def + (uint32_t)off);
+    }
 }
 
 /* One Xbox pixel shader state, from the selected definition where it carries
@@ -640,6 +706,8 @@ static uint32_t ps_state(uint32_t xbox)
 {
     uint32_t off;
 
+    if (g_ps_def && ps_array_on() && state_ready() == 1)
+        return guest_rs(xbox == 54 ? XRS_COMPLEX : xbox);
     if (!g_ps_def || (xbox >= 10 && xbox <= 25))
         return guest_rs(xbox);
     if (xbox <= 7)        off = 0x00 + 4 * xbox;
@@ -737,6 +805,34 @@ static void forward_pixel_shader(IDirect3DDevice8 *dev)
     }
     modes = ps_state(54);                         /* PSTextureModes      */
     count = ps_state(53);                         /* PSCOMBINERCOUNT     */
+
+    /* RECOMP_HLE_D3D8_PS_COMPARE=<n>: at the n-th draw through here, print
+     * every pixel shader state twice -- from the selected definition and
+     * from the render state array -- to tell which of the two a title
+     * actually keeps its combiner setup in. */
+    {
+        static long compare_at = -2, draws;
+
+        if (compare_at == -2) {
+            const char *v = getenv("RECOMP_HLE_D3D8_PS_COMPARE");
+            compare_at = v ? strtol(v, NULL, 0) : -1;
+        }
+        if (compare_at >= 0 && draws++ == compare_at) {
+            uint32_t x;
+
+            fprintf(stderr, "[HLE-D3D8] PS compare at draw %ld: handle 0x%08X def 0x%08X\n",
+                    compare_at, g_ps_handle, g_ps_def);
+            for (x = 0; x <= 56; x++) {
+                int off = ps_def_offset(x);
+                uint32_t dv = (g_ps_def && off >= 0) ? HLE_MEM32(g_ps_def + (uint32_t)off) : 0;
+                uint32_t rv = guest_rs(x == 54 ? XRS_COMPLEX : x);
+
+                fprintf(stderr, "[HLE-D3D8]   ps[%2u] def 0x%08X rs 0x%08X%s\n", x, dv, rv,
+                        (g_ps_def && off >= 0 && dv != rv) ? "  <- differ" : "");
+            }
+            fflush(stderr);
+        }
+    }
 
     if (g_ps_def) {
         /* Structure comes from the definition, constants from the render

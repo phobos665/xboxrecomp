@@ -2974,6 +2974,7 @@ static uint32_t g_inline_nverts;
 
 void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
                           uint32_t stride, int from_buffer);
+void hle_d3d8_push_constants_sync(void);
 
 /* 1 if this call was part of an immediate-mode vertex and has been taken. */
 static int inline_vertex_data(uint32_t reg, const float v[4])
@@ -3623,6 +3624,10 @@ int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
 #define SHADOW_SCRATCH 8
 #define SURFACE_PARENT 20
 
+/* The multisample factors of the screen surface being drawn into, 1x1 for
+ * any other target (shadow_set_render_target). */
+static UINT g_target_aa_x = 1, g_target_aa_y = 1;
+
 static struct { UINT width, height; IDirect3DTexture8 *texture; } g_scratch[SHADOW_SCRATCH];
 static struct { UINT width, height; IDirect3DSurface8 *surface; } g_depths[SHADOW_SCRATCH];
 
@@ -3638,6 +3643,16 @@ static void surface_measure(uint32_t va, UINT *w, UINT *h, uint32_t *fmt)
         *w = 1u << ((format >> 20) & 0xF);
         *h = 1u << ((format >> 24) & 0xF);
     }
+}
+
+IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surface);
+
+static int rt_surfaces_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_RT_SURFACES", 1);
+    return on;
 }
 
 static int rt_parentless_is_backbuffer(void)
@@ -3838,6 +3853,14 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
              * Burnout 2 black -- so this is a switch until the library has
              * been measured with it. */
             kind = 0;
+        } else if (!parent && rt_surfaces_on()) {
+            /* A bare surface: a host render target keyed by its memory, which
+             * a texture over the same memory then samples
+             * (hle_d3d8_render_surface). RECOMP_HLE_D3D8_RT_SURFACES=0 sends
+             * these to a scratch target again. */
+            texture = hle_d3d8_render_surface(g_shadow, rt);
+            target = (IDirect3DBaseTexture8 *)texture;
+            kind = texture ? 1 : 2;
         } else {
             kind = 2;
         }
@@ -3895,16 +3918,66 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         }
     }
 
+    /* A multisampled device's screen is larger than the device: 2x
+     * horizontal makes a 640x480 device's back buffer and depth 1280x480,
+     * and Swap filters that down to the 640x480 front buffer. The NV2A
+     * rasterises such a surface in the device's own pixels -- the title's
+     * viewports and its programs' screen space say 640 -- so the host, whose
+     * back buffer is the device's size, draws it at that size. Measured on
+     * Need for Speed Underground 2 (multisample type 0x1021): every pass to
+     * the screen was refused for its 1280x480 depth beside the 640x480 host
+     * target, and the screen stayed black. */
+    {
+        UINT ax = 1, ay = 1;
+
+        if (kind == 0 && rt && g_shadow_width && g_shadow_height &&
+            w % g_shadow_width == 0 && h % g_shadow_height == 0) {
+            ax = w / g_shadow_width;
+            ay = h / g_shadow_height;
+        }
+        if (ax >= 1 && ay >= 1 && ax <= 4 && ay <= 4 && (ax > 1 || ay > 1)) {
+            static int said;
+
+            if (!said++)
+                fprintf(stderr, "[HLE-D3D8] shadow: the screen surface 0x%08X is %ux%u "
+                        "for a %ux%u device (multisampled, %ux%u); drawn at the "
+                        "device's size\n", rt, w, h, g_shadow_width, g_shadow_height,
+                        ax, ay);
+            w = g_shadow_width;
+            h = g_shadow_height;
+            g_target_aa_x = ax;
+            g_target_aa_y = ay;
+        } else {
+            g_target_aa_x = g_target_aa_y = 1;
+        }
+    }
+
     if (zs) {
         int own;
 
         surface_measure(zs, &zw, &zh, &zfmt);
+        /* The screen's depth is multisampled with it. */
+        if (kind == 0 && zw % g_target_aa_x == 0 && zh % g_target_aa_y == 0) {
+            zw /= g_target_aa_x;
+            zh /= g_target_aa_y;
+        }
         if (shadow_trace_on())
             fprintf(stderr, "[TRACE swap %lu]   depth 0x%08X data 0x%08X parent 0x%08X "
                     "%ux%u format 0x%02X\n", g_shadow_swaps, zs, HLE_MEM32(zs + 4),
                     HLE_MEM32(zs + SURFACE_PARENT), zw, zh, zfmt);
         g_z_scale = xbox_depth_z_scale(zfmt);
-        own = g_autodepth_va ? zs == g_autodepth_va : (zw == w && zh == h);
+        /* The device's depth is its memory, not one surface object: a title
+         * can wrap the same buffer in a surface of its own, as it does the
+         * frame buffer (g_swap_data). Need for Speed Underground 2 draws its
+         * final pass to the screen with depth 0x003EA4A8 over the same data
+         * as the device's 0x002F982C; read as a foreign depth it got a
+         * scratch surface of the guest's size, which the host refuses beside
+         * a scaled back buffer. */
+        own = g_autodepth_va
+            ? (zs == g_autodepth_va ||
+               (HLE_MEM32(zs + 4) && HLE_MEM32(zs + 4) == HLE_MEM32(g_autodepth_va + 4) &&
+                zw == w && zh == h))
+            : (zw == w && zh == h);
         depth = (kind == 0 && own && g_device_depth) ? g_device_depth : NULL;
         /* A depth texture the title will sample: render into its host copy
          * (RECOMP_HLE_D3D8_SHADOW_MAPS=0 for the old scratch depth). */
@@ -4412,6 +4485,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
 
     if (!g_shadow || !verts || !stride || !count)
         return;
+    hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
@@ -4469,6 +4543,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
 
     if (!g_shadow || !idx || !verts || !stride || !count)
         return;
+    hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
