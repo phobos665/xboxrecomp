@@ -25,7 +25,8 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from tools.recomp.manual_scan import scan, strip_disabled, definition_names  # noqa: E402
+from tools.recomp.manual_scan import (scan, strip_disabled, definition_names,  # noqa: E402
+                                     manual_sources, duplicate_definitions)
 
 
 SAMPLE = """\
@@ -105,6 +106,62 @@ def test_strip_disabled_handles_nested_conditionals():
 def test_missing_file_excludes_nothing():
     skip, wrap, ref = scan("/no/such/recomp_manual.c")
     assert skip == set() and wrap == set() and ref == set()
+
+
+def _write_split(tmp):
+    """recomp_manual.c plus an overrides/ folder, as a title project keeps them."""
+    manual = os.path.join(tmp, "recomp_manual.c")
+    with open(manual, "w") as f:
+        f.write("void sub_00011000(void) { g_esp += 4; return; }\n")
+    over = os.path.join(tmp, "overrides")
+    os.makedirs(os.path.join(over, "ui"))
+    with open(os.path.join(over, "camera.c"), "w") as f:
+        f.write("extern void sub_00044000_gen(void);\n"
+                "void sub_00044000(void) { sub_00044000_gen(); }\n")
+    with open(os.path.join(over, "ui", "hud.c"), "w") as f:
+        f.write("void sub_00022000(void)\n{\n    sub_00055000();\n}\n"
+                "#if 0\nvoid sub_00066000(void) { }\n#endif\n")
+    with open(os.path.join(over, "notes.txt"), "w") as f:
+        f.write("void sub_00077000(void) { }\n")   # not C: not scanned
+    return manual, over
+
+
+def test_directory_of_overrides_scans_as_one_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        manual, over = _write_split(tmp)
+        skip, wrap, ref = scan([manual, over])
+        names = definition_names([manual, over])
+    assert skip == {0x11000, 0x22000, 0x44000}, [hex(a) for a in sorted(skip)]
+    assert wrap == {0x44000}
+    assert 0x55000 in ref
+    assert 0x66000 not in skip, "an #if 0 override in a subfolder counted"
+    assert 0x77000 not in skip, "a non-.c file was scanned"
+    assert names == {"sub_00011000", "sub_00022000", "sub_00044000"}
+
+
+def test_sources_are_ordered_and_recursive():
+    with tempfile.TemporaryDirectory() as tmp:
+        manual, over = _write_split(tmp)
+        files = [os.path.relpath(f, tmp) for f in manual_sources([manual, over])]
+    assert files == ["recomp_manual.c",
+                     os.path.join("overrides", "camera.c"),
+                     os.path.join("overrides", "ui", "hud.c")], files
+
+
+def test_duplicate_definition_across_files_is_reported():
+    with tempfile.TemporaryDirectory() as tmp:
+        manual, over = _write_split(tmp)
+        with open(os.path.join(over, "again.c"), "w") as f:
+            f.write("void sub_00011000(void) { }\n")
+        dups = duplicate_definitions([manual, over])
+    assert list(dups) == ["sub_00011000"], dups
+    assert len(dups["sub_00011000"]) == 2
+
+
+def test_single_file_path_still_works_as_before():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp)
+        assert scan(p) == scan([p])
 
 
 def _run():

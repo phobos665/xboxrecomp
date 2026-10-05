@@ -133,8 +133,14 @@ def build_commands(args, xbe: Path, analysis_json: Path):
                                if project else None)
     if gen_dir:
         lift += ["--gen-dir", gen_dir]
-    if project and (project / "src" / "recomp_manual.c").is_file():
-        lift += ["--exclude-manual", str(project / "src" / "recomp_manual.c")]
+    # src/overrides/ is optional: a title may keep its overrides one
+    # subsystem to a file there, beside recomp_manual.c (which keeps
+    # recomp_lookup_manual and the diagnostics). Both are scanned as one.
+    if project:
+        for manual in (project / "src" / "recomp_manual.c",
+                       project / "src" / "overrides"):
+            if manual.exists():
+                lift += ["--exclude-manual", str(manual)]
     if args.game_name:
         lift += ["--game-name", args.game_name]
     if args.trace_all_entries:

@@ -1,6 +1,12 @@
 """
 What recomp_manual.c defines.
 
+"recomp_manual.c" here means the title's hand-written override sources: that
+one file, plus every *.c under a folder given in its place (a title project's
+src/overrides/, so overrides can be kept one subsystem to a file). Every
+function below takes a path or a list of paths, and a directory stands for
+the C files under it.
+
 Single source of truth, deliberately. Both the recompiler (deciding what NOT to
 generate) and gen_dangling_stubs.py (deciding what still needs a stub) have to
 agree on what counts as a definition. When they each had their own regex they
@@ -44,19 +50,62 @@ def strip_disabled(src):
     return "".join(out)
 
 
-def definition_names(path):
-    """Names of functions actually defined (compiled) in `path`."""
-    if not os.path.exists(path):
-        return set()
-    live = strip_disabled(open(path, encoding="utf-8", errors="replace").read())
-    return {m.group(1) for m in _SUB_DEF_RE.finditer(live)}
+def manual_sources(paths):
+    """The C files `paths` stands for, in a stable order.
+
+    A file is itself; a directory is every *.c beneath it, sorted, so two
+    machines scan the same files in the same order. A missing path is
+    skipped (the caller decides whether that deserves a warning).
+    """
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    out = []
+    for p in paths:
+        p = os.fspath(p)
+        if os.path.isdir(p):
+            for root, dirs, files in os.walk(p):
+                dirs.sort()
+                out.extend(os.path.join(root, f) for f in sorted(files)
+                           if f.endswith(".c"))
+        elif os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def _live_sources(paths):
+    """[(file, source with #if 0 regions removed)] for every manual source."""
+    return [(f, strip_disabled(open(f, encoding="utf-8", errors="replace").read()))
+            for f in manual_sources(paths)]
+
+
+def duplicate_definitions(paths):
+    """{name: [files]} for each sub_ defined in more than one manual source.
+
+    One override per function: the second definition is a duplicate symbol at
+    link time, and the message the linker gives names neither file usefully.
+    """
+    seen = {}
+    for f, live in _live_sources(paths):
+        for m in _SUB_DEF_RE.finditer(live):
+            seen.setdefault(m.group(1), []).append(f)
+    return {name: files for name, files in seen.items() if len(files) > 1}
+
+
+def definition_names(paths):
+    """Names of functions actually defined (compiled) in `paths`."""
+    names = set()
+    for _, live in _live_sources(paths):
+        names |= {m.group(1) for m in _SUB_DEF_RE.finditer(live)}
+    return names
 
 
 _REF_RE = re.compile(r"\bsub_([0-9A-Fa-f]{8})\b")
 
 
 def scan(path):
-    """(skip, wrap, referenced) for functions the manual file handles.
+    """(skip, wrap, referenced) for functions the manual sources handle.
+
+    `path` is a file, a directory of override files, or a list of either.
 
     skip:       defined by hand -- gen must declare but not define them.
     wrap:       manual calls the generated body as sub_X_gen -- gen must still
@@ -67,11 +116,17 @@ def scan(path):
                 to SwapCopy_D3D_..., gen defines that and nothing defines
                 sub_00350C10. Correctness beats a prettier name.
     """
-    if not os.path.exists(path):
+    sources = _live_sources(path)
+    if not sources:
         print(f"WARNING: {path} not found; excluding nothing.", file=sys.stderr)
         return set(), set(), set()
-    live = strip_disabled(open(path, encoding="utf-8", errors="replace").read())
-    skip = {int(m.group(2), 16) for m in _SUB_DEF_RE.finditer(live)}
-    wrap = {int(m.group(2), 16) for m in _WRAP_RE.finditer(live)}
-    referenced = {int(m.group(1), 16) for m in _REF_RE.finditer(live)}
+    for name, files in sorted(duplicate_definitions(path).items()):
+        print(f"WARNING: {name} is defined in more than one override file "
+              f"({', '.join(files)}); the link will fail on it.",
+              file=sys.stderr)
+    skip, wrap, referenced = set(), set(), set()
+    for _, live in sources:
+        skip |= {int(m.group(2), 16) for m in _SUB_DEF_RE.finditer(live)}
+        wrap |= {int(m.group(2), 16) for m in _WRAP_RE.finditer(live)}
+        referenced |= {int(m.group(1), 16) for m in _REF_RE.finditer(live)}
     return skip, wrap, referenced

@@ -286,14 +286,17 @@ def main():
                              "this refreshes it in seconds instead of hours. "
                              "Original bodies this lift did not emit are left "
                              "0, which the replacements report at run time.")
-    parser.add_argument("--exclude-manual", metavar="FILE",
+    parser.add_argument("--exclude-manual", metavar="PATH", action="append",
                         nargs="?", const="src/game/recomp/recomp_manual.c",
-                        help="Scan a C file (default recomp_manual.c) for the "
+                        help="Scan a C file (default recomp_manual.c), or "
+                             "every *.c in a directory, for the "
                              "functions it defines by hand and skip generating "
                              "their bodies -- the same effect as listing them in "
                              "--manual-functions, but read straight from the "
                              "source of truth so the two cannot drift. Handles "
                              "sub_X_gen wrappers and pins referenced sub_ names. "
+                             "Repeat it to scan several (a title's "
+                             "recomp_manual.c and its src/overrides/). "
                              "Ported from the Burnout 3 fork.")
     parser.add_argument("--trace-functions", metavar="FILE",
                         help="JSON list of addresses to emit an entry trace "
@@ -535,7 +538,7 @@ def main():
             newly = {a for a in (skip - wrap) if a in known} - manual
             manual |= newly
             print(f"Excluding {len(newly)} functions defined in "
-                  f"{args.exclude_manual}"
+                  f"{', '.join(args.exclude_manual)}"
                   + (f"; {pinned} pinned to sub_ names" if pinned else "")
                   + (f"; {len(wrap & known)} wrapped as sub_X_gen" if wrap else ""),
                   file=sys.stderr)

@@ -103,9 +103,10 @@ def refresh_thunks(t, verbose=False):
         cmd += ["--identified", str(ident)]
     if syms.is_file():
         cmd += ["--hle-symbols", str(syms)]
-    manual = t["project"] / "src" / "recomp_manual.c"
-    if manual.is_file():
-        cmd += ["--exclude-manual", str(manual)]
+    for manual in (t["project"] / "src" / "recomp_manual.c",
+                   t["project"] / "src" / "overrides"):
+        if manual.exists():
+            cmd += ["--exclude-manual", str(manual)]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
         # The refresh declines when it cannot produce a working thunk file --
