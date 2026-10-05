@@ -2901,10 +2901,52 @@ class Lifter:
                 break
             inside.append(target)
         # Two arms is the smallest thing worth calling a switch; one is more
-        # likely a coincidence than a jump table.
+        # likely a coincidence than a jump table -- unless the function reads
+        # a byte table of indices into it (_indexes_byte_table).
         if len(inside) >= 2:
             return inside
+        if len(inside) == 1 and self._indexes_byte_table(table_va, 1):
+            return inside
         return []
+
+    def _indexes_byte_table(self, table_va, entries):
+        """Whether this function reads a byte table of indices into the dword
+        table at table_va: a two-level switch.
+
+        MSVC compiles a switch whose cases share bodies as
+        `movzx eax, byte ptr [eax + B]; jmp dword ptr [eax*4 + T]` with the
+        byte table straight after the dword table, so B == T + 4 * entries.
+        When every case shares one body the dword table has a single entry,
+        and the one-arm rule above lifted the dispatch as a runtime jump whose
+        target, mid-function, never resolved: WWE Raw 2's sub_00156800 (six
+        cases, bytes all 0, one arm at 0x00156825) did that and the title
+        crashed loading a match. DisasmEngine._two_level_switch is the same
+        test on the disassembler's side.
+
+        Looks for `0F B6 /r` with a [reg + disp32] operand (mod 10, no SIB)
+        whose displacement is B anywhere in the function, and requires the
+        first index to be in range.
+        """
+        if not self.xbe_data or self.func_end <= self.func_start:
+            return False
+        byte_tbl = table_va + 4 * entries
+        start = va_to_file_offset(self.func_start)
+        first = va_to_file_offset(byte_tbl)
+        if start is None or first is None or first >= len(self.xbe_data):
+            return False
+        if self.xbe_data[first] >= entries:
+            return False
+        code = self.xbe_data[start:start + (self.func_end - self.func_start)]
+        needle = struct.pack('<I', byte_tbl)
+        at = code.find(needle)
+        while at != -1:
+            if at >= 3:
+                modrm = code[at - 1]
+                if (code[at - 3] == 0x0F and code[at - 2] == 0xB6
+                        and (modrm >> 6) == 2 and (modrm & 7) != 4):
+                    return True
+            at = code.find(needle, at + 1)
+        return False
 
     def _lift_jmp(self, insn, ops):
         if insn.jump_target:
