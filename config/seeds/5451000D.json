@@ -1,5 +1,15 @@
 [
  {
+  "start": "0x00014E10",
+  "observed": true,
+  "note": "Indirect tail-jump target observed at run time (10,000+ times in a match, from 0x0001D3D9). Starts `mov eax,[esp+4]` straight after the ret of sub_00014DA0 with no padding, which no prologue probe recognises. Checked by hand: a whole function (arg read, call 0x19930, ...)."
+ },
+ {
+  "start": "0x0001D840",
+  "observed": true,
+  "note": "Indirect tail-jump target observed at run time (from 0x000BA50A). `mov eax,[esp+4]; push eax; call 0x19970; add esp,4; mov eax,1; ret` straight after the ret of sub_0001D830, unpadded. Checked by hand."
+ },
+ {
   "start": "0x00020E08",
   "observed": true,
   "note": "Out-of-line tail of sub_000206F0 (pop esi; mov eax,1; pop ebx; ret), two instructions into sub_00020E06. sub_000206F0's switch default (ja at the top, before edi/ebp are pushed) jumps here, so it was a [STUB] at run time and the parent returned with esi/ebx unrestored; sub_0001DDD0 then read through esi=0xFA108AEA and faulted (run r2, 49.7 s). Pops only registers the parent saved; checked by hand."
