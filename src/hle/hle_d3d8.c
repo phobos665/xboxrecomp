@@ -2974,6 +2974,7 @@ static uint32_t g_inline_nverts;
 
 void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
                           uint32_t stride, int from_buffer);
+void hle_d3d8_push_constants_sync(void);
 
 /* 1 if this call was part of an immediate-mode vertex and has been taken. */
 static int inline_vertex_data(uint32_t reg, const float v[4])
@@ -4484,6 +4485,7 @@ void hle_d3d8_shadow_draw(uint32_t xpt, uint32_t count, const void *verts,
 
     if (!g_shadow || !verts || !stride || !count)
         return;
+    hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
@@ -4541,6 +4543,7 @@ void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *
 
     if (!g_shadow || !idx || !verts || !stride || !count)
         return;
+    hle_d3d8_push_constants_sync();    /* hle_d3d8_vertex.c */
     if (!shadow_can_draw(xpt, stride))
         return;
     if (!xbox_primitive_to_host(xpt, count, &pt, &prims)) {
