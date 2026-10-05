@@ -236,6 +236,168 @@ static uint8_t *push_gather(uint32_t first, uint32_t vertices, uint32_t *stride)
     return out;
 }
 
+/* ------------------------------------------------------------------------
+ * Vertex shader constants the title writes into the push buffer itself.
+ *
+ * Need for Speed Underground 2 never calls a SetVertexShaderConstant for its
+ * object transforms: its renderer (0x000A2EA7 and the code around it) takes
+ * the device's push pointer, writes SET_TRANSFORM_CONSTANT_LOAD (0x1EA4) and
+ * SET_TRANSFORM_CONSTANT (0x0B80) with the matrices, and moves the pointer
+ * on. Nothing executes the push buffer here, so every object was drawn with
+ * whatever c96..c99 last held -- the front end's 2D identity -- and the race
+ * came out as triangles stretched across the screen.
+ *
+ * So before each draw the push buffer is walked from where the last walk
+ * stopped to the device's put pointer (the first word of the device, as
+ * D3DDevice_BeginStateBig reads it), following jumps, one level of calls and
+ * returns, and the constant loads in it are applied in order. That is what
+ * the NV2A would have loaded by the time it reached the draw, whoever wrote
+ * the commands -- the XDK's own SetVertexShaderConstant writes are in there
+ * too, and replaying them again in order changes nothing. The viewport pair
+ * (58, 59) is left to shadow mode, which keeps its own. Anything that is not
+ * a command header ends the walk and resynchronises at the put pointer.
+ * RECOMP_HLE_D3D8_PB_CONSTANTS=0 turns it off.
+ * ------------------------------------------------------------------------ */
+HLE_IMPORT_VAR(D3D_g_pDevice);
+int xbox_EnvSwitch(const char *name, int default_on);   /* xbox_memory_layout.c */
+
+#define PB_CONST_LOAD   0x1EA4u
+#define PB_CONST_FIRST  0x0B80u
+#define PB_CONST_END    0x0C00u
+#define PB_MAX_WORDS    (4u * 1024u * 1024u)
+
+static uint32_t g_pb_scan;              /* next unscanned word (VA); 0 = resync */
+static uint32_t g_pb_load;              /* the NV2A's constant load pointer */
+static float    g_pb_cur[4];
+static float    g_pb_run[MAX_CONSTANT_REGISTERS][4];
+static int      g_pb_run_first = -1, g_pb_run_count;
+static unsigned long g_pb_constants, g_pb_resyncs, g_pb_walks;
+
+static void pb_flush(void)
+{
+    if (g_pb_run_first >= 0 && g_pb_run_count > 0)
+        host_vsh_set_constant(g_pb_run_first, &g_pb_run[0][0], g_pb_run_count);
+    g_pb_run_first = -1;
+    g_pb_run_count = 0;
+}
+
+static void pb_constant(uint32_t reg, const float v[4])
+{
+    if (reg >= MAX_CONSTANT_REGISTERS || reg == 58u || reg == 59u) {
+        pb_flush();
+        return;
+    }
+    if (g_pb_run_first < 0 || (uint32_t)(g_pb_run_first + g_pb_run_count) != reg ||
+        g_pb_run_count >= MAX_CONSTANT_REGISTERS) {
+        pb_flush();
+        g_pb_run_first = (int)reg;
+    }
+    memcpy(g_pb_run[g_pb_run_count++], v, sizeof g_pb_run[0]);
+    g_pb_constants++;
+}
+
+static void pb_method(uint32_t method, uint32_t value)
+{
+    if (method == PB_CONST_LOAD) {
+        g_pb_load = value;
+    } else if (method >= PB_CONST_FIRST && method < PB_CONST_END) {
+        uint32_t comp = ((method - PB_CONST_FIRST) / 4u) & 3u;
+
+        memcpy(&g_pb_cur[comp], &value, sizeof value);
+        if (comp == 3u)
+            pb_constant(g_pb_load++, g_pb_cur);
+    }
+}
+
+static int pb_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PB_CONSTANTS", 1);
+    return on;
+}
+
+void hle_d3d8_push_constants_sync(void)
+{
+    uint32_t device, put, va, ret = 0, words = 0;
+    int jumps = 0;
+
+    if (!pb_on() || !hle_var_D3D_g_pDevice || !hle_d3d8_shadow_device())
+        return;
+    device = HLE_MEM32(hle_var_D3D_g_pDevice);
+    if (!device || !guest_readable(device, 4u))
+        return;
+    put = HLE_MEM32(device);
+    if (!put || !guest_readable(put, 4u))
+        return;
+    if (!g_pb_scan) {
+        g_pb_scan = put;
+        return;
+    }
+    g_pb_walks++;
+    va = g_pb_scan;
+    while (va != put) {
+        uint32_t w, count, method, i;
+
+        if (!guest_readable(va, 4u) || ++words > PB_MAX_WORDS)
+            goto resync;
+        w = HLE_MEM32(va);
+        if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {
+            /* A jump: the buffer wrapping, or a segment change. */
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
+            if (++jumps > 8)
+                goto resync;
+            va = CONTIG_BASE | (target & 0x0FFFFFFFu);
+            continue;
+        }
+        if ((w & 3u) == 2u) {             /* a call, one level deep */
+            if (ret)
+                goto resync;
+            ret = va + 4u;
+            va = CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            continue;
+        }
+        if (w == 0x00020000u) {           /* return */
+            if (!ret)
+                goto resync;
+            va = ret;
+            ret = 0;
+            continue;
+        }
+        if ((w & 0xA0030003u) != 0u)      /* not a method header */
+            goto resync;
+        count = (w >> 18) & 0x7FFu;
+        method = w & 0x1FFCu;
+        if (method == PB_CONST_LOAD || (method + 4u * count > PB_CONST_FIRST &&
+                                        method < PB_CONST_END)) {
+            int noninc = (w & 0x40000000u) != 0u;
+
+            if (!guest_readable(va + 4u, 4ull * count))
+                goto resync;
+            for (i = 0; i < count; i++)
+                pb_method(noninc ? method : method + 4u * i, HLE_MEM32(va + 4u + 4u * i));
+        }
+        va += 4u + 4u * count;
+        words += count;
+    }
+    pb_flush();
+    g_pb_scan = put;
+    return;
+resync:
+    pb_flush();
+    g_pb_resyncs++;
+    {
+        static int said;
+        if (said++ < 3)
+            fprintf(stderr, "[HLE-D3D8] push buffer constants: walk from 0x%08X lost its "
+                    "way at 0x%08X (word 0x%08X); resynchronised at 0x%08X "
+                    "(%lu constants applied over %lu walks so far)\n", g_pb_scan, va,
+                    guest_readable(va, 4u) ? HLE_MEM32(va) : 0u, put, g_pb_constants,
+                    g_pb_walks);
+    }
+    g_pb_scan = put;
+}
+
 /* Title RAM or the contiguous window. */
 static int guest_readable(uint32_t va, uint64_t bytes)
 {
@@ -303,6 +465,9 @@ static void report(void)
         fprintf(stderr, "[HLE-D3D8] shadow buffers: skipped %lu with no stream 0 buffer, "
                 "%lu out of range; %lu drawn from title-pushed arrays (%lu not)\n",
                 g_skip_no_stream, g_skip_range, g_push_draws, g_push_failed);
+        if (g_pb_walks)
+            fprintf(stderr, "[HLE-D3D8] push buffer constants: %lu applied over %lu walks, "
+                    "%lu resync(s)\n", g_pb_constants, g_pb_walks, g_pb_resyncs);
         last = now;
     }
 }
