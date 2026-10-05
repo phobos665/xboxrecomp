@@ -3644,6 +3644,16 @@ static void surface_measure(uint32_t va, UINT *w, UINT *h, uint32_t *fmt)
     }
 }
 
+IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surface);
+
+static int rt_surfaces_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_RT_SURFACES", 1);
+    return on;
+}
+
 static int rt_parentless_is_backbuffer(void)
 {
     static int on = -1;
@@ -3842,6 +3852,14 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
              * Burnout 2 black -- so this is a switch until the library has
              * been measured with it. */
             kind = 0;
+        } else if (!parent && rt_surfaces_on()) {
+            /* A bare surface: a host render target keyed by its memory, which
+             * a texture over the same memory then samples
+             * (hle_d3d8_render_surface). RECOMP_HLE_D3D8_RT_SURFACES=0 sends
+             * these to a scratch target again. */
+            texture = hle_d3d8_render_surface(g_shadow, rt);
+            target = (IDirect3DBaseTexture8 *)texture;
+            kind = texture ? 1 : 2;
         } else {
             kind = 2;
         }

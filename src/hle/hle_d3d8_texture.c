@@ -557,6 +557,9 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
     return e->host;
 }
 
+static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
+                                               unsigned long now);
+
 static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
 {
     unsigned long now = hle_d3d8_shadow_swaps();
@@ -572,6 +575,13 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
         IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
         if (fb)
             return fb;
+    }
+    /* Memory the title rendered into as a bare surface: the host's drawing
+     * is the content (hle_d3d8_render_surface). */
+    {
+        IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
+        if (rs)
+            return rs;
     }
 
     for (i = 0; i < g_texture_count; i++) {
@@ -1218,6 +1228,82 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
     fprintf(stderr, "[HLE-D3D8] shadow render target texture 0x%08X: format 0x%02X "
             "%ux%u, %u level(s)\n", va, t.fmt, t.width, t.height, t.levels);
     return e->host;
+}
+
+/* Whether two pixel containers describe the same pixels: the format and the
+ * dimensions, not the mip count or the container's own bits. */
+static int same_pixels(uint32_t fa, uint32_t sa, uint32_t fb, uint32_t sb)
+{
+    if (((fa >> 8) & 0xFFu) != ((fb >> 8) & 0xFFu))
+        return 0;
+    if (sa || sb)
+        return sa == sb;
+    return ((fa >> 20) & 0xFFu) == ((fb >> 20) & 0xFFu);
+}
+
+/* A render target the title made as a bare surface (no parent texture), and
+ * samples through a texture object of its own over the same memory -- the
+ * NV2A reads texels from an address, so the two are one image. Need for
+ * Speed Underground 2 builds its reflections and bloom that way: 320x240
+ * LIN_A8R8G8B8 surfaces at 0x003EA400 and friends, bound back as textures
+ * at 0x003E75DC (same data 0x02B85700). Sent to a scratch target, what was
+ * drawn was thrown away and the texture read the guest's bytes -- the
+ * allocator's 0xAA fill, a flat grey across the menu's floor.
+ *
+ * The entry is keyed by the pixels (data, format, size), with va 0, and
+ * host_texture finds it from any texture or surface over that memory. NULL
+ * (counted) if the surface is not one this file can mirror. */
+IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surface)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    texture_entry *e;
+    uint32_t data = HLE_MEM32(surface + 4), format = HLE_MEM32(surface + 12);
+    uint32_t size = HLE_MEM32(surface + 16);
+    IDirect3DTexture8 *have = rendered_surface_for(data, format, size, now);
+
+    if (have)
+        return have;
+    if (!read_layout(surface, &t))
+        return NULL;
+    e = cache_slot(dev, now);
+    if (!e)
+        return NULL;
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, 1, D3DUSAGE_RENDERTARGET,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT, &e->host)) ||
+        !e->host) {
+        memset(e, 0, sizeof *e);
+        g_skip_create++;
+        return NULL;
+    }
+    e->va = 0;
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->rendered = 1;
+    e->checked_swap = e->used_swap = now;
+    fprintf(stderr, "[HLE-D3D8] shadow render target surface 0x%08X: format 0x%02X %ux%u "
+            "at 0x%08X, sampled by any texture over that memory\n",
+            surface, t.fmt, t.width, t.height, data);
+    return e->host;
+}
+
+/* The host render target a texture's memory was drawn into as a bare
+ * surface (hle_d3d8_render_surface), or NULL. */
+static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
+                                               unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size)) {
+            c->used_swap = now;
+            return c->host;
+        }
+    }
+    return NULL;
 }
 
 /* 1x1 opaque white, created once, never evicted. */
