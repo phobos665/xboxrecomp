@@ -26,6 +26,7 @@
  */
 
 #include "kernel.h"
+#include "mod_patches.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #ifdef _WIN32
@@ -10671,4 +10672,10 @@ void xbox_kernel_bridge_init(void)
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
+    /* A mod's tuning patches (mod_patches.h). Here because this is the last
+     * step every host's start-up shares before guest code runs: the image is
+     * mapped, the path layer knows the mods folder, and the thunk table this
+     * function just wrote cannot overwrite a patch. Watchpoints arm after
+     * this, so patching does not trip them. */
+    xbox_mod_patches_apply();
 }

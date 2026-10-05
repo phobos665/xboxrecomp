@@ -304,6 +304,17 @@ static int xbox_mods_lookup(const WCHAR *remainder, WCHAR *out, DWORD n)
     return 1;
 }
 
+/* The mods folder in the ANSI code page (for the A-suffixed calls in
+ * mod_patches.c), or 0 when there is no overlay. */
+int xbox_path_mods_dir(char *out, size_t n)
+{
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    if (!s_mods_dir[0] || !n)
+        return 0;
+    return WideCharToMultiByte(CP_ACP, 0, s_mods_dir, -1, out, (int)n, NULL, NULL) > 0;
+}
+
 /*
  * The raw disk device, \Device\Harddisk0\Partition0.
  *
@@ -706,6 +717,17 @@ static int xbox_mods_lookup(const char *remainder, char *out, DWORD n)
     if (stat(candidate, &st) != 0 || S_ISDIR(st.st_mode))
         return 0;
     memcpy(out, candidate, (size_t)len + 1);
+    return 1;
+}
+
+/* The mods folder, or 0 when there is no overlay. */
+int xbox_path_mods_dir(char *out, size_t n)
+{
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    if (!s_mods_dir[0] || !n || strlen(s_mods_dir) >= n)
+        return 0;
+    memcpy(out, s_mods_dir, strlen(s_mods_dir) + 1);
     return 1;
 }
 

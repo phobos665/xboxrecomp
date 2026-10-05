@@ -567,6 +567,8 @@ typedef char  xbox_host_char;
 const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
+/* The mods folder that overlays the disc (kernel_path.c), or 0 if none. */
+int xbox_path_mods_dir(char *out, size_t n);
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
