@@ -1,0 +1,37 @@
+[
+ {
+  "start": "0x00020E08",
+  "observed": true,
+  "note": "Out-of-line tail of sub_000206F0 (pop esi; mov eax,1; pop ebx; ret), two instructions into sub_00020E06. sub_000206F0's switch default (ja at the top, before edi/ebp are pushed) jumps here, so it was a [STUB] at run time and the parent returned with esi/ebx unrestored; sub_0001DDD0 then read through esi=0xFA108AEA and faulted (run r2, 49.7 s). Pops only registers the parent saved; checked by hand."
+ },
+ {
+  "start": "0x00028FB0",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0014BEE9",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001535E0",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0017CDB0",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00189250",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00232D04",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ }
+]

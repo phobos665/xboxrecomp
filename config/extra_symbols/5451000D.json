@@ -1,0 +1,81 @@
+{
+  "_title": "WWE Raw 2 (0x5451000D), XDK 5233",
+  "_why": [
+    "XbSymbolDatabase does not cover XMV, the video library, so these",
+    "addresses had no names and could not be replaced by name. Without them",
+    "the title decodes its intro movies (Movie/Intro/int_thq.xmv first) with",
+    "its own lifted decoder and every frame after the legal screen is black:",
+    "the shadow renderer saw 2 texture uploads and no re-uploads in 660 swaps.",
+    "",
+    "scripts/section_calls.py finds seven calls crossing into the XMV section",
+    "(0x0020A480..0x00232314). Create and Destroy sit at the same offsets into",
+    "the section as Breakdown's, Future Perfect's and Black's (+0x10D, +0x651);",
+    "the rest are named from how the player code at 0x000211F0..0x000217CC",
+    "calls them, against the protocol in src/hle/hle_xmv.c."
+  ],
+  "symbols": [
+    {
+      "library": "XMV",
+      "kind": "function",
+      "address": 2139533,
+      "name": "XMVPlaybackCreate",
+      "call": "stdcall",
+      "stack_bytes": 12,
+      "_note": "0x0020A58D, from 0x00021612 in the player at 0x000215F0, three arguments; the player calls its stream-info reader (0x000211F0) straight after."
+    },
+    {
+      "library": "XMV",
+      "kind": "function",
+      "address": 2140881,
+      "name": "XMVPlaybackDestroy",
+      "call": "stdcall",
+      "stack_bytes": 4,
+      "_note": "0x0020AAD1, from 0x0002141E with the handle; the caller zeroes its handle field at +0x10C after."
+    },
+    {
+      "library": "XMV",
+      "kind": "function",
+      "address": 2141107,
+      "name": "XMVPlaybackGetStreamInfo",
+      "call": "stdcall",
+      "stack_bytes": 8,
+      "_note": "0x0020ABB3, from 0x00021214: (handle, the player's +0x110); the caller then reads the audio stream count at +0x11C."
+    },
+    {
+      "library": "XMV",
+      "kind": "function",
+      "address": 2141135,
+      "name": "XMVPlaybackGetAudioStreamInfo",
+      "call": "stdcall",
+      "stack_bytes": 12,
+      "_note": "0x0020ABCF, from 0x0002123D in a loop over the audio stream count and from 0x000216D0/0x000216FD: (handle, index, &info); the caller tests the format tag for 0x69 (Xbox ADPCM)."
+    },
+    {
+      "library": "XMV",
+      "kind": "function",
+      "address": 2141287,
+      "name": "XMVPlaybackCreateAudioStream",
+      "call": "stdcall",
+      "stack_bytes": 20,
+      "_note": "0x0020AC67, from 0x00021721, 0x00021792 and 0x000217B8: (handle, index, 0, info or NULL, &stream)."
+    },
+    {
+      "library": "XMV",
+      "kind": "function",
+      "address": 2141668,
+      "name": "XMVPlaybackStart",
+      "call": "stdcall",
+      "stack_bytes": 4,
+      "_note": "0x0020ADE4, from 0x000217A6 with the handle, before the first Update."
+    },
+    {
+      "library": "XMV",
+      "kind": "function",
+      "address": 2141681,
+      "name": "XMVPlaybackUpdate",
+      "call": "stdcall",
+      "stack_bytes": 16,
+      "_note": "0x0020ADF1, from 0x0002136A in 0x000212F0: (handle, a surface from the player's table at +0x134, &status, user); the caller compares the status with 1."
+    }
+  ]
+}
