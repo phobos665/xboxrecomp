@@ -356,5 +356,65 @@ class EntriesByDisplacement(unittest.TestCase):
         self.assertEqual(engine.jump_table_entries(table_va), targets)
 
 
+def build_two_level(n_targets, with_movzx=True, first_index=0):
+    """WWE Raw 2's sub_00156800 shape: a byte table of case -> body indices
+    straight after a dword table of bodies, dispatched by
+
+        movzx eax, byte ptr [eax + B]     0F B6 80 <B>
+        jmp   dword ptr [eax*4 + T]       FF 24 85 <T>
+
+    with T immediately after the jump and B == T + 4 * n_targets."""
+    img = _Image(BASE, b"\x90" * 0x400)
+    off = 0x20
+    table_va = BASE + off + 7 + 7
+    byte_va = table_va + 4 * n_targets
+    if with_movzx:
+        img.code[off:off + 3] = b"\x0f\xb6\x80"
+    else:
+        img.code[off:off + 3] = b"\x8d\x80\x00"   # not a movzx
+    img.code[off + 3:off + 7] = struct.pack("<I", byte_va)
+    img.code[off + 7:off + 10] = b"\xff\x24\x85"
+    img.code[off + 10:off + 14] = struct.pack("<I", table_va)
+    targets = [BASE + 0x100 + i * 0x10 for i in range(n_targets)]
+    for i, t in enumerate(targets):
+        o = table_va - BASE + i * 4
+        img.code[o:o + 4] = struct.pack("<I", t)
+    o = byte_va - BASE
+    img.code[o:o + 6] = bytes([first_index] * 6)
+    return img, table_va, targets
+
+
+class TwoLevelSwitches(unittest.TestCase):
+    """A dword table under min_entries is still a switch when a movzx reads
+    the byte table that starts where it ends."""
+
+    def _tables(self, img):
+        engine = DisasmEngine(img)
+        engine.linear_sweep(img.sections[0])
+        engine.resync_jump_tables()
+        return engine
+
+    def test_a_one_entry_table_behind_a_byte_table_is_found(self):
+        img, table_va, targets = build_two_level(1)
+        engine = self._tables(img)
+        self.assertIn(table_va, engine.jump_tables)
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+
+    def test_two_entries_as_well(self):
+        img, table_va, targets = build_two_level(2)
+        engine = self._tables(img)
+        self.assertEqual(engine.jump_table_entries(table_va), targets)
+
+    def test_without_the_movzx_a_short_table_is_still_left_alone(self):
+        img, table_va, _ = build_two_level(1, with_movzx=False)
+        engine = self._tables(img)
+        self.assertNotIn(table_va, engine.jump_tables)
+
+    def test_an_index_past_the_table_is_not_this_switch(self):
+        img, table_va, _ = build_two_level(1, first_index=3)
+        engine = self._tables(img)
+        self.assertNotIn(table_va, engine.jump_tables)
+
+
 if __name__ == "__main__":
     unittest.main()
