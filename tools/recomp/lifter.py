@@ -2046,6 +2046,11 @@ class Lifter:
         if len(ops) < 1:
             return ["/* push: no operand */"]
         val = _fmt_operand_read(ops[0])
+        # An operand-size prefix makes push move two bytes, not four. (Segment
+        # registers keep a 4-byte slot; _REG_WIDTH does not list them.)
+        if ops[0].type in ("reg", "mem") and _operand_width(ops[0]) == 2:
+            return [f"{{ uint16_t _pv = (uint16_t)({val}); esp -= 2; "
+                    f"MEM16(esp) = _pv; }} /* push16 */"]
         return [f"PUSH32(esp, {val});"]
 
     def _lift_pop(self, insn, ops):
@@ -2056,6 +2061,11 @@ class Lifter:
             # Segment register pop → discard from stack
             if r in ("fs", "gs", "cs", "ds", "es", "ss"):
                 return [f"{{ uint32_t _tmp; POP32(esp, _tmp); }} /* pop {r} - segment register */"]
+            # pop r16 takes two bytes and writes only the low half. POP32 with
+            # the 16-bit name emitted `POP32(esp, bx)`, which is not C at all.
+            if _operand_width(ops[0]) == 2:
+                return [f"{{ uint32_t _tmp = MEM16(esp); esp += 2; "
+                        f"{_fmt_set_reg(r, '_tmp')} }} /* pop16 */"]
             # Sample esp at each pop in a traced function. An epilogue that ends
             # `mov esp, ebp` restores esp unconditionally, so any drift inside
             # the function is erased before a return-time trace can see it --
@@ -2065,6 +2075,9 @@ class Lifter:
                 return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", "pop {r}");',
                         f"POP32(esp, {r});"]
             return [f"POP32(esp, {r});"]
+        elif _operand_width(ops[0]) == 2:
+            return [f"{{ uint32_t _tmp = MEM16(esp); esp += 2; "
+                    f"{_fmt_operand_write(ops[0], '_tmp')} }} /* pop16 */"]
         else:
             return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]
 
