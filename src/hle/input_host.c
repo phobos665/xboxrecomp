@@ -123,7 +123,8 @@ static void fake_apply(RecompInputGamepad *g, int i)
  *
  * A step may also be `snap` (`95000:snap`): at that moment the whole of guest
  * RAM is written to RECOMP_SNAP_DIR (else the working directory) as
- * snap_<ms>.bin, 64 MB, guest address = file offset. Two snapshots either
+ * snap_<ms>.bin, 128 MB: low RAM at file offset = guest address, then the
+ * contiguous window, file offset 64 MB = guest 0x80000000. Two snapshots either
  * side of a scripted action -- before and after five shots -- and a diff finds
  * what the action changed: the way to find an ammo counter, a health value
  * or a timer without knowing anything about the title. */
@@ -221,10 +222,11 @@ static int seq_owns_pad(void)
 }
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);   /* src/kernel/xbox_memory_layout.c */
+#define XBOX_CONTIG_BASE_VA 0x80000000u           /* XBOX_CONTIG_BASE, src/kernel/kernel.h */
 
-/* Guest RAM, 0 .. 64 MB, to snap_<ms>.bin. Pages the host cannot read (the
+/* Guest RAM, 0 .. 64 MB and 0x80000000 .. +64 MB, to snap_<ms>.bin. Pages the host cannot read (the
  * guard page at 0, anything protected) are written as zeros, so the file is
- * always the full size and an offset is always the guest address. */
+ * always the full size and an offset always maps to one guest address. */
 static void seq_snapshot(unsigned long at_ms)
 {
     enum { RAM = 64u << 20, CHUNK = 64u << 10 };
@@ -234,6 +236,7 @@ static void seq_snapshot(unsigned long at_ms)
     char path[600];
     FILE *f;
     uint32_t va;
+    int window;
 
     if (!base) {
         fprintf(stderr, "  [PAD] snap at %lu ms: guest memory is not mapped yet\n", at_ms);
@@ -246,15 +249,24 @@ static void seq_snapshot(unsigned long at_ms)
         fprintf(stderr, "  [PAD] snap at %lu ms: cannot write %s\n", at_ms, path);
         return;
     }
-    for (va = 0; va < RAM; va += CHUNK) {
-        MEMORY_BASIC_INFORMATION mbi;
-        const void *src = zeros;
-        if (VirtualQuery(base + va, &mbi, sizeof mbi) == sizeof mbi
-            && mbi.State == MEM_COMMIT
-            && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
-            && (uint8_t *)mbi.BaseAddress + mbi.RegionSize >= base + va + CHUNK)
-            src = base + va;
-        fwrite(src, 1, CHUNK, f);
+    /* Two windows, one after the other: low RAM (the image and its heap),
+     * then the contiguous window at 0x80000000 where physical memory is seen
+     * -- MmAllocateContiguousMemory, and with it most of a title's objects. A
+     * snapshot of low RAM alone found TimeSplitters 2's shot statistics and
+     * none of its ammunition. */
+    for (window = 0; window < 2; window++) {
+        uint64_t start = window ? XBOX_CONTIG_BASE_VA : 0;
+        for (va = 0; va < RAM; va += CHUNK) {
+            const uint8_t *p = base + start + va;
+            MEMORY_BASIC_INFORMATION mbi;
+            const void *src = zeros;
+            if (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi
+                && mbi.State == MEM_COMMIT
+                && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+                && (const uint8_t *)mbi.BaseAddress + mbi.RegionSize >= p + CHUNK)
+                src = p;
+            fwrite(src, 1, CHUNK, f);
+        }
     }
     fclose(f);
     fprintf(stderr, "  [PAD] snap at %lu ms -> %s\n", at_ms, path);
