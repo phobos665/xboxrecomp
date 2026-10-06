@@ -111,6 +111,65 @@ void dropBuffer(uint32_t slot, const char *reason)
     }
 }
 
+/* RECOMP_AUDIO_RECORD=<folder>: everything handed to the output is also
+ * written there, one WAV per voice -- slot<n>_<ms>_<rate>.wav, <ms> the time
+ * since the first sound -- for checking a sound mod or a decoder without
+ * listening. Chunks are appended as they come, so a DirectSound buffer that
+ * the HLE pumps a piece at a time is one continuous file; a new file starts
+ * when a voice's rate or format changes. The header is brought up to date
+ * after every chunk, so a run that is killed still leaves valid files. Written
+ * whether or not the run is muted. Slots as in audio_output.h. */
+struct Recording {
+    FILE *file;
+    uint32_t rate, channels, bits, bytes;
+};
+Recording recordings[kVoiceCount];
+
+void recordBuffer(uint32_t slot, const uint8_t *pcm, uint32_t bytes,
+                  uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample)
+{
+    static const char *dir = std::getenv("RECOMP_AUDIO_RECORD");
+    static ULONGLONG start;
+    if (!dir || !*dir || slot >= kVoiceCount || !pcm || !bytes) return;
+    if (!start) {
+        start = GetTickCount64();
+        CreateDirectoryA(dir, nullptr);
+        std::fprintf(stderr, "[audio-output] recording every voice to %s\n", dir);
+    }
+    Recording &r = recordings[slot];
+    if (r.file && (r.rate != sample_rate || r.channels != channels || r.bits != bits_per_sample)) {
+        std::fclose(r.file);
+        r = {};
+    }
+    const uint32_t align = channels * (bits_per_sample / 8);
+    if (!r.file) {
+        char path[MAX_PATH];
+        std::snprintf(path, sizeof path, "%s\\slot%03u_%08llu_%u.wav", dir, slot,
+                      static_cast<unsigned long long>(GetTickCount64() - start), sample_rate);
+        r.file = std::fopen(path, "wb");
+        if (!r.file) return;
+        r.rate = sample_rate;
+        r.channels = channels;
+        r.bits = bits_per_sample;
+        const uint32_t zero = 0, fmt = 16, rate_bytes = sample_rate * align;
+        const uint16_t tag = 1, ch = static_cast<uint16_t>(channels),
+                       blk = static_cast<uint16_t>(align), bits = static_cast<uint16_t>(bits_per_sample);
+        std::fwrite("RIFF", 1, 4, r.file); std::fwrite(&zero, 4, 1, r.file);
+        std::fwrite("WAVEfmt ", 1, 8, r.file); std::fwrite(&fmt, 4, 1, r.file);
+        std::fwrite(&tag, 2, 1, r.file); std::fwrite(&ch, 2, 1, r.file);
+        std::fwrite(&sample_rate, 4, 1, r.file); std::fwrite(&rate_bytes, 4, 1, r.file);
+        std::fwrite(&blk, 2, 1, r.file); std::fwrite(&bits, 2, 1, r.file);
+        std::fwrite("data", 1, 4, r.file); std::fwrite(&zero, 4, 1, r.file);
+    }
+    std::fwrite(pcm, 1, bytes, r.file);
+    r.bytes += bytes;
+    const uint32_t riff = 36 + r.bytes;
+    std::fseek(r.file, 4, SEEK_SET); std::fwrite(&riff, 4, 1, r.file);
+    std::fseek(r.file, 40, SEEK_SET); std::fwrite(&r.bytes, 4, 1, r.file);
+    std::fseek(r.file, 0, SEEK_END);
+    std::fflush(r.file);
+}
+
 } // namespace
 
 extern "C" void recomp_audio_output_initialize(void)
@@ -217,6 +276,8 @@ extern "C" int recomp_audio_output_submit(
     int32_t volume_hundredth_db)
 {
     recomp_audio_output_initialize();
+    if (channels >= 1 && channels <= 2 && (bits_per_sample == 8 || bits_per_sample == 16))
+        recordBuffer(slot, pcm, bytes, sample_rate, channels, bits_per_sample);
     if (!engine || bytes == 0) return 0;
     if (slot >= kVoiceCount || !pcm || bytes > kMaxBufferBytes ||
         sample_rate < XAUDIO2_MIN_SAMPLE_RATE ||

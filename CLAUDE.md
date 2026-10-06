@@ -123,6 +123,13 @@ played them (`RECOMP_DSOUND_WALLCLOCK=1` for the old wall clock). If a title's s
 drifts again, read `[audio-output] dropped=` and the `[DSOUND] ... from the host's play
 position` line before suspecting anything else.
 
+**`RECOMP_AUDIO_RECORD=<folder>` writes what the title played** (Oct 2026): one WAV per output
+voice, `slot<n>_<ms>_<rate>.wav`, appended chunk by chunk (a new file when a voice's rate
+changes), valid even if the run is killed, and written when muted. A one-shot effect lands
+as its own short file on a buffer slot, so a sound mod can be checked sample for sample
+without listening: TimeSplitters 2's GoldenEye sniper shot came back 100% identical to what
+the mod encoded.
+
 **Widescreen and internal resolution** are investigated in
 `docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or
 game-specific. Two things to know before touching either: `XGetVideoFlags` returns 0 today
