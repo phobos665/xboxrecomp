@@ -3344,6 +3344,9 @@ static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 /* Whether each token's file was opened for asynchronous I/O: CreateOptions
  * without FILE_SYNCHRONOUS_IO_ALERT or _NONALERT. See bridge_NtReadFile. */
 static unsigned char s_handle_async[BRIDGE_HANDLE_MAX];
+/* Whether it was opened with FILE_NO_INTERMEDIATE_BUFFERING. See
+ * bridge_NtWriteFile: the host file is buffered, the Xbox one was not. */
+static unsigned char s_handle_nobuf[BRIDGE_HANDLE_MAX];
 
 /* What kind of object each token refers to.
  *
@@ -3442,6 +3445,7 @@ static HANDLE bridge_take_handle(uint32_t token)
             HANDLE h = s_handle_table[i];
             s_handle_table[i] = NULL;
             s_handle_async[i] = 0;
+            s_handle_nobuf[i] = 0;
             return h;
         }
     }
@@ -3636,9 +3640,21 @@ static void bridge_mark_async(uint32_t handle_va, uint32_t options)
     if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG)
         return;
     i = token & BRIDGE_HANDLE_MASK;
-    if (i > 0 && i < BRIDGE_HANDLE_MAX)
+    if (i > 0 && i < BRIDGE_HANDLE_MAX) {
         s_handle_async[i] = (options & (XBOX_FILE_SYNCHRONOUS_IO_ALERT |
                                         XBOX_FILE_SYNCHRONOUS_IO_NONALERT)) == 0;
+        s_handle_nobuf[i] = (options & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) != 0;
+    }
+}
+
+static int bridge_handle_is_nobuf(uint32_t token)
+{
+    uint32_t i;
+
+    if ((token & 0xFF000000u) != BRIDGE_HANDLE_TAG)
+        return 0;
+    i = token & BRIDGE_HANDLE_MASK;
+    return i > 0 && i < BRIDGE_HANDLE_MAX && s_handle_nobuf[i];
 }
 
 static int bridge_handle_is_async(uint32_t token)
@@ -3734,12 +3750,21 @@ static void bridge_NtCreateFile(void)
                   : _e == 183u ? " ERROR_ALREADY_EXISTS" : "",
                     access, share, disposition, options, nm ? nm : "(none)",
                     obj_attrs ? BRIDGE_MEM32(obj_attrs) : 0u);
-        } else
+        } else {
             /* The disposition matters on success too: an overwrite or
              * supersede of an existing file truncates it, which is how a
              * title's freshly written cache file can come back as zeros. */
-            fprintf(stderr, "  [FILE] -> 0x%08X (access 0x%08X disposition %u options 0x%X)\n",
+            fprintf(stderr, "  [FILE] -> 0x%08X (access 0x%08X disposition %u options 0x%X)",
                     g_eax, access, disposition, options);
+            /* A create names what it made: a relative name with a root
+             * handle prints no [PATH] line of its own. */
+            if (disposition != 1u) {
+                const char *nm = obj_attrs ? bridge_get_xbox_path(obj_attrs) : NULL;
+                fprintf(stderr, " name \"%s\" root 0x%08X", nm ? nm : "(none)",
+                        obj_attrs ? BRIDGE_MEM32(obj_attrs) : 0u);
+            }
+            fprintf(stderr, "\n");
+        }
     }
     fflush(stderr);
 }
@@ -4044,9 +4069,25 @@ static void bridge_NtReadFile(void)
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         fflush(stderr);
     }
-    bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
-    bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
-                            iostatus);
+    /* A request that fails before it pends completes nothing.
+     *
+     * The I/O manager copies an IRP's status into the caller's status block,
+     * and signals its event, only when the IRP succeeded or had pended; one a
+     * driver refuses outright -- a read starting at or past the end of the
+     * file -- just returns the error. An OVERLAPPED's status block therefore
+     * still holds the STATUS_PENDING XAPI's ReadFile put there. Forza's
+     * reader depends on it: its read-ahead past the end of Euro.SXWad fails
+     * with ERROR_HANDLE_EOF, it sets that OVERLAPPED's event itself, and its
+     * next GetOverlappedResult on it must succeed. Written here, the block
+     * said STATUS_END_OF_FILE, GetOverlappedResult failed, and the title
+     * showed its dirty-disc screen. Asynchronous handles only, which is where
+     * the status block outlives the call. */
+    int failed_outright = async_file && (g_eax & 0xC0000000u) == 0xC0000000u;
+    if (!failed_outright) {
+        bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
+        bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
+                                iostatus);
+    }
 
     /* A read on an asynchronous handle pends.
      *
@@ -4269,8 +4310,28 @@ static void bridge_NtWriteFile(void)
         poff = &off;
     }
     bridge_log_guest_text(buffer_va, length);
+    /* An unbuffered write that pads the file's last sector does not move its
+     * end. The title has to write whole sectors, so the tail of a file it
+     * sized first goes out rounded up; the Xbox keeps the size it was given,
+     * and the host file -- buffered, see xbox_NtCreateFile -- would grow to
+     * the sector. Forza's installer sets each cache file's size, copies it
+     * unbuffered, then compares the size with its manifest: 0xB0A00 against
+     * 0xB0899 made it re-create every file, empty, and show its dirty-disc
+     * screen. Only the padding is held back; a write that starts at or past
+     * the end, or runs a sector or more beyond it, still extends the file. */
+    LARGE_INTEGER eof_before = {0};
+    int hold_eof = poff && length && bridge_handle_is_nobuf(STACK_ARG(0))
+                && GetFileSizeEx(handle, &eof_before)
+                && off.QuadPart < eof_before.QuadPart
+                && off.QuadPart + length > eof_before.QuadPart
+                && off.QuadPart + length - eof_before.QuadPart < 512;
     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    if (hold_eof && g_eax == 0) {
+        FILE_END_OF_FILE_INFO eof;
+        eof.EndOfFile = eof_before;
+        SetFileInformationByHandle(handle, FileEndOfFileInfo, &eof, sizeof eof);
+    }
     {
         /* The [READ] line's counterpart, first few only: where a write took
          * its bytes from, how many, the first word, and what came back. */
