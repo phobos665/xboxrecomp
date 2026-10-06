@@ -3735,7 +3735,11 @@ static void bridge_NtCreateFile(void)
                     access, share, disposition, options, nm ? nm : "(none)",
                     obj_attrs ? BRIDGE_MEM32(obj_attrs) : 0u);
         } else
-            fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
+            /* The disposition matters on success too: an overwrite or
+             * supersede of an existing file truncates it, which is how a
+             * title's freshly written cache file can come back as zeros. */
+            fprintf(stderr, "  [FILE] -> 0x%08X (access 0x%08X disposition %u options 0x%X)\n",
+                    g_eax, access, disposition, options);
     }
     fflush(stderr);
 }
@@ -4267,6 +4271,23 @@ static void bridge_NtWriteFile(void)
     bridge_log_guest_text(buffer_va, length);
     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    {
+        /* The [READ] line's counterpart, first few only: where a write took
+         * its bytes from, how many, the first word, and what came back. */
+        static int said, said_big;
+        if (said < 24 || (length >= 65536u && said_big < 12)) {
+            const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
+            if (said < 24) said++; else said_big++;
+            WCHAR where[MAX_PATH];
+            DWORD wn = GetFinalPathNameByHandleW(handle, where, MAX_PATH, FILE_NAME_NORMALIZED);
+            fprintf(stderr, "  [WRITE] @%s%lld want=%u wrote=%u st=0x%08X <- 0x%08X  %02X %02X %02X %02X  %ls\n",
+                    poff ? "" : "seq", poff ? (long long)off.QuadPart : 0LL, length,
+                    (unsigned)ios.Information, (unsigned)g_eax, buffer_va,
+                    p && length > 0 ? p[0] : 0, p && length > 1 ? p[1] : 0,
+                    p && length > 2 ? p[2] : 0, p && length > 3 ? p[3] : 0,
+                    wn && wn < MAX_PATH ? where : L"?");
+        }
+    }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
@@ -4300,6 +4321,18 @@ static void bridge_NtSetInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    {
+        /* What a title changes about an open file, the first few times:
+         * end-of-file, allocation, position, rename, delete. */
+        static int said;
+        if (said < 32 && info_va) {
+            said++;
+            fprintf(stderr, "  [FILE] SetInformation class %u len %u: %08X %08X %08X\n",
+                    infoclass, length, BRIDGE_MEM32(info_va),
+                    length > 4 ? BRIDGE_MEM32(info_va + 4) : 0u,
+                    length > 8 ? BRIDGE_MEM32(info_va + 8) : 0u);
+        }
+    }
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
