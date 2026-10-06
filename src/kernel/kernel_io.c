@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ============================================================================
@@ -399,8 +400,9 @@ NTSTATUS __stdcall xbox_IoCreateSymbolicLink(
             g_symlinks[i].used = TRUE;
             strcpy(g_symlinks[i].link, link);
             strcpy(g_symlinks[i].target, target);
-            xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_IO,
-                "IoCreateSymbolicLink: '%s' -> '%s'", link, target);
+            /* Always said: a title mounting its own drive letter is a
+             * bring-up fact (Forza mounts N: and its cache lives there). */
+            fprintf(stderr, "  [PATH] link %s -> %s\n", link, target);
             return STATUS_SUCCESS;
         }
     }
