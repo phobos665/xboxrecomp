@@ -81,18 +81,19 @@ extern ptrdiff_t g_xbox_mem_offset;
  * TODO: Set these from your xbe_parser output.
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
-#define YOUR_GAME_ENTRY_POINT   0x000BC0A5  /* XBE entry point VA */
+#define YOUR_GAME_ENTRY_POINT   0x000BD2F5  /* XBE entry point VA */
 /* Relative to the executable's own directory, titles/<title>/build/<Config>/,
  * which is where scripts/run_and_report.py starts it. Run it from there by
  * hand too, or the XBE is not found. */
-#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\Max Payne\\default.xbe"
-#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\Max Payne"
+#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\MaxPayne\\default.xbe"
+#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\MaxPayne"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
 /* Defined in recomp_trace.c. Declared here rather than pulled from
  * the generated headers, which this file does not include. */
 void recomp_profile_dump(void);
+void recomp_exit_trace_init(void);      /* src/kernel/exit_trace.c */
 
 /* Defined in kernel_bridge.c: the APU is a separate library the kernel must
  * not need to link, so the kernel takes its interrupt line as a callback. */
@@ -521,6 +522,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    /* And the other way a run ends: an exit nobody logged. Prints [EXIT]
+     * with the code and both stacks before the process goes (exit_trace.c). */
+    recomp_exit_trace_init();
 
     /* Step 1: Find and load the XBE */
     {
