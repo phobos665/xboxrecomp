@@ -478,6 +478,11 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
                 g_esp, g_eax, g_ecx, g_edx, g_esi, g_edi);
         print_callers();
         print_stack();
+        /* Read the value with the page open. With RECOMP_WATCH_READS the
+         * page is no-access, and reading it here faulted inside this
+         * handler: every report was followed by a "read" from guest_read32
+         * itself until the budget ran out. */
+        protect_one(va, 1, PAGE_READWRITE);
         g_step_before = guest_read32(g_watch[idx].va);
         g_step_va = g_watch[idx].va;
     } else {
