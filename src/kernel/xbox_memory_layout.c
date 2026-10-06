@@ -3301,6 +3301,15 @@ uint32_t xbox_AllocThreadTib(void)
                    XBOX_THREAD_OBJ_SIZE);
             *(uint32_t *)TIB_VA(obj + XBOX_THREAD_ID_OFF) =
                 g_next_guest_thread_id++;
+            /* And its own TLS data. KTHREAD.TlsData (+0x28) is where XAPI's
+             * thread start-up finds the block it zero-fills and copies the
+             * template into; inherited, it was the main thread's block, so
+             * every new thread reset the main thread's thread-locals. Forza
+             * lost XAPI's current fiber that way -- each worker's start-up
+             * zeroed it -- and its first SwitchToFiber had nowhere to come
+             * from. The loader points the main thread's at its block the
+             * same way. */
+            *(uint32_t *)TIB_VA(obj + 0x28) = block;
             *(uint32_t *)TIB_VA(tib + 0x28) = obj;
         }
     }
