@@ -3719,17 +3719,22 @@ static void bridge_NtCreateFile(void)
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
         /* What was asked, as well as what came back: a failure on an existing
          * file is a bug only if the disposition should have opened it. */
-        if (g_eax)
+        /* And the name: a path that never reached translation prints no
+         * [PATH] line, so without it a failure says nothing about which file.
+         * Forza's cache writes failed that way, PATH_NOT_FOUND with no name. */
+        if (g_eax) {
+            const char *nm = obj_attrs ? bridge_get_xbox_path(obj_attrs) : NULL;
             fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s; access 0x%08X "
-                            "share %u disposition %u options 0x%X)\n",
+                            "share %u disposition %u options 0x%X) name \"%s\" root 0x%08X\n",
                     g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
                   : _e ==  3u ? " ERROR_PATH_NOT_FOUND"
                   : _e == 80u ? " ERROR_FILE_EXISTS"
                   : _e == 183u ? " ERROR_ALREADY_EXISTS" : "",
-                    access, share, disposition, options);
-        else
+                    access, share, disposition, options, nm ? nm : "(none)",
+                    obj_attrs ? BRIDGE_MEM32(obj_attrs) : 0u);
+        } else
             fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
     }
     fflush(stderr);
