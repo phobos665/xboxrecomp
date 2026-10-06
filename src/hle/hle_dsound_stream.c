@@ -638,17 +638,15 @@ HLE_EXPORT(CDirectSoundStream_Process)
     HLE_RETURN(DS_OK);
 }
 
-/* HRESULT CDirectSoundStream::Flush(this). Every pending packet comes back
- * flushed, and the clock moves to the end of the data. */
-HLE_EXPORT(CDirectSoundStream_Flush)
+/* Every pending packet comes back flushed, and the clock moves to the end of
+ * the data. */
+static void flush_stream(uint32_t object)
 {
-    g_calls_flush++;
-    note_caller("Flush");
     uint64_t now = now_ms();
     Stream *s;
 
     lock();
-    s = find_by_object(HLE_ARG(0));
+    s = find_by_object(object);
     if (s) {
         Packet flushed[MAX_PACKETS];
         int n = 0, i;
@@ -666,6 +664,42 @@ HLE_EXPORT(CDirectSoundStream_Flush)
         (void)now;
     }
     unlock();
+}
+
+/* HRESULT CDirectSoundStream::Flush(this) */
+HLE_EXPORT(CDirectSoundStream_Flush)
+{
+    g_calls_flush++;
+    note_caller("Flush");
+    flush_stream(HLE_ARG(0));
+    HLE_RETURN(DS_OK);
+}
+
+/* HRESULT CDirectSoundStream::FlushEx(this, REFERENCE_TIME rtTimeStamp,
+ * DWORD dwFlags). The timestamp is two stack words, so dwFlags is the
+ * fourth argument.
+ *
+ * Done now, whatever the timestamp and flags say. DSSTREAMFLUSHEX_ASYNC (1)
+ * lets the hardware finish the flush later, and a title that asks for it
+ * then pumps DirectSoundDoWork and polls GetStatus until the stream is idle:
+ * WWE Raw 2 does exactly that after each intro movie (0x00027BD0). With only
+ * Flush replaced, the XDK's own FlushEx ran against a stream this file owns,
+ * no packet ever completed, and the title spun there with no frame presented
+ * again -- 31 million GetStatus calls in 25 seconds. Completing every packet
+ * immediately is a flush that finished quickly, which an async caller has to
+ * accept anyway. A non-zero timestamp (flush at a future time) is treated as
+ * now; no title seen asks for one. */
+HLE_EXPORT(CDirectSoundStream_FlushEx)
+{
+    static int said;
+    g_calls_flush++;
+    note_caller("FlushEx");
+    if (said < 4 && (HLE_ARG(1) || HLE_ARG(2))) {
+        said++;
+        fprintf(stderr, "[DSOUND] stream FlushEx at time %08X%08X, flags %X: "
+                "flushed now\n", HLE_ARG(2), HLE_ARG(1), HLE_ARG(3));
+    }
+    flush_stream(HLE_ARG(0));
     HLE_RETURN(DS_OK);
 }
 

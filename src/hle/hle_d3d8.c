@@ -156,17 +156,24 @@ void hle_d3d8_note_stage_texels(uint32_t stage, uint32_t phys)
         g_stage_texels[stage] = phys;
 }
 
-/* RECOMP_XMV_LAYER=1: draw a playing movie over the frame on the host's
- * movie layer even when the title draws it itself -- for a title whose own
- * movie draw comes out wrong, and to tell a decoding fault from a drawing one. */
-static int movie_layer_forced(void)
+/* RECOMP_XMV_LAYER: whether a playing movie goes over the frame on the
+ * host's movie layer when the title draws it itself.
+ *   1      always -- for a title whose own movie draw comes out wrong, and
+ *          to tell a decoding fault from a drawing one
+ *   0      never: only a movie no draw sampled goes on the layer. For a
+ *          title that composes its menus over a YUY2 movie (WWE Raw 2's
+ *          front end is UI drawn over the movies in Movie/Menu, and the layer
+ *          covered all of it)
+ *   unset  a YUY2 movie goes on the layer even when sampled, others do not
+ *          (see the call in the swap path) */
+static int movie_layer_mode(void)
 {
-    static int forced = -1;
-    if (forced < 0) {
+    static int mode = -2;
+    if (mode == -2) {
         const char *e = getenv("RECOMP_XMV_LAYER");
-        forced = e && *e && strcmp(e, "0") != 0;
+        mode = !e || !*e ? -1 : strcmp(e, "0") != 0;
     }
-    return forced;
+    return mode;
 }
 
 /* After a draw reached the host. */
@@ -2102,7 +2109,8 @@ static void frame_end_shadow(void)
             d3d8_movie_draw();
             g_movie_drawn = 1;
         } else if (g_movie_phys &&
-                   (!g_movie_sampled || g_movie_yuy2 || movie_layer_forced())) {
+                   (!g_movie_sampled || movie_layer_mode() == 1 ||
+                    (g_movie_yuy2 && movie_layer_mode() != 0))) {
             /* A movie is playing and no draw this frame sampled its picture.
              * The title shows it by a way the host cannot see -- XGRA and
              * Breakdown draw through push buffers they fill themselves -- so
@@ -2115,7 +2123,8 @@ static void frame_end_shadow(void)
              * Breakdown use it that way, and Otogi, which textures from it,
              * does so through a two-pass draw that comes out black here while
              * the layer shows its promo exactly (RECOMP_XMV_LAYER=1). The
-             * cost is that anything drawn over such a movie is covered. */
+             * cost is that anything drawn over such a movie is covered,
+             * which is why RECOMP_XMV_LAYER=0 turns this case off. */
             d3d8_movie_draw();
             g_movie_drawn = 1;
         }
@@ -2352,6 +2361,11 @@ static int xbox_vsdt_expanded(uint32_t format, UINT *size)
     case 0x25: *size = 4; return 2;      /* SHORT2 */
     case 0x35: *size = 6; return 3;      /* SHORT3 */
     case 0x45: *size = 8; return 4;      /* SHORT4 */
+    /* NORMSHORT3: the one normalised-short width DXGI has no format for.
+     * WWE Raw 2's menu and in-ring declarations put one at v13, and every
+     * draw through them was skipped as "program without layout" -- about
+     * 23 a frame in the menus, the front-end text among them. */
+    case 0x31: *size = 6; return 3;
     default:   return 0;
     }
 }
@@ -4455,6 +4469,15 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
                 n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
                 n[2] = (float)((int32_t)bits >> 22) / 511.0f;
                 count = 3;
+            } else if (p->packed_format[k] == 0x31u) { /* NORMSHORT3 */
+                /* The SNORM rule, as NORMSHORT1/2/4 get from their DXGI
+                 * formats, so every width agrees: s / 32767, -32768 to -1. */
+                count = 3;
+                for (c = 0; c < count; c++) {
+                    int16_t s;
+                    memcpy(&s, at + 2 * c, sizeof s);
+                    n[c] = s == -32768 ? -1.0f : (float)s / 32767.0f;
+                }
             } else {                                 /* SHORTn: the value itself */
                 count = (int)(p->packed_format[k] >> 4);
                 for (c = 0; c < count; c++) {

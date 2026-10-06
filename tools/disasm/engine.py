@@ -252,6 +252,49 @@ class DisasmEngine:
 
         return count
 
+    def _two_level_switch(self, tbl: int, entries: int,
+                          dispatch_end: Optional[int]) -> bool:
+        """Whether a table too short for resync_jump_tables is a switch anyway.
+
+        MSVC compiles a switch whose cases share bodies as two tables: the
+        case value indexes a byte table, and the byte indexes a dword table of
+        the distinct bodies --
+
+            movzx eax, byte ptr [eax + B]
+            jmp   dword ptr [eax*4 + T]
+
+        with the dword table at T and the byte table straight after it, so
+        B == T + 4 * entries. When every case shares one body the dword table
+        has one entry, under min_entries, and was left as data. WWE Raw 2's
+        sub_00156800 is exactly that (six cases, bytes 00 00 00 00 00 00, one
+        target at 0x00156825): the dispatch lifted as a runtime jump, its only
+        case never became a label, and the title crashed loading a match.
+
+        The movzx naming the byte table where this table ends is far stronger
+        evidence than "the words look like pointers", which is what the
+        minimum guards against, so it is accepted at any size. Searched in the
+        32 bytes before the dispatch: `0F B6 /r` with a [reg + disp32] operand
+        (mod 10, no SIB) whose displacement is B. The first index must also be
+        in range, or B is not a byte table of this switch.
+        """
+        if dispatch_end is None:
+            return False
+        byte_tbl = tbl + entries * 4
+        window = self.image.read_bytes_at_va(dispatch_end - 32, 32)
+        if not window or len(window) < 32:
+            return False
+        for i in range(len(window) - 6):
+            if window[i] != 0x0F or window[i + 1] != 0xB6:
+                continue
+            modrm = window[i + 2]
+            if (modrm >> 6) != 2 or (modrm & 7) == 4:
+                continue
+            if int.from_bytes(window[i + 3:i + 7], "little") != byte_tbl:
+                continue
+            first = self.image.read_bytes_at_va(byte_tbl, 1)
+            return bool(first) and first[0] < entries
+        return False
+
     def resync_jump_tables(self, min_entries: int = 3,
                            max_entries: int = 512) -> int:
         """
@@ -428,7 +471,10 @@ class DisasmEngine:
                     break
                 back += 1
 
-            if entries + back < min_entries:
+            if entries + back < min_entries and not (
+                    back == 0 and entries > 0 and
+                    self._two_level_switch(tbl, entries,
+                                           dispatch_end.get(tbl))):
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
                 # would delete real instructions.
