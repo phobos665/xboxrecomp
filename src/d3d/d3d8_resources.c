@@ -1709,6 +1709,12 @@ BOOL d3d8_format_is_linear(D3DFORMAT fmt)
     case 0x3F: case 0x40: case 0x41: case 0x5B: case 0x5C: case 0x5D:
     case 0x5E: case 0x5F: case 0x60: case 0x61: case 0x62: case 0x63:
     case 0x67: case 0x68: case 0x79: case 0x7A:
+    /* YUY2 and UYVY have no swizzled form: the NV2A only has them as
+     * linear images, so they are addressed in texels like the LIN_ formats.
+     * Missing here, a title that draws its own movie from a YUY2 texture
+     * (WWE Raw 2's intros and menu backgrounds) sampled one clamped texel
+     * across the whole quad -- a flat colour where the picture should be. */
+    case 0x24: case 0x25:
         return TRUE;
     default:
         return FALSE;
