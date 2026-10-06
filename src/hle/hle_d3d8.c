@@ -894,11 +894,15 @@ static void shadow_read_declaration(int slot, uint32_t handle);
  * when the XDK writes its own again, which a new declaration makes it do. */
 void hle_d3d8_push_arrays_off(void);
 
+
 static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
     int i;
 
     hle_d3d8_push_arrays_off();
+    if (shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] vertex shader 0x%08X (slot %u)\n",
+                g_shadow_swaps, handle, address);
     g_shadow_vs = handle;
     g_shadow_vs_is_program = (handle & 1) != 0;
     if (!g_shadow_vs_is_program) {
@@ -1318,6 +1322,13 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
         shadow_use_viewport(1);
     } else {
         if (fvf_stride(g_shadow_vs) != stride) {
+            /* Which FVF disagrees with which stride, the first few times. */
+            static int said;
+            if (said < 8) {
+                said++;
+                fprintf(stderr, "[HLE-D3D8] draw skipped: FVF 0x%08X is %u bytes, the title's stride %u\n",
+                        g_shadow_vs, fvf_stride(g_shadow_vs), stride);
+            }
             g_draws_stride++;
             return 0;
         }
@@ -3138,6 +3149,9 @@ static void inline_draw(void)
 
     if (!g_shadow || !n)
         return;
+    if (shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] inline draw: %u vertices, primitive %u, vertex shader 0x%08X\n",
+                g_shadow_swaps, n, g_inline_xpt, g_shadow_vs);
     if (g_shadow_vs_is_program) {
         inline_draw_program(n);
         return;
@@ -4187,6 +4201,86 @@ HLE_EXPORT(D3DDevice_EnableOverlay)
 #endif
 }
 
+#ifdef _WIN32
+/* A picture the title decoded itself, put on the overlay plane.
+ *
+ * The plane's picture came only from hle_xmv.c, which decodes XMV movies on
+ * the host. A title with its own decoder fills the surface and hands it to
+ * UpdateOverlay, and the scan-out shows that surface -- so it is what the
+ * plane has to show. Forza's attract video is Bink, decoded into a YUY2
+ * surface each frame, and its front end was black. A surface the XMV player
+ * already writes is its own movie and is left to it.
+ *
+ * A D3DSurface is Common, Data (physical), Lock, Format, Size, as in
+ * hle_xmv_play.c's write_surface; YUY2 is BT.601 studio range. */
+static void overlay_from_surface(uint32_t surface)
+{
+    static uint8_t *bgra;
+    static size_t cap;
+    static int logged;
+    uint32_t data, format, size, fmt, w, h, pitch, x, y;
+    const uint8_t *src;
+
+    if (!surface)
+        return;
+    data = HLE_MEM32(surface + 4);
+    format = HLE_MEM32(surface + 12);
+    size = HLE_MEM32(surface + 16);
+    fmt = (format >> 8) & 0xFFu;
+    w = (size & 0xFFFu) + 1u;
+    h = ((size >> 12) & 0xFFFu) + 1u;
+    pitch = (((size >> 24) & 0xFFu) + 1u) * 64u;
+    if (g_movie_phys && (data & 0x0FFFFFFFu) == g_movie_phys)
+        return;
+    if (logged < 2) {
+        logged++;
+        fprintf(stderr, "[HLE-D3D8] overlay surface 0x%08X: format 0x%02X %ux%u pitch %u, data "
+                "0x%08X, colour key %s 0x%08X -- %s\n", surface, fmt, w, h, pitch, data,
+                HLE_ARG(3) ? "on" : "off", HLE_ARG(4),
+                !size ? "swizzled, not shown"
+                : (fmt == 0x24u || fmt == 0x12u || fmt == 0x1Eu) ? "shown" : "a format not shown");
+    }
+    if (!size || !data || (fmt != 0x24u && fmt != 0x12u && fmt != 0x1Eu) ||
+        pitch < w * (fmt == 0x24u ? 2u : 4u) ||
+        (uint64_t)(data & 0x03FFFFFFu) + (uint64_t)pitch * h > 0x04000000u)
+        return;
+    if ((size_t)w * h * 4u > cap) {
+        free(bgra);
+        cap = (size_t)w * h * 4u;
+        bgra = (uint8_t *)malloc(cap);
+        if (!bgra) {
+            cap = 0;
+            return;
+        }
+    }
+    src = (const uint8_t *)HLE_PTR(0x80000000u | (data & 0x0FFFFFFFu));
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = src + (size_t)y * pitch;
+        uint8_t *out = bgra + (size_t)y * w * 4u;
+
+        if (fmt != 0x24u) {                       /* LIN_A8R8G8B8 / X8R8G8B8 */
+            memcpy(out, row, (size_t)w * 4u);
+            for (x = 0; x < w; x++)
+                out[x * 4u + 3u] = 0xFF;
+            continue;
+        }
+        for (x = 0; x < w; x++) {                 /* YUY2: Y0 U Y1 V */
+            const uint8_t *q = row + (x & ~1u) * 2u;
+            int c = 298 * ((int)q[(x & 1u) * 2u] - 16);
+            int d = (int)q[1] - 128, e = (int)q[3] - 128;
+            int r = (c + 409 * e + 128) >> 8;
+            int g = (c - 100 * d - 208 * e + 128) >> 8;
+            int b = (c + 516 * d + 128) >> 8;
+            out[x * 4u + 0u] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+            out[x * 4u + 1u] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+            out[x * 4u + 2u] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+            out[x * 4u + 3u] = 0xFF;
+        }
+    }
+    d3d8_movie_set_frame(bgra, w, h);
+}
+#endif
+
 /* void D3DDevice_UpdateOverlay(D3DSurface *pSurface, const RECT *SrcRect,
  *     const RECT *DstRect, BOOL EnableColorKey, D3DCOLOR ColorKey)          */
 HLE_EXPORT(D3DDevice_UpdateOverlay)
@@ -4196,6 +4290,10 @@ HLE_EXPORT(D3DDevice_UpdateOverlay)
     first_call(&seen, "D3DDevice_UpdateOverlay", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_UpdateOverlay, "D3DDevice_UpdateOverlay"))
         HLE_RETURN(0u);
+#ifdef _WIN32
+    /* Before the body: it pops the arguments. */
+    overlay_from_surface(HLE_ARG(0));
+#endif
     HLE_CALL_ORIGINAL(D3DDevice_UpdateOverlay);
 #ifdef _WIN32
     /* A title that never calls EnableOverlay still means the plane to show
