@@ -192,6 +192,13 @@ mod by archive rebuilds every archive that holds it, and a run that reaches an
 archive the mod missed shows the original again. That is the case for Route B, whose
 replacement is one file keyed by content.
 
+For TimeSplitters 2 the game had the answer itself: it mounts `data/xbt.pak`,
+`xbob.pak` and `xbsound.pak` (not on the disc) after each level's archives. A
+split2-recomp override moves them to the front of its archive table, and one small
+`xbt.pak` in the mods folder then replaces a texture in every level (6 Oct 2026). Other
+titles with a similar search path may have the same opening; Route B is still the
+general answer.
+
 **Route B textures: 3.5–6 days** (T4–T6), excluding T7.
 
 ### Models
