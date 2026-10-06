@@ -176,8 +176,8 @@ reverse engineering or tooling that transfers to no other game.
 | # | Work item | Route | Days | Kind |
 |---|---|---|---|---|
 | T1 | Overlay directory in `kernel_path.c`: try `<overlay>/<rel>` before `<game_dir>/<rel>`, behind an env switch. **Done** (`mods.md`, Oct 2026) | A | 1 | Toolkit |
-| T2 | `P8CK`/`P4CK` unpack + repack tool in `tools/`. **Done in split2-recomp** (`tools/ts2pak.py`), not yet run on the disc | A | 0.5 | TS2 (or use `tspak`/`Splitter`: 0) |
-| T3 | `.xbt` ↔ DDS converter, all four format codes. **Done in split2-recomp** (`tools/xbt.py`; format 3 unverified) | A | 1–2 | TS2 (or use `fmt_xbox.py` as a spec: 1) |
+| T2 | `P8CK`/`P4CK` unpack + repack tool in `tools/`. **Done in split2-recomp** (`tools/ts2pak.py`): all 68 PAL archives rebuild byte-identical, and a texture mod through the overlay reached the screen (6 Oct 2026) | A | 0.5 | TS2 (or use `tspak`/`Splitter`: 0) |
+| T3 | `.xbt` ↔ DDS converter, all four format codes. **Done in split2-recomp** (`tools/xbt.py`). The header is now known -- +0x00/+0x04 stored size, +0x08/+0x0C shown size, +0x10 mip count less one, +0x14 format -- and all 19,180 textures on the PAL disc fit it and round-trip through DDS. The disc uses formats 0-2 only | A | 1–2 | TS2 (or use `fmt_xbox.py` as a spec: 1) |
 | T4 | Unsampled content hash at cache-entry time, exposed; `RECOMP_TEX_DUMP` writes every bound texture as DDS named by hash | B | 1–2 | Toolkit |
 | T5 | Replacement loader: index a directory of `<hash>.dds`, build the host texture from it in `host_texture()` instead of from guest memory | B | 2–3 | Toolkit |
 | T6 | Offline indexer: hash every `.xbt` payload in every pak, emit `<hash> -> chr.pak:textures/0267.xbt` so dumps have human names | B | 0.5–1 | TS2 |
@@ -185,6 +185,12 @@ reverse engineering or tooling that transfers to no other game.
 
 **Route A textures: 2.5–3.5 days** (T1–T3), and the result is a permanently modified
 disc image that the title loads with no runtime involvement at all.
+
+Route A's cost, measured once it existed: TimeSplitters 2 keeps a copy of shared
+textures in every level archive (the B-button prompt is in 43 of them), so a texture
+mod by archive rebuilds every archive that holds it, and a run that reaches an
+archive the mod missed shows the original again. That is the case for Route B, whose
+replacement is one file keyed by content.
 
 **Route B textures: 3.5–6 days** (T4–T6), excluding T7.
 
