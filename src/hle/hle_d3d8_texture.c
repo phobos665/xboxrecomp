@@ -112,6 +112,7 @@ static int g_stage0_framebuffer;
 
 static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev);
 
+static unsigned long g_switch_hits, g_switch_misses;   /* D3DDevice_SwitchTexture */
 static unsigned long g_bound_count, g_uploads, g_reuploads, g_skip_type,
                      g_skip_cube, g_skip_format, g_skip_range, g_skip_create;
 
@@ -134,12 +135,70 @@ static uint32_t level_rows(uint32_t fmt, uint32_t h)
 
 /* Reads the guest pixel container. 0 with a skip counter bumped if the
  * texture is one this file does not forward. */
+/* Textures known only by their Data and Format, with no object of their own
+ * (D3DDevice_SwitchTexture). Each gets an odd key, which no real object --
+ * dword-aligned guest memory -- can have, and the key stands in for the
+ * object's VA wherever a texture is identified; obj_field reads its fields
+ * from here instead of guest memory. Swizzled and compressed formats only:
+ * their Format word carries every dimension, where a linear one needs the
+ * object's Size. */
+#define SYNTH_MAX 4096
+static struct { uint32_t data, format; } g_synth[SYNTH_MAX];
+static int g_synth_count, g_synth_next;
+
+static int is_synth(uint32_t va) { return (va & 1u) != 0u; }
+
+static uint32_t synth_key(uint32_t data, uint32_t format)
+{
+    /* A direct-mapped memo in front of the scan: a title switches between
+     * the same few hundred textures thousands of times a frame. */
+    static int memo[1024];
+    uint32_t h = ((data >> 7) ^ (data >> 17) ^ (format * 0x9E3779B1u)) & 1023u;
+    int i = memo[h] - 1;
+
+    if (i >= 0 && i < g_synth_count && g_synth[i].data == data && g_synth[i].format == format)
+        return ((uint32_t)(i + 1) << 4) | 1u;
+    for (i = 0; i < g_synth_count; i++)
+        if (g_synth[i].data == data && g_synth[i].format == format) {
+            memo[h] = i + 1;
+            return ((uint32_t)(i + 1) << 4) | 1u;
+        }
+    if (g_synth_count < SYNTH_MAX) {
+        i = g_synth_count++;
+    } else {
+        i = g_synth_next;                 /* reuse the oldest slot */
+        g_synth_next = (g_synth_next + 1) % SYNTH_MAX;
+    }
+    g_synth[i].data = data;
+    g_synth[i].format = format;
+    memo[h] = i + 1;
+    return ((uint32_t)(i + 1) << 4) | 1u;
+}
+
+/* A field of a texture object: Common (+0), Data (+4), Format (+12) or
+ * Size (+16), from guest memory or from the synthetic table. */
+static uint32_t obj_field(uint32_t va, uint32_t off)
+{
+    if (is_synth(va)) {
+        uint32_t i = (va >> 4) - 1u;
+        if (i >= (uint32_t)g_synth_count)
+            return 0;
+        switch (off) {
+        case 0:  return COMMON_TYPE_TEXTURE | 1u;
+        case 4:  return g_synth[i].data;
+        case 12: return g_synth[i].format;
+        default: return 0;
+        }
+    }
+    return HLE_MEM32(va + off);
+}
+
 static int read_layout(uint32_t va, texture_layout *t)
 {
-    uint32_t common = HLE_MEM32(va + 0);
-    uint32_t data   = HLE_MEM32(va + 4);
-    uint32_t format = HLE_MEM32(va + 12);
-    uint32_t size   = HLE_MEM32(va + 16);
+    uint32_t common = obj_field(va, 0);
+    uint32_t data   = obj_field(va, 4);
+    uint32_t format = obj_field(va, 12);
+    uint32_t size   = obj_field(va, 16);
     uint32_t l;
     uint64_t bytes = 0;
 
@@ -557,12 +616,15 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
     return e->host;
 }
 
+static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
+                                               unsigned long now);
+
 static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
 {
     unsigned long now = hle_d3d8_shadow_swaps();
     texture_layout t;
     texture_entry *e = NULL;
-    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    uint32_t data = obj_field(va, 4), format = obj_field(va, 12), size = obj_field(va, 16);
     int i;
 
     /* Before the ordinary lookup, because these are not identified by
@@ -572,6 +634,13 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
         IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
         if (fb)
             return fb;
+    }
+    /* Memory the title rendered into as a bare surface: the host's drawing
+     * is the content (hle_d3d8_render_surface). */
+    {
+        IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
+        if (rs)
+            return rs;
     }
 
     for (i = 0; i < g_texture_count; i++) {
@@ -1220,6 +1289,82 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
     return e->host;
 }
 
+/* Whether two pixel containers describe the same pixels: the format and the
+ * dimensions, not the mip count or the container's own bits. */
+static int same_pixels(uint32_t fa, uint32_t sa, uint32_t fb, uint32_t sb)
+{
+    if (((fa >> 8) & 0xFFu) != ((fb >> 8) & 0xFFu))
+        return 0;
+    if (sa || sb)
+        return sa == sb;
+    return ((fa >> 20) & 0xFFu) == ((fb >> 20) & 0xFFu);
+}
+
+/* A render target the title made as a bare surface (no parent texture), and
+ * samples through a texture object of its own over the same memory -- the
+ * NV2A reads texels from an address, so the two are one image. Need for
+ * Speed Underground 2 builds its reflections and bloom that way: 320x240
+ * LIN_A8R8G8B8 surfaces at 0x003EA400 and friends, bound back as textures
+ * at 0x003E75DC (same data 0x02B85700). Sent to a scratch target, what was
+ * drawn was thrown away and the texture read the guest's bytes -- the
+ * allocator's 0xAA fill, a flat grey across the menu's floor.
+ *
+ * The entry is keyed by the pixels (data, format, size), with va 0, and
+ * host_texture finds it from any texture or surface over that memory. NULL
+ * (counted) if the surface is not one this file can mirror. */
+IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surface)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    texture_entry *e;
+    uint32_t data = HLE_MEM32(surface + 4), format = HLE_MEM32(surface + 12);
+    uint32_t size = HLE_MEM32(surface + 16);
+    IDirect3DTexture8 *have = rendered_surface_for(data, format, size, now);
+
+    if (have)
+        return have;
+    if (!read_layout(surface, &t))
+        return NULL;
+    e = cache_slot(dev, now);
+    if (!e)
+        return NULL;
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, 1, D3DUSAGE_RENDERTARGET,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT, &e->host)) ||
+        !e->host) {
+        memset(e, 0, sizeof *e);
+        g_skip_create++;
+        return NULL;
+    }
+    e->va = 0;
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->rendered = 1;
+    e->checked_swap = e->used_swap = now;
+    fprintf(stderr, "[HLE-D3D8] shadow render target surface 0x%08X: format 0x%02X %ux%u "
+            "at 0x%08X, sampled by any texture over that memory\n",
+            surface, t.fmt, t.width, t.height, data);
+    return e->host;
+}
+
+/* The host render target a texture's memory was drawn into as a bare
+ * surface (hle_d3d8_render_surface), or NULL. */
+static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
+                                               unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size)) {
+            c->used_swap = now;
+            return c->host;
+        }
+    }
+    return NULL;
+}
+
 /* 1x1 opaque white, created once, never evicted. */
 static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev)
 {
@@ -1255,6 +1400,9 @@ static void report(void)
                 "%lu out of range, %lu create failed\n",
                 g_bound_count, g_texture_count, g_uploads, g_reuploads, g_skip_type,
                 g_skip_cube, g_skip_format, g_skip_range, g_skip_create);
+        if (g_switch_hits || g_switch_misses)
+            fprintf(stderr, "[HLE-D3D8] SwitchTexture: %lu bound, %lu matched no mirrored "
+                    "texture\n", g_switch_hits, g_switch_misses);
         fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds, "
                 "%lu refused by the host, %lu past the cache\n",
                 g_cube_count, g_cube_binds, g_cube_failed, g_cube_full);
@@ -1319,6 +1467,82 @@ HLE_EXPORT(D3DDevice_SetTexture)
 #endif
 }
 
+/* void __fastcall D3DDevice_SwitchTexture(DWORD Method, DWORD Data,
+ *     DWORD Format) -- Xbox-only: change a stage's texture by writing its
+ * offset and format straight into the push buffer, with no texture object
+ * and no SetTexture. Need for Speed Underground 2's material code takes this
+ * path for most draws (0x000A87B3: Method 0x00081B00, the texture's own Data
+ * and Format); with only SetTexture seen, its font quads drew with the
+ * loading screen's picture and its buildings with the sky.
+ *
+ * The stage comes from the method (NV097_SET_TEXTURE_OFFSET is 0x1B00 + 64
+ * per stage). The texture is found among those already mirrored by its Data
+ * and Format, and bound through its object as SetTexture would. One no
+ * SetTexture has bound is mirrored from Data and Format alone (synth_key),
+ * which describe a swizzled or compressed texture completely: measured on
+ * NFSU2, 3.8M of 4.0M calls in a race run named such a texture. A linear one
+ * would need its object's Size, so it is counted and the stage left as it
+ * was. Cxbx-Reloaded replaces it too (EMUPATCH(D3DDevice_SwitchTexture)). */
+HLE_ORIGINAL(D3DDevice_SwitchTexture);
+
+HLE_EXPORT(D3DDevice_SwitchTexture)
+{
+    static int seen;
+#ifdef _WIN32
+    uint32_t method = g_ecx, data = g_edx, format = HLE_ARG(0);
+#endif
+
+    if (!seen) {
+        seen = 1;
+        fprintf(stderr, "[HLE] D3DDevice_SwitchTexture(0x%X) replaced by name\n", g_ecx);
+    }
+    if (!hle_original_D3DDevice_SwitchTexture) {
+        fprintf(stderr, "[HLE] D3DDevice_SwitchTexture: original body missing -- regenerate the lift\n");
+        return;
+    }
+    HLE_CALL_ORIGINAL(D3DDevice_SwitchTexture);
+#ifdef _WIN32
+    {
+        uint32_t m = method & 0x1FFCu, stage, va = 0;
+        int i;
+
+        if (!hle_d3d8_shadow_device() || m < 0x1B00u || m >= 0x1C00u)
+            return;
+        stage = (m - 0x1B00u) / 0x40u;
+        for (i = 0; i < g_texture_count; i++) {
+            texture_entry *c = &g_textures[i];
+            if (c->host && c->va && !is_synth(c->va) && c->data == data &&
+                c->format == format &&
+                HLE_MEM32(c->va + 4) == data && HLE_MEM32(c->va + 12) == format) {
+                va = c->va;
+                break;
+            }
+        }
+        /* Not one SetTexture has bound: a swizzled or compressed texture is
+         * described completely by its Format, so it is mirrored from that. */
+        if (!va && !d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) &&
+            ((format >> 4) & 0xFu) == 2u && !(format & FORMAT_CUBEMAP))
+            va = synth_key(data, format);
+        if (!va) {
+            if (g_switch_misses++ < 3)
+                fprintf(stderr, "[HLE-D3D8] SwitchTexture stage %u: data 0x%08X format "
+                        "0x%08X matches no mirrored texture; the stage keeps what it had\n",
+                        stage, data, format);
+            return;
+        }
+        g_switch_hits++;
+        if (hle_d3d8_defer_recording()) {
+            uint32_t a[2];
+            a[0] = stage;
+            a[1] = va;
+            hle_d3d8_defer_op(op_set_texture, a, sizeof a);
+        } else {
+            shadow_set_texture(stage, va);
+        }
+    }
+#endif
+}
+
 #ifdef _WIN32
 static void shadow_set_texture(uint32_t stage, uint32_t texture)
 {
@@ -1332,11 +1556,11 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
             /* A cube the title rendered into is bound as itself, and one it
              * filled from memory as a copy of those bytes (static_cube). */
             static int static_cubes = -1;
-            IDirect3DCubeTexture8 *cube = bound_cube(texture);
+            IDirect3DCubeTexture8 *cube = is_synth(texture) ? NULL : bound_cube(texture);
 
             if (static_cubes < 0)
                 static_cubes = xbox_EnvSwitch("RECOMP_HLE_D3D8_STATIC_CUBES", 1);
-            if (!cube && static_cubes)
+            if (!cube && static_cubes && !is_synth(texture))
                 cube = static_cube(dev, texture);
 
             if (cube) {
@@ -1350,7 +1574,7 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
             }
             host = host_texture(dev, texture);
         }
-        hle_d3d8_note_stage_texels(stage, texture ? HLE_MEM32(texture + 4) & 0x0FFFFFFFu : 0u);
+        hle_d3d8_note_stage_texels(stage, texture ? obj_field(texture, 4) & 0x0FFFFFFFu : 0u);
         g_bound[stage] = host;
         g_bound_entry[stage] = NULL;
         {
@@ -1397,8 +1621,8 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
             fprintf(stderr, "[TRACE swap %lu] SetTexture stage %u <- 0x%08X common 0x%08X "
                     "data 0x%08X format 0x%08X size 0x%08X -> %s\n",
                     hle_d3d8_shadow_swaps(), stage, texture,
-                    texture ? HLE_MEM32(texture) : 0, texture ? HLE_MEM32(texture + 4) : 0,
-                    texture ? HLE_MEM32(texture + 12) : 0, texture ? HLE_MEM32(texture + 16) : 0,
+                    texture ? obj_field(texture, 0) : 0, texture ? obj_field(texture, 4) : 0,
+                    texture ? obj_field(texture, 12) : 0, texture ? obj_field(texture, 16) : 0,
                     !texture ? "none" : fb ? "frame buffer copy" : host ? "host texture" : "white");
         }
         report();
