@@ -26,6 +26,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,7 +49,7 @@ enum {
  * a menu but not a place in a level, and "walk to where it looks wrong" is
  * how a rendering bug gets reproduced without a person at the pad. The names
  * match the controls in the binding config (src/input/input_bindings.c). */
-enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK };
+enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK, FAKE_SNAP };
 enum { STICK_LX, STICK_LY, STICK_RX, STICK_RY };
 
 static const struct { const char *name; int kind; unsigned value; int sign; } FAKE[] = {
@@ -62,6 +64,9 @@ static const struct { const char *name; int kind; unsigned value; int sign; } FA
     { "lstick_left",  FAKE_STICK, STICK_LX, -1 }, { "lstick_right", FAKE_STICK, STICK_LX,  1 },
     { "rstick_up",    FAKE_STICK, STICK_RY,  1 }, { "rstick_down",  FAKE_STICK, STICK_RY, -1 },
     { "rstick_left",  FAKE_STICK, STICK_RX, -1 }, { "rstick_right", FAKE_STICK, STICK_RX,  1 },
+    /* Not a control: a RECOMP_INPUT_SEQ step that writes guest RAM to a file
+     * (seq_snapshot below). Presses nothing. */
+    { "snap",         FAKE_SNAP,  0,          0 },
 };
 
 /* Name -> FAKE index, or -1. `n` is the name's length inside a longer spec. */
@@ -79,6 +84,8 @@ static void fake_apply(RecompInputGamepad *g, int i)
     int16_t push = (int16_t)(FAKE[i].sign > 0 ? 32767 : -32767);
 
     switch (FAKE[i].kind) {
+    case FAKE_SNAP:
+        break;
     case FAKE_ANALOG:
         g->analog_buttons[FAKE[i].value] = 0xFFu;
         break;
@@ -112,9 +119,16 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * no save state to restore a native process to -- lifted code is mid-flight
  * on real threads with host GPU objects behind it -- so replaying the presses
  * is how a run gets back to the same screen. The sequence is the save state.
- * Nothing is pressed after the last step ends. */
+ * Nothing is pressed after the last step ends.
+ *
+ * A step may also be `snap` (`95000:snap`): at that moment the whole of guest
+ * RAM is written to RECOMP_SNAP_DIR (else the working directory) as
+ * snap_<ms>.bin, 64 MB, guest address = file offset. Two snapshots either
+ * side of a scripted action -- before and after five shots -- and a diff finds
+ * what the action changed: the way to find an ammo counter, a health value
+ * or a timer without knowing anything about the title. */
 #define SEQ_MAX 128
-static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; } s_seq[SEQ_MAX];
+static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; int fired; } s_seq[SEQ_MAX];
 static int s_seq_count = -1;
 static unsigned long long s_seq_t0;
 
@@ -206,6 +220,47 @@ static int seq_owns_pad(void)
     return !with_pad;
 }
 
+extern ptrdiff_t xbox_GetMemoryOffset(void);   /* src/kernel/xbox_memory_layout.c */
+
+/* Guest RAM, 0 .. 64 MB, to snap_<ms>.bin. Pages the host cannot read (the
+ * guard page at 0, anything protected) are written as zeros, so the file is
+ * always the full size and an offset is always the guest address. */
+static void seq_snapshot(unsigned long at_ms)
+{
+    enum { RAM = 64u << 20, CHUNK = 64u << 10 };
+    const uint8_t *base = (const uint8_t *)xbox_GetMemoryOffset();
+    static uint8_t zeros[CHUNK];
+    const char *dir = getenv("RECOMP_SNAP_DIR");
+    char path[600];
+    FILE *f;
+    uint32_t va;
+
+    if (!base) {
+        fprintf(stderr, "  [PAD] snap at %lu ms: guest memory is not mapped yet\n", at_ms);
+        return;
+    }
+    snprintf(path, sizeof path, "%s%ssnap_%lu.bin", dir && *dir ? dir : "",
+             dir && *dir ? "\\" : "", at_ms);
+    f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "  [PAD] snap at %lu ms: cannot write %s\n", at_ms, path);
+        return;
+    }
+    for (va = 0; va < RAM; va += CHUNK) {
+        MEMORY_BASIC_INFORMATION mbi;
+        const void *src = zeros;
+        if (VirtualQuery(base + va, &mbi, sizeof mbi) == sizeof mbi
+            && mbi.State == MEM_COMMIT
+            && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+            && (uint8_t *)mbi.BaseAddress + mbi.RegionSize >= base + va + CHUNK)
+            src = base + va;
+        fwrite(src, 1, CHUNK, f);
+    }
+    fclose(f);
+    fprintf(stderr, "  [PAD] snap at %lu ms -> %s\n", at_ms, path);
+    fflush(stderr);
+}
+
 static void seq_input(RecompInputGamepad *g)
 {
     unsigned long long t;
@@ -217,6 +272,12 @@ static void seq_input(RecompInputGamepad *g)
         s_seq_t0 = GetTickCount64();
     t = GetTickCount64() - s_seq_t0;
     for (i = 0; i < s_seq_count; i++) {
+        if (!s_seq[i].fired && t >= s_seq[i].at) {
+            s_seq[i].fired = 1;
+            for (k = 0; k < s_seq[i].nkeys; k++)
+                if (FAKE[s_seq[i].keys[k]].kind == FAKE_SNAP)
+                    seq_snapshot(s_seq[i].at);
+        }
         if (t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
             continue;
         for (k = 0; k < s_seq[i].nkeys; k++)
