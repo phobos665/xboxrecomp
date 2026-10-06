@@ -985,11 +985,28 @@ static void bridge_NtQueryVirtualMemory(void)
     BRIDGE_MEM32(info_va + 0x14) = 0x04;               /* Protect */
     BRIDGE_MEM32(info_va + 0x18) = 0x20000;            /* MEM_PRIVATE */
 
+    /* Past the top of user space there is nothing to describe, and the
+     * kernel says so: that refusal is what ends a walk of the address space
+     * (query, then step to BaseAddress + RegionSize). This answered every
+     * address above guest RAM as one free 4 KB page with STATUS_SUCCESS, so a
+     * walk went page by page to 4 GB, wrapped to 0 and began again. Max Payne
+     * walks it on its loading screen and never left: 3.69 billion calls in
+     * 150 seconds. MM_HIGHEST_USER_ADDRESS on the Xbox is 0x7FFEFFFF. */
+    if (page_base > 0x7FFEFFFFu) {
+        g_eax = 0xC000000Du;               /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+
     if (page_base >= g_xbox_code_lo && page_base < XBOX_TOTAL_RAM) {
         BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
     } else {
-        BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
+        /* A free range is one region up to whatever comes next -- the image
+         * below it, or the top of user space above guest RAM -- not a
+         * page at a time, which made even a walk that ended take about a
+         * million calls. */
+        uint32_t end = page_base < g_xbox_code_lo ? g_xbox_code_lo : 0x7FFF0000u;
+        BRIDGE_MEM32(info_va + 0x0C) = end > page_base ? end - page_base : 0x1000u;
         BRIDGE_MEM32(info_va + 0x10) = 0x10000;        /* MEM_FREE */
         BRIDGE_MEM32(info_va + 0x08) = 0;
         BRIDGE_MEM32(info_va + 0x18) = 0;
