@@ -1106,6 +1106,19 @@ static void ff_vs_prepare_draw(DWORD fvf)
  * a fog coordinate rather than a factor (program_fog above). */
 static int g_draw_is_program;
 
+/* Whether a texture-stage operation reads D3DTA_TEXTURE (base 2) through
+ * one of the arguments it uses. */
+static int ff_op_reads_texture(DWORD op, DWORD arg1, DWORD arg2)
+{
+    if (op <= D3DTOP_DISABLE)
+        return 0;
+    if (op == D3DTOP_SELECTARG1)
+        return (arg1 & 0x0Fu) == 2u;
+    if (op == D3DTOP_SELECTARG2)
+        return (arg2 & 0x0Fu) == 2u;
+    return (arg1 & 0x0Fu) == 2u || (arg2 & 0x0Fu) == 2u;
+}
+
 void d3d8_shaders_prepare_draw(DWORD handle)
 {
     RhiShader *ps;
@@ -1241,6 +1254,21 @@ void d3d8_shaders_prepare_draw(DWORD handle)
 
             pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1];
             pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2];
+            /* A stage with no texture that reads D3DTA_TEXTURE does not take
+             * part. The host device binds white there (so register combiners
+             * read what they always did), and as a fixed-function argument
+             * that white replaced everything before it: BLiNX draws its
+             * title movie with stage 1 still set to MODULATE(TEXTURE,
+             * DIFFUSE) over no texture, and the movie came out pure white,
+             * where on the console it plays. Disabling the stage, as D3D's
+             * DISABLE does, leaves stage 0's result. Inferred from that
+             * title's picture, not measured on hardware. */
+            if (!tex && (ff_op_reads_texture(colorop, tss[D3DTSS_COLORARG1],
+                                             tss[D3DTSS_COLORARG2]) ||
+                         ff_op_reads_texture(pc->stage_color[stage][3],
+                                             tss[D3DTSS_ALPHAARG1],
+                                             tss[D3DTSS_ALPHAARG2])))
+                pc->stage_color[stage][0] = D3DTOP_DISABLE;
         }
 
         rhi_buffer_unmap(g_ps_cb);

@@ -1988,6 +1988,54 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     /* Map the full Xbox address space (covers all sections + stack + heap).
      * Size is runtime-configurable: retail 64 MB, devkit debug builds 128 MB. */
+    /* Give back the RAM that demand-loaded sections hold here and would not
+     * hold on hardware.
+     *
+     * A section without the preload flag is paged in by XeLoadSection and
+     * out by XeUnloadSection, so on a console it takes physical pages only
+     * while loaded. This runtime keeps every section resident at its VA, and
+     * VA is RAM here, so the whole of them comes out of the heap. BLiNX
+     * links 38.7 MB of models and maps that way (MDL*, MAP*): its heap
+     * started at 0x03A50000 with 5.7 MB left, its CRT committed past the
+     * top of RAM, and the first 1 MB sound bank read at 0x040B2010 landed
+     * on 0x000B2010 through the mirror -- over its own .text and vtables.
+     *
+     * So map that much more address space, the way xbox_SetMapSize does for
+     * Half-Life 2: the heap runs to the end of the mapping, and RAM -- what
+     * the guest is told it has -- is unchanged. Rounded up to a power-of-two
+     * multiple of RAM because the mirrors stride at the mapped size and a
+     * 26-bit wrap has to stay a wrap. Every other title in games/ has under
+     * 0.1 MB of demand-loaded sections, so the 1 MB floor leaves them as
+     * they were. */
+    if (!g_xbox_map_size && xbe_size >= 0x0124) {
+        DWORD base_addr = *(const DWORD *)(xbe + XBE_BASE_ADDR_OFFSET);
+        DWORD count     = *(const DWORD *)(xbe + XBE_SECTION_COUNT_OFFSET);
+        DWORD hdrs      = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET)
+                          - base_addr;
+        uint64_t demand = 0;
+
+        for (DWORD si = 0; si < count && si < 64; si++) {
+            const uint8_t *sh = xbe + hdrs + si * SECTHDR_SIZE;
+
+            if (hdrs + (si + 1) * SECTHDR_SIZE > xbe_size)
+                break;
+            if (!(*(const DWORD *)(sh + SECTHDR_FLAGS) & 0x00000002u))  /* PRELOAD */
+                demand += *(const DWORD *)(sh + SECTHDR_VSIZE);
+        }
+        if (demand >= 1024 * 1024) {
+            size_t map = g_xbox_total_ram;
+
+            while (map < g_xbox_total_ram + demand)
+                map *= 2;
+            g_xbox_map_size = map;
+            fprintf(stderr, "  Demand-loaded sections: %u KB resident here, "
+                    "paged on hardware -- mapping %zu MB so the heap keeps "
+                    "the RAM they would free (RAM stays %zu MB)\n",
+                    (unsigned)(demand / 1024), map / (1024 * 1024),
+                    g_xbox_total_ram / (1024 * 1024));
+        }
+    }
+
     /* The mapped range, which is not necessarily RAM. Mirrors are placed
      * at multiples of this, so growing it is what stops a title's
      * above-RAM allocations from aliasing low memory. */

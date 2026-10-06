@@ -1,0 +1,12 @@
+{
+ "data": [
+  {
+   "pattern": "MDL*",
+   "note": "BLiNX: demand-loaded model sections (MDLPL, MDLB1..MDLB10, MDLEN, MDLR2..MDLR9). No call or jump from .text or the XDK sections lands in them -- only data immediates and reads -- and swept as code they produced several thousand phantom functions."
+  },
+  {
+   "pattern": "MAP[0-9]*",
+   "note": "BLiNX: demand-loaded map sections (MAP11..MAP93), as above. 'MAP[0-9]*' rather than 'MAP*' so a library section named MAP... in some other build is not caught."
+  }
+ ]
+}

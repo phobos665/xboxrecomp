@@ -1698,10 +1698,15 @@ static UINT base_texture_palette(IDirect3DBaseTexture8 *texture)
  * samples these with texel coordinates rather than 0..1, so a shader that
  * samples one has to scale the coordinates by 1/size (see
  * NV2APSConstants.tex_scale). The list is every LIN_ enumerator in
- * d3d8_xbox.h, depth and float formats included. */
+ * d3d8_xbox.h, depth and float formats included, plus YUY2 and UYVY: they
+ * carry no LIN_ prefix because they have no swizzled form at all. BLiNX's
+ * Sofdec movies are a 1024x512 YUY2 texture drawn with texel coordinates
+ * (0..640, 0..448); unscaled, every pixel sampled the clamped edge and the
+ * title screen's movie came out as a flat colour. */
 BOOL d3d8_format_is_linear(D3DFORMAT fmt)
 {
     switch ((unsigned)fmt) {
+    case 0x24: case 0x25:                                   /* YUY2, UYVY */
     case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
     case 0x16: case 0x17: case 0x18: case 0x1B: case 0x1C: case 0x1D:
     case 0x1E: case 0x1F: case 0x20: case 0x2E: case 0x2F: case 0x30:
