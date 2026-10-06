@@ -96,6 +96,10 @@ void rhi_image_update(RhiImage *img, uint32_t sub, const RhiBox *box,
 {
     g_rhi->image_update(img, sub, box, data, row_pitch, slice_pitch);
 }
+int rhi_image_copy(RhiImage *dst, RhiImage *src)
+{
+    return g_rhi->image_copy ? g_rhi->image_copy(dst, src) : -1;
+}
 int rhi_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitch)
 {
     return g_rhi->image_readback(img, sub, dst, dst_pitch);

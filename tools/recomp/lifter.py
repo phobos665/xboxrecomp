@@ -1870,6 +1870,32 @@ class Lifter:
                 "  /* rdtsc */",
             ]
 
+        # ── CPU identification ──
+        #
+        # Bink (Hunter, Max Payne, THPS2X) asks whether the CPU has MMX the
+        # classic way: toggle EFLAGS.ID through pushfd/popfd to see whether
+        # cpuid exists, then test cpuid(1) edx bit 23. All three were
+        # RECOMP_UNIMPL no-ops, and pushfd pushing nothing made the `pop`
+        # after it read unrelated stack data, so the answer was arbitrary.
+        # Answered "no", Bink picks a blitter table whose non-MMX entries are
+        # null and the first movie spins on null calls -- Hunter carried a
+        # per-title override for exactly that. The Xbox's CPU is a Pentium III,
+        # so the runtime answers as one (recomp_cpuid, recomp_eflags_*).
+        # pushfd's arithmetic flags are not rebuilt from the lazy flag state;
+        # only IF, DF and the AC/ID bits a program set are -- which is all
+        # that CPU-detection code reads.
+        if m == "cpuid":
+            return [
+                "{ uint32_t _id[4]; recomp_cpuid(eax, ecx, _id);",
+                "  eax = _id[0]; ebx = _id[1]; ecx = _id[2]; edx = _id[3]; }"
+                "  /* cpuid */",
+            ]
+        if m == "pushfd":
+            return ["PUSH32(esp, recomp_eflags_push()); /* pushfd */"]
+        if m == "popfd":
+            return ["{ uint32_t _efl; POP32(esp, _efl); recomp_eflags_pop(_efl); }"
+                    " /* popfd */"]
+
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
         # is zero the destination is left untouched and ZF is set; that is the

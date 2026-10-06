@@ -182,6 +182,21 @@ three, once 4.7 s in, no fault, no kernel call). `RECOMP_EXIT_TRACE=0` turns it 
 `timeout`-killed run shows as `ExitProcess(0x8F)` from a remote thread -- that is the
 killer, not the title.
 
+**BLiNX: the Time Sweeper (XDK 4831, 5 Oct 2026) reaches its first level, drawn, with its
+movies playing.** Four things were toolkit-wide. (1) Its image links 38.7 MB of model and
+map data as 42 demand-loaded sections (`MDL*`, `MAP*`). Swept as code they made 10,700
+phantom functions; `config/sections/<TITLEID>.json` now names a title's data sections
+(passed as `--data-sections`), which took the lift from 17,225 functions to 9,124 and
+disassembly from 612 s to 59 s. (2) Resident, those sections left the heap 5.7 MB, the CRT
+committed past 64 MB, and a sound bank read through the mirror landed on `.text`. The
+layout now maps extra address space (as `xbox_SetMapSize` does) for an XBE with over 1 MB of
+non-preload sections; no other title in `games/` has more than 0.1 MB. (3)-(4) are renderer
+rules -- a declaration on one non-zero stream, a draw sampling its own render target, a
+stage with no texture -- in `docs/technical/shadow-mode.md` ("A level drawn and then painted
+over"). Its Sofdec sections needed the same seeds as Outrun 2's (`PSGSFD_I`/`_P` bases).
+Not yet checked: `XeLoadSection` never restores a section's bytes, so a title that patches
+a demand-loaded section in place and reloads it later sees its own patches, not the disc's.
+
 Two things that cost days and are worth knowing before touching this code. The title's
 **deferred render state arrays do not follow its pixel shader** — `SetPixelShader` selects
 an object carrying a `D3DPIXELSHADERDEF`, and the arrays hold whichever shader last went

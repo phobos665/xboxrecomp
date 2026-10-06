@@ -1964,6 +1964,50 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * in different lifted bodies of the same guest routine. */
 RECOMP_TLS int g_df = 0;
 
+/* The EFLAGS bits a program can set and read back through popfd/pushfd
+ * without the lifter's flag model knowing: AC (bit 18) and ID (bit 21).
+ * Per thread, like the real register. */
+static RECOMP_TLS uint32_t g_eflags_sticky = 0;
+
+uint32_t recomp_eflags_push(void)
+{
+    /* IF and the always-one bit 1; DF from the lifted direction flag. */
+    return 0x00000202u | (g_df ? 0x00000400u : 0u) | g_eflags_sticky;
+}
+
+void recomp_eflags_pop(uint32_t eflags)
+{
+    g_eflags_sticky = eflags & 0x00240000u;
+    g_df = (eflags & 0x00000400u) != 0u;
+}
+
+/* cpuid as the Xbox's CPU answers it: a 733 MHz Pentium III (Coppermine,
+ * family 6 model 8) with a 128 KB L2. Bink's MMX probe and the CRT's SSE
+ * check are what read it. Leaves past 2 answer zeros, as a CPU whose maximum
+ * standard leaf is 2 does for an out-of-range leaf on this family. */
+void recomp_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+{
+    (void)subleaf;
+    switch (leaf) {
+    case 0:                                     /* max leaf, "GenuineIntel" */
+        out[0] = 2u;          out[1] = 0x756E6547u;
+        out[2] = 0x6C65746Eu; out[3] = 0x49656E69u;
+        break;
+    case 1:                                     /* signature and features */
+        out[0] = 0x0000068Au; out[1] = 0u; out[2] = 0u;
+        /* FPU VME DE PSE TSC MSR PAE MCE CX8 SEP MTRR PGE MCA CMOV PAT PSE36,
+         * MMX (23), FXSR (24), SSE (25); no APIC, no PSN. */
+        out[3] = 0x0383F9FFu;
+        break;
+    case 2:                                     /* cache descriptors */
+        out[0] = 0x03020101u; out[1] = 0u; out[2] = 0u; out[3] = 0x0C040841u;
+        break;
+    default:
+        out[0] = out[1] = out[2] = out[3] = 0u;
+        break;
+    }
+}
+
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
@@ -1988,6 +2032,54 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     /* Map the full Xbox address space (covers all sections + stack + heap).
      * Size is runtime-configurable: retail 64 MB, devkit debug builds 128 MB. */
+    /* Give back the RAM that demand-loaded sections hold here and would not
+     * hold on hardware.
+     *
+     * A section without the preload flag is paged in by XeLoadSection and
+     * out by XeUnloadSection, so on a console it takes physical pages only
+     * while loaded. This runtime keeps every section resident at its VA, and
+     * VA is RAM here, so the whole of them comes out of the heap. BLiNX
+     * links 38.7 MB of models and maps that way (MDL*, MAP*): its heap
+     * started at 0x03A50000 with 5.7 MB left, its CRT committed past the
+     * top of RAM, and the first 1 MB sound bank read at 0x040B2010 landed
+     * on 0x000B2010 through the mirror -- over its own .text and vtables.
+     *
+     * So map that much more address space, the way xbox_SetMapSize does for
+     * Half-Life 2: the heap runs to the end of the mapping, and RAM -- what
+     * the guest is told it has -- is unchanged. Rounded up to a power-of-two
+     * multiple of RAM because the mirrors stride at the mapped size and a
+     * 26-bit wrap has to stay a wrap. Every other title in games/ has under
+     * 0.1 MB of demand-loaded sections, so the 1 MB floor leaves them as
+     * they were. */
+    if (!g_xbox_map_size && xbe_size >= 0x0124) {
+        DWORD base_addr = *(const DWORD *)(xbe + XBE_BASE_ADDR_OFFSET);
+        DWORD count     = *(const DWORD *)(xbe + XBE_SECTION_COUNT_OFFSET);
+        DWORD hdrs      = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET)
+                          - base_addr;
+        uint64_t demand = 0;
+
+        for (DWORD si = 0; si < count && si < 64; si++) {
+            const uint8_t *sh = xbe + hdrs + si * SECTHDR_SIZE;
+
+            if (hdrs + (si + 1) * SECTHDR_SIZE > xbe_size)
+                break;
+            if (!(*(const DWORD *)(sh + SECTHDR_FLAGS) & 0x00000002u))  /* PRELOAD */
+                demand += *(const DWORD *)(sh + SECTHDR_VSIZE);
+        }
+        if (demand >= 1024 * 1024) {
+            size_t map = g_xbox_total_ram;
+
+            while (map < g_xbox_total_ram + demand)
+                map *= 2;
+            g_xbox_map_size = map;
+            fprintf(stderr, "  Demand-loaded sections: %u KB resident here, "
+                    "paged on hardware -- mapping %zu MB so the heap keeps "
+                    "the RAM they would free (RAM stays %zu MB)\n",
+                    (unsigned)(demand / 1024), map / (1024 * 1024),
+                    g_xbox_total_ram / (1024 * 1024));
+        }
+    }
+
     /* The mapped range, which is not necessarily RAM. Mirrors are placed
      * at multiples of this, so growing it is what stops a title's
      * above-RAM allocations from aliasing low memory. */

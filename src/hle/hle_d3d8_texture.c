@@ -1600,11 +1600,18 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
         /* The host pixel shader samples every stage whatever its operation
          * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
          * stage with no host texture would turn the draw black once the
-         * title's own texture operations are forwarded. It gets opaque white
-         * instead. That a missing Xbox texture contributes white is assumed,
-         * not verified against hardware. */
+         * title's own texture operations are forwarded. A texture the title
+         * bound but this file could not mirror gets opaque white instead.
+         *
+         * A stage the title left empty is passed on as empty. The host
+         * device then binds white itself, so a combiner reads what it read
+         * before, and its fixed-function path knows the stage has no texture
+         * and leaves it out where it reads one (d3d8_shaders.c). Passed as
+         * white, the stage overwrote everything before it: BLiNX's title
+         * movie came out white. */
         host_SetTexture(dev, stage,
-                        (IDirect3DBaseTexture8 *)(host ? host : white_texture(dev)));
+                        (IDirect3DBaseTexture8 *)(host ? host : texture ? white_texture(dev)
+                                                                        : NULL));
         g_bound_count++;
         if (hle_d3d8_trace_on()) {
             int fb = 0, i;

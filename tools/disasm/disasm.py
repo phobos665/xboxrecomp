@@ -38,6 +38,7 @@ class Disassembler:
                  verbose: bool = False,
                  force: bool = False,
                  extra_sections: Optional[list] = None,
+                 data_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
                  observed_seeds: Optional[set] = None):
         self.xbe_path = xbe_path
@@ -48,6 +49,7 @@ class Disassembler:
         self.verbose = verbose
         self.force = force
         self.extra_sections = extra_sections or []
+        self.data_sections = data_sections or []
         self.seed_functions = seed_functions or []
         # Seeds a run actually reached (see _load_seed_functions). They are
         # not guesses, so the mid-instruction guard below does not apply.
@@ -88,7 +90,8 @@ class Disassembler:
             if json_path and cache.is_valid(self.xbe_path, json_path,
                                              self.text_only,
                                              self.extra_sections,
-                                             self.seed_functions):
+                                             self.seed_functions,
+                                             self.data_sections):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -99,7 +102,8 @@ class Disassembler:
         # Phase 1: Load
         if self.verbose:
             print("Phase 1: Loading binary image...")
-        self.image = load_image(self.xbe_path, self.analysis_json)
+        self.image = load_image(self.xbe_path, self.analysis_json,
+                                data_sections=self.data_sections)
         if self.verbose:
             print(f"  Loaded: {self.image.filepath}")
             print(f"  Base: 0x{self.image.base_address:08X}  "
@@ -305,7 +309,8 @@ class Disassembler:
             json_path = self._find_analysis_json()
             if json_path:
                 cache.save(self.xbe_path, json_path, self.text_only, elapsed,
-                           self.extra_sections, self.seed_functions)
+                           self.extra_sections, self.seed_functions,
+                           self.data_sections)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")

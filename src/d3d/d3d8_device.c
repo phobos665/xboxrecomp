@@ -909,6 +909,41 @@ static HRESULT __stdcall dev_GetTextureStageState(IDirect3DDevice8 *self, DWORD 
     return S_OK;
 }
 
+/* What an empty stage samples: opaque white, so a register combiner that
+ * reads the stage's texture register gets white, as the HLE's own
+ * placeholder gave it before the device knew the stage was empty. The
+ * fixed-function path does not sample it at all: a stage with no texture
+ * that reads D3DTA_TEXTURE is disabled there (d3d8_shaders.c). */
+static RhiView *empty_stage_view(void)
+{
+    static RhiView *view;
+    static int tried;
+    RhiImageDesc d;
+    RhiSubresourceData init;
+    RhiViewDesc vd;
+    RhiImage *img;
+    static const uint32_t white = 0xFFFFFFFFu;
+
+    if (view || tried || !rhi_device_ready())
+        return view;
+    tried = 1;
+    memset(&d, 0, sizeof d);
+    d.type = RHI_IMAGE_2D;
+    d.width = d.height = d.depth = d.mip_levels = d.samples = 1;
+    d.format = RHI_FORMAT_B8G8R8A8_UNORM;
+    d.bind = RHI_BIND_SAMPLED;
+    init.data = &white;
+    init.row_pitch = init.slice_pitch = 4;
+    if (!(img = rhi_image_create(&d, &init)))
+        return NULL;
+    memset(&vd, 0, sizeof vd);
+    vd.dim = RHI_VIEW_DIM_2D;
+    vd.mip_count = vd.layer_count = 1;
+    view = rhi_view_create(img, RHI_VIEW_SAMPLED, &vd);
+    rhi_image_destroy(img);             /* the view holds it */
+    return view;
+}
+
 static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDirect3DBaseTexture8 *pTexture)
 {
     (void)self;
@@ -929,9 +964,11 @@ static HRESULT __stdcall dev_SetTexture(IDirect3DDevice8 *self, DWORD Stage, IDi
         if (g_device_state.tss[Stage][D3DTSS_COLOROP] == D3DTOP_DISABLE)
             g_device_state.tss[Stage][D3DTSS_COLOROP] = D3DTOP_MODULATE;
     } else {
-        RhiView *null_srv = NULL;
-        rhi_set_textures(Stage, 1, &null_srv);
-        g_device_state.tss[Stage][D3DTSS_COLOROP] = D3DTOP_DISABLE;
+        /* An empty stage. Its COLOROP is left as the title set it: whether
+         * the stage takes part is decided per draw, from what it reads
+         * (d3d8_shaders.c), not by overwriting the title's state here. */
+        RhiView *empty = empty_stage_view();
+        rhi_set_textures(Stage, 1, &empty);
     }
     return S_OK;
 }
@@ -1203,6 +1240,110 @@ static void stage0_probe(void)
     free(px);
 }
 
+/* A draw that samples the render target it is drawing into.
+ *
+ * The NV2A allows it, and titles use it for a full-screen pass that reads
+ * each pixel and writes it back changed: BLiNX renders its shadow volumes
+ * into the scene's alpha channel, then draws one quad over the scene with
+ * the scene itself bound at stage 0 to darken what the volumes marked.
+ * D3D11 does not: a view of the bound render target is dropped as a shader
+ * input (rebind_stage_srvs clears it on purpose, so the stage is not left
+ * pointing at it), and the stage reads zeros -- so the quad wrote black over
+ * the whole level, every frame, and only what was drawn after it showed.
+ *
+ * Each pixel of such a pass reads only its own texel, so the target as it
+ * stood before the draw is exactly what the hardware reads. Copy it into a
+ * scratch image of the same size and format and bind that for this draw.
+ * A target that is a level other than 0, or a format the copy refuses, is
+ * left as it was. */
+static struct {
+    RhiImage     *img;
+    RhiView      *srv;
+    RhiImageDesc  desc;
+} g_feedback;
+static unsigned long g_feedback_copies;
+
+static int feedback_scratch(RhiImage *target)
+{
+    RhiImageDesc d;
+    RhiViewDesc vd;
+
+    rhi_image_get_desc(target, &d);
+    if (d.type != RHI_IMAGE_2D || (d.samples && d.samples > 1) || d.cube)
+        return 0;
+    if (g_feedback.img && g_feedback.desc.width == d.width &&
+        g_feedback.desc.height == d.height && g_feedback.desc.format == d.format)
+        return 1;
+    if (g_feedback.srv) rhi_view_destroy(g_feedback.srv);
+    if (g_feedback.img) rhi_image_destroy(g_feedback.img);
+    g_feedback.srv = NULL;
+    g_feedback.img = NULL;
+    g_feedback.desc = d;
+    d.depth = 1;
+    d.mip_levels = 1;
+    d.samples = 1;
+    d.sample_quality = 0;
+    d.usage = 0;
+    d.cpu_access = 0;
+    d.bind = RHI_BIND_SAMPLED;
+    if (!(g_feedback.img = rhi_image_create(&d, NULL)))
+        return 0;
+    memset(&vd, 0, sizeof vd);
+    vd.dim = RHI_VIEW_DIM_2D;
+    vd.mip_count = 1;
+    vd.layer_count = 1;
+    g_feedback.srv = rhi_view_create(g_feedback.img, RHI_VIEW_SAMPLED, &vd);
+    if (!g_feedback.srv) {
+        rhi_image_destroy(g_feedback.img);
+        g_feedback.img = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+/* Bind the copy on every stage that holds the current target. Returns the
+ * stages it bound, for feedback_end. */
+static DWORD feedback_begin(void)
+{
+    RhiImage *target = g_cur_rt ? g_cur_rt->image : NULL;
+    DWORD stage, mask = 0;
+
+    if (!target || g_cur_rt->subresource != 0)
+        return 0;
+    for (stage = 0; stage < MAX_TEXTURE_STAGES; stage++) {
+        if (!g_cur_textures[stage] || d3d8_base_resource(g_cur_textures[stage]) != target)
+            continue;
+        if (!mask) {
+            if (!feedback_scratch(target) || rhi_image_copy(g_feedback.img, target) != 0) {
+                static int said;
+                if (!said++)
+                    fprintf(stderr, "D3D8: a draw samples its own render target and the "
+                            "target could not be copied; that stage reads black\n");
+                return 0;
+            }
+            if (!g_feedback_copies++)
+                fprintf(stderr, "D3D8: a draw samples its own render target (stage %lu); "
+                        "it reads a copy taken just before the draw\n", (unsigned long)stage);
+        }
+        rhi_set_textures(stage, 1, &g_feedback.srv);
+        mask |= 1u << stage;
+    }
+    return mask;
+}
+
+/* Back to what rebind_stage_srvs leaves for a stage holding the target:
+ * nothing bound, which is all D3D11 allows while it is the target. */
+static void feedback_end(DWORD mask)
+{
+    DWORD stage;
+
+    for (stage = 0; mask; stage++, mask >>= 1)
+        if (mask & 1u) {
+            RhiView *none = NULL;
+            rhi_set_textures(stage, 1, &none);
+        }
+}
+
 static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 {
     (void)self;
@@ -1219,7 +1360,11 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
 
     rhi_set_topology(topology);
     stage0_probe();
-    rhi_draw(vertex_count, StartVertex);
+    {
+        DWORD fb = feedback_begin();
+        rhi_draw(vertex_count, StartVertex);
+        feedback_end(fb);
+    }
     return S_OK;
 }
 
@@ -1239,7 +1384,11 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
 
     rhi_set_topology(topology);
     stage0_probe();
-    rhi_draw_indexed(index_count, StartIndex, (int32_t)g_cur_ib_base_vertex);
+    {
+        DWORD fb = feedback_begin();
+        rhi_draw_indexed(index_count, StartIndex, (int32_t)g_cur_ib_base_vertex);
+        feedback_end(fb);
+    }
     return S_OK;
 }
 
@@ -1316,7 +1465,11 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
 
     rhi_set_topology(topology);
     stage0_probe();
-    rhi_draw(vertex_count, 0);
+    {
+        DWORD fb = feedback_begin();
+        rhi_draw(vertex_count, 0);
+        feedback_end(fb);
+    }
 
     /* Restore previous VB binding if any */
     if (g_cur_vb) {
@@ -1368,7 +1521,11 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
 
     rhi_set_topology(topology);
     stage0_probe();
-    rhi_draw_indexed(index_count, 0, 0);
+    {
+        DWORD fb = feedback_begin();
+        rhi_draw_indexed(index_count, 0, 0);
+        feedback_end(fb);
+    }
 
     /* Restore previous bindings */
     if (g_cur_vb) {
@@ -1558,8 +1715,9 @@ static void rebind_stage_srvs(RhiImage *target)
     for (stage = 0; stage < MAX_TEXTURE_STAGES; stage++) {
         RhiView *srv = NULL;
 
-        if (g_cur_textures[stage] &&
-            d3d8_base_resource(g_cur_textures[stage]) != target)
+        if (!g_cur_textures[stage])
+            srv = empty_stage_view();
+        else if (d3d8_base_resource(g_cur_textures[stage]) != target)
             srv = d3d8_base_srv(g_cur_textures[stage]);
         rhi_set_textures(stage, 1, &srv);
     }
