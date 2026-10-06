@@ -28,6 +28,7 @@ add_library(xbox_hle STATIC
     hle_input.c
     hle_xmv.c
     hle_xmv_play.c
+    hle_xapi_fiber.c
     input_model.c
 )
 
