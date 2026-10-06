@@ -259,6 +259,20 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
                         (unsigned long)t[D3DTSS_TEXCOORDINDEX],
                         (unsigned long)t[D3DTSS_ADDRESSU], (unsigned long)t[D3DTSS_ADDRESSV]);
         }
+        /* Fog, when on: a fog factor of 0 paints a draw in the fog colour,
+         * which with black fog is a black screen that looks like nothing
+         * was drawn (RECOMP_D3D8_PS_SHOW=foga shows the factor). */
+        if (rs[D3DRS_FOGENABLE]) {
+            float fs, fe, fd;
+            memcpy(&fs, &rs[D3DRS_FOGSTART], sizeof fs);
+            memcpy(&fe, &rs[D3DRS_FOGEND], sizeof fe);
+            memcpy(&fd, &rs[D3DRS_FOGDENSITY], sizeof fd);
+            fprintf(stderr, "[draw %4ld] fog table %lu vertex %lu range %lu start %g end %g "
+                    "density %g color 0x%08lX\n", n,
+                    (unsigned long)rs[D3DRS_FOGTABLEMODE], (unsigned long)rs[D3DRS_FOGVERTEXMODE],
+                    (unsigned long)rs[D3DRS_RANGEFOGENABLE], fs, fe, fd,
+                    (unsigned long)rs[D3DRS_FOGCOLOR]);
+        }
     }
     if (g_dump_target && n == g_max_draws && g_replay_dev && !g_target_at_limit)
         g_replay_dev->lpVtbl->GetRenderTarget(g_replay_dev, &g_target_at_limit);

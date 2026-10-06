@@ -54,6 +54,11 @@ static const struct { const char *name; int kind; unsigned value; int sign; } FA
     { "start", FAKE_BUTTON, XBOX_START, 0 },      { "back",  FAKE_BUTTON, XBOX_BACK, 0 },
     { "up",    FAKE_BUTTON, XBOX_DPAD_UP, 0 },    { "down",  FAKE_BUTTON, XBOX_DPAD_DOWN, 0 },
     { "left",  FAKE_BUTTON, XBOX_DPAD_LEFT, 0 },  { "right", FAKE_BUTTON, XBOX_DPAD_RIGHT, 0 },
+    /* The binding config's names for the same buttons. Without them a script
+     * written with those names stopped at the first one ("unknown button
+     * 'dpad_up'") and every later step was silently dropped. */
+    { "dpad_up",   FAKE_BUTTON, XBOX_DPAD_UP, 0 },   { "dpad_down",  FAKE_BUTTON, XBOX_DPAD_DOWN, 0 },
+    { "dpad_left", FAKE_BUTTON, XBOX_DPAD_LEFT, 0 }, { "dpad_right", FAKE_BUTTON, XBOX_DPAD_RIGHT, 0 },
     { "a",     FAKE_ANALOG, HOST_ANALOG_A, 0 },   { "b",     FAKE_ANALOG, HOST_ANALOG_B, 0 },
     { "x",     FAKE_ANALOG, HOST_ANALOG_X, 0 },   { "y",     FAKE_ANALOG, HOST_ANALOG_Y, 0 },
     { "white", FAKE_ANALOG, HOST_ANALOG_WHITE, 0 }, { "black", FAKE_ANALOG, HOST_ANALOG_BLACK, 0 },

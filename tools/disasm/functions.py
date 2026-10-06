@@ -85,6 +85,11 @@ class FunctionDetector:
         # the function they land in.
         self._alias_entries: Dict[int, int] = {}
 
+        # gap_prologue starts that turned out to be the middle of a function
+        # found later (see _find_function_end). Dropped from the candidates,
+        # and the bounds pass skips them.
+        self._absorbed: set = set()
+
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
         Run all detection passes and build the function database.
@@ -1083,7 +1088,7 @@ class FunctionDetector:
                 measured = self._find_function_end(
                     target, end,
                     section_end.get(sec.name if sec else "", None))
-                if measured and target < measured < end:
+                if self._measured_extends(target, end, measured):
                     end = measured
             if end <= target:
                 continue
@@ -1230,7 +1235,7 @@ class FunctionDetector:
             measured = self._find_function_end(
                 target, end,
                 section.virtual_addr + section.virtual_size)
-            if measured and target < measured < end:
+            if self._measured_extends(target, end, measured):
                 end = measured
             if end <= target:
                 continue
@@ -1362,7 +1367,7 @@ class FunctionDetector:
                     end = starts[k] if k < len(starts) else section_end[sec.name]
                     measured = self._find_function_end(
                         target, end, section_end[sec.name])
-                    if measured and target < measured < end:
+                    if self._measured_extends(target, end, measured):
                         end = measured
                 if end <= target:
                     continue
@@ -1461,6 +1466,8 @@ class FunctionDetector:
 
         # Create functions
         for idx, start_addr in enumerate(sorted_starts):
+            if start_addr in self._absorbed or start_addr not in self._candidates:
+                continue                # a gap_prologue start a body ran over
             confidence, method = self._candidates[start_addr]
 
             # Determine section
@@ -1528,6 +1535,63 @@ class FunctionDetector:
         max_addr = start   # exclusive end of the code decoded so far
         max_target = start  # highest branch target that must be *inside* it
         addr = start
+
+        # A gap_prologue start is only as good as the gap it was found in.
+        # _pass_gap_prologues runs before the tail-jump alias pass, so a
+        # function found by the later pass can have had its own code claimed
+        # as a start: Jet Set Radio Future's sub_00025040 returns at
+        # 0x25232 and keeps its shared epilogue at 0x252B5, reached by
+        # eleven conditional jumps from above the ret; 0x25233 sat in a gap,
+        # began with a prologue, and became a function. Clamped to it, the
+        # body's jumps past it were lifted as tail calls to stubs, and the
+        # title skipped its own epilogue. So when the clamp is such a start,
+        # measure to the start after it instead; if this body's own jumps
+        # cross the clamp, the clamp was never a function. Dropped here, and
+        # the bounds pass skips it.
+        absorbed = getattr(self, "_absorbed", None)
+        if absorbed is not None:
+            # A start already absorbed bounds nothing: look past it.
+            while next_func is not None and next_func in absorbed:
+                next_func = self._next_start_after(next_func)
+        if next_func is not None and self._gap_prologue_start(next_func):
+            after = self._next_start_after(next_func)
+            unclamped = self._find_function_end(start, after, sec_end)
+            if unclamped > next_func:
+                # Only this body's own branches decide. An unconditional
+                # `jmp` *to* the start is a tail call to a real function and
+                # keeps it. A conditional branch to it, a switch case landing
+                # on it, or any branch beyond it means the code there is this
+                # function's: compiled code never tail-calls through a jcc
+                # or a switch table. (JSRF's sub_00025040 reaches 0x25233
+                # with `je`, and its switch table has cases past it.)
+                beyond = False
+                tail_call = False
+                scan = start
+                while scan < unclamped:
+                    tbl_end = self.engine.jump_tables.get(scan)
+                    if tbl_end is not None and tbl_end <= unclamped:
+                        scan = tbl_end
+                        continue
+                    insn = self.engine.get_instruction(scan)
+                    if insn is None:
+                        break
+                    targets = []
+                    if insn.is_branch and insn.jump_target is not None:
+                        t = insn.jump_target
+                        if t == next_func and insn.is_jump and not insn.is_cond_jump:
+                            tail_call = True
+                        else:
+                            targets.append(t)
+                    if insn.jump_table is not None:
+                        targets += self.engine.jump_table_entries(insn.jump_table)
+                    if any(next_func <= t < unclamped for t in targets):
+                        beyond = True
+                    scan = insn.end_address
+                if beyond and not tail_call:
+                    absorbed.add(next_func)
+                    self._candidates.pop(next_func, None)
+                    self.functions.pop(next_func, None)
+                    return unclamped
 
         # Upper bound
         upper = sec_end if sec_end else start + 0x100000
@@ -1618,6 +1682,47 @@ class FunctionDetector:
             addr = insn.end_address
 
         return max_addr
+
+    def _measured_extends(self, target: int, end: int,
+                          measured: Optional[int]) -> bool:
+        """Does an alias body's measured end replace its clamp `end`?
+
+        Normally only a shorter body does: the clamp is the next known start.
+        But when _find_function_end has just absorbed that start -- a
+        gap_prologue the body's own branches cross -- the measurement runs
+        past it on purpose, and keeping the clamp leaves the alias ending at
+        an address that is no longer a function: every branch to it becomes
+        a call to a stub. JSRF's sub_00025040 lost 0x25233 that way, and the
+        same shape cost 202 stubs across the title.
+        """
+        if not measured or measured <= target:
+            return False
+        return measured < end or end in self._absorbed
+
+    def _next_start_after(self, addr: int) -> Optional[int]:
+        """The lowest candidate or function start above `addr` that has not
+        been absorbed, or None."""
+        absorbed = getattr(self, "_absorbed", set())
+        following = [a for a in getattr(self, "_candidates", {})
+                     if a > addr and a not in absorbed]
+        following += [a for a in getattr(self, "functions", {})
+                      if a > addr and a not in absorbed]
+        return min(following) if following else None
+
+    def _gap_prologue_start(self, addr: int) -> bool:
+        """Is `addr` a start that only _pass_gap_prologues vouched for?
+        False on a detector built without candidate tables (the tests)."""
+        cands = getattr(self, "_candidates", None)
+        funcs = getattr(self, "functions", None)
+        if cands is None or funcs is None or not hasattr(self, "_absorbed"):
+            return False
+        if addr in self._absorbed:
+            return False
+        cand = cands.get(addr)
+        if cand is not None and cand[1] == "gap_prologue":
+            return True
+        fn = funcs.get(addr)
+        return fn is not None and getattr(fn, "detection_method", "") == "gap_prologue"
 
     def _table_after(self, addr: int, upper: int) -> Optional[int]:
         """End of an embedded jump table starting at or just after `addr`.

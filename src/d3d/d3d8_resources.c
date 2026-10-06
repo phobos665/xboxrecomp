@@ -1702,7 +1702,8 @@ static UINT base_texture_palette(IDirect3DBaseTexture8 *texture)
  * carry no LIN_ prefix because they have no swizzled form at all. BLiNX's
  * Sofdec movies are a 1024x512 YUY2 texture drawn with texel coordinates
  * (0..640, 0..448); unscaled, every pixel sampled the clamped edge and the
- * title screen's movie came out as a flat colour. */
+ * title screen's movie came out as a flat colour. WWE Raw 2's intros and
+ * menu backgrounds (576x448 YUY2 over the movie's own surface) did the same. */
 BOOL d3d8_format_is_linear(D3DFORMAT fmt)
 {
     switch ((unsigned)fmt) {
