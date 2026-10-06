@@ -1,5 +1,5 @@
 /**
- * Max Payne - Recompiled Game Entry Point
+ * blinx - Recompiled Game Entry Point
  *
  * This is the Windows executable that hosts the recompiled game code.
  * It performs the following initialization sequence:
@@ -21,7 +21,7 @@
  *   - Customize the VEH handler for game-specific crash diagnosis
  *
  * XBE Details (fill in from xbe_parser output):
- *   Title:       Max Payne
+ *   Title:       blinx
  *   Title ID:    0x00000000
  *   Base addr:   0x00010000
  *   Entry point: 0x00000000
@@ -81,12 +81,12 @@ extern ptrdiff_t g_xbox_mem_offset;
  * TODO: Set these from your xbe_parser output.
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
-#define YOUR_GAME_ENTRY_POINT   0x000BD2F5  /* XBE entry point VA */
+#define YOUR_GAME_ENTRY_POINT   0x000F4D97  /* XBE entry point VA */
 /* Relative to the executable's own directory, titles/<title>/build/<Config>/,
  * which is where scripts/run_and_report.py starts it. Run it from there by
  * hand too, or the XBE is not found. */
-#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\MaxPayne\\default.xbe"
-#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\MaxPayne"
+#define YOUR_GAME_XBE_PATH      "..\\..\\..\\..\\games\\blinx\\default.xbe"
+#define YOUR_GAME_DIR            "..\\..\\..\\..\\games\\blinx"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -512,7 +512,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== Max Payne - Static Recompilation ===\n");
+    printf("=== blinx - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
@@ -538,7 +538,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                      "Looked for:\n%s", tried);
             fprintf(stderr, "%s\n", message);
             log_hint(message, sizeof message);
-            MessageBoxA(NULL, message, "Max Payne", MB_ICONERROR);
+            MessageBoxA(NULL, message, "blinx", MB_ICONERROR);
             return 1;
         }
         printf("Game files: %s\n", g_game_dir);
@@ -547,7 +547,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                      "Found the game at\n%s\nbut could not read default.xbe.",
                      g_game_dir);
             log_hint(message, sizeof message);
-            MessageBoxA(NULL, message, "Max Payne", MB_ICONERROR);
+            MessageBoxA(NULL, message, "blinx", MB_ICONERROR);
             return 1;
         }
     }

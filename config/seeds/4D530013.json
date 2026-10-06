@@ -1,0 +1,18 @@
+[
+ {
+  "start": "0x00182CD8",
+  "note": "XPP device-type init (XInitDevices calls [record+4]); lone pointer inside a record in the executable XPP section, so no table pass sees it. Unresolved icall observed at runtime; push ebp prologue."
+ },
+ {
+  "start": "0x00183525",
+  "note": "XPP device-type init (XInitDevices calls [record+4]), as above. Unresolved icall observed at runtime; starts directly after a ret 8."
+ },
+ {
+  "start": "0x00181800",
+  "note": "Base of section PSGSFD_I (Sofdec), reached only through the pointer table at .rdata 0x1CF97C; no function in the section was detected. Unresolved icall observed at runtime while opening microsoft.sfd, then a fault at 0x84016EC0. Same shape as Outrun 2's PSGSFD_I/_P."
+ },
+ {
+  "start": "0x001824C0",
+  "note": "Base of section PSGSFD_P (Sofdec), next entry in the same .rdata 0x1CF97C table. Unresolved icall observed at runtime."
+ }
+]

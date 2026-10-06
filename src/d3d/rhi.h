@@ -370,6 +370,11 @@ void       rhi_image_update(RhiImage *img, uint32_t subresource, const RhiBox *b
  * every probe that looks at pixels uses -- frame dumps, F11, the brightness
  * and frame-buffer probes, replay --out -- so it keeps working on any
  * backend. */
+/* Copy the whole of src's first subresource into dst's, on the GPU. Both
+ * plain 2D, single-sampled, one level, the same size and format; -1 if not
+ * or if the backend cannot. Touches no pipeline state, so it is safe in the
+ * middle of a draw's setup. */
+int        rhi_image_copy(RhiImage *dst, RhiImage *src);
 int        rhi_image_readback(RhiImage *img, uint32_t subresource,
                               void *dst, uint32_t dst_pitch);
 

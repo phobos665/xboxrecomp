@@ -144,6 +144,43 @@ the frame if something drew that frame.
 its 2D ones. Burnout 2 draws 2-6 times on a loading frame and 690-910 in a
 race frame, so a fixed interval samples loading screens almost every time.
 
+## A level drawn and then painted over (BLiNX, 5 Oct 2026)
+
+BLiNX: the Time Sweeper (XDK 4831) reached its first level with ~13,000
+draws a frame reaching the host and a black world. Three separate rules,
+each NV2A behaviour rather than anything about the title:
+
+1. **A declaration can live entirely on one stream that is not 0.** Its
+   skinned meshes declare twelve registers on stream 1 (108-byte vertices).
+   With stream 0 assumed, every register was "another stream" to copy in,
+   twelve against a limit of eight, and 1,500 draws a frame were skipped as
+   "program without layout" -- silently, until that refusal was made to say
+   why. A program now records the one stream it reads as its base stream,
+   and buffer draws take their vertices and stride from it
+   (`hle_d3d8_shadow_base_stream`).
+2. **A draw may sample the render target it draws into.** The scene goes to
+   an offscreen target; shadow volumes accumulate in its alpha; then one
+   full-screen quad samples that same target to darken what they marked.
+   The NV2A allows this, since each pixel reads only its own texel. D3D11
+   drops a view of the bound target, so the quad read zeros and wrote black
+   over the whole level. Found by bisecting the captured frame with
+   `--draws N --dump-target`: the target held the level at draw 13,230 and
+   was black at 13,231. Such a draw now samples a copy of the target taken
+   just before it (`feedback_begin` in `d3d8_device.c`, on the new
+   `rhi_image_copy`).
+3. **A stage with no texture that reads `D3DTA_TEXTURE` does not take part.**
+   The title movie (Sofdec, decoded by the title into a YUY2 texture) is
+   drawn with stage 1 still `MODULATE(TEXTURE, DIFFUSE)` over no texture.
+   Bound as the white placeholder, that stage replaced the movie with white.
+   The HLE now passes an empty stage on as empty; the device binds white
+   there itself (so combiners read what they always did) and its
+   fixed-function path disables such a stage. This is inferred from the
+   title's picture, not measured on hardware.
+
+Also: YUY2 and UYVY are linear (texel-addressed) though they carry no `LIN_`
+name, and `--list-draws` now prints every active stage's ops and, for small
+UP draws, every vertex.
+
 ## What is per-title here
 
 Very little. The replacement boundary is per XDK build, and below it everything

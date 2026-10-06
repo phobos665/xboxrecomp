@@ -32,6 +32,7 @@ project, or the second title silently lifts from the first one's disassembly
 """
 
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -100,6 +101,8 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     # Picked up by default so running the pipeline never quietly discards them.
     for seed_file in args.seeds:
         disasm += ["--seed-functions", str(seed_file)]
+    if getattr(args, "data_sections", None):
+        disasm += ["--data-sections", ",".join(args.data_sections)]
     if args.verbose:
         disasm.append("-v")
 
@@ -269,6 +272,17 @@ def main() -> int:
         if legacy.is_file():
             print(f"warning: {legacy} is ignored; seeds are per-title now, "
                   f"in config/seeds/<TITLEID>.json", file=sys.stderr)
+
+    # Sections that hold data although the XBE marks them executable, which
+    # it does for nearly all of them. Per title, like the seeds: a name that
+    # is data in one game (MDL*, MAP*) may be code in another.
+    args.data_sections = []
+    title = xbe_title_id(xbe)
+    sec_file = REPO / "config" / "sections" / ((title or "") + ".json")
+    if title and sec_file.is_file():
+        entries = json.loads(sec_file.read_text(encoding="utf-8")).get("data", [])
+        args.data_sections = [e["pattern"] for e in entries]
+        print(f"data sections: {', '.join(args.data_sections)} ({sec_file.name})")
 
     if not args.dry_run and not xbe.is_file():
         print(f"error: XBE not found: {xbe}", file=sys.stderr)

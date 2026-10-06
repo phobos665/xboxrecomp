@@ -1970,6 +1970,40 @@ static int ensure_readback(VkDeviceSize size)
     return 1;
 }
 
+static int v_image_copy(RhiImage *dst, RhiImage *src)
+{
+    VkImage s, d;
+    VkImageLayout src_layout;
+    VkImageCopy region;
+
+    if (!dst || !src || dst == src || dst->desc.type != RHI_IMAGE_2D ||
+        src->desc.type != RHI_IMAGE_2D || dst->swapchain ||
+        dst->desc.width != src->desc.width || dst->desc.height != src->desc.height ||
+        dst->format != src->format || dst->desc.samples > 1 || src->desc.samples > 1 ||
+        is_depth_format(src->format))
+        return -1;
+    end_rendering();
+    if ((s = image_handle(src)) == VK_NULL_HANDLE || (d = image_handle(dst)) == VK_NULL_HANDLE)
+        return -1;
+    if (!src->swapchain && src->steady != VK_IMAGE_LAYOUT_GENERAL)
+        to_layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (dst->steady != VK_IMAGE_LAYOUT_GENERAL)
+        to_layout(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    src_layout = src->swapchain ? SC.layouts[SC.index] : src->layout;
+    memset(&region, 0, sizeof region);
+    region.srcSubresource.aspectMask = region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = region.dstSubresource.layerCount = 1;
+    region.extent.width = src->desc.width;
+    region.extent.height = src->desc.height;
+    region.extent.depth = 1;
+    vkCmdCopyImage(cmd(), s, src_layout, d, dst->layout, 1, &region);
+    if (!src->swapchain)
+        to_layout(src, src->steady);
+    to_layout(dst, dst->steady);
+    full_barrier(cmd());
+    return 0;
+}
+
 static int v_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitch)
 {
     uint32_t mips, mip, layer, w, h, row_bytes, rows, r;
@@ -3487,6 +3521,7 @@ const RhiBackend rhi_vulkan_backend = {
     v_set_topology, v_set_vertex_layout, v_set_vertex_buffer, v_set_index_buffer, v_set_shader,
     v_set_uniform_buffers, v_set_textures, v_set_samplers, v_set_blend_state, v_set_depth_state,
     v_set_raster_state, v_draw, v_draw_indexed, v_clear_color, v_clear_depth,
+    v_image_copy,
 };
 
 #endif /* RHI_HAVE_VULKAN */

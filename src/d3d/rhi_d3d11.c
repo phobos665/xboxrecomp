@@ -664,6 +664,22 @@ static void staging_release(void)
     g_staging.tex = NULL;
 }
 
+static int d_image_copy(RhiImage *dst, RhiImage *src)
+{
+    D3D11_TEXTURE2D_DESC a, b;
+
+    if (!dst || !src || dst == src || dst->desc.type != RHI_IMAGE_2D ||
+        src->desc.type != RHI_IMAGE_2D)
+        return -1;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)dst->res, &a);
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)src->res, &b);
+    if (a.Width != b.Width || a.Height != b.Height || a.Format != b.Format ||
+        a.SampleDesc.Count != 1 || b.SampleDesc.Count != 1)
+        return -1;
+    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, dst->res, 0, 0, 0, 0, src->res, 0, NULL);
+    return 0;
+}
+
 static int d_image_readback(RhiImage *img, uint32_t sub, void *dst, uint32_t dst_pitch)
 {
     D3D11_TEXTURE2D_DESC src_desc, want;
@@ -1290,6 +1306,7 @@ const RhiBackend rhi_d3d11_backend = {
     d_set_topology, d_set_vertex_layout, d_set_vertex_buffer, d_set_index_buffer, d_set_shader,
     d_set_uniform_buffers, d_set_textures, d_set_samplers, d_set_blend_state, d_set_depth_state,
     d_set_raster_state, d_draw, d_draw_indexed, d_clear_color, d_clear_depth,
+    d_image_copy,
 };
 
 #endif /* _WIN32 */
