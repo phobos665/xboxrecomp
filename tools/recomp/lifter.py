@@ -2046,6 +2046,11 @@ class Lifter:
         if len(ops) < 1:
             return ["/* push: no operand */"]
         val = _fmt_operand_read(ops[0])
+        # An operand-size prefix makes push move two bytes, not four. (Segment
+        # registers keep a 4-byte slot; _REG_WIDTH does not list them.)
+        if ops[0].type in ("reg", "mem") and _operand_width(ops[0]) == 2:
+            return [f"{{ uint16_t _pv = (uint16_t)({val}); esp -= 2; "
+                    f"MEM16(esp) = _pv; }} /* push16 */"]
         return [f"PUSH32(esp, {val});"]
 
     def _lift_pop(self, insn, ops):
@@ -2056,6 +2061,11 @@ class Lifter:
             # Segment register pop → discard from stack
             if r in ("fs", "gs", "cs", "ds", "es", "ss"):
                 return [f"{{ uint32_t _tmp; POP32(esp, _tmp); }} /* pop {r} - segment register */"]
+            # pop r16 takes two bytes and writes only the low half. POP32 with
+            # the 16-bit name emitted `POP32(esp, bx)`, which is not C at all.
+            if _operand_width(ops[0]) == 2:
+                return [f"{{ uint32_t _tmp = MEM16(esp); esp += 2; "
+                        f"{_fmt_set_reg(r, '_tmp')} }} /* pop16 */"]
             # Sample esp at each pop in a traced function. An epilogue that ends
             # `mov esp, ebp` restores esp unconditionally, so any drift inside
             # the function is erased before a return-time trace can see it --
@@ -2065,6 +2075,9 @@ class Lifter:
                 return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", "pop {r}");',
                         f"POP32(esp, {r});"]
             return [f"POP32(esp, {r});"]
+        elif _operand_width(ops[0]) == 2:
+            return [f"{{ uint32_t _tmp = MEM16(esp); esp += 2; "
+                    f"{_fmt_operand_write(ops[0], '_tmp')} }} /* pop16 */"]
         else:
             return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]
 
@@ -2888,10 +2901,52 @@ class Lifter:
                 break
             inside.append(target)
         # Two arms is the smallest thing worth calling a switch; one is more
-        # likely a coincidence than a jump table.
+        # likely a coincidence than a jump table -- unless the function reads
+        # a byte table of indices into it (_indexes_byte_table).
         if len(inside) >= 2:
             return inside
+        if len(inside) == 1 and self._indexes_byte_table(table_va, 1):
+            return inside
         return []
+
+    def _indexes_byte_table(self, table_va, entries):
+        """Whether this function reads a byte table of indices into the dword
+        table at table_va: a two-level switch.
+
+        MSVC compiles a switch whose cases share bodies as
+        `movzx eax, byte ptr [eax + B]; jmp dword ptr [eax*4 + T]` with the
+        byte table straight after the dword table, so B == T + 4 * entries.
+        When every case shares one body the dword table has a single entry,
+        and the one-arm rule above lifted the dispatch as a runtime jump whose
+        target, mid-function, never resolved: WWE Raw 2's sub_00156800 (six
+        cases, bytes all 0, one arm at 0x00156825) did that and the title
+        crashed loading a match. DisasmEngine._two_level_switch is the same
+        test on the disassembler's side.
+
+        Looks for `0F B6 /r` with a [reg + disp32] operand (mod 10, no SIB)
+        whose displacement is B anywhere in the function, and requires the
+        first index to be in range.
+        """
+        if not self.xbe_data or self.func_end <= self.func_start:
+            return False
+        byte_tbl = table_va + 4 * entries
+        start = va_to_file_offset(self.func_start)
+        first = va_to_file_offset(byte_tbl)
+        if start is None or first is None or first >= len(self.xbe_data):
+            return False
+        if self.xbe_data[first] >= entries:
+            return False
+        code = self.xbe_data[start:start + (self.func_end - self.func_start)]
+        needle = struct.pack('<I', byte_tbl)
+        at = code.find(needle)
+        while at != -1:
+            if at >= 3:
+                modrm = code[at - 1]
+                if (code[at - 3] == 0x0F and code[at - 2] == 0xB6
+                        and (modrm >> 6) == 2 and (modrm & 7) != 4):
+                    return True
+            at = code.find(needle, at + 1)
+        return False
 
     def _lift_jmp(self, insn, ops):
         if insn.jump_target:
