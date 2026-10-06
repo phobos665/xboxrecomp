@@ -905,7 +905,24 @@ static void bridge_NtAllocateVirtualMemory(void)
      * two. This clamp is enough for a title that reserves generously and
      * commits little, and it fails loudly and later rather than silently and
      * at startup if one does not. */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* A region starts on the allocation granularity, 64 KB, as on the console
+     * and in NT. Titles rely on it: Forza's operator delete tells its small-
+     * object pool from the CRT heap by one bit per 64 KB region (0x589340,
+     * indexed by ptr >> 16), and its pool pages are one-page VirtualAllocs.
+     * Packed 4 KB apart, fifteen pages shared a window with each other and
+     * with the end of the process heap; releasing one page cleared the bit
+     * for all of them, the next delete of a live slot went to RtlFreeHeap
+     * with a pointer 8 bytes off a block, and the heap was corrupt by the
+     * race load. The gap this leaves is reused for smaller-aligned requests
+     * (xbox_HeapAlloc). Off by default (RECOMP_VA_64K=1): our guest addresses
+     * are also its storage, so every one-page region costs a whole 64 KB of
+     * the 64 MB, and Forza ran out of heap in its race load with it on. */
+    static int va_64k = -1;
+    if (va_64k < 0)
+        va_64k = xbox_EnvSwitch("RECOMP_VA_64K", 0);
+    if (va_64k)
+        size = (size + 0xFFFu) & ~0xFFFu;
+    uint32_t xbox_va = xbox_HeapAlloc(size, va_64k ? 0x10000u : 4096u);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
          * space above RAM, where it costs no heap and the pages are distinct.

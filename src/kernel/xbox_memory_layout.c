@@ -4824,6 +4824,19 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         return 0;
     }
 
+    /* The space alignment skipped stays usable. A 64 KB-aligned virtual
+     * allocation (bridge_NtAllocateVirtualMemory) can leave most of a 64 KB
+     * window behind it; recorded as a free block -- before the new one, so
+     * the table stays in address order -- it serves the next request with a
+     * smaller alignment instead of being lost. */
+    if (alignment >= 0x10000u && result - g_heap_next >= 64u &&
+        g_heap_block_count + 1 < XBOX_HEAP_MAX_BLOCKS) {
+        g_heap_blocks[g_heap_block_count].addr = g_heap_next;
+        g_heap_blocks[g_heap_block_count].size = result - g_heap_next;
+        g_heap_blocks[g_heap_block_count].free = 1;
+        g_heap_block_count++;
+    }
+
     g_heap_next = result + size;
 
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
