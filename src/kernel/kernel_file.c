@@ -128,6 +128,51 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* Which partition image a volume-root handle stands for.
+ *
+ * A partition opened as a directory is redirected to the folder that holds
+ * its image (below), which is right for what the title does with the handle
+ * -- a volume query -- but loses which partition it asked about. Forza
+ * formats Partition4 with 64 KB clusters, then opens
+ * \Device\Harddisk0\Partition4\ and checks the volume reports that size; the
+ * query only saw the save folder. So the redirect records the image here,
+ * and the volume query looks it up. Entries are dropped on close and checked
+ * against the handle's current folder, so a reused handle value is not
+ * mistaken for an old one. */
+#define VOLUME_HANDLES 16
+static struct { HANDLE h; WCHAR image[MAX_PATH]; WCHAR dir[MAX_PATH]; } s_volume_handles[VOLUME_HANDLES];
+
+static void volume_handle_note(HANDLE h, const WCHAR *image, const WCHAR *dir)
+{
+    int i, slot = -1;
+    for (i = 0; i < VOLUME_HANDLES; i++) {
+        if (s_volume_handles[i].h == h) { slot = i; break; }
+        if (!s_volume_handles[i].h && slot < 0) slot = i;
+    }
+    if (slot < 0)
+        slot = 0;
+    s_volume_handles[slot].h = h;
+    wcscpy_s(s_volume_handles[slot].image, MAX_PATH, image);
+    wcscpy_s(s_volume_handles[slot].dir, MAX_PATH, dir);
+}
+
+static const WCHAR *volume_handle_image(HANDLE h)
+{
+    int i;
+    for (i = 0; i < VOLUME_HANDLES; i++)
+        if (s_volume_handles[i].h == h && h)
+            return s_volume_handles[i].image;
+    return NULL;
+}
+
+static void volume_handle_forget(HANDLE h)
+{
+    int i;
+    for (i = 0; i < VOLUME_HANDLES; i++)
+        if (s_volume_handles[i].h == h)
+            s_volume_handles[i].h = NULL;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -135,7 +180,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     ULONG CreateDisposition, ULONG CreateOptions)
 {
     WCHAR win_path[MAX_PATH];
+    WCHAR redirected_image[MAX_PATH];
     HANDLE h;
+    redirected_image[0] = 0;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
     (void)AllocationSize;
 
@@ -164,6 +211,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
         WCHAR *slash = wcsrchr(win_path, L'\\');
         if (slash && slash != win_path) {
+            wcscpy_s(redirected_image, MAX_PATH, win_path);
             *slash = 0;
             xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
                      "NtCreateFile: directory open of a device image, "
@@ -220,6 +268,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (h != INVALID_HANDLE_VALUE && redirected_image[0])
+            volume_handle_note(h, redirected_image, win_path);
     } else {
         /* XBOX_FILE_NO_INTERMEDIATE_BUFFERING is deliberately not passed on.
          *
@@ -367,6 +417,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        volume_handle_forget(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -570,11 +621,83 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* The sectors per cluster recorded in a FATX superblock at the start of the
+ * file behind `h`, or 0 when it does not hold one (a host directory, an
+ * ordinary file, a partition image nobody has formatted). The superblock is
+ * "FATX", a volume serial, then sectors per cluster, all little-endian.
+ *
+ * Partition paths open the raw image file (kernel_path.c), so a title that
+ * formats a cache partition itself and then asks the new volume for its
+ * geometry is asking about this. Forza does exactly that for its second
+ * cache drive N: -- it formats Partition4 with the cluster size it wants,
+ * then refuses the volume (ERROR_UNRECOGNIZED_VOLUME) unless the query
+ * reports that same size, and never links N:. Every answer here used to be
+ * the fixed 16 KB; Forza formats with 64 KB clusters.
+ *
+ * Read through a second handle opened by name: the title's own handle on a
+ * volume root is typically opened for SYNCHRONIZE alone, which cannot read,
+ * and a separate handle leaves its file pointer alone too. */
+static DWORD fatx_sectors_per_cluster(HANDLE h, ULONGLONG *image_bytes)
+{
+    BYTE sb[12];
+    DWORD got = 0, n;
+    WCHAR path[MAX_PATH];
+    HANDLE r;
+    LARGE_INTEGER size;
+    BOOL ok;
+
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return 0;
+    if (volume_handle_image(h)) {
+        /* A volume root redirected to the images' folder: the image it
+         * stands for, if the handle still names that folder. */
+        WCHAR now[MAX_PATH];
+        int i;
+        const WCHAR *img = volume_handle_image(h);
+        n = GetFinalPathNameByHandleW(h, now, MAX_PATH, FILE_NAME_NORMALIZED);
+        for (i = 0; i < VOLUME_HANDLES; i++)
+            if (s_volume_handles[i].h == h)
+                break;
+        /* GetFinalPathNameByHandleW answers with a \\?\ prefix. */
+        if (n == 0 || n >= MAX_PATH || i == VOLUME_HANDLES ||
+            _wcsicmp(now + (wcsncmp(now, L"\\\\?\\", 4) == 0 ? 4 : 0),
+                     s_volume_handles[i].dir) != 0)
+            return 0;
+        wcscpy_s(path, MAX_PATH, img);
+    } else {
+        if (GetFileType(h) != FILE_TYPE_DISK)
+            return 0;
+        n = GetFinalPathNameByHandleW(h, path, MAX_PATH, FILE_NAME_NORMALIZED);
+        if (n == 0 || n >= MAX_PATH || n < 4 || _wcsicmp(path + n - 4, L".img") != 0)
+            return 0;                      /* only a partition image */
+    }
+    r = CreateFileW(path, GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (r == INVALID_HANDLE_VALUE)
+        return 0;
+    ok = GetFileSizeEx(r, &size) && size.QuadPart >= (LONGLONG)sizeof sb &&
+         ReadFile(r, sb, sizeof sb, &got, NULL) && got == sizeof sb;
+    CloseHandle(r);
+    if (!ok || memcmp(sb, "FATX", 4) != 0)
+        return 0;
+    {
+        DWORD spc = (DWORD)sb[8] | ((DWORD)sb[9] << 8) | ((DWORD)sb[10] << 16) |
+                    ((DWORD)sb[11] << 24);
+        /* A power of two between one sector and 128 KB, or it is not one. */
+        if (spc == 0 || spc > 256 || (spc & (spc - 1)) != 0)
+            return 0;
+        if (image_bytes)
+            *image_bytes = (ULONGLONG)size.QuadPart;
+        return spc;
+    }
+}
+
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -582,7 +705,27 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            ULONGLONG image_bytes = 0;
+            DWORD spc = fatx_sectors_per_cluster(FileHandle, &image_bytes);
+            if (spc) {
+                /* A volume the title formatted: its own geometry, sized to
+                 * the image, and free space no larger than the host has. */
+                ULONGLONG cs = (ULONGLONG)XBOX_BYTES_PER_SECTOR * spc;
+                ULONGLONG avail = image_bytes;
+                if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free) &&
+                    free_bytes.QuadPart < avail)
+                    avail = free_bytes.QuadPart;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = spc;
+                info->TotalAllocationUnits.QuadPart = image_bytes / cs;
+                info->AvailableAllocationUnits.QuadPart = avail / cs;
+                {
+                    static int said;
+                    if (said++ < 4)
+                        fprintf(stderr, "  [FILE] volume query: a FATX volume with %lu-byte "
+                                "clusters\n", (unsigned long)cs);
+                }
+            } else if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
