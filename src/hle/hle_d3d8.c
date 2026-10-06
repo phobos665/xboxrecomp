@@ -468,6 +468,8 @@ static uint32_t g_backbuffer_va, g_autodepth_va;
 static uint32_t g_swap_data[SWAP_SURFACES];
 static int      g_nswap;
 
+static void note_framebuffer_phys(uint32_t data);
+
 static void note_swap_surface(uint32_t va)
 {
     uint32_t data;
@@ -483,6 +485,15 @@ static void note_swap_surface(uint32_t va)
             return;
     if (g_nswap < SWAP_SURFACES)
         g_swap_data[g_nswap++] = data;
+    /* A swap surface is a frame buffer, so a texture over its memory is the
+     * title reading its own screen -- registered now, not only when it is
+     * the back buffer at a Swap. XGRA draws each frame into one of two
+     * 640x576 buffers and then copies it onto the other with a full-screen
+     * quad textured from the first buffer's memory; only the buffer current
+     * at Swap had been registered, so the copy sampled guest memory the GPU
+     * never wrote and painted the whole frame black (a replay without that
+     * one draw shows the front end). */
+    note_framebuffer_phys(data);
 }
 
 static int is_swap_data(uint32_t data)
