@@ -244,23 +244,31 @@ static int guest_readable(uint32_t va, uint64_t bytes)
     return va >= CONTIG_BASE && (uint64_t)va + bytes <= (uint64_t)CONTIG_BASE + CONTIG_SIZE;
 }
 
-/* Host pointer to vertex `first` of the stream 0 buffer, for `vertices`
- * vertices, or NULL (counted) if there is no buffer or it would read outside
- * the contiguous window. */
-static const void *stream0_vertices(uint32_t first, uint32_t vertices)
+/* From hle_d3d8.c: the stream the selected program's vertices come from. */
+uint32_t hle_d3d8_shadow_base_stream(void);
+
+/* Host pointer to vertex `first` of the draw's own stream -- stream 0, or
+ * the one stream the selected program reads (hle_d3d8_shadow_base_stream) --
+ * for `vertices` vertices, with that stream's stride in *stride; NULL
+ * (counted) if there is no buffer or it would read outside the contiguous
+ * window. */
+static const void *stream0_vertices(uint32_t first, uint32_t vertices, uint32_t *stride)
 {
+    uint32_t base = hle_d3d8_shadow_base_stream();
+    uint32_t vb = base ? g_stream_vb[base] : g_stream0_vb;
     uint32_t data, va;
     uint64_t start, bytes;
 
-    if (!g_stream0_vb || !g_stream0_stride || !guest_readable(g_stream0_vb, 12u)) {
+    *stride = base ? g_stream_stride[base] : g_stream0_stride;
+    if (!vb || !*stride || !guest_readable(vb, 12u)) {
         g_skip_no_stream++;
         return NULL;
     }
-    data = HLE_MEM32(g_stream0_vb + 4u);
+    data = HLE_MEM32(vb + 4u);
     /* Where the title's own D3DVertexBuffer_Lock2 hands out the vertices. */
     va = data | CONTIG_BASE;
-    start = (uint64_t)(va - CONTIG_BASE) + (uint64_t)first * g_stream0_stride;
-    bytes = (uint64_t)vertices * g_stream0_stride;
+    start = (uint64_t)(va - CONTIG_BASE) + (uint64_t)first * *stride;
+    bytes = (uint64_t)vertices * *stride;
     if (!data || start + bytes > CONTIG_SIZE) {
         g_skip_range++;
         return NULL;
@@ -407,10 +415,11 @@ HLE_EXPORT(D3DDevice_DrawVertices)
         }
         report();
     } else if (hle_d3d8_shadow_device() && count) {
-        const void *verts = stream0_vertices(start, count);
+        uint32_t stride;
+        const void *verts = stream0_vertices(start, count, &stride);
         if (verts) {
             hle_d3d8_shadow_set_first_vertex(start);
-            hle_d3d8_shadow_draw(xpt, count, verts, g_stream0_stride, 1);
+            hle_d3d8_shadow_draw(xpt, count, verts, stride, 1);
         }
         report();
     }
@@ -436,7 +445,7 @@ HLE_EXPORT(D3DDevice_DrawIndexedVertices)
     if (hle_d3d8_shadow_device() && count && index_va &&
         guest_readable(index_va, (uint64_t)count * 2u)) {
         const uint16_t *idx = (const uint16_t *)HLE_PTR(index_va);
-        uint32_t i, vertices = 0;
+        uint32_t i, vertices = 0, vstride;
         const void *verts;
 
         for (i = 0; i < count; i++)
@@ -474,10 +483,10 @@ HLE_EXPORT(D3DDevice_DrawIndexedVertices)
                 fprintf(stderr, "[HLE-D3D8] shadow buffers: CDevice_SetStateVB never "
                         "ran; indexed buffer draws use base vertex 0\n");
         }
-        verts = stream0_vertices(g_base_vertex, vertices);
+        verts = stream0_vertices(g_base_vertex, vertices, &vstride);
         if (verts) {
             hle_d3d8_shadow_set_first_vertex(g_base_vertex);
-            hle_d3d8_shadow_draw_indexed(xpt, count, idx, verts, g_stream0_stride, 1);
+            hle_d3d8_shadow_draw_indexed(xpt, count, idx, verts, vstride, 1);
         }
         report();
     }

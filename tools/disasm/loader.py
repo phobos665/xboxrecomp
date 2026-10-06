@@ -191,9 +191,31 @@ def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
     return None
 
 
-def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImage:
+def is_data_section(name: str, patterns=None) -> bool:
+    """True when a section holds data, whatever its executable flag says.
+
+    The conventional PE names always; `patterns` adds a title's own, as
+    fnmatch globs (config/sections/<TITLEID>.json, via --data-sections).
+    """
+    import fnmatch
+    if name in DATA_SECTION_NAMES:
+        return True
+    return any(fnmatch.fnmatchcase(name, p) for p in (patterns or ()))
+
+
+def load_image(xbe_path: str, analysis_json: Optional[str] = None,
+               data_sections=None) -> BinaryImage:
     """
     Load an XBE binary and its analysis metadata.
+
+    data_sections: fnmatch patterns for sections that hold data although the
+    XBE marks them executable, which is nearly all of them. A matching section
+    is loaded as non-executable, so every "is this code" test in the detector
+    rejects it at once -- not only the section list the sweep is given, but
+    also the immediate, data-pointer and call-target passes that consult
+    `section.executable` directly. Blinx carries 42 demand-loaded model and
+    map sections (MDL*, MAP*, 40 MB); swept as code they produced 10,700
+    phantom functions, two-thirds of its lift.
 
     Args:
         xbe_path: Path to the .xbe file.
@@ -245,7 +267,10 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
             raw_addr=_parse_hex(sec_data["raw_addr"]),
             raw_size=sec_data["raw_size"],
             writable=sec_data["writable"],
-            executable=sec_data["executable"],
+            executable=(sec_data["executable"]
+                        and not (data_sections
+                                 and is_data_section(sec_data["name"],
+                                                     data_sections))),
             flags=sec_data["flags"],
         ))
 

@@ -67,6 +67,13 @@ def main():
              "e.g., --extra-sections XIPS,DOLBY)",
     )
     parser.add_argument(
+        "--data-sections",
+        default=None,
+        help="Comma-separated section names or fnmatch globs that hold data "
+             "although the XBE marks them executable (e.g. MDL*,MAP*). "
+             "scripts/recompile.py passes config/sections/<TITLEID>.json",
+    )
+    parser.add_argument(
         "--seed-functions",
         action="append",
         default=None,
@@ -94,6 +101,8 @@ def main():
         config.configure_from_xbe(args.xbe_path)
 
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
+        data = ([s.strip() for s in args.data_sections.split(",") if s.strip()]
+                if args.data_sections else [])
         seed_funcs = []
         observed = set()
         for _seed_path in (args.seed_functions or []):
@@ -111,6 +120,7 @@ def main():
             verbose=args.verbose,
             force=args.force,
             extra_sections=extra,
+            data_sections=data,
             seed_functions=seed_funcs,
             observed_seeds=observed,
         )

@@ -78,6 +78,9 @@ typedef struct RhiBackend {
     void (*draw_indexed)(uint32_t, uint32_t, int32_t);
     void (*clear_color)(RhiView *, const float *);
     void (*clear_depth)(RhiView *, uint32_t, float, uint8_t);
+    /* Last, so a backend's positional initialiser that predates it leaves it
+     * NULL, which rhi_image_copy reports as unsupported. */
+    int  (*image_copy)(RhiImage *dst, RhiImage *src);
 } RhiBackend;
 
 extern const RhiBackend rhi_d3d11_backend;

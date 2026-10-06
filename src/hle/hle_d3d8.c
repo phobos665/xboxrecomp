@@ -736,6 +736,13 @@ struct shadow_program {
     uint8_t  packed_raw[SHADOW_MAX_PACKED];
     UINT     packed_size[SHADOW_MAX_PACKED];
     int      other_streams;              /* any register from stream 1..15 */
+    /* The stream a draw takes its vertices from: the one stream every
+     * register reads when there is only one, else 0. BLiNX declares its
+     * skinned meshes entirely on stream 1 -- twelve registers, 108-byte
+     * vertices -- and with stream 0 assumed every one of them was "another
+     * stream" to copy in, twelve against a limit of eight, so 1,500 draws a
+     * frame were skipped and its world was black. */
+    uint32_t base_stream;
     UINT     expanded_bytes;
     /* The declaration as the title's own D3DVSD tokens give it, decoded at
      * CreateVertexShader. Used instead of the copy the XDK parses into the
@@ -770,6 +777,16 @@ static int      g_shadow_vs_slot = -1;   /* its g_programs entry, or -1 */
 uint32_t hle_d3d8_shadow_program_object(void)
 {
     return g_shadow_vs_is_program ? (g_shadow_vs & ~1u) : 0u;
+}
+
+/* The stream a buffer draw takes its vertices from under the program
+ * selected now (struct shadow_program, base_stream); 0 under an FVF. */
+uint32_t hle_d3d8_shadow_base_stream(void)
+{
+    if (!g_shadow_vs_is_program || g_shadow_vs_kind != SHADER_HOST_PROGRAM ||
+        g_shadow_vs_slot < 0)
+        return 0u;
+    return g_programs[g_shadow_vs_slot].base_stream;
 }
 
 /* The handle is the address of the title's shader object, so a shader
@@ -2489,13 +2506,30 @@ static void shadow_read_declaration(int slot, uint32_t handle)
     UINT shift = 0, out = 0;
     int n = 0, packed = 0, refused = 0;
 
+    uint32_t base = 0xFFFFFFFFu;
+
     p->has_declaration = 0;
     p->extent = 0;
     p->packed_count = 0;
     p->other_streams = 0;
     p->expanded_bytes = 0;
+    p->base_stream = 0;
     if (!object)
         return;
+    /* One stream throughout: that stream is the draw's own vertex. */
+    for (i = 0; i < 16u; i++) {
+        uint32_t stream, offset, format;
+
+        decl_attr(p, object, i, &stream, &offset, &format);
+        if (format <= 0x02u)
+            continue;
+        if (base == 0xFFFFFFFFu)
+            base = stream;
+        else if (base != stream)
+            base = 0;
+    }
+    if (base > 15u)
+        base = 0;
     for (i = 0; i < 16u; i++) {
         uint32_t stream, offset, format;
         RhiFormat dxgi;
@@ -2508,14 +2542,19 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         if ((floats = xbox_vsdt_expanded(format, &size)) != 0) {
             packed++;
             shift += (UINT)floats * 4u;
-        } else if ((stream != 0u || (offset & 3u)) &&
+        } else if ((stream != base || (offset & 3u)) &&
                    xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
             packed++;
             shift += (size + 3u) & ~3u;
         }
     }
-    if (packed > SHADOW_MAX_PACKED)
+    if (packed > SHADOW_MAX_PACKED) {
+        if (notes++ < 16)
+            fprintf(stderr, "[HLE-D3D8] shadow declaration 0x%08X: %d registers need "
+                    "unpacking, past the %d a draw can expand; its draws are skipped\n",
+                    handle, packed, SHADOW_MAX_PACKED);
         return;
+    }
     packed = 0;
 
     for (i = 0; i < 16u; i++) {
@@ -2533,7 +2572,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             p->packed_offset[packed] = offset;
             p->packed_out[packed] = out;
             p->packed_format[packed] = format;
-            p->packed_stream[packed] = (uint8_t)stream;
+            p->packed_stream[packed] = (uint8_t)(stream == base ? 0u : stream);
             p->packed_raw[packed] = 0;
             p->packed_size[packed] = size;
             packed++;
@@ -2542,11 +2581,11 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             out += (UINT)floats * 4u;
         } else if (!xbox_vsdt_to_dxgi(format, &dxgi, &size)) {
             refused = 1;
-        } else if (stream != 0u || (offset & 3u)) {
+        } else if (stream != base || (offset & 3u)) {
             p->packed_offset[packed] = offset;
             p->packed_out[packed] = out;
             p->packed_format[packed] = format;
-            p->packed_stream[packed] = (uint8_t)stream;
+            p->packed_stream[packed] = (uint8_t)(stream == base ? 0u : stream);
             p->packed_raw[packed] = 1;
             p->packed_size[packed] = size;
             packed++;
@@ -2564,7 +2603,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
             break;
         }
         in[n].reg = (int)i;
-        if (stream != 0u)
+        if (stream != base)
             p->other_streams = 1;
         else if (offset + size > p->extent)
             p->extent = offset + size;
@@ -2575,10 +2614,19 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         p->has_declaration = 1;
         p->packed_count = packed;
         p->expanded_bytes = shift;
+        p->base_stream = base;
     } else if (refused && notes++ < 16) {
         fprintf(stderr, "[HLE-D3D8] shadow declaration 0x%08X: v%u (stream %u, format "
                 "0x%02X) has no host layout; its draws are skipped\n",
                 handle, bad_reg, bad_stream, bad_format);
+    } else if (!refused && notes++ < 16) {
+        /* Said, because silence here reads exactly like success: BLiNX
+         * skipped 1,500 draws a frame as "program without layout" with
+         * every declaration it logged looking fine. */
+        fprintf(stderr, "[HLE-D3D8] shadow declaration 0x%08X: %s; its draws are "
+                "skipped\n", handle,
+                n == 0 ? "no register is declared (object + 20 is empty)"
+                       : "the host refused the layout");
     }
 }
 #endif
@@ -3047,6 +3095,7 @@ static void inline_draw_program(uint32_t n)
     p->packed_count = 0;
     p->other_streams = 0;
     p->expanded_bytes = 0;
+    p->base_stream = 0;
     hle_d3d8_shadow_draw(g_inline_xpt, n, g_inline_verts, sizeof g_inline_verts[0], 0);
     *p = saved;
     if (saved.has_declaration)
