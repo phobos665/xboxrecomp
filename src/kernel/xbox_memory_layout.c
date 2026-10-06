@@ -1964,6 +1964,50 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * in different lifted bodies of the same guest routine. */
 RECOMP_TLS int g_df = 0;
 
+/* The EFLAGS bits a program can set and read back through popfd/pushfd
+ * without the lifter's flag model knowing: AC (bit 18) and ID (bit 21).
+ * Per thread, like the real register. */
+static RECOMP_TLS uint32_t g_eflags_sticky = 0;
+
+uint32_t recomp_eflags_push(void)
+{
+    /* IF and the always-one bit 1; DF from the lifted direction flag. */
+    return 0x00000202u | (g_df ? 0x00000400u : 0u) | g_eflags_sticky;
+}
+
+void recomp_eflags_pop(uint32_t eflags)
+{
+    g_eflags_sticky = eflags & 0x00240000u;
+    g_df = (eflags & 0x00000400u) != 0u;
+}
+
+/* cpuid as the Xbox's CPU answers it: a 733 MHz Pentium III (Coppermine,
+ * family 6 model 8) with a 128 KB L2. Bink's MMX probe and the CRT's SSE
+ * check are what read it. Leaves past 2 answer zeros, as a CPU whose maximum
+ * standard leaf is 2 does for an out-of-range leaf on this family. */
+void recomp_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+{
+    (void)subleaf;
+    switch (leaf) {
+    case 0:                                     /* max leaf, "GenuineIntel" */
+        out[0] = 2u;          out[1] = 0x756E6547u;
+        out[2] = 0x6C65746Eu; out[3] = 0x49656E69u;
+        break;
+    case 1:                                     /* signature and features */
+        out[0] = 0x0000068Au; out[1] = 0u; out[2] = 0u;
+        /* FPU VME DE PSE TSC MSR PAE MCE CX8 SEP MTRR PGE MCA CMOV PAT PSE36,
+         * MMX (23), FXSR (24), SSE (25); no APIC, no PSN. */
+        out[3] = 0x0383F9FFu;
+        break;
+    case 2:                                     /* cache descriptors */
+        out[0] = 0x03020101u; out[1] = 0u; out[2] = 0u; out[3] = 0x0C040841u;
+        break;
+    default:
+        out[0] = out[1] = out[2] = out[3] = 0u;
+        break;
+    }
+}
+
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;

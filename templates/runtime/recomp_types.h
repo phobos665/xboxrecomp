@@ -433,6 +433,14 @@ void recomp_stub_missing(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* cpuid, answered as the Xbox's Pentium III: leaf in eax, subleaf in ecx,
+ * out[] = eax, ebx, ecx, edx. And the EFLAGS word pushfd pushes / popfd
+ * restores: IF and DF, plus the AC and ID bits a program set (the "does this
+ * CPU have cpuid" test toggles ID). xbox_memory_layout.c. */
+void recomp_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+uint32_t recomp_eflags_push(void);
+void recomp_eflags_pop(uint32_t eflags);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);
