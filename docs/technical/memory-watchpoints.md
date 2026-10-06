@@ -70,6 +70,25 @@ Addresses in the contiguous window (`0x80000000`, where
 `MmAllocateContiguousMemory` and most streamed data land) can be watched as
 well as low RAM. They used to be refused as "outside mapped guest RAM".
 
+**A field of an object, wherever it is: `*PTR+OFF`.** A heap object can be
+at a different address from run to run, but a global usually points at it.
+`RECOMP_WATCH_WRITE=*0x00356AA8+0x44C` watches offset `0x44C` of whatever
+`0x00356AA8` holds, read when the watch arms; a pointer that does not lead to
+guest RAM then drops that watch with a line saying so. TimeSplitters 2's
+player record moves between runs; this is how its clip counter was watched
+(and how the code that reloads it, and so the weapon table, was found).
+
+**Arming at a moment of play: `RECOMP_WATCH_ARM_ON=script`.** The watches are
+held until the input script reaches a `watch` step
+(`RECOMP_INPUT_SEQ=...,99500:watch,100000:lstick_up:3000,...`), so they arm
+after the object exists and just before the action being studied, timed by
+the same clock as the presses.
+
+A write to the rest of a watched page is stepped over silently. That used to
+open the wrong page when watches sat on two different pages -- the first
+watch's, not the one that faulted -- so the write faulted again and was
+reported as a crash; it opens the faulting page now.
+
 ### Arming late: `RECOMP_WATCH_ARM_ON`
 
 `RECOMP_WATCH_ARM_ON=<text>` holds the watches until the title opens a file

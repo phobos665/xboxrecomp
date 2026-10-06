@@ -73,6 +73,8 @@ typedef struct {
     uint32_t va;
     uint32_t len;
     uint32_t last;      /* value at the last report, for the -> arrow */
+    uint32_t ptr;       /* "*PTR+OFF": a field of what PTR points to; 0 = plain */
+    uint32_t off;
 } Watch;
 
 static Watch   g_watch[MAX_WATCH];
@@ -86,7 +88,9 @@ static long    g_arm_on_nth = 1;    /* ...on the Nth matching open ("text#N") */
 /* Single-step state is per thread: two threads can be mid-step at once, and
  * each has to put back its own page. */
 static RECOMP_TLS void    *g_step_page;
-static RECOMP_TLS uint32_t g_step_va;
+static RECOMP_TLS uint32_t g_step_va;       /* the watched word, to read after */
+static RECOMP_TLS uint32_t g_step_fault;    /* the address that faulted: its page
+                                             * is the one to restore */
 static RECOMP_TLS uint32_t g_step_before;
 static RECOMP_TLS int      g_step_pending;
 
@@ -142,9 +146,39 @@ static void protect_one(uint32_t va, uint32_t len, DWORD prot)
     VirtualProtect((LPVOID)first, (SIZE_T)(last - first) + 0x1000, prot, &old);
 }
 
+/* "*PTR+OFF" watches take their address from guest memory when they arm,
+ * so a field of a heap object can be watched though the object moves from
+ * run to run (TimeSplitters 2's player record: reached through a .data
+ * global, on the heap at a different address when the load order differs).
+ * One that does not resolve to RAM is dropped, with a line saying so. */
+static void resolve_pointers(void)
+{
+    int i, j;
+    for (i = 0; i < g_n_watch; i++) {
+        uint32_t base;
+        if (!g_watch[i].ptr)
+            continue;
+        base = guest_read32(g_watch[i].ptr);
+        g_watch[i].va = base + g_watch[i].off;
+        if (!base || !guest_in_ram(g_watch[i].va, g_watch[i].len)) {
+            fprintf(stderr, "[WATCH] *0x%08X+0x%X: the pointer holds 0x%08X, "
+                    "not guest RAM; dropped\n", g_watch[i].ptr, g_watch[i].off, base);
+            for (j = i; j + 1 < g_n_watch; j++)
+                g_watch[j] = g_watch[j + 1];
+            g_n_watch--;
+            i--;
+            continue;
+        }
+        g_watch[i].last = guest_read32(g_watch[i].va);
+        fprintf(stderr, "[WATCH] *0x%08X+0x%X is 0x%08X, currently 0x%08X\n",
+                g_watch[i].ptr, g_watch[i].off, g_watch[i].va, g_watch[i].last);
+    }
+}
+
 static void arm_all(void)
 {
     int i;
+    resolve_pointers();
     for (i = 0; i < g_n_watch; i++)
         protect_one(g_watch[i].va, g_watch[i].len, arm_protection());
 }
@@ -274,17 +308,34 @@ void xbox_watch_init(void)
      * the thing being watched is almost always a pointer or a counter. */
     for (p = spec; *p && g_n_watch < MAX_WATCH; ) {
         char *end = NULL;
-        uint32_t va = (uint32_t)strtoul(p, &end, 0);
-        uint32_t len = 4;
+        uint32_t va, len = 4, ptr = 0, off = 0;
+        int deref = *p == '*';
+        if (deref)
+            p++;
+        va = (uint32_t)strtoul(p, &end, 0);
         if (end == p)
             break;
         p = end;
+        if (deref) {
+            ptr = va;
+            if (*p == '+') {
+                off = (uint32_t)strtoul(p + 1, &end, 0);
+                p = end;
+            }
+        }
         if (*p == ':') {
             len = (uint32_t)strtoul(p + 1, &end, 0);
             p = end;
             if (len == 0) len = 4;
         }
-        if (!guest_in_ram(va, len)) {
+        if (ptr) {
+            g_watch[g_n_watch].ptr = ptr;
+            g_watch[g_n_watch].off = off;
+            g_watch[g_n_watch].len = len;
+            fprintf(stderr, "[WATCH] watching *0x%08X+0x%X (%u bytes), resolved when "
+                    "it arms\n", ptr, off, len);
+            g_n_watch++;
+        } else if (!guest_in_ram(va, len)) {
             fprintf(stderr, "[WATCH] 0x%08X is outside mapped guest RAM; skipped\n", va);
         } else {
             g_watch[g_n_watch].va = va;
@@ -309,6 +360,16 @@ void xbox_watch_init(void)
      * different screens and the run never reached the cutscene at all. */
     {
         const char *on = getenv("RECOMP_WATCH_ARM_ON");
+        if (on && !strcmp(on, "script")) {
+            /* Held for the input script's `watch` step (RECOMP_INPUT_SEQ):
+             * the moment in play the watch is about, timed with the presses
+             * that get there. */
+            snprintf(g_arm_on, sizeof g_arm_on, "%s", "\001script");
+            fprintf(stderr, "[WATCH] %d watchpoint(s) held for the input script's "
+                    "`watch` step\n", g_n_watch);
+            fflush(stderr);
+            return;
+        }
         if (on && *on) {
             /* "text#N": the Nth open of a matching file. A pack a title
              * opens at boot and again at the moment of interest -- Future
@@ -352,6 +413,18 @@ void xbox_watch_note_path(const char *xbox_path)
     fflush(stderr);
 }
 
+void xbox_watch_arm_now(const char *why)
+{
+    if (!g_n_watch || !g_arm_on[0])
+        return;                         /* nothing held */
+    g_arm_on[0] = 0;
+    arm_all();
+    fprintf(stderr, "[WATCH] armed by %s: %d watchpoint(s) on %s, budget %ld reports\n",
+            why ? why : "request", g_n_watch,
+            g_watch_reads ? "reads and writes" : "writes", g_watch_budget);
+    fflush(stderr);
+}
+
 int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
                          int is_write)
 {
@@ -369,7 +442,7 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     /* Already stepping on this thread means the step itself faulted on
      * something else. Do not recurse: put the page back and decline. */
     if (g_step_pending) {
-        protect_one(g_step_va, 4, arm_protection());
+        protect_one(g_step_fault, 1, arm_protection());
         g_step_pending = 0;
         return 0;
     }
@@ -410,14 +483,21 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
     } else {
         /* Collateral: some other address on the same page. Step over it
          * silently. */
-        g_step_va = g_watch[0].va;
+        g_step_va = va;
         g_step_before = 0;
         idx = -1;
     }
 
     /* Let the access happen, then trap immediately after it so the page can
-     * be protected again -- and so the value it wrote can be read. */
-    protect_one(g_step_va, 4, PAGE_READWRITE);
+     * be protected again -- and so the value it wrote can be read.
+     *
+     * The page to open is the one that faulted. It used to be the watched
+     * word's page, and for a collateral write the first watch's: with two
+     * watches on different pages, a write beside the second one opened the
+     * first one's page, faulted again, and was declined as a crash
+     * (TimeSplitters 2, watches at 0x452C0C and 0x451AC0, write to 0x451ACC). */
+    g_step_fault = va;
+    protect_one(g_step_fault, 1, PAGE_READWRITE);
     ep->ContextRecord->EFlags |= TRAP_FLAG;
     g_step_pending = idx >= 0 ? 1 : 2;   /* 2 = silent */
     fflush(stderr);
@@ -444,7 +524,7 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep)
     }
 
     if (!g_disarmed)
-        protect_one(g_step_va, 4, arm_protection());
+        protect_one(g_step_fault, 1, arm_protection());
     (void)g_step_page;
     return 1;
 }

@@ -49,7 +49,7 @@ enum {
  * a menu but not a place in a level, and "walk to where it looks wrong" is
  * how a rendering bug gets reproduced without a person at the pad. The names
  * match the controls in the binding config (src/input/input_bindings.c). */
-enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK, FAKE_SNAP };
+enum { FAKE_BUTTON, FAKE_ANALOG, FAKE_STICK, FAKE_SNAP, FAKE_WATCH };
 enum { STICK_LX, STICK_LY, STICK_RX, STICK_RY };
 
 static const struct { const char *name; int kind; unsigned value; int sign; } FAKE[] = {
@@ -67,6 +67,8 @@ static const struct { const char *name; int kind; unsigned value; int sign; } FA
     /* Not a control: a RECOMP_INPUT_SEQ step that writes guest RAM to a file
      * (seq_snapshot below). Presses nothing. */
     { "snap",         FAKE_SNAP,  0,          0 },
+    /* Arms watchpoints held with RECOMP_WATCH_ARM_ON=script. Presses nothing. */
+    { "watch",        FAKE_WATCH, 0,          0 },
 };
 
 /* Name -> FAKE index, or -1. `n` is the name's length inside a longer spec. */
@@ -85,6 +87,7 @@ static void fake_apply(RecompInputGamepad *g, int i)
 
     switch (FAKE[i].kind) {
     case FAKE_SNAP:
+    case FAKE_WATCH:
         break;
     case FAKE_ANALOG:
         g->analog_buttons[FAKE[i].value] = 0xFFu;
@@ -127,7 +130,11 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * contiguous window, file offset 64 MB = guest 0x80000000. Two snapshots either
  * side of a scripted action -- before and after five shots -- and a diff finds
  * what the action changed: the way to find an ammo counter, a health value
- * or a timer without knowing anything about the title. */
+ * or a timer without knowing anything about the title.
+ *
+ * And `watch` arms the watchpoints held with RECOMP_WATCH_ARM_ON=script
+ * (src/kernel/xbox_watchpoint.c) at that moment: a watch on a field of an
+ * object that only exists once play has started, armed when it does. */
 #define SEQ_MAX 128
 static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; int fired; } s_seq[SEQ_MAX];
 static int s_seq_count = -1;
@@ -222,6 +229,7 @@ static int seq_owns_pad(void)
 }
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);   /* src/kernel/xbox_memory_layout.c */
+extern void xbox_watch_arm_now(const char *why); /* src/kernel/xbox_watchpoint.c */
 #define XBOX_CONTIG_BASE_VA 0x80000000u           /* XBOX_CONTIG_BASE, src/kernel/kernel.h */
 
 /* Guest RAM, 0 .. 64 MB and 0x80000000 .. +64 MB, to snap_<ms>.bin. Pages the host cannot read (the
@@ -289,6 +297,8 @@ static void seq_input(RecompInputGamepad *g)
             for (k = 0; k < s_seq[i].nkeys; k++)
                 if (FAKE[s_seq[i].keys[k]].kind == FAKE_SNAP)
                     seq_snapshot(s_seq[i].at);
+                else if (FAKE[s_seq[i].keys[k]].kind == FAKE_WATCH)
+                    xbox_watch_arm_now("the input script");
         }
         if (t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
             continue;

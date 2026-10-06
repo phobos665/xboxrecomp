@@ -36,10 +36,15 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep);
  * watchpoint above an address to watch. Safe to call from a fault handler. */
 /* RECOMP_WATCH_ARM_ON=<text>: hold the watches until the title opens a file
  * whose path contains <text>. Called with every translated guest path. */
+/* RECOMP_WATCH_ARM_ON=script: hold them until this is called -- by the
+ * input script's `watch` step (src/hle/input_host.c), at a scripted moment
+ * of play. A "*PTR+OFF" watch takes its address from PTR at this point. */
 #ifdef _WIN32
 void xbox_watch_note_path(const char *xbox_path);
+void xbox_watch_arm_now(const char *why);
 #else
 #define xbox_watch_note_path(p)                 ((void)0)
+#define xbox_watch_arm_now(why)                 ((void)0)
 #endif
 
 void xbox_watch_scan_value(uint32_t value);

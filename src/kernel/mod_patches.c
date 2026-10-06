@@ -528,7 +528,11 @@ static int runtime_exec(uint32_t va, void *ctx)
         memcpy(&flags, s + 0, 4);
         memcpy(&sva, s + 4, 4);
         memcpy(&size, s + 8, 4);
-        if ((flags & 0x4) && va >= sva && va - sva < size)
+        /* Code is executable and not writable. Data sections can carry the
+         * executable flag too -- TimeSplitters 2's .data is writable,
+         * preload and executable (flags 7) -- and a patch there is exactly
+         * what this is for, so writable sections do not count. */
+        if ((flags & 0x4) && !(flags & 0x1) && va >= sva && va - sva < size)
             return 1;
     }
     return 0;
