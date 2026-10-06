@@ -476,9 +476,47 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         }
     }
 
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "Unrecognized Xbox path: %s", xbox_path);
-    MultiByteToWideChar(CP_ACP, 0, xbox_path, -1, host_path_buf, buf_size);
-    return TRUE;
+    /* A path no rule knows stays inside the save folder.
+     *
+     * It used to go to the host as written, so a relative name landed in the
+     * executable's working directory and an absolute one wherever it pointed:
+     * Forza copied five 514 KB CarIcons files beside the executable through a
+     * destination with no drive in front of it. On the console such a path
+     * opens nothing a title could damage. Here it goes under
+     * <save dir>\unmapped, keeping its name, so a title that writes one and
+     * reads it back still works and nothing outside the run's folders is
+     * touched. */
+    {
+        static int said;
+        WCHAR rel[MAX_PATH], dir[MAX_PATH], *p, *slash;
+        const char *s = xbox_path;
+
+        while (*s == '\\' || *s == '/')
+            s++;
+        MultiByteToWideChar(CP_ACP, 0, s, -1, rel, MAX_PATH);
+        for (p = rel; *p; p++) {
+            if (*p == L'/') *p = L'\\';
+            if (*p == L':') *p = L'_';
+        }
+        /* No climbing out: ".." components become "__". */
+        for (p = rel; (p = wcsstr(p, L"..")) != NULL; )
+            p[0] = p[1] = L'_';
+        swprintf_s(host_path_buf, buf_size, L"%s\\unmapped\\%s", s_save_dir, rel);
+        wcscpy_s(dir, MAX_PATH, host_path_buf);
+        slash = wcsrchr(dir, L'\\');
+        if (slash) {
+            *slash = 0;
+            SHCreateDirectoryExW(NULL, dir, NULL);
+        }
+        if (said < 16) {
+            said++;
+            fprintf(stderr, "  [PATH] %s matches no device; kept in the save folder as %ls\n",
+                    xbox_path, host_path_buf);
+            fflush(stderr);
+        }
+        xbox_remember_host_path(host_path_buf);
+        return TRUE;
+    }
 
 translate:
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
@@ -646,12 +684,30 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         }
     }
 
-    /* Unrecognized path: pass through, just normalize separators. */
-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "Unrecognized Xbox path: %s", xbox_path);
-    snprintf(host_path_buf, buf_size, "%s", xbox_path);
-    for (char* p = host_path_buf; *p; p++)
-        if (*p == '\\') *p = '/';
-    return TRUE;
+    /* Unrecognized path: kept under <save dir>/unmapped, as on Windows (see
+     * the comment there), never passed through to the host. */
+    {
+        char dir[MAX_PATH], *slash;
+        const char *s = xbox_path;
+
+        while (*s == '\\' || *s == '/')
+            s++;
+        snprintf(host_path_buf, buf_size, "%s/unmapped/%s", s_save_dir, s);
+        for (char* p = host_path_buf + strlen(s_save_dir); *p; p++) {
+            if (*p == '\\') *p = '/';
+            if (*p == ':') *p = '_';
+            if (p[0] == '.' && p[1] == '.') p[0] = p[1] = '_';
+        }
+        snprintf(dir, sizeof dir, "%s", host_path_buf);
+        slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = 0;
+            mkdir_p(dir);
+        }
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "Unrecognized Xbox path: %s -> %s",
+                 xbox_path, host_path_buf);
+        return TRUE;
+    }
 
 translate:
     {
