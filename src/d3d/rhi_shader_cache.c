@@ -8,8 +8,9 @@
  * again every run, because the in-memory caches are thrown away at exit.
  *
  * So the compiled blob is kept, one file per shader, under
- *   <user dir>/shadercache/<title id>/<backend>/<key>.bin
- * (recomp_config_user_dir: %APPDATA%\xboxrecomp on Windows). The key is a hash of everything that
+ *   <cache dir>/shadercache/<title id>/<backend>/<key>.bin
+ * (recomp_cache_dir: %APPDATA%\xboxrecomp on Windows, ~/Library/Caches/xboxrecomp
+ * on macOS). The key is a hash of everything that
  * went into the compile: the HLSL, its macros, entry point, profile and
  * optimisation flag, plus a backend tag that names the compile settings. A
  * change to the generator changes the HLSL and so the key; nothing has to be
@@ -154,7 +155,10 @@ static int cache_dir(const char *backend, char *out, size_t n)
     char base[600];
     int len;
 
-    if (!recomp_config_user_dir(base, sizeof base))
+    /* Disposable, so the cache directory (~/Library/Caches/xboxrecomp on
+     * macOS, $XDG_CACHE_HOME/xboxrecomp on Linux); on Windows that is the
+     * same %APPDATA%\xboxrecomp the cache always lived in. */
+    if (!recomp_cache_dir(base, sizeof base))
         return 0;
     make_dir(base);
     len = snprintf(out, n, "%s" SEP "shadercache", base);
