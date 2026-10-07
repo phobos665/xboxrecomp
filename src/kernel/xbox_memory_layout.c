@@ -1166,6 +1166,14 @@ void xbox_GuestLockNotePriority(DWORD tid, int32_t prio)
             return;
         }
     }
+    {
+        /* Slots are never freed (and Windows reuses thread ids, so a new
+         * thread can inherit a dead one's entry): say so when it fills. */
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) == 1)
+            fprintf(stderr, "  [GUESTLOCK] priority table full (%d threads); thread %lu "
+                            "counts as priority 0\n", GL_PRIO_SLOTS, (unsigned long)tid);
+    }
 }
 
 static int32_t guest_my_priority(void)
