@@ -74,6 +74,8 @@
 #include "d3d8_movie.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
+#include "rhi.h"                         /* rhi_set_wait_hooks */
+#include "../kernel/xbox_memory_layout.h"  /* the guest lock */
 
 static void first_call(int *seen, const char *name, uint32_t arg)
 {
@@ -773,7 +775,15 @@ static void shadow_create(uint32_t pp_va)
     if (pp_va && HLE_MEM32(pp_va + 32))
         g_z_scale = xbox_depth_z_scale(HLE_MEM32(pp_va + 36));
 
-    hwnd = shadow_window(width, height);
+    {
+        /* Opening the window waits for the thread that owns it (the window
+         * thread here, the main thread off Windows) and touches no guest
+         * state, so the other guest threads keep running meanwhile. */
+        int held = xbox_GuestLockDrop();
+
+        hwnd = shadow_window(width, height);
+        xbox_GuestLockRestore(held);
+    }
     g_shadow_hwnd = hwnd;
     if (!hwnd)
         return;
@@ -786,6 +796,11 @@ static void shadow_create(uint32_t pp_va)
     pp.Windowed = TRUE;
     pp.EnableAutoDepthStencil = TRUE;
 
+    /* The renderer drops the guest lock around each of its waits on the GPU
+     * or the window system (acquire, present, frames in flight): a present
+     * that sleeps on the display must not stop every other guest thread.
+     * Nothing in src/d3d touches guest state. A no-op where the lock is off. */
+    rhi_set_wait_hooks(xbox_GuestLockDrop, xbox_GuestLockRestore);
     d3d = xbox_Direct3DCreate8(0);
     hr = d3d ? d3d->lpVtbl->CreateDevice(d3d, 0, 1 /* HAL */, hwnd, 0, &pp, &g_shadow)
              : E_FAIL;

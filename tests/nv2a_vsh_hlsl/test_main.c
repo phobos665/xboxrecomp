@@ -9,25 +9,38 @@
  * feeding an a0-relative constant read, an oFog write, and temp writes to R12
  * (which is oPos) and R13 (which does not exist), and a read of R13. Each
  * result goes to
- * D3DCompile with the profile and entry point the runtime uses.
+ * D3DCompile with the profile and entry point the runtime uses -- on Windows;
+ * elsewhere to DXC, to SPIR-V, exactly as the Vulkan backend compiles it
+ * (rhi_vulkan_dxc.cpp: the same profile mapping, binding shifts and layout).
  *
  * It also checks the shape the generator promises: inside a slot, every value
  * is computed into a local before anything is written, because the MAC and
  * ILU run in parallel on the hardware.
  *
- * Windows only, for D3DCompile. No device, window or game files.
+ * No device, window or game files. Off Windows it needs DXC (a Vulkan SDK);
+ * without one it reports itself skipped (exit 77).
  */
 
 #include "d3d8_internal.h"
+#if defined(_WIN32)
 #include <d3d11.h>   /* this test drives D3D11 itself */
 #include <d3dcompiler.h>
+#endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* d3d8_vsh.c's links to the rest of the D3D8 layer. Nothing here creates a
  * device; only the generator and the compiler run. */
+#if defined(_WIN32)
 ID3D11Device        *d3d8_GetD3D11Device(void)  { return NULL; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return NULL; }
+#else
+/* rhi_vulkan_dxc.cpp */
+int rhi_vk_dxc_compile(uint32_t stage, const RhiShaderSource *src,
+                       uint32_t **spirv, size_t *spirv_bytes, char *err, size_t err_len);
+static int g_no_compiler;
+#endif
 DWORD                d3d8_GetCurrentFVF(void)   { return 0; }
 BOOL                 d3d8_target_is_screen(void) { return TRUE; }   /* camera zoom: d3d8_device.c */
 
@@ -195,9 +208,17 @@ static void compile_program(const char *name, const uint32_t *words, int count)
 {
     static NV2AVshProgram prog;
     static char hlsl[1 << 17];
+#if defined(_WIN32)
     ID3DBlob *code = NULL;
     ID3DBlob *errors = NULL;
     HRESULT hr;
+#else
+    RhiShaderSource src;
+    uint32_t *spirv = NULL;
+    size_t bytes = 0;
+    static char err[8192];
+    int ok;
+#endif
     int len;
 
     nv2a_vsh_parse(words, count, &prog);
@@ -206,6 +227,7 @@ static void compile_program(const char *name, const uint32_t *words, int count)
     if (len <= 0)
         return;
 
+#if defined(_WIN32)
     hr = D3DCompile(hlsl, (SIZE_T)len, name, NULL, NULL, "main", "vs_5_0",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
     if (FAILED(hr))
@@ -220,6 +242,26 @@ static void compile_program(const char *name, const uint32_t *words, int count)
         ID3D10Blob_Release(code);
     if (errors)
         ID3D10Blob_Release(errors);
+#else
+    memset(&src, 0, sizeof src);
+    src.hlsl = hlsl;
+    src.len = (size_t)len;
+    src.name = name;
+    src.entry = "main";
+    src.target = "vs_5_0";
+    src.optimize = 1;
+    ok = rhi_vk_dxc_compile(RHI_STAGE_VERTEX, &src, &spirv, &bytes, err, sizeof err);
+    if (!ok && strstr(err, "DXC is not available")) {
+        g_no_compiler = 1;
+        return;
+    }
+    if (!ok)
+        printf("---- %s: DXC failed ----\n%s\n---- source ----\n%s\n", name, err, hlsl);
+    check(ok && bytes >= 20 && spirv && spirv[0] == 0x07230203u, name,
+          "the generated HLSL compiles to SPIR-V");
+    check(locals_before_writes(hlsl), name, "every slot computes before it writes");
+    free(spirv);
+#endif
 }
 
 int main(void)
@@ -267,6 +309,12 @@ int main(void)
     set_field(w, F_A_TEMP, 4, 13);
     compile_program("read_r13_is_zero", w, 1);
 
+#if !defined(_WIN32)
+    if (g_no_compiler) {
+        printf("nv2a_vsh_hlsl: skipped, no DXC to compile with\n");
+        return 77;
+    }
+#endif
     printf("nv2a_vsh_hlsl: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

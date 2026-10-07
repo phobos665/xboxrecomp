@@ -674,7 +674,21 @@ int video_dump_frame_bmp(const char *path)
 
 int  video_init(void)            { return -1; }
 void video_shutdown(void)        {}
-int  video_open(const char *p)   { (void)p; return -1; }
+#include <stdio.h>
+
+/* Said once, so a title whose movies are plain containers (not XMV, which
+ * xmv_decode.c plays through FFmpeg everywhere) does not just skip them in
+ * silence. */
+int  video_open(const char *p)
+{
+    static int said;
+
+    if (!said++)
+        fprintf(stderr, "[VIDEO] %s: this platform has no Media Foundation, and the "
+                "container player has no other decoder yet; the movie is skipped\n",
+                p ? p : "(movie)");
+    return -1;
+}
 int  video_update(float dt)      { (void)dt; return -1; }
 void video_render(void)          {}
 int  video_is_finished(void)     { return 1; }

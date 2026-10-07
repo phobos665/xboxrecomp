@@ -238,9 +238,12 @@ Burnout 2, built from this branch:
   motors yet, on any port.
 - **Per-title overrides** beyond dropping a file next to the executable -- no
   profiles, no per-title directory in the per-user config.
-- **A POSIX backend.** The parser is portable and builds anywhere; the
-  sampling is XInput and `GetAsyncKeyState`, so on POSIX every port reads
-  neutral until an SDL2 backend exists (the same gap `src/hle`'s audio and
-  input backends already have).
+- **The keyboard off Windows, live.** Pads go through SDL3 everywhere. Since
+  Oct 2026 the keyboard does too off Windows: `input_bindings.c` reads
+  `SDL_GetKeyboardState`, translating the config's virtual-key names to SDL
+  scancodes (generic SHIFT/CTRL/ALT answer for either side, as on Windows).
+  Unlike `GetAsyncKeyState` it only hears keys while the game's window has
+  the focus, so a `RECOMP_WINDOW_BACKGROUND=1` run never does. The table has
+  not been exercised with a person at the keyboard on macOS yet.
 - **Memory units and other XPP devices.** Only gamepads are bound; the model
   still answers "nothing connected" for everything else.

@@ -16,6 +16,8 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #define RECOMP_MKDIR(p) _mkdir(p)
 #else
 #include <sys/stat.h>
@@ -125,34 +127,98 @@ static void parse(FILE *f)
 
 /* Per-user, beside the input bindings, because a setting is a judgement
  * about this machine rather than about this copy of the game. */
+/* <base>/xboxrecomp, where base is the environment variable `var` if it is
+ * set, else $HOME/<home_rel> (POSIX). 0 if neither gives a base. */
+static int dir_from(char *out, size_t n, const char *var, const char *home_rel)
+{
+    const char *base = var ? getenv(var) : NULL;
+    int len;
+
+#if defined(_WIN32)
+    (void)home_rel;
+    if (!base || !*base)
+        return 0;
+    len = snprintf(out, n, "%s\\xboxrecomp", base);
+#else
+    if (base && *base) {
+        len = snprintf(out, n, "%s/xboxrecomp", base);
+    } else {
+        const char *h = getenv("HOME");
+        if (!h || !*h || !home_rel)
+            return 0;
+        len = snprintf(out, n, "%s/%s/xboxrecomp", h, home_rel);
+    }
+#endif
+    return len > 0 && (size_t)len < n;
+}
+
 static int user_dir(char *out, size_t n)
 {
 #if defined(_WIN32)
-    const char *home = getenv("APPDATA");
-    const char *tail = "\\xboxrecomp";
+    return dir_from(out, n, "APPDATA", NULL);
+#elif defined(__APPLE__)
+    return dir_from(out, n, NULL, "Library/Application Support");
 #else
-    const char *home = getenv("XDG_CONFIG_HOME");
-    const char *tail = "/xboxrecomp";
-    char buf[512];
-
-    if (!home || !*home) {
-        const char *h = getenv("HOME");
-
-        if (!h)
-            return 0;
-        snprintf(buf, sizeof buf, "%s/.config", h);
-        home = buf;
-    }
+    return dir_from(out, n, "XDG_CONFIG_HOME", ".config");
 #endif
-    if (!home || !*home)
-        return 0;
-    snprintf(out, n, "%s%s", home, tail);
-    return 1;
 }
 
 int recomp_config_user_dir(char *out, size_t n)
 {
     return user_dir(out, n);
+}
+
+int recomp_data_dir(char *out, size_t n)
+{
+#if defined(_WIN32)
+    return dir_from(out, n, "LOCALAPPDATA", NULL);
+#elif defined(__APPLE__)
+    return dir_from(out, n, NULL, "Library/Application Support");
+#else
+    return dir_from(out, n, "XDG_DATA_HOME", ".local/share");
+#endif
+}
+
+int recomp_cache_dir(char *out, size_t n)
+{
+#if defined(_WIN32)
+    return user_dir(out, n);
+#elif defined(__APPLE__)
+    return dir_from(out, n, NULL, "Library/Caches");
+#else
+    return dir_from(out, n, "XDG_CACHE_HOME", ".cache");
+#endif
+}
+
+int recomp_make_dirs(const char *path)
+{
+    char buf[1024];
+    size_t len = path ? strlen(path) : 0;
+    size_t i;
+
+    if (!len || len >= sizeof buf)
+        return 0;
+    memcpy(buf, path, len + 1);
+    /* Each prefix ending at a separator, then the whole path. A drive root
+     * ("C:\") or "/" fails to mkdir harmlessly: it exists. */
+    for (i = 1; i < len; i++) {
+        if (buf[i] == '/' || buf[i] == '\\') {
+            char c = buf[i];
+            buf[i] = '\0';
+            RECOMP_MKDIR(buf);
+            buf[i] = c;
+        }
+    }
+    RECOMP_MKDIR(buf);
+    {
+#if defined(_WIN32)
+        struct _stat st;
+        return _stat(buf, &st) == 0 && (st.st_mode & _S_IFDIR);
+#else
+        struct stat st;
+        return stat(buf, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+    }
 }
 
 static void title_file(char *out, size_t n, const char *dir)

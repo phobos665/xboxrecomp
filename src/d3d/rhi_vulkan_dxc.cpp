@@ -199,6 +199,14 @@ extern "C" int rhi_vk_dxc_compile(uint32_t stage, const RhiShaderSource *src,
     keep.push_back(L"-E");
     keep.push_back(widen(src->entry ? src->entry : "main"));
     keep.push_back(src->optimize ? L"-O3" : L"-O1");
+    /* The language the generators are written in: D3DCompile's, where a
+     * ?: on vectors selects per component. HLSL 2021 (DXC's default since
+     * 1.7) refuses that, so without this the result depended on which DXC
+     * was found -- the Vulkan SDK's refused every combiner shader that
+     * reads a title's own texture modes (its dotmap helpers), and an older
+     * DXC took them. tests/nv2a_combiners_hlsl is what found it. */
+    keep.push_back(L"-HV");
+    keep.push_back(L"2018");
     /* D3D11's constant-buffer packing, exactly: the renderer fills its
      * constant buffers from C structs laid out for it. */
     keep.push_back(L"-fvk-use-dx-layout");
