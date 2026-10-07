@@ -5092,6 +5092,8 @@ static void bridge_KeQueryBasePriorityThread(void)
 
 static void bridge_KeSetBasePriorityThread(void)
 {
+    /* Also for the guest lock, which hands over by priority. */
+    xbox_GuestLockNotePriority(STACK_ARG(0), (int32_t)STACK_ARG(1));
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
         XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
 }
@@ -8241,8 +8243,9 @@ static void bridge_KeSetPriorityProcess(void)
 /* --- KeSetPriorityThread (ordinal 148, 2 args = 8 bytes) --- */
 static void bridge_KeSetPriorityThread(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
+    /* An absolute priority (8 is normal); the guest lock weighs it as an
+     * increment from normal. */
+    xbox_GuestLockNotePriority(STACK_ARG(0), (int32_t)STACK_ARG(1) - 8);
     g_eax = 0;
 }
 

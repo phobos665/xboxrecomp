@@ -1522,6 +1522,12 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        # Loop headers: blocks a later block (or the block itself) jumps back
+        # to. Each gets RECOMP_BACKEDGE() after its label, once per iteration
+        # of any loop through it: the point where a spinning guest thread lets
+        # another one have the guest lock (recomp_types.h).
+        loop_headers = {t for t, ps in preds.items() if any(p >= t for p in ps)}
+
         # Settle the flag state before emitting anything.
         #
         # Blocks are walked in address order, so the predecessor on a back
@@ -1621,6 +1627,8 @@ class FunctionTranslator:
                 # otherwise produce `loc_X:` immediately before `}` and fail to
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
+            if bb.start in loop_headers:
+                lines.append("    RECOMP_BACKEDGE();")
 
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The

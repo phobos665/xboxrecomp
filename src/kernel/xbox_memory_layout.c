@@ -1016,13 +1016,221 @@ void xbox_GuestLockInit(void)
  * interrupt does. */
 static RECOMP_TLS int g_guest_thread;
 
+/* Fairness: the quantum, and who is waiting.
+ *
+ * The mutex under the lock is not fair (Darwin's pthread mutex and Windows'
+ * CRITICAL_SECTION both let the releasing thread take it straight back), and
+ * a guest thread only lets go at a kernel call. So a thread that loops on
+ * kernel calls (BLiNX enters and leaves a critical section 160,000 times
+ * waiting for its loader) re-wins the lock every time, and one that spins in
+ * lifted code without any (BLiNX again, polling an I/O port) never lets go at
+ * all: with the lock on, BLiNX never reached its first Swap.
+ *
+ * The console's answer is preemption: a thread's quantum ends. The answer
+ * here is the same at the two places a guest thread can let go -- coming back
+ * from a kernel call (xbox_GuestLockRestore), and at a loop's back edge in
+ * lifted code (RECOMP_BACKEDGE, emitted by the lifter at every loop header):
+ * when another thread is waiting and this one has held the lock for its
+ * quantum, it hands the lock over and waits its turn.
+ *
+ * g_guest_lock_waiters counts threads blocked on the lock, guest or host; it
+ * is the one thing a back edge reads, a plain (not thread-local) volatile, so
+ * the common case costs a load and a predicted branch, and the compiler
+ * cannot hoist it out of a loop. g_guest_takes counts acquisitions, so a
+ * thread handing over can tell when someone else has run.
+ *
+ *   RECOMP_GUEST_QUANTUM_US=<us>  the quantum (2000)
+ *
+ * Handoffs and host waits are counted and printed every five seconds while
+ * they happen ([GUESTLOCK] lines). */
+volatile int32_t g_guest_lock_waiters;
+static volatile LONG     g_guest_takes;
+static volatile int64_t  g_guest_since_ns;     /* when the holder took it */
+static RECOMP_TLS LONG   g_guest_takes_at_drop;
+static int64_t           g_guest_quantum_ns = -1;
+
+static volatile LONG     s_gl_handoff_backedge, s_gl_handoff_kernel;
+static volatile LONG     s_gl_host_waits, s_gl_host_timeouts;
+static volatile int64_t  s_gl_host_wait_ns, s_gl_host_wait_max_ns;
+static volatile int64_t  s_gl_last_report_ns;
+
+static int64_t guest_quantum_ns(void)
+{
+    if (g_guest_quantum_ns < 0) {
+        const char *v = getenv("RECOMP_GUEST_QUANTUM_US");
+        long us = v && *v ? strtol(v, NULL, 0) : 2000;
+        g_guest_quantum_ns = (int64_t)(us > 0 ? us : 0) * 1000;
+    }
+    return g_guest_quantum_ns;
+}
+
+static void guest_lock_report(int64_t now)
+{
+    int64_t last = s_gl_last_report_ns;
+    LONG bk, kn, hw, ht;
+    int64_t wait_ns, max_ns;
+
+    if (now - last < 5000000000ll ||
+        !__atomic_compare_exchange_n(&s_gl_last_report_ns, &last, now, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        return;
+    bk = InterlockedExchange(&s_gl_handoff_backedge, 0);
+    kn = InterlockedExchange(&s_gl_handoff_kernel, 0);
+    hw = InterlockedExchange(&s_gl_host_waits, 0);
+    ht = InterlockedExchange(&s_gl_host_timeouts, 0);
+    wait_ns = __atomic_exchange_n(&s_gl_host_wait_ns, 0, __ATOMIC_SEQ_CST);
+    max_ns = __atomic_exchange_n(&s_gl_host_wait_max_ns, 0, __ATOMIC_SEQ_CST);
+    if (!last)
+        return;                       /* the first call only starts the clock */
+    fprintf(stderr, "  [GUESTLOCK] last 5 s: handoffs at back edges %ld, after "
+                    "kernel calls %ld; host threads waited %ld times (avg %.2f ms, "
+                    "max %.2f ms, %ld gave up) [quantum %lld us]\n",
+            (long)bk, (long)kn, (long)hw,
+            hw ? (double)wait_ns / hw / 1e6 : 0.0, (double)max_ns / 1e6,
+            (long)ht, (long long)(guest_quantum_ns() / 1000));
+    fflush(stderr);
+}
+
+/* Priority, as the console's scheduler would weigh it.
+ *
+ * Round-robin alone hands half the CPU to whatever spins: BLiNX's lowest
+ * thread is an idle counter (MEM32(0x414ACC)++ until a flag is set) that on
+ * the console runs only when nothing else can. So a waiter of higher priority
+ * than the holder gets the lock at the holder's next back edge or kernel
+ * call, an equal one when the holder's quantum is up, and a lower one only
+ * when the holder blocks -- or, against starvation, after 20 quanta. A host
+ * thread waiting (an interrupt) outranks every guest thread.
+ *
+ * Guest priorities come from KeSetBasePriorityThread, keyed by the guest
+ * thread object the title names (xbox_GuestLockNotePriority); 0 until set. */
+#define GL_PRIO_MIN   (-16)
+#define GL_PRIO_MAX   16
+#define GL_PRIO_HOST  (GL_PRIO_MAX + 1)
+#define GL_PRIO_SLOTS 64
+static struct { volatile uint32_t obj; volatile int32_t prio; } s_gl_prio[GL_PRIO_SLOTS];
+static volatile LONG s_gl_waiting_at[GL_PRIO_HOST - GL_PRIO_MIN + 1];
+
+void xbox_GuestLockNotePriority(uint32_t thread_obj, int32_t prio)
+{
+    int i;
+    if (!thread_obj)
+        return;
+    if (prio < GL_PRIO_MIN) prio = GL_PRIO_MIN;
+    if (prio > GL_PRIO_MAX) prio = GL_PRIO_MAX;
+    {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) <= 16) {
+            fprintf(stderr, "  [GUESTLOCK] guest thread 0x%08X priority %d\n",
+                    thread_obj, (int)prio);
+            fflush(stderr);
+        }
+    }
+    for (i = 0; i < GL_PRIO_SLOTS; i++) {
+        uint32_t have = s_gl_prio[i].obj;
+        if (have == thread_obj ||
+            (have == 0 && InterlockedCompareExchange((volatile LONG *)&s_gl_prio[i].obj,
+                                                     (LONG)thread_obj, 0) == 0)) {
+            s_gl_prio[i].prio = prio;
+            return;
+        }
+    }
+}
+
+uint32_t xbox_CurrentThreadObject(void);   /* below */
+
+static int32_t guest_my_priority(void)
+{
+    uint32_t obj;
+    int i;
+    if (!g_guest_thread)
+        return GL_PRIO_HOST;
+    obj = xbox_CurrentThreadObject();
+    for (i = 0; obj && i < GL_PRIO_SLOTS && s_gl_prio[i].obj; i++)
+        if (s_gl_prio[i].obj == obj)
+            return s_gl_prio[i].prio;
+    return 0;
+}
+
+static void guest_wait_begin(int32_t prio)
+{
+    InterlockedIncrement(&s_gl_waiting_at[prio - GL_PRIO_MIN]);
+    InterlockedIncrement((volatile LONG *)&g_guest_lock_waiters);
+}
+
+static void guest_wait_end(int32_t prio)
+{
+    InterlockedDecrement((volatile LONG *)&g_guest_lock_waiters);
+    InterlockedDecrement(&s_gl_waiting_at[prio - GL_PRIO_MIN]);
+}
+
+/* Should the holder let go now? Only asked when somebody is waiting. */
+static int guest_should_hand_over(int64_t now)
+{
+    int32_t mine = guest_my_priority(), top;
+    int64_t held = now - g_guest_since_ns, q = guest_quantum_ns();
+
+    for (top = GL_PRIO_HOST; top >= GL_PRIO_MIN; top--)
+        if (s_gl_waiting_at[top - GL_PRIO_MIN] > 0)
+            break;
+    if (top < GL_PRIO_MIN)
+        return 0;
+    if (top > mine)
+        return 1;
+    if (top == mine)
+        return held >= q;
+    return held >= 20 * q;
+}
+
+/* depth 0 -> 1: this thread now holds it. */
+static void guest_took(void)
+{
+    InterlockedIncrement(&g_guest_takes);
+    g_guest_since_ns = host_time_ns();
+}
+
+/* Blocking acquire for a guest thread, counted as a waiter while it waits. */
+static void guest_cs_enter(void)
+{
+    if (g_guest_depth == 0) {
+        if (!TryEnterCriticalSection(&g_guest_cs)) {
+            int32_t prio = guest_my_priority();
+            guest_wait_begin(prio);
+            EnterCriticalSection(&g_guest_cs);
+            guest_wait_end(prio);
+        }
+        guest_took();
+    } else {
+        EnterCriticalSection(&g_guest_cs);   /* recursive: already ours */
+    }
+    g_guest_depth++;
+}
+
+/* After letting go at its quantum: give a waiter the chance to take the
+ * lock before this thread asks again. Returns once someone else has taken it
+ * (g_guest_takes moved), nobody is waiting any more, or 2 ms passed -- a
+ * waiter that is slow to wake must not cost more than that. */
+static void guest_handoff_wait(LONG takes_before)
+{
+    int64_t until = host_time_ns() + 2000000;
+    int spins = 0;
+
+    while (g_guest_takes == takes_before && g_guest_lock_waiters > 0) {
+        if (++spins > 64) {
+            if (host_time_ns() >= until)
+                break;
+            Sleep(0);
+        } else {
+            SwitchToThread();
+        }
+    }
+}
+
 void xbox_GuestLockEnter(void)
 {
     g_guest_thread = 1;
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return;
-    EnterCriticalSection(&g_guest_cs);
-    g_guest_depth++;
+    guest_cs_enter();
 }
 
 void xbox_GuestLockLeave(void)
@@ -1040,6 +1248,8 @@ int xbox_GuestLockDrop(void)
     int held = 0;
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return 0;
+    if (g_guest_depth > 0)
+        g_guest_takes_at_drop = g_guest_takes;
     while (g_guest_depth > 0) {
         g_guest_depth--;
         LeaveCriticalSection(&g_guest_cs);
@@ -1050,46 +1260,52 @@ int xbox_GuestLockDrop(void)
 
 /* A host thread about to run guest code -- the timer thread's ISRs and DPCs,
  * a device model's interrupt -- takes the lock like a guest thread, but with
- * a bound: on the console an interrupt preempts whatever is running, so a
- * guest thread spinning in lifted code on a flag the ISR sets (no kernel call
- * in the loop, so it never drops the lock) would wait forever for an ISR that
- * waits for it. Past the bound the routine runs anyway, as it always did, and
- * the first time says so.
- *
- * While a host thread is waiting, a guest thread coming back from a kernel
- * call yields before re-taking the lock (xbox_GuestLockRestore): a TryEnter
- * loop is not queued on the mutex, and a guest thread that makes a kernel
- * call every few microseconds would otherwise win it every time.
+ * a bound: on the console an interrupt preempts whatever is running, so it
+ * must not wait forever for a guest thread that does not let go. Past the
+ * bound the routine runs anyway, as it always did, and the first time says
+ * so. While it waits it counts as a waiter, so the holder hands over at its
+ * next back edge or kernel call once its quantum is up.
  *
  * Returns 1 if the lock was taken (pair with xbox_GuestLockLeave), 0 if the
  * lock is off or the bound passed. Recursive: a thread that already holds it
  * gets it at once. */
-static volatile LONG g_guest_host_waiting;
-
 int xbox_GuestLockEnterTimed(DWORD ms)
 {
     ULONGLONG deadline;
     unsigned spins;
+    int64_t t0;
 
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return 0;
     if (TryEnterCriticalSection(&g_guest_cs)) {
-        g_guest_depth++;
+        if (g_guest_depth++ == 0)
+            guest_took();
         return 1;
     }
-    InterlockedIncrement(&g_guest_host_waiting);
+    t0 = host_time_ns();
+    guest_wait_begin(GL_PRIO_HOST);
     deadline = GetTickCount64() + ms;
     for (spins = 0; GetTickCount64() < deadline; ) {
         /* Yield at first, then sleep: a vblank thread waiting out a busy
          * guest thread should not burn a core for the whole bound. */
         Sleep(++spins < 50 ? 0 : 1);
         if (TryEnterCriticalSection(&g_guest_cs)) {
-            InterlockedDecrement(&g_guest_host_waiting);
-            g_guest_depth++;
+            int64_t now = host_time_ns(), w = now - t0, max;
+            guest_wait_end(GL_PRIO_HOST);
+            if (g_guest_depth++ == 0)
+                guest_took();
+            InterlockedIncrement(&s_gl_host_waits);
+            __atomic_add_fetch(&s_gl_host_wait_ns, w, __ATOMIC_RELAXED);
+            max = s_gl_host_wait_max_ns;
+            while (w > max && !__atomic_compare_exchange_n(&s_gl_host_wait_max_ns,
+                       &max, w, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                ;
+            guest_lock_report(now);
             return 1;
         }
     }
-    InterlockedDecrement(&g_guest_host_waiting);
+    guest_wait_end(GL_PRIO_HOST);
+    InterlockedIncrement(&s_gl_host_timeouts);
     {
         static volatile LONG said;
         if (InterlockedIncrement(&said) == 1) {
@@ -1121,20 +1337,50 @@ int xbox_GuestLockEnterForCall(DWORD host_ms)
     return xbox_GuestLockEnterTimed(host_ms);
 }
 
+/* Back from a kernel call. If somebody is waiting, nobody has taken the lock
+ * since this thread let go, and this thread's quantum is up, hand over first:
+ * otherwise a thread that loops on kernel calls wins the unfair mutex back
+ * every time. */
 void xbox_GuestLockRestore(int held)
 {
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return;
-    if (held > 0 && g_guest_host_waiting) {
-        /* Let the waiting host thread in first; bounded, it may be gone. */
-        int spins;
-        for (spins = 0; spins < 200 && g_guest_host_waiting; spins++)
-            SwitchToThread();
+    if (held > 0 && g_guest_lock_waiters > 0 &&
+        g_guest_takes == g_guest_takes_at_drop) {
+        int64_t now = host_time_ns();
+        if (guest_should_hand_over(now)) {
+            InterlockedIncrement(&s_gl_handoff_kernel);
+            guest_handoff_wait(g_guest_takes_at_drop);
+            guest_lock_report(now);
+        }
     }
-    while (held-- > 0) {
-        EnterCriticalSection(&g_guest_cs);
-        g_guest_depth++;
-    }
+    while (held-- > 0)
+        guest_cs_enter();
+}
+
+/* RECOMP_BACKEDGE's slow path: another thread is waiting and this one is at
+ * a loop header in lifted code. Hand over if its quantum is up. Called only
+ * when g_guest_lock_waiters is non-zero, so the clock read is off the common
+ * path. A thread that does not hold the lock (lock off, or a host thread that
+ * gave up waiting) has nothing to hand over. */
+void recomp_guest_backedge_yield(void)
+{
+    int64_t now;
+    int held;
+    LONG takes;
+
+    if (g_guest_depth <= 0)
+        return;
+    now = host_time_ns();
+    if (!guest_should_hand_over(now))
+        return;
+    takes = g_guest_takes;
+    held = xbox_GuestLockDrop();
+    InterlockedIncrement(&s_gl_handoff_backedge);
+    guest_handoff_wait(takes);
+    guest_lock_report(now);
+    while (held-- > 0)
+        guest_cs_enter();
 }
 
 int xbox_EnvSwitch(const char *name, int default_on)

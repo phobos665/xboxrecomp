@@ -329,6 +329,25 @@ void recomp_int_divide_fault(uint32_t code);
     } while (0)
 #endif
 
+/* A loop's back edge: the place a guest thread lets another one run.
+ *
+ * With the guest lock on (the default on ARM hosts) only one guest thread is
+ * in lifted code at a time, and a thread lets go only at a kernel call -- so
+ * one that spins in lifted code waiting for another guest thread would wait
+ * forever, where the console's scheduler would end its quantum. The
+ * translator puts this at every loop header. It reads one plain global, the
+ * number of threads waiting for the lock: zero (always, with the lock off) is
+ * a load and a predicted branch; non-zero calls the runtime, which hands the
+ * lock over if this thread has held it for its quantum (xbox_memory_layout.c,
+ * RECOMP_GUEST_QUANTUM_US). Volatile, so the compiler re-reads it on every
+ * iteration even of a loop that touches no other memory. */
+extern volatile int32_t g_guest_lock_waiters;
+void recomp_guest_backedge_yield(void);
+#define RECOMP_BACKEDGE() do {                                           \
+        if (RECOMP_UNLIKELY(g_guest_lock_waiters))                       \
+            recomp_guest_backedge_yield();                               \
+    } while (0)
+
 /* SSE float-to-int conversions, as x86 does them.
  *
  * cvttss2si/cvttsd2si truncate; cvtss2si/cvtsd2si round under MXCSR.RC,
