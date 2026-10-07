@@ -573,6 +573,23 @@ static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
 static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 
+/* ---- Fibers and stack limits ------------------------------------------
+ * Win32 fibers on a small native context switch (win32_compat.c). While a
+ * thread runs on a fiber, GetCurrentThreadStackLimits reports that fiber's
+ * stack, as on Windows. */
+typedef VOID (WINAPI *LPFIBER_START_ROUTINE)(LPVOID lpFiberParameter);
+#define ERROR_ALREADY_FIBER 1280u
+VOID   GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high);
+LPVOID ConvertThreadToFiber(LPVOID param);
+LPVOID CreateFiber(SIZE_T stackSize, LPFIBER_START_ROUTINE start, LPVOID param);
+LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags,
+                     LPFIBER_START_ROUTINE start, LPVOID param);
+VOID   SwitchToFiber(LPVOID fiber);
+VOID   DeleteFiber(LPVOID fiber);
+BOOL   IsThreadAFiber(void);
+LPVOID GetCurrentFiber(void);
+LPVOID GetFiberData(void);
+
 #ifdef __cplusplus
 }
 #endif

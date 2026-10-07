@@ -39,11 +39,32 @@
  * a tenth of a core -- run it at 250 for a measurement, 1000 for a profile.
  */
 
+/*
+ * macOS: the same sampler on Mach. task_threads() lists the threads,
+ * thread_suspend() and thread_get_state() read each one's pc and frame
+ * pointer, the walk follows the frame-pointer chain (which every function on
+ * Apple's platforms keeps) through mach_vm_read_overwrite so a bad pointer
+ * ends the walk instead of faulting, and dladdr() names addresses at report
+ * time. Lifted functions resolve to their sub_XXXXXXXX as long as the
+ * executable is not stripped.
+ */
+
+#if defined(_WIN32) || defined(__APPLE__)
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
 #include <dbghelp.h>
 #include <psapi.h>
+#else
+#include "win32_compat.h"
+#include <dlfcn.h>
+#include <pthread.h>
+#include <time.h>
+#include <wchar.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,7 +92,11 @@ typedef struct {
 
 typedef struct {
     DWORD      tid;
+#ifdef _WIN32
     HANDLE     handle;
+#else
+    thread_act_t handle;     /* a send right this table owns */
+#endif
     int        alive;
     char       name[48];
     unsigned   samples;
@@ -138,6 +163,7 @@ static void chain_add(SampleChain *table, unsigned *used, const uintptr_t *fr, i
     }
 }
 
+#ifdef _WIN32
 typedef void (WINAPI *SetThreadDescription_t)(HANDLE, PCWSTR);
 typedef HRESULT (WINAPI *GetThreadDescription_t)(HANDLE, PWSTR *);
 
@@ -267,6 +293,160 @@ static int sample_thread(SampleThread *t, uintptr_t *frames, int max_frames)
     return n;
 }
 
+static double thread_cpu_seconds(const SampleThread *t)
+{
+    FILETIME ct, et, kt, ut;
+
+    if (GetThreadTimes(t->handle, &ct, &et, &kt, &ut)) {
+        ULONGLONG total = (((ULONGLONG)kt.dwHighDateTime << 32) | kt.dwLowDateTime)
+                        + (((ULONGLONG)ut.dwHighDateTime << 32) | ut.dwLowDateTime);
+        return (double)(total - t->cpu_100ns_at_start) / 1e7;
+    }
+    return 0.0;
+}
+
+#else  /* __APPLE__ */
+
+static ULONGLONG thread_cpu_100ns(thread_act_t port)
+{
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+
+    if (thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &n) != KERN_SUCCESS)
+        return 0;
+    return (ULONGLONG)(info.user_time.seconds + info.system_time.seconds) * 10000000ull
+         + (ULONGLONG)(info.user_time.microseconds + info.system_time.microseconds) * 10ull;
+}
+
+static double thread_cpu_seconds(const SampleThread *t)
+{
+    ULONGLONG now = thread_cpu_100ns(t->handle);
+    return now ? (double)(now - t->cpu_100ns_at_start) / 1e7 : 0.0;
+}
+
+static void thread_name(SampleThread *t)
+{
+    pthread_t pt;
+
+    if (t->tid == s_main_tid) {
+        strcpy(t->name, "guest main");
+        return;
+    }
+    pt = pthread_from_mach_thread_np(t->handle);
+    if (pt)
+        pthread_getname_np(pt, t->name, sizeof t->name);
+    if (!t->name[0])
+        snprintf(t->name, sizeof t->name, "thread %lu", (unsigned long)t->tid);
+}
+
+/* Keep the thread table current: threads come and go. Once a second. A
+ * thread that has gone keeps its row (and the port right) so its samples
+ * still report. */
+static void refresh_threads(void)
+{
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t count = 0, k;
+    int i;
+
+    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS)
+        return;
+    for (i = 0; i < s_thread_count; i++)
+        s_threads[i].alive = 0;
+
+    for (k = 0; k < count; k++) {
+        thread_act_t port = list[k];
+        int keep = 0;
+
+        if (port == (thread_act_t)s_self_tid)
+            goto drop;
+        for (i = 0; i < s_thread_count; i++)
+            if (s_threads[i].handle == port)
+                break;
+        if (i < s_thread_count) {
+            s_threads[i].alive = 1;
+            goto drop;          /* the row already holds a right */
+        }
+        if (s_thread_count < SAMPLE_MAX_THREADS) {
+            SampleThread *t = &s_threads[s_thread_count];
+            memset(t, 0, sizeof *t);
+            t->tid = (DWORD)port;
+            t->handle = port;
+            t->alive = 1;
+            t->leaf = (SampleSlot *)calloc(SAMPLE_SLOTS, sizeof(SampleSlot));
+            t->incl = (SampleSlot *)calloc(SAMPLE_SLOTS, sizeof(SampleSlot));
+            t->chain = (SampleChain *)calloc(SAMPLE_CHAIN_SLOTS, sizeof(SampleChain));
+            if (t->leaf && t->incl && t->chain) {
+                t->cpu_100ns_at_start = thread_cpu_100ns(port);
+                thread_name(t);
+                s_thread_count++;
+                keep = 1;
+            } else {
+                free(t->leaf); free(t->incl); free(t->chain);
+            }
+        }
+    drop:
+        if (!keep)
+            mach_port_deallocate(mach_task_self(), port);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof *list);
+}
+
+/* Read one thread's pc and walk its frame records. Nothing here allocates or
+ * takes a lock, because the suspended thread may hold malloc's. */
+static int sample_thread(SampleThread *t, uintptr_t *frames, int max_frames)
+{
+    uintptr_t pc, fp;
+    int n = 0;
+
+    if (thread_suspend(t->handle) != KERN_SUCCESS) {
+        t->alive = 0;
+        return 0;
+    }
+#if defined(__aarch64__)
+    {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(t->handle, ARM_THREAD_STATE64, (thread_state_t)&st,
+                             &cnt) != KERN_SUCCESS)
+            goto out;
+        pc = (uintptr_t)arm_thread_state64_get_pc(st);
+        fp = (uintptr_t)arm_thread_state64_get_fp(st);
+    }
+#else
+    {
+        x86_thread_state64_t st;
+        mach_msg_type_number_t cnt = x86_THREAD_STATE64_COUNT;
+        if (thread_get_state(t->handle, x86_THREAD_STATE64, (thread_state_t)&st,
+                             &cnt) != KERN_SUCCESS)
+            goto out;
+        pc = (uintptr_t)st.__rip;
+        fp = (uintptr_t)st.__rbp;
+    }
+#endif
+    frames[n++] = pc;
+    while (n < max_frames && fp && !(fp & 7)) {
+        uintptr_t rec[2];            /* [0] caller's fp, [1] return address */
+        mach_vm_size_t got = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fp,
+                                   sizeof rec, (mach_vm_address_t)rec, &got)
+                != KERN_SUCCESS || got != sizeof rec)
+            break;
+        /* Return addresses carry no pointer-authentication bits in an arm64
+         * (not arm64e) process; mask to the user address range anyway. */
+        rec[1] &= 0x0000FFFFFFFFFFFFull;
+        if (!rec[1])
+            break;
+        frames[n++] = rec[1];
+        if (rec[0] <= fp)            /* stacks grow down: callers are above */
+            break;
+        fp = rec[0];
+    }
+out:
+    thread_resume(t->handle);
+    return n;
+}
+#endif /* __APPLE__ */
+
 /* ------------------------------------------------------------ resolving */
 
 typedef struct {
@@ -295,6 +475,32 @@ static const ResolvedAddr *resolve(uintptr_t addr)
         if (r->addr == addr)
             return r;
         if (!r->addr) {
+#ifndef _WIN32
+            Dl_info info;
+            const char *base = "?";
+
+            r->addr = addr;
+            r->base = addr;
+            s_resolved_used++;
+            memset(&info, 0, sizeof info);
+            if (dladdr((const void *)addr, &info) && info.dli_fname) {
+                const char *p;
+                base = info.dli_fname;
+                for (p = info.dli_fname; *p; p++)
+                    if (*p == '/')
+                        base = p + 1;
+            }
+            snprintf(r->module, sizeof r->module, "%s", base);
+            if (info.dli_sname && info.dli_saddr) {
+                snprintf(r->name, sizeof r->name, "%s", info.dli_sname);
+                r->base = (uintptr_t)info.dli_saddr;
+            } else {
+                snprintf(r->name, sizeof r->name, "%s+0x%llx", r->module,
+                         (unsigned long long)(addr - (uintptr_t)info.dli_fbase));
+                r->base = (uintptr_t)info.dli_fbase;
+            }
+            return r;
+#else
             char buf[sizeof(SYMBOL_INFO) + 256];
             SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
             DWORD64 disp = 0;
@@ -331,6 +537,7 @@ static const ResolvedAddr *resolve(uintptr_t addr)
                 r->base = (uintptr_t)mod;   /* one bucket per unresolved module */
             }
             return r;
+#endif
         }
     }
     return NULL;
@@ -345,7 +552,12 @@ enum {
 static const char *const CAT_NAMES[CAT_COUNT] = {
     "lifted game code", "trace hook (recomp_trace_enter)", "runtime (dispatch, icall)",
     "hle_ (HLE boundary)", "d3d8_ (host renderer layer)", "kernel bridge",
-    "nv2a_ (push buffer)", "apu / dsound", "C runtime", "host D3D11/driver",
+    "nv2a_ (push buffer)", "apu / dsound", "C runtime",
+#ifdef _WIN32
+    "host D3D11/driver",
+#else
+    "host Metal/MoltenVK/driver",
+#endif
     "waiting (kernel wait/sleep)", "OS (other)", "other"
 };
 
@@ -355,6 +567,26 @@ static int categorise(const ResolvedAddr *r)
 {
     const char *m = r->module, *n = r->name;
 
+#ifndef _WIN32
+    /* Darwin: every blocking call ends in a libsystem_kernel trap. */
+    if (strcmp(m, "libsystem_kernel.dylib") == 0) {
+        if (strstr(n, "wait") || strstr(n, "psynch") || strstr(n, "ulock")
+            || strstr(n, "mach_msg") || strstr(n, "sleep") || strstr(n, "kevent")
+            || strstr(n, "select") || strstr(n, "poll") || strstr(n, "workq")
+            || strstr(n, "semwait") || strstr(n, "os_sync"))
+            return CAT_WAIT;
+        return CAT_OS;
+    }
+    if (starts(m, "libsystem_c") || starts(m, "libsystem_malloc")
+        || starts(m, "libsystem_platform") || starts(m, "libc++"))
+        return CAT_CRT;
+    if (starts(m, "libsystem_") || starts(m, "libdyld") || starts(m, "libobjc")
+        || starts(m, "CoreFoundation") || starts(m, "Foundation"))
+        return CAT_OS;
+    if (starts(m, "Metal") || starts(m, "AGX") || starts(m, "libMoltenVK")
+        || starts(m, "libvulkan") || starts(m, "IOGPU") || starts(m, "QuartzCore"))
+        return CAT_HOST_D3D;
+#endif
     if (_stricmp(m, "ntdll.dll") == 0 || _stricmp(m, "KERNELBASE.dll") == 0
         || _stricmp(m, "kernel32.dll") == 0 || _stricmp(m, "win32u.dll") == 0) {
         if (strstr(n, "Wait") || strstr(n, "Delay") || strstr(n, "Sleep")
@@ -590,17 +822,12 @@ static void report(int final)
     for (i = 0; i < s_thread_count; i++) {
         SampleThread *t = &s_threads[i];
         unsigned cats[CAT_COUNT], running, c;
-        double cpu_s = 0.0;
+        double cpu_s;
         int n, k;
-        FILETIME ct, et, kt, ut;
 
         if (!t->samples)
             continue;
-        if (GetThreadTimes(t->handle, &ct, &et, &kt, &ut)) {
-            ULONGLONG total = (((ULONGLONG)kt.dwHighDateTime << 32) | kt.dwLowDateTime)
-                            + (((ULONGLONG)ut.dwHighDateTime << 32) | ut.dwLowDateTime);
-            cpu_s = (double)(total - t->cpu_100ns_at_start) / 1e7;
-        }
+        cpu_s = thread_cpu_seconds(t);
         memset(cats, 0, sizeof cats);
         n = aggregate(t->leaf, agg, AGG_MAX, cats);
         running = t->samples - cats[CAT_WAIT];
@@ -696,28 +923,38 @@ static void report_at_exit(void) { report(1); }
 
 static DWORD WINAPI sampler_thread(LPVOID unused)
 {
+#ifdef _WIN32
     HANDLE timer;
+#endif
     LARGE_INTEGER last_refresh, last_report;
     uintptr_t frames[SAMPLE_MAX_DEPTH];
 
     (void)unused;
+#ifdef _WIN32
     s_self_tid = GetCurrentThreadId();
+#else
+    s_self_tid = (DWORD)mach_thread_self();
+    pthread_setname_np("sampler");
+#endif
     QueryPerformanceFrequency(&s_qpf);
     QueryPerformanceCounter(&s_t0);
     last_refresh.QuadPart = 0;
     last_report = s_t0;
 
+#ifdef _WIN32
     /* The high-resolution timer is what makes a 1 kHz rate real; without it
      * the wait rounds up to the scheduler tick. */
     timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
                                    TIMER_ALL_ACCESS);
     if (!timer)
         timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+#endif
 
     for (;;) {
         LARGE_INTEGER now;
         int i;
 
+#ifdef _WIN32
         if (timer) {
             LARGE_INTEGER due;
             due.QuadPart = -(LONGLONG)(10000000.0 / s_hz);
@@ -727,6 +964,14 @@ static DWORD WINAPI sampler_thread(LPVOID unused)
         } else {
             Sleep(1);
         }
+#else
+        {
+            /* A sampling interval need not be exact, only regular. */
+            double ns = 1e9 / s_hz;
+            struct timespec ts = { 0, (long)(ns < 1e5 ? 1e5 : ns) };
+            nanosleep(&ts, NULL);
+        }
+#endif
         QueryPerformanceCounter(&now);
         if (now.QuadPart - last_refresh.QuadPart > s_qpf.QuadPart) {
             refresh_threads();
@@ -772,7 +1017,9 @@ void xbox_SamplerStart(void)
 {
     const char *v = getenv("RECOMP_SAMPLE");
     HANDLE h;
+#ifdef _WIN32
     MODULEINFO mi;
+#endif
 
     if (!v || !*v)
         return;
@@ -784,6 +1031,7 @@ void xbox_SamplerStart(void)
     v = getenv("RECOMP_SAMPLE_DEPTH");
     if (v && atoi(v) > 0) s_depth = atoi(v);
 
+#ifdef _WIN32
     s_main_tid = GetCurrentThreadId();
     s_exe = GetModuleHandleW(NULL);
     if (GetModuleInformation(GetCurrentProcess(), s_exe, &mi, sizeof mi)) {
@@ -795,6 +1043,27 @@ void xbox_SamplerStart(void)
      * module+offset only. */
     SymSetOptions(SymGetOptions() | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
+#else
+    s_main_tid = (DWORD)mach_thread_self();
+    {
+        /* The executable is image 0; its code is the __TEXT segment. */
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header(0);
+        const struct load_command *lc = (const struct load_command *)(mh + 1);
+        uint32_t k;
+
+        s_exe = (HMODULE)mh;
+        for (k = 0; mh && k < mh->ncmds; k++) {
+            if (lc->cmd == LC_SEGMENT_64 &&
+                strcmp(((const struct segment_command_64 *)lc)->segname, "__TEXT") == 0) {
+                s_exe_lo = (uintptr_t)mh;
+                s_exe_hi = s_exe_lo + ((const struct segment_command_64 *)lc)->vmsize;
+                break;
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+    }
+#endif
 
     InitializeCriticalSection(&s_lock);
     atexit(report_at_exit);
@@ -811,6 +1080,7 @@ void xbox_SamplerStart(void)
  * missing. */
 void xbox_NameCurrentThread(const wchar_t *name)
 {
+#ifdef _WIN32
     static SetThreadDescription_t set_desc;
     static int looked;
 
@@ -821,9 +1091,21 @@ void xbox_NameCurrentThread(const wchar_t *name)
     }
     if (set_desc)
         set_desc(GetCurrentThread(), name);
+#else
+    /* Names are ASCII; Darwin keeps 63 bytes and names only the caller. */
+    char buf[64];
+    size_t i;
+
+    for (i = 0; name && name[i] && i < sizeof buf - 1; i++)
+        buf[i] = (name[i] < 0x80) ? (char)name[i] : '?';
+    buf[i] = '\0';
+    pthread_setname_np(buf);
+#endif
 }
 
-#else  /* !_WIN32 */
+#else  /* neither Windows nor macOS */
+
+#include <wchar.h>
 
 void xbox_SamplerStart(void) {}
 void xbox_NameCurrentThread(const wchar_t *name) { (void)name; }

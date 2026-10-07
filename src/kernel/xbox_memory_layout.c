@@ -935,10 +935,24 @@ void xbox_GuestConcurrencyReport(void)
     fflush(stderr);
 }
 
+/* On by default where the host is weakly ordered. Lifted code reads and
+ * writes guest memory with plain volatile accesses and no barriers, which x86's
+ * total store order makes behave like the console's single CPU in nearly every
+ * case that matters (a flag published after the data it guards). An ARM host
+ * reorders those stores, and guest threads on two cores see each other's
+ * writes out of order. One guest thread at a time in lifted code -- with the
+ * lock's acquire and release as the barriers between them -- is the
+ * uniprocessor the code was written for. RECOMP_GUEST_LOCK=0 turns it off. */
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define GUEST_LOCK_DEFAULT 1
+#else
+#define GUEST_LOCK_DEFAULT 0
+#endif
+
 int xbox_GuestLockOn(void)
 {
     if (g_guest_lock_on < 0)
-        g_guest_lock_on = xbox_EnvSwitch("RECOMP_GUEST_LOCK", 0);
+        g_guest_lock_on = xbox_EnvSwitch("RECOMP_GUEST_LOCK", GUEST_LOCK_DEFAULT);
     return g_guest_lock_on;
 }
 
@@ -1755,16 +1769,15 @@ void recomp_set_foreign_longjmp(recomp_foreign_longjmp_fn fn)
     s_foreign_longjmp = fn;
 }
 
+/* Fiber-aware on every host: the POSIX GetCurrentThreadStackLimits
+ * (win32_compat.c) reports the running fiber's stack, as Windows does. */
 static int recomp_on_current_stack(uintptr_t a)
 {
-#if defined(_WIN32)
     ULONG_PTR lo, hi;
     GetCurrentThreadStackLimits(&lo, &hi);
+    if (lo >= hi)
+        return 1;   /* no answer from the host: assume the jump is local */
     return a >= lo && a < hi;
-#else
-    (void)a;
-    return 1;   /* nothing switches native stacks here yet */
-#endif
 }
 
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va)

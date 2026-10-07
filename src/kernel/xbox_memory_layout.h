@@ -230,8 +230,11 @@ int xbox_EnvSwitch(const char *name, int default_on);
  * released and Restore takes it back, because a bridge that runs guest code
  * can re-enter.
  *
- * RECOMP_GUEST_LOCK=1 turns it on. Off by default: this is an experiment,
- * and a title that works today must not change because of one.
+ * RECOMP_GUEST_LOCK=1 turns it on. Off by default on x86 hosts: there it is
+ * an experiment, and a title that works today must not change because of
+ * one. On by default on ARM hosts (RECOMP_GUEST_LOCK=0 turns it off), whose
+ * weak memory ordering breaks the barrier-free guest code that x86 lets
+ * through.
  */
 void xbox_GuestLockInit(void);
 void xbox_GuestLockEnter(void);

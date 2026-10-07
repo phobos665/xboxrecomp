@@ -1597,6 +1597,46 @@ static ULONGLONG bridge_guest_deadline(uint32_t timeout_va, int *poll_only)
 #if defined(_MSC_VER)
 #pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
 #endif
+#if defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>      /* macOS 14.4 */
+#include <os/clock.h>
+#endif
+
+/* Sleep on a counter until it is not `seen` any more, a wake, or `ms`.
+ * WaitOnAddress on Windows, os_sync_wait_on_address on macOS; elsewhere a
+ * plain 1 ms sleep, which is what every host did before. Spurious returns
+ * are allowed: callers re-check what they are waiting for. */
+static void bridge_wait_on_counter(volatile LONG *addr, LONG seen, DWORD ms)
+{
+#if defined(_WIN32)
+    WaitOnAddress((volatile VOID *)addr, &seen, sizeof seen, ms);
+#elif defined(__APPLE__)
+    if (__builtin_available(macOS 14.4, *)) {
+        os_sync_wait_on_address_with_timeout((void *)addr, (uint64_t)(uint32_t)seen,
+                                             sizeof(LONG), OS_SYNC_WAIT_ON_ADDRESS_NONE,
+                                             OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                             (uint64_t)ms * 1000000u);
+    } else {
+        Sleep(1);
+    }
+#else
+    (void)addr; (void)seen; (void)ms;
+    Sleep(1);
+#endif
+}
+
+static void bridge_wake_counter(volatile LONG *addr)
+{
+#if defined(_WIN32)
+    WakeByAddressAll((PVOID)addr);
+#elif defined(__APPLE__)
+    if (__builtin_available(macOS 14.4, *))
+        os_sync_wake_by_address_all((void *)addr, sizeof(LONG),
+                                    OS_SYNC_WAKE_BY_ADDRESS_NONE);
+#else
+    (void)addr;
+#endif
+}
 
 #define EVENT_GEN_SLOTS 1024u
 static volatile LONG g_event_gen_va[EVENT_GEN_SLOTS];
@@ -1626,9 +1666,7 @@ static void event_wake_waiters(uint32_t va)
     volatile LONG *gen = event_generation(va);
     if (gen) {
         InterlockedIncrement(gen);
-#ifdef _WIN32
-        WakeByAddressAll((PVOID)gen);
-#endif
+        bridge_wake_counter(gen);
     }
 }
 
@@ -1655,14 +1693,9 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
         if (poll_only || (deadline && GetTickCount64() >= deadline))
             return 0x00000102u;                 /* STATUS_TIMEOUT */
         if (gen) {
-#ifdef _WIN32
             /* Sleep on the counter; a set wakes this at once. The 1 ms cap
              * keeps timeouts and a missed wake from costing more than that. */
-            LONG seen = gen0;
-            WaitOnAddress((volatile VOID *)gen, &seen, sizeof seen, 1);
-#else
-            Sleep(1);
-#endif
+            bridge_wait_on_counter(gen, gen0, 1);
         } else if (++spins < 64) {
             SwitchToThread();
         } else {
