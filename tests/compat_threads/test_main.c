@@ -206,12 +206,46 @@ static DWORD WINAPI fiber_thread(LPVOID p)
     return 0;
 }
 
+/* Stack sizes as Windows gives them: a size is a commit, the reservation is
+ * at least the default, unless STACK_SIZE_PARAM_IS_A_RESERVATION. */
+static ULONG_PTR g_stack_bytes;
+static DWORD WINAPI stack_probe(LPVOID p)
+{
+    ULONG_PTR lo, hi;
+    (void)p;
+    GetCurrentThreadStackLimits(&lo, &hi);
+    g_stack_bytes = hi - lo;
+    return 0;
+}
+
+static ULONG_PTR stack_of(SIZE_T size, DWORD flags)
+{
+    HANDLE h = CreateThread(NULL, size, stack_probe, NULL, flags, NULL);
+    g_stack_bytes = 0;
+    CHECK(h != NULL);
+    CHECK(WaitForSingleObject(h, 2000) == WAIT_OBJECT_0);
+    CloseHandle(h);
+    return g_stack_bytes;
+}
+
+static void test_stack_sizes(void)
+{
+    CHECK(stack_of(0, 0) >= (8u << 20));
+    CHECK(stack_of(16 * 1024, 0) >= (8u << 20));
+    CHECK(stack_of(32u << 20, 0) >= (32u << 20));
+    {
+        ULONG_PTR r = stack_of(256 * 1024, STACK_SIZE_PARAM_IS_A_RESERVATION);
+        CHECK(r >= 256 * 1024 && r < (1u << 20));
+    }
+}
+
 int main(void)
 {
     HANDLE h;
 
     test_fibers();
     test_suspend();
+    test_stack_sizes();
     h = CreateThread(NULL, 0, fiber_thread, NULL, 0, NULL);
     CHECK(WaitForSingleObject(h, 2000) == WAIT_OBJECT_0);
     CloseHandle(h);

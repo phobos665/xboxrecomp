@@ -667,6 +667,8 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+#define W32_DEFAULT_STACK ((size_t)8 << 20)
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
@@ -710,10 +712,26 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     o->suspend_count = (flags & CREATE_SUSPENDED) ? 1 : 0;
     o->refcount      = 2;   /* one for caller, one for the trampoline */
 
+    /* The stack, as Windows sizes it. There a size is a *commit* unless
+     * STACK_SIZE_PARAM_IS_A_RESERVATION says otherwise, and the reservation
+     * stays the executable's default (1 MB) -- so the kernel's 16 KB
+     * KernelStackSize still gets a megabyte to grow into. POSIX has no
+     * commit/reserve split and its defaults are smaller (512 KB for a
+     * secondary thread on macOS), and lifted code recurses on the host
+     * stack, so: at least 8 MB of reservation unless the caller asked for an
+     * exact one. Address space only; pages are touched as the stack grows. */
+    {
+        size_t want = (size_t)stackSize;
+        if (!(flags & STACK_SIZE_PARAM_IS_A_RESERVATION) && want < W32_DEFAULT_STACK)
+            want = W32_DEFAULT_STACK;
+        if (want < 65536)
+            want = 65536;
+        want = (want + 16383) & ~(size_t)16383;   /* a multiple of any page size */
+        stackSize = want;
+    }
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    if (stackSize)
-        pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
+    pthread_attr_setstacksize(&attr, stackSize);
 
     if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&attr);
