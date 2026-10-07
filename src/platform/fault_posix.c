@@ -22,7 +22,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>   /* <ucontext.h> wants _XOPEN_SOURCE for routines this does not use */
+#else
 #include <ucontext.h>
+#endif
 
 static const int g_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP };
 

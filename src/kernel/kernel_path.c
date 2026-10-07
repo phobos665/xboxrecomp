@@ -685,4 +685,11 @@ translate:
     }
 }
 
+/* The Windows branch remembers the last translation for the bridge's .wmv
+ * movie trigger; this one does not yet, so that trigger never fires here. */
+const wchar_t *xbox_LastHostPath(void)
+{
+    return L"";
+}
+
 #endif /* _WIN32 */

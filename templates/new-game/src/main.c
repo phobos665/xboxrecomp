@@ -105,6 +105,10 @@ void recomp_exit_trace_init(void);      /* src/kernel/exit_trace.c */
  * not need to link, so the kernel takes its interrupt line as a callback. */
 void xbox_SetApuInterruptSource(int (*pending)(void));
 
+/* Generated with the lifted code (recomp_dispatch.c); declared in
+ * recomp_types.h, which this file does not include. */
+int recomp_dispatch_init(void);
+
 static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
 
 /* ============================================================
@@ -269,6 +273,7 @@ static void print_guest_context(uintptr_t pc)
 
 static int route_device_fault(recomp_fault *f, uintptr_t fault_addr, int is_write)
 {
+#ifdef _WIN32
     struct _CONTEXT *ctx = (struct _CONTEXT *)f->ctx;
     uint32_t va = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
 
@@ -288,6 +293,16 @@ static int route_device_fault(recomp_fault *f, uintptr_t fault_addr, int is_writ
             return 1;
     }
     return 0;
+#else
+    /* The device decoders read x86-64 instructions out of a Windows
+     * CONTEXT (src/apu/apu_mmio_hook.c). Off Windows they come with the
+     * runtime's own fault route; until then a trapped register reports
+     * as a crash, which names it. */
+    (void)f;
+    (void)fault_addr;
+    (void)is_write;
+    return 0;
+#endif
 }
 
 /* Faults that are meant to happen: serviced and resumed, never reported.
