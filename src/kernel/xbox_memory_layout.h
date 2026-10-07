@@ -246,6 +246,10 @@ void xbox_GuestLockRestore(int held);
  * xbox_GuestLockLeave), 0 if the lock is off or the wait ran out -- the guest
  * code runs either way, as an interrupt would. */
 int  xbox_GuestLockEnterTimed(DWORD ms);
+/* The same for a call into guest code made from inside the runtime, on
+ * whatever thread: a guest thread (one that took xbox_GuestLockEnter) waits
+ * unbounded, as after a kernel call; a host thread waits at most host_ms. */
+int  xbox_GuestLockEnterForCall(DWORD host_ms);
 int  xbox_GuestLockOn(void);
 int  xbox_GuestConcurrencyOn(void);
 void xbox_GuestLiftedEnter(void);

@@ -426,11 +426,12 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
  * would otherwise run it with no lock at all, and so would a host thread
  * delivering an ISR or a DPC. With the lock on (the default on ARM hosts) that
  * is guest code running beside other guest code, the very thing the lock is
- * there to stop: the main thread of every title ran that way. Bounded, so an
- * interrupt never waits on a guest thread that spins without yielding; a no-op
- * when the lock is off. */
+ * there to stop: the main thread of every title ran that way. On a guest
+ * thread it waits as after any kernel call; on a host thread it is bounded,
+ * so an interrupt never waits on a guest thread that spins without yielding
+ * (xbox_GuestLockEnterForCall). A no-op when the lock is off. */
 #define BRIDGE_CALL_GUEST(fn) do {                         \
-        int _bcg_held = xbox_GuestLockEnterTimed(100);     \
+        int _bcg_held = xbox_GuestLockEnterForCall(100);   \
         (fn)();                                            \
         if (_bcg_held)                                     \
             xbox_GuestLockLeave();                         \

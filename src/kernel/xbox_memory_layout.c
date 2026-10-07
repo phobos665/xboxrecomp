@@ -1009,8 +1009,15 @@ void xbox_GuestLockInit(void)
     }
 }
 
+/* Set on a thread that runs as a guest thread (it took the lock with
+ * xbox_GuestLockEnter: the main thread at start-up, every spawned worker), so
+ * xbox_GuestLockEnterForCall knows to wait as a guest does rather than as an
+ * interrupt does. */
+static RECOMP_TLS int g_guest_thread;
+
 void xbox_GuestLockEnter(void)
 {
+    g_guest_thread = 1;
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return;
     EnterCriticalSection(&g_guest_cs);
@@ -1061,6 +1068,7 @@ static volatile LONG g_guest_host_waiting;
 int xbox_GuestLockEnterTimed(DWORD ms)
 {
     ULONGLONG deadline;
+    unsigned spins;
 
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return 0;
@@ -1070,14 +1078,16 @@ int xbox_GuestLockEnterTimed(DWORD ms)
     }
     InterlockedIncrement(&g_guest_host_waiting);
     deadline = GetTickCount64() + ms;
-    do {
-        Sleep(0);
+    for (spins = 0; GetTickCount64() < deadline; ) {
+        /* Yield at first, then sleep: a vblank thread waiting out a busy
+         * guest thread should not burn a core for the whole bound. */
+        Sleep(++spins < 50 ? 0 : 1);
         if (TryEnterCriticalSection(&g_guest_cs)) {
             InterlockedDecrement(&g_guest_host_waiting);
             g_guest_depth++;
             return 1;
         }
-    } while (GetTickCount64() < deadline);
+    }
     InterlockedDecrement(&g_guest_host_waiting);
     {
         static volatile LONG said;
@@ -1089,6 +1099,25 @@ int xbox_GuestLockEnterTimed(DWORD ms)
         }
     }
     return 0;
+}
+
+/* Guest code called from inside the runtime. On a guest thread (a kernel
+ * call that runs a callback: the inline main-thread start, an APC, an inline
+ * DPC) this waits as xbox_GuestLockRestore does, unbounded: a timeout there
+ * would leave that thread running lifted code unlocked for as long as the
+ * callback lasts -- the whole game, for the inline main thread. On a host
+ * thread (an ISR or DPC delivered by the timer or a device thread) it is
+ * xbox_GuestLockEnterTimed. Decided at run time, because kernel_run_dpc and
+ * kernel_raise_interrupt run on both. */
+int xbox_GuestLockEnterForCall(DWORD host_ms)
+{
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready)
+        return 0;
+    if (g_guest_thread) {
+        xbox_GuestLockEnter();
+        return 1;
+    }
+    return xbox_GuestLockEnterTimed(host_ms);
 }
 
 void xbox_GuestLockRestore(int held)
@@ -1251,7 +1280,9 @@ void xbox_Nv2aFlipGateArm(void)
         /* Swap is an HLE call, not a kernel call, so the guest lock is still
          * held here; a frame's worth of waiting with it held would stop every
          * other guest thread (audio, streaming) for that long. Dropped for
-         * the wait, as a kernel wait drops it. */
+         * the wait, as a kernel wait drops it. That includes the lent wait:
+         * the idle hook (frame interpolation, hle_d3d8_interp.c) replays
+         * recorded host calls and must not touch guest memory. */
         int guest_held = xbox_GuestLockDrop();
 
         /* Only while one Swap a vblank is the cadence: the release is then
