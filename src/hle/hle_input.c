@@ -95,6 +95,18 @@ static RecompInputModel g_model;
 static CRITICAL_SECTION g_lock;
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 
+/* The console's USB enumerates its devices after XInitDevices, so a pad that
+ * is in at power-on is not attached at once: XGetDevices made straight after
+ * start-up returns nothing, and the pad arrives a moment later as an
+ * insertion through XGetDeviceChanges. A title may depend on that. Mortal
+ * Kombat: Shaolin Monks calls XGetDevices at start-up, keeps the mask, and
+ * opens a pad only when XGetDeviceChanges reports it inserted -- so a pad
+ * attached from the first call was never opened, and "Press START" could not
+ * be pressed. Until this time (GetTickCount64 ms) no pad is attached;
+ * RECOMP_INPUT_ENUM_MS sets how long after the first input call that is
+ * (default 500; 0 attaches at once, as before). */
+static ULONGLONG g_enum_until;
+
 static BOOL CALLBACK init(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
     uint32_t present, port, count = 0u;
@@ -103,7 +115,19 @@ static BOOL CALLBACK init(PINIT_ONCE once, PVOID param, PVOID *ctx)
     InitializeCriticalSection(&g_lock);
     recomp_bindings_init();               /* logs the config file it read */
     present = recomp_bindings_present_mask();
-    recomp_input_reset(&g_model, present);
+    {
+        const char *v = getenv("RECOMP_INPUT_ENUM_MS");
+        long ms = v && *v ? strtol(v, NULL, 10) : 500;
+        if (ms < 0)
+            ms = 0;
+        g_enum_until = ms ? GetTickCount64() + (ULONGLONG)ms : 0;
+        /* Nothing attached until enumeration is done (refresh_connected). */
+        recomp_input_reset(&g_model, ms ? 0u : present);
+        if (ms)
+            fprintf(stderr, "[INPUT] device enumeration takes %ld ms, as the console's "
+                            "USB does: pads in at start-up arrive as insertions after it "
+                            "(RECOMP_INPUT_ENUM_MS=0 attaches them at once)\n", ms);
+    }
     for (port = 0u; port < RECOMP_INPUT_PORT_COUNT; port++)
         if (present & (1u << port))
             count++;
@@ -137,6 +161,13 @@ static void unlock(void) { LeaveCriticalSection(&g_lock); }
 static void refresh_connected(void)
 {
     uint32_t present = recomp_bindings_present_mask(), port;
+
+    if (g_enum_until) {
+        if (GetTickCount64() < g_enum_until)
+            present = 0u;                 /* still enumerating */
+        else
+            g_enum_until = 0;
+    }
 
     for (port = 0u; port < RECOMP_INPUT_PORT_COUNT; port++) {
         bool now = (present & (1u << port)) != 0u;

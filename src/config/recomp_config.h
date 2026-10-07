@@ -38,9 +38,29 @@
 void recomp_config_set_title(uint32_t title_id);
 /* The title id given above, 0 before it is known. */
 uint32_t recomp_config_title_id(void);
-/* The per-user directory settings live in (%APPDATA%\xboxrecomp on
- * Windows); 0 if there is none. Caches go beneath it. */
+/* The per-user directories, the one place each is decided. Each returns 1
+ * and writes the path (no trailing separator), or 0 if the host has no home
+ * to put it in. None creates anything (recomp_make_dirs does), and none needs
+ * SDL or any other initialisation: they read the environment only.
+ * RECOMP_USER_DIR=<dir> overrides all three (user and data are <dir>, cache
+ * is <dir>/cache), for tests and scripted runs.
+ *
+ *   user  settings and input bindings
+ *         Windows %APPDATA%\xboxrecomp; macOS ~/Library/Application Support/
+ *         xboxrecomp; Linux $XDG_CONFIG_HOME (or ~/.config)/xboxrecomp
+ *   data  saves -- the FATX partition images and T:/U:/Z: -- unless
+ *         RECOMP_SAVE_DIR says otherwise (kernel_path.c reads that)
+ *         Windows %LOCALAPPDATA%\xboxrecomp; macOS as user; Linux
+ *         $XDG_DATA_HOME (or ~/.local/share)/xboxrecomp
+ *   cache disposable, rebuilt when missing (the shader cache)
+ *         Windows as user; macOS ~/Library/Caches/xboxrecomp; Linux
+ *         $XDG_CACHE_HOME (or ~/.cache)/xboxrecomp */
 int recomp_config_user_dir(char *out, size_t n);
+int recomp_data_dir(char *out, size_t n);
+int recomp_cache_dir(char *out, size_t n);
+/* mkdir -p: every missing directory on the way to path. 1 if it exists
+ * afterwards. */
+int recomp_make_dirs(const char *path);
 
 /* The value for a setting: the environment variable if it is set and not
  * empty, then the config file, then NULL. Either name may be NULL to skip

@@ -28,9 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
-#ifdef _WIN32
-#include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
-#endif
+#include "platform/host_timer.h"   /* the vblank clock's precise sleep */
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -420,6 +418,25 @@ static void bridge_set_handle_kind(HANDLE h, int kind);
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 
+/* Call guest code from inside the runtime, holding the guest lock.
+ *
+ * The dispatcher drops the guest lock around every kernel call, so a bridge
+ * that calls back into lifted code -- the title's main thread started inline
+ * by PsCreateSystemThreadEx, an APC, a DPC run inline, an exception handler --
+ * would otherwise run it with no lock at all, and so would a host thread
+ * delivering an ISR or a DPC. With the lock on (the default on ARM hosts) that
+ * is guest code running beside other guest code, the very thing the lock is
+ * there to stop: the main thread of every title ran that way. On a guest
+ * thread it waits as after any kernel call; on a host thread it is bounded,
+ * so an interrupt never waits on a guest thread that spins without yielding
+ * (xbox_GuestLockEnterForCall). A no-op when the lock is off. */
+#define BRIDGE_CALL_GUEST(fn) do {                         \
+        int _bcg_held = xbox_GuestLockEnterForCall(100);   \
+        (fn)();                                            \
+        if (_bcg_held)                                     \
+            xbox_GuestLockLeave();                         \
+    } while (0)
+
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                      uint32_t ctx2)
 {
@@ -427,7 +444,7 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     g_seh_ebp = g_esp;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     g_esp += 12;
 }
 
@@ -449,6 +466,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     xbox_GuestLockEnter();
     xbox_GuestLiftedEnter();
     xbox_NameCurrentThread(L"guest worker");
+    if (xbox_EnvSwitch("RECOMP_GUESTLOCK_TRACE", 0))
+        fprintf(stderr, "  [THREAD] guest worker tid %lu (ctx 0x%08X)\n",
+                (unsigned long)GetCurrentThreadId(), ctx1);
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -547,7 +567,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                BRIDGE_CALL_GUEST(fn);
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
@@ -1472,6 +1492,17 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 
+/* RECOMP_THREAD_TRACE=1: who suspends, resumes and re-prioritises whom, by
+ * host thread id, and which thread each file read comes from -- for a title
+ * whose threads hand work to each other by suspending and resuming. */
+static int bridge_thread_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_THREAD_TRACE", 0);
+    return on;
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 /* Guest dispatcher objects.
  *
@@ -1597,6 +1628,46 @@ static ULONGLONG bridge_guest_deadline(uint32_t timeout_va, int *poll_only)
 #if defined(_MSC_VER)
 #pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
 #endif
+#if defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>      /* macOS 14.4 */
+#include <os/clock.h>
+#endif
+
+/* Sleep on a counter until it is not `seen` any more, a wake, or `ms`.
+ * WaitOnAddress on Windows, os_sync_wait_on_address on macOS; elsewhere a
+ * plain 1 ms sleep, which is what every host did before. Spurious returns
+ * are allowed: callers re-check what they are waiting for. */
+static void bridge_wait_on_counter(volatile LONG *addr, LONG seen, DWORD ms)
+{
+#if defined(_WIN32)
+    WaitOnAddress((volatile VOID *)addr, &seen, sizeof seen, ms);
+#elif defined(__APPLE__)
+    if (__builtin_available(macOS 14.4, *)) {
+        os_sync_wait_on_address_with_timeout((void *)addr, (uint64_t)(uint32_t)seen,
+                                             sizeof(LONG), OS_SYNC_WAIT_ON_ADDRESS_NONE,
+                                             OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                             (uint64_t)ms * 1000000u);
+    } else {
+        Sleep(1);
+    }
+#else
+    (void)addr; (void)seen; (void)ms;
+    Sleep(1);
+#endif
+}
+
+static void bridge_wake_counter(volatile LONG *addr)
+{
+#if defined(_WIN32)
+    WakeByAddressAll((PVOID)addr);
+#elif defined(__APPLE__)
+    if (__builtin_available(macOS 14.4, *))
+        os_sync_wake_by_address_all((void *)addr, sizeof(LONG),
+                                    OS_SYNC_WAKE_BY_ADDRESS_NONE);
+#else
+    (void)addr;
+#endif
+}
 
 #define EVENT_GEN_SLOTS 1024u
 static volatile LONG g_event_gen_va[EVENT_GEN_SLOTS];
@@ -1626,9 +1697,7 @@ static void event_wake_waiters(uint32_t va)
     volatile LONG *gen = event_generation(va);
     if (gen) {
         InterlockedIncrement(gen);
-#ifdef _WIN32
-        WakeByAddressAll((PVOID)gen);
-#endif
+        bridge_wake_counter(gen);
     }
 }
 
@@ -1655,14 +1724,9 @@ static uint32_t bridge_wait_guest_event(volatile LONG *state, int sync,
         if (poll_only || (deadline && GetTickCount64() >= deadline))
             return 0x00000102u;                 /* STATUS_TIMEOUT */
         if (gen) {
-#ifdef _WIN32
             /* Sleep on the counter; a set wakes this at once. The 1 ms cap
              * keeps timeouts and a missed wake from costing more than that. */
-            LONG seen = gen0;
-            WaitOnAddress((volatile VOID *)gen, &seen, sizeof seen, 1);
-#else
-            Sleep(1);
-#endif
+            bridge_wait_on_counter(gen, gen0, 1);
         } else if (++spins < 64) {
             SwitchToThread();
         } else {
@@ -2127,7 +2191,7 @@ static void bridge_NtUserIoApcDispatcher(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = information;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = (status == 0) ? 0 : status;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
 
     g_eax = 0;
 }
@@ -2406,7 +2470,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     return 1;
 }
 
@@ -2446,7 +2510,7 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2594,7 +2658,7 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     return (int)(g_eax & 1u);
 }
 
@@ -3084,11 +3148,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
      * fires within about 0.5 ms. Where it is unavailable, timeBeginPeriod(1)
      * gets Sleep close to 1 ms at the cost of a system-wide 1 kHz tick. */
     {
-        HANDLE hires = CreateWaitableTimerExW(NULL, NULL,
-                                              0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
-                                              TIMER_ALL_ACCESS);
+        host_timer *hires = host_timer_create(HOST_TIMER_HIGH_RES_ONLY);
         if (!hires && vblank_clock_wait_us() >= 0)
-            timeBeginPeriod(1);
+            host_sleep_precision_1ms();
+        /* A thread that wakes each vblank and does little: real-time where
+         * the host has it (macOS), so its sleeps are on time without the
+         * stepped wait's spin. Nothing on Windows. */
+        if (hires && host_thread_realtime(16667, 1000, 3000))
+            fprintf(stderr, "  [NV2A] vblank clock thread is real-time\n");
 
         for (;;) {
             long long now;
@@ -3103,10 +3170,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 if (wait_us > 10000)
                     wait_us = 10000;
                 if (hires) {
-                    LARGE_INTEGER due;
-                    due.QuadPart = -(wait_us * 10);
-                    SetWaitableTimer(hires, &due, 0, NULL, NULL, FALSE);
-                    WaitForSingleObject(hires, INFINITE);
+                    /* A timer that will not arm must not become a spin. */
+                    if (host_timer_wait_us(hires, wait_us, INFINITE) == HOST_WAIT_NOT_ARMED)
+                        Sleep(1);
                 } else {
                     Sleep((DWORD)((wait_us + 999) / 1000));
                 }
@@ -3358,6 +3424,8 @@ static unsigned char s_handle_kind[BRIDGE_HANDLE_MAX];
 
 /* The guest-side dispatcher object synthesised for each token, or 0. */
 static uint32_t s_handle_dispatcher[BRIDGE_HANDLE_MAX];
+/* The object ObReferenceObjectByHandle hands out for NtCurrentThread. */
+static uint32_t *s_pseudo_thread_obj;
 
 
 static uint32_t bridge_handle_token(HANDLE h)
@@ -3787,7 +3855,7 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-        fn();
+        BRIDGE_CALL_GUEST(fn);
         g_esp += 12;
     } else {
         uint32_t ord = 0;
@@ -3944,7 +4012,7 @@ static void bridge_RtlUnwind(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
-                fn();
+                BRIDGE_CALL_GUEST(fn);
                 /* 16, not 20: the handler's own `ret` has already taken the
                  * return address off, leaving just the four arguments for the
                  * caller to drop. Cleaning 20 leaves esp four bytes high, and
@@ -4022,6 +4090,8 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
+        if (bridge_thread_trace())
+            fprintf(stderr, "  [READ] tid %lu:\n", (unsigned long)GetCurrentThreadId());
         if (poff)
             fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X -> 0x%08X  %02X %02X %02X %02X\n",
                     (long long)off.QuadPart, length, got,
@@ -4772,6 +4842,8 @@ static void bridge_ObReferenceObjectByHandle(void)
             if (i < PSEUDO_MAX && pseudo_handle[i] == handle) {
                 slot_disp = &pseudo_disp[i];
                 disp = *slot_disp;
+                if (handle == 0xFFFFFFFEu)      /* NtCurrentThread */
+                    s_pseudo_thread_obj = &pseudo_disp[i];
             }
         }
     }
@@ -5032,16 +5104,64 @@ static void bridge_KeDisconnectInterrupt(void)
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
  * missing, so the thunk fell through to the fallback and returned 0. */
+static DWORD bridge_thread_object_tid(uint32_t obj);
+
+/* The thread's own base priority, as last set.
+ *
+ * xbox_KeQueryBasePriorityThread underneath passes the guest thread object to
+ * Win32 GetThreadPriority as if it were a host handle. It is not one, the call
+ * fails, and the failure maps to 0: every title on every host got 0 for every
+ * thread. A title that saves a priority and restores it later (XAPI's
+ * GetThreadPriority/SetThreadPriority pair -- BLiNX's CRI ADX lock does it
+ * around every lock) put each thread it ran on back to normal. The answer
+ * now comes from the record KeSetBasePriorityThread keeps by host thread id
+ * (bridge_thread_object_tid resolves the object, including the pseudo-handle
+ * one every NtCurrentThread shares); 0 for a thread never set, as before. */
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    int32_t prio = 0;
+    xbox_GuestLockQueryPriority(bridge_thread_object_tid(STACK_ARG(0)), &prio);
+    g_eax = (uint32_t)prio;
+}
+
+/* The host thread a guest thread object stands for, for the guest lock's
+ * priorities: the caller, when the object is its own (its TIB's, or the one
+ * object every NtCurrentThread reference shares); else the thread whose
+ * handle owns the object. 0 if none. */
+uint32_t xbox_CurrentThreadObject(void);
+
+static DWORD bridge_thread_object_tid(uint32_t obj)
+{
+    uint32_t i;
+    if (!obj)
+        return 0;
+    if (obj == xbox_CurrentThreadObject() ||
+        (s_pseudo_thread_obj && obj == *s_pseudo_thread_obj))
+        return GetCurrentThreadId();
+    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+        if (s_handle_dispatcher[i] == obj && s_handle_kind[i] == BRIDGE_OBJ_THREAD)
+            return GetThreadId(bridge_resolve_handle(BRIDGE_HANDLE_TAG | i));
+    return 0;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+    DWORD tid = bridge_thread_object_tid(STACK_ARG(0));
+    int32_t prev = 0;
+
+    /* The previous increment comes from the same record
+     * KeQueryBasePriorityThread reads (see there; the host call's answer was
+     * 0 for the same reason), and the new one goes into it -- also for the
+     * guest lock, which hands over by priority. */
+    xbox_GuestLockQueryPriority(tid, &prev);
+    xbox_GuestLockNotePriority(tid, (int32_t)STACK_ARG(1));
+    if (bridge_thread_trace())
+        fprintf(stderr, "  [THREADS] tid %lu sets tid %lu priority %d (was %d)\n",
+                (unsigned long)GetCurrentThreadId(), (unsigned long)tid,
+                (int)(int32_t)STACK_ARG(1), (int)prev);
+    (void)xbox_KeSetBasePriorityThread(XBOX_TO_NATIVE(STACK_ARG(0)),
+                                       (LONG)STACK_ARG(1));
+    g_eax = (uint32_t)prev;
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
@@ -5129,18 +5249,30 @@ static void bridge_NtReleaseMutant(void)
 static void bridge_NtSuspendThread(void)
 {
     uint32_t count_va = STACK_ARG(1);
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
 
     g_eax = (uint32_t)xbox_NtSuspendThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+        h, count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    if (bridge_thread_trace())
+        fprintf(stderr, "  [THREADS] tid %lu suspends tid %lu -> 0x%08X prev %u\n",
+                (unsigned long)GetCurrentThreadId(), (unsigned long)GetThreadId(h),
+                g_eax, count_va ? BRIDGE_MEM32(count_va) : 0u);
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
 static void bridge_NtResumeThread(void)
 {
+    uint32_t count_va = STACK_ARG(1);
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+
+    /* The count pointer is optional: NULL must stay NULL, not become guest
+     * address 0's host address and have the count written there. */
     g_eax = (uint32_t)xbox_NtResumeThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+        h, count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    if (bridge_thread_trace())
+        fprintf(stderr, "  [THREADS] tid %lu resumes tid %lu -> 0x%08X prev %u\n",
+                (unsigned long)GetCurrentThreadId(), (unsigned long)GetThreadId(h),
+                g_eax, count_va ? BRIDGE_MEM32(count_va) : 0u);
 }
 
 /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
@@ -7953,8 +8085,11 @@ static void bridge_KeResumeThread(void)
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
-    if (hThread)
-        g_eax = (uint32_t)ResumeThread(hThread);
+    if (hThread) {
+        DWORD prev;
+        g_eax = xbox_GuestThreadResume(hThread, &prev)
+                    ? (uint32_t)prev : (uint32_t)ResumeThread(hThread);
+    }
     else
         g_eax = 0;
 }
@@ -7966,8 +8101,11 @@ static void bridge_KeSuspendThread(void)
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
-    if (hThread)
-        g_eax = (uint32_t)SuspendThread(hThread);
+    if (hThread) {
+        DWORD prev;
+        g_eax = xbox_GuestThreadSuspend(hThread, &prev)
+                    ? (uint32_t)prev : (uint32_t)SuspendThread(hThread);
+    }
     else
         g_eax = 0;
 }
@@ -8189,8 +8327,10 @@ static void bridge_KeSetPriorityProcess(void)
 /* --- KeSetPriorityThread (ordinal 148, 2 args = 8 bytes) --- */
 static void bridge_KeSetPriorityThread(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
+    /* An absolute priority (8 is normal); the guest lock weighs it as an
+     * increment from normal. */
+    xbox_GuestLockNotePriority(bridge_thread_object_tid(STACK_ARG(0)),
+                               (int32_t)STACK_ARG(1) - 8);
     g_eax = 0;
 }
 
@@ -8647,7 +8787,7 @@ static void bridge_PsCreateSystemThread(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                BRIDGE_CALL_GUEST(fn);
                 g_esp += 12;
             } else {
                 const char *inline_workers = getenv("RECOMP_WORKERS");
@@ -10240,6 +10380,56 @@ static void kcaller_report(void)
                 g_kcaller_ordinal, (unsigned long long)g_kcaller_other);
 }
 
+/* The kernel calls that can block a guest thread: waits, delays, a contended
+ * critical section, disc and file I/O, a thread suspending or ending itself.
+ * Around these the guest lock goes to whoever is waiting, as the console's
+ * scheduler would run another thread. Every other call runs to completion
+ * without a reschedule there, so it is not a handoff point here either
+ * (xbox_GuestLockDropForKernel). A call missing from this list costs at most
+ * RECOMP_GUEST_RESERVE_US (50 ms) of other guest threads' time when it does
+ * block, and the log names it. */
+static int bridge_may_block(uint32_t ordinal)
+{
+    switch (ordinal) {
+    case 12:  /* ExAcquireReadWriteLockExclusive */
+    case 13:  /* ExAcquireReadWriteLockShared */
+    case 49:  /* HalReturnToFirmware */
+    case 66:  /* IoCreateFile */
+    case 84:  /* IoSynchronousDeviceIoControlRequest */
+    case 95:  /* KeBugCheck */
+    case 99:  /* KeDelayExecutionThread */
+    case 158: /* KeWaitForMultipleObjects */
+    case 159: /* KeWaitForSingleObject */
+    case 190: /* NtCreateFile */
+    case 196: /* NtDeviceIoControlFile */
+    case 198: /* NtFlushBuffersFile */
+    case 200: /* NtFsControlFile */
+    case 202: /* NtOpenFile */
+    case 219: /* NtReadFile */
+    case 220: /* NtReadFileScatter */
+    case 223: /* NtRemoveIoCompletion */
+    case 230: /* NtSignalAndWaitForSingleObjectEx */
+    /* Not 152/231 (Ke/NtSuspendThread): suspending another thread does not
+     * block, and BLiNX's ADX unlock suspends its spinner and then restores
+     * its own priority from a shared slot -- a handoff between the two let
+     * the main thread overwrite the slot. A thread suspending itself gives
+     * the reservation up there (xbox_GuestThreadSuspend). */
+    case 233: /* NtWaitForSingleObject */
+    case 234: /* NtWaitForSingleObjectEx */
+    case 235: /* NtWaitForMultipleObjectsEx */
+    case 236: /* NtWriteFile */
+    case 237: /* NtWriteFileGather */
+    case 238: /* NtYieldExecution */
+    case 258: /* PsTerminateSystemThread */
+    case 277: /* RtlEnterCriticalSection */
+    case 278: /* RtlEnterCriticalSectionAndRegion */
+    case 327: /* XeLoadSection */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
@@ -10380,7 +10570,7 @@ static void kernel_thunk_dispatch(void)
          * to enumerate which ordinals block. It also costs one uncontended
          * acquire per kernel call, which is the price of not having to be
          * right about that list. */
-        int _guest_held = xbox_GuestLockDrop();
+        int _guest_held = xbox_GuestLockDropForKernel(bridge_may_block(ordinal), ordinal);
         xbox_GuestLiftedLeave();
         if (xbox_FpsWaitProfileOn()) {
             /* RECOMP_WAIT_PROFILE: how long this call held the thread. */
@@ -10398,7 +10588,7 @@ static void kernel_thunk_dispatch(void)
          * the lock on -- which is meant to make overlap impossible -- took
          * the reported overlaps from 1,625 to 8,265,550. The meter has to
          * read zero under the lock or it is not measuring what it claims. */
-        xbox_GuestLockRestore(_guest_held);
+        xbox_GuestLockRestoreForKernel(_guest_held);
         xbox_GuestLiftedEnter();
         if (g_esp != _esp_before) {
             static uint8_t said[XBOX_KERNEL_THUNK_TABLE_SIZE];

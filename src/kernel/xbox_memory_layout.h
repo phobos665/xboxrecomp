@@ -230,14 +230,54 @@ int xbox_EnvSwitch(const char *name, int default_on);
  * released and Restore takes it back, because a bridge that runs guest code
  * can re-enter.
  *
- * RECOMP_GUEST_LOCK=1 turns it on. Off by default: this is an experiment,
- * and a title that works today must not change because of one.
+ * RECOMP_GUEST_LOCK=1 turns it on. Off by default on x86 hosts: there it is
+ * an experiment, and a title that works today must not change because of
+ * one. On by default on ARM hosts (RECOMP_GUEST_LOCK=0 turns it off), whose
+ * weak memory ordering breaks the barrier-free guest code that x86 lets
+ * through.
  */
 void xbox_GuestLockInit(void);
 void xbox_GuestLockEnter(void);
 void xbox_GuestLockLeave(void);
 int  xbox_GuestLockDrop(void);
 void xbox_GuestLockRestore(int held);
+/* The same around a kernel bridge call, which knows whether the call can
+ * block. One that cannot (NtResumeThread, KeSetBasePriorityThread, ...) is
+ * not a place another guest thread gets in: on the console a call like that
+ * runs to completion without a reschedule, and titles build locks on it. Host
+ * threads (interrupts) and the caller's own callbacks still take the lock
+ * during the call. */
+int  xbox_GuestLockDropForKernel(int may_block, uint32_t ordinal);
+void xbox_GuestLockRestoreForKernel(int held);
+/* Sleep ms from guest context (a title override's wait loop) without holding
+ * the guest lock: Drop, leave lifted code, Sleep, Restore, enter -- a
+ * blocking point, as a blocking kernel call is, so the highest-priority
+ * waiter takes over. Plain Sleep(ms) where the lock is off. */
+void xbox_GuestSleep(DWORD ms);
+/* For a host thread about to run guest code (an ISR, a DPC, a device
+ * callback): the lock, waiting at most ms. 1 if taken (then
+ * xbox_GuestLockLeave), 0 if the lock is off or the wait ran out -- the guest
+ * code runs either way, as an interrupt would. */
+int  xbox_GuestLockEnterTimed(DWORD ms);
+/* The same for a call into guest code made from inside the runtime, on
+ * whatever thread: a guest thread (one that took xbox_GuestLockEnter) waits
+ * unbounded, as after a kernel call; a host thread waits at most host_ms. */
+int  xbox_GuestLockEnterForCall(DWORD host_ms);
+/* A guest thread's priority, for the guest lock's handoffs: its host thread
+ * id and the KeSetBasePriorityThread increment (-16..16, 0 normal). */
+void xbox_GuestLockNotePriority(DWORD tid, int32_t prio);
+/* The increment last noted for that thread: 1 and *prio if there is one,
+ * 0 if none was ever set (the thread runs at 0). Also what
+ * KeQueryBasePriorityThread answers, so it is kept whether or not the lock
+ * is on. */
+int  xbox_GuestLockQueryPriority(DWORD tid, int32_t *prio);
+/* Guest NtSuspendThread/NtResumeThread with the guest lock on: the target
+ * parks itself at its next safe point instead of being stopped holding the
+ * lock. 1 if handled (prev = the previous suspend count), 0 to fall back to
+ * SuspendThread/ResumeThread (lock off, not a running guest thread, or the
+ * caller itself). */
+int  xbox_GuestThreadSuspend(HANDLE thread, DWORD *prev);
+int  xbox_GuestThreadResume(HANDLE thread, DWORD *prev);
 int  xbox_GuestLockOn(void);
 int  xbox_GuestConcurrencyOn(void);
 void xbox_GuestLiftedEnter(void);
@@ -456,8 +496,15 @@ extern uint32_t g_xbox_low_shift;
  *
  * XBOX_TIB_MAIN is where the first thread's TIB is built; every spawned
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
- * it. */
-#define XBOX_TIB_MAIN       0x00001000
+ * it.
+ *
+ * 0x4000 rather than the 0x1000 it was: RECOMP_TRAP_NULL protects guest
+ * page zero, and on a host with 16 KB pages (Apple Silicon) that protection
+ * covers the whole host page 0..0x3FFF. The TIB there would trap on every
+ * fs: access. Nothing addresses the TIB but through g_fs_base -- the lifted
+ * code reads fs:[N] as MEM32(XBOX_FS_BASE + N) -- so the move changes no
+ * title, on any host. */
+#define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 

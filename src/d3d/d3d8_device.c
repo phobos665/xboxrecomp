@@ -351,11 +351,41 @@ static BOOL two_d_squeeze(float *k_out, float *cx_out)
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
+/* xbox_D3D8SetWindowSize: the drawable's size in pixels, from the window's
+ * owner, where there is no HWND to ask (a CAMetalLayer on Apple). */
+static volatile LONG g_window_w, g_window_h;
+
+void xbox_D3D8SetWindowSize(UINT width, UINT height)
+{
+    InterlockedExchange(&g_window_w, (LONG)width);
+    InterlockedExchange(&g_window_h, (LONG)height);
+}
+
+/* The size the swap chain should be: the window's client area. FALSE when
+ * nothing says (no window, or an owner that has not reported one yet). */
+static BOOL window_size(const D3D8DeviceState *s, UINT *w, UINT *h)
+{
+#if defined(_WIN32)
+    RECT rc;
+
+    if (!s->hwnd || !GetClientRect(s->hwnd, &rc))
+        return FALSE;
+    *w = (UINT)(rc.right - rc.left);
+    *h = (UINT)(rc.bottom - rc.top);
+    return TRUE;
+#else
+    (void)s;
+    *w = (UINT)InterlockedCompareExchange(&g_window_w, 0, 0);
+    *h = (UINT)InterlockedCompareExchange(&g_window_h, 0, 0);
+    return *w && *h;
+#endif
+}
+
 static void present_scene(void)
 {
     D3D8DeviceState *s = &g_device_state;
     D3D8DisplayFit fit;
-    RECT rc;
+    UINT w, h;
 
     if (!rhi_swapchain_view() || !s->rhi_scene_srv)
         return;
@@ -365,9 +395,7 @@ static void present_scene(void)
      * right all the way through still reaches the screen distorted. Keep
      * the buffer the size of the window and the stretch is the identity;
      * the fit below then puts bars around the picture instead. */
-    if (s->hwnd && GetClientRect(s->hwnd, &rc)) {
-        UINT w = (UINT)(rc.right - rc.left), h = (UINT)(rc.bottom - rc.top);
-
+    if (window_size(s, &w, &h)) {
         if (w && h && (w != s->swap_width || h != s->swap_height)) {
             if (rhi_swapchain_resize(w, h) == 0) {
                 s->swap_width = w;
@@ -561,7 +589,7 @@ static HRESULT create_render_targets(D3D8DeviceState *state)
         if (FAILED(hr))
             fprintf(stderr, "D3D8 display: the %ux%u scene target could not be "
                     "made (0x%08lX); nothing will be drawn\n",
-                    state->width, state->height, (unsigned long)hr);
+                    state->width, state->height, (unsigned long)(uint32_t)hr);
     }
     if (FAILED(hr)) return hr;
 
@@ -674,6 +702,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         /* Cleanup subsystems first */
         up_ring_shutdown();
         d3d8_overlay_shutdown();
+        d3d8_clear_shutdown();
         d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
         d3d8_display_shutdown();
@@ -818,9 +847,52 @@ static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *self)
     return S_OK;
 }
 
+/* Clear's rectangles in the target's host pixels, clipped to it. TRUE when
+ * the clear is the whole target after all: no rectangles, or one that covers
+ * it -- which is the native clear's fast path. */
+#define CLEAR_MAX_RECTS 64
+static BOOL clear_rects_to_host(DWORD count, const D3DRECT *rects, UINT w, UINT h,
+                                RhiRect *out, UINT *n_out)
+{
+    float sx = rt_scale_x(), sy = rt_scale_y();
+    DWORD i;
+    UINT n = 0;
+
+    *n_out = 0;
+    if (!count || !rects)
+        return TRUE;
+    for (i = 0; i < count && n < CLEAR_MAX_RECTS; i++) {
+        RhiRect r;
+
+        r.left   = (int32_t)((float)rects[i].x1 * sx);
+        r.top    = (int32_t)((float)rects[i].y1 * sy);
+        r.right  = (int32_t)((float)rects[i].x2 * sx);
+        r.bottom = (int32_t)((float)rects[i].y2 * sy);
+        if (r.left < 0) r.left = 0;
+        if (r.top < 0) r.top = 0;
+        if (r.right > (int32_t)w) r.right = (int32_t)w;
+        if (r.bottom > (int32_t)h) r.bottom = (int32_t)h;
+        if (r.right <= r.left || r.bottom <= r.top)
+            continue;                   /* nothing of it is on the target */
+        if (r.left == 0 && r.top == 0 && r.right == (int32_t)w && r.bottom == (int32_t)h)
+            return TRUE;                /* one of them is the whole target */
+        out[n++] = r;
+    }
+    *n_out = n;
+    return FALSE;
+}
+
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
-    (void)self; (void)Count; (void)pRects; (void)Stencil;
+    RhiRect host_rects[CLEAR_MAX_RECTS];
+    UINT n_rects = 0, target_w, target_h;
+    float clear_color[4] = {
+        ((Color >> 16) & 0xFF) / 255.0f,  /* R */
+        ((Color >>  8) & 0xFF) / 255.0f,  /* G */
+        ((Color >>  0) & 0xFF) / 255.0f,  /* B */
+        ((Color >> 24) & 0xFF) / 255.0f,  /* A */
+    };
+    (void)self;
     g_d3d_clear_count++;
 
     /* Clear the currently bound targets. With no depth surface bound there
@@ -828,15 +900,28 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
     RhiView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.rhi_default_rtv;
     RhiView *dsv = g_cur_ds ? g_cur_ds->dsv : NULL;
 
-    if ((Flags & D3DCLEAR_TARGET) && rtv) {
-        float clear_color[4] = {
-            ((Color >> 16) & 0xFF) / 255.0f,  /* R */
-            ((Color >>  8) & 0xFF) / 255.0f,  /* G */
-            ((Color >>  0) & 0xFF) / 255.0f,  /* B */
-            ((Color >> 24) & 0xFF) / 255.0f,  /* A */
-        };
-        rhi_clear_color(rtv, clear_color);
+    /* With rectangles, only those parts of the target, in its own pixels
+     * and whatever the viewport and the scissor say (d3d8_clear.c). A
+     * rectangle that is the whole target, or none at all, is the native
+     * clear below. */
+    target_w = g_cur_rt ? g_cur_rt->width : g_device_state.width;
+    target_h = g_cur_rt ? g_cur_rt->height : g_device_state.height;
+    if (!clear_rects_to_host(Count, pRects, target_w, target_h, host_rects, &n_rects)) {
+        if (n_rects &&
+            d3d8_clear_rects(rtv, dsv, target_w, target_h, host_rects, n_rects,
+                             (Flags & D3DCLEAR_TARGET) != 0, (Flags & D3DCLEAR_ZBUFFER) != 0,
+                             (Flags & D3DCLEAR_STENCIL) != 0, clear_color, Z,
+                             (uint8_t)Stencil) != 0) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "D3D8: a Clear with rectangles could not be drawn; "
+                        "it is not applied\n");
+        }
+        return S_OK;
     }
+
+    if ((Flags & D3DCLEAR_TARGET) && rtv)
+        rhi_clear_color(rtv, clear_color);
 
     if ((Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) && dsv) {
         uint32_t clear_flags = 0;
@@ -2611,25 +2696,25 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     /* Initialize shader and state subsystems */
     hr = d3d8_shaders_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: Shader init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: Shader init failed: 0x%08lX\n", (unsigned long)(uint32_t)hr);
         return hr;
     }
 
     hr = d3d8_states_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: State init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: State init failed: 0x%08lX\n", (unsigned long)(uint32_t)hr);
         return hr;
     }
 
     hr = d3d8_combiners_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: Combiner init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: Combiner init failed: 0x%08lX\n", (unsigned long)(uint32_t)hr);
         /* Non-fatal: fall back to fixed-function pixel shaders */
     }
 
     hr = d3d8_vsh_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: VSH init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: VSH init failed: 0x%08lX\n", (unsigned long)(uint32_t)hr);
         /* Non-fatal: fall back to FVF vertex shaders */
     }
 

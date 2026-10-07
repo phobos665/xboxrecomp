@@ -99,11 +99,26 @@ processor's trap flag so the *next* instruction raises a single-step
 exception — at which point the write has landed, the new value can be read,
 and the page is protected again.
 
+On macOS and Linux (`src/kernel/xbox_watchpoint.c`, the POSIX half) there is
+no step. arm64 user space has no trap flag, so the handler does the store
+itself. It decodes the faulting instruction (`src/platform/mmio_decode_a64.h`),
+performs it through the guest arena's always-writable alias of the same
+memory (`w32_backdoor`), and resumes after it. The page never opens, so the
+"one-instruction window" below does not exist there, and the report is the
+same apart from `host insn:`, which is the 32-bit arm64 word. Measured on
+TimeSplitters 2 under macOS (`RECOMP_WATCH_WRITE=0x4000`, the main TIB's SEH
+head): three reports, before and after values right, and the run continued
+exactly as an unwatched one.
+
 That mechanism has consequences worth knowing before you trust the output.
 
 - **Protection is per page**, so a watch on one word traps every write to the
   4 KB around it. Those are stepped over silently, but they cost a fault
-  each, and on a busy page that is slow.
+  each, and on a busy page that is slow. On a 16 KB-page host (Apple
+  Silicon) the host page is 16 KB, so the other 12 KB fault too. The guest
+  still sees 4 KB protection: those accesses are completed as plain memory
+  by the fault route's pass-through, and they cost a fault each in the same
+  way.
 
 - **There is a one-instruction window** where the page is writable. Another
   thread writing in that window is missed. Guest code here is cooperatively

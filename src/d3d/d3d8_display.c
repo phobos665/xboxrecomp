@@ -13,8 +13,6 @@
 #include "d3d8_display.h"
 #include "recomp_config.h"
 
-#if defined(_WIN32)
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -204,7 +202,13 @@ static const char kSource[] =
     "Texture2D<float4> scene : register(t9);\n"
     "SamplerState smp : register(s9);\n"
     "float4 ps_main(VSOut i) : SV_Target {\n"
-    "    float2 base = (i.pos.xy - p.xy) * p.zw;\n"
+    /* The footprint's corner: SV_Position is the pixel's centre (x + 0.5),
+     * and the taps below already step to their own centres, so counting
+     * from the centre put every tap half an output pixel right and down --
+     * at scale 1 the presented frame was each 2x2 block of the scene
+     * averaged, a half-pixel blur, and at 2x the box filter read the wrong
+     * four texels. */
+    "    float2 base = (i.pos.xy - 0.5 - p.xy) * p.zw;\n"
     "    float2 step = p.zw / TAPS;\n"
     "    float4 sum = 0;\n"
     "    [unroll] for (int y = 0; y < TAPS; y++)\n"
@@ -412,4 +416,3 @@ void d3d8_display_shutdown(void)
     g.failed = 0;
 }
 
-#endif /* _WIN32 */

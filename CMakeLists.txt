@@ -108,14 +108,17 @@ add_subdirectory(src/input)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# The host shell off Windows: the main-thread loop and the game window (SDL3).
+if(NOT WIN32)
+    add_subdirectory(src/host)
+endif()
+
 # XDK functions replaced by name (tools/recomp/hle.py)
 add_subdirectory(src/hle)
 
 # Frame replay tool: replays a D3D8 capture into the host renderer with no
-# game running (src/hle/d3d8_capture.h). Windows only, like the D3D11 backend.
-if(WIN32)
-    add_subdirectory(src/replay)
-endif()
+# game running (src/hle/d3d8_capture.h). Windowless off Windows.
+add_subdirectory(src/replay)
 
 # ── Tests ─────────────────────────────────────────────────────
 
@@ -126,10 +129,29 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     enable_testing()
     add_subdirectory(tests/nv2a_vsh)
     add_subdirectory(tests/d3d8_capture)        # portable: the capture container
+    add_subdirectory(tests/host_timer)          # portable: the sub-millisecond timer
+    add_subdirectory(tests/mmio_decode)         # x86-64 decoder; skips on other CPUs
+    if(NOT WIN32)
+        add_subdirectory(tests/host_window)     # needs a display; run by hand
+        add_subdirectory(tests/audio_output)    # muted; skips with no device
+        add_subdirectory(tests/d3d8_replay)     # the renderer, headless (needs a Vulkan device)
+        add_subdirectory(tests/guest_memory)    # POSIX memory backend semantics
+        add_subdirectory(tests/mmio_decode_a64) # arm64 fault emulation vs hardware
+        add_subdirectory(tests/guest_faults)    # trapped pages via the signal path
+        add_subdirectory(tests/memory_layout)   # the real layout, 64 and 128 MB maps
+        add_subdirectory(tests/compat_threads)  # POSIX thread and fiber shims
+    endif()
+    # Built under src/d3d (tests/d3d8_smoke); pure parsing, no device.
+    add_test(NAME d3d8_final_default COMMAND d3d8_final_default)
     if(WIN32)
-        add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
-        # Built under src/d3d (tests/d3d8_smoke); pure parsing, no device.
-        add_test(NAME d3d8_final_default COMMAND d3d8_final_default)
+        add_subdirectory(tests/nv2a_vsh_hlsl)       # D3DCompile
+        add_subdirectory(tests/nv2a_combiners_hlsl)
+    else()
+        add_test(NAME d3d8_smoke COMMAND d3d8_smoke)    # the format layer
+        if(XBOXRECOMP_DXC_INCLUDE)
+            add_subdirectory(tests/nv2a_vsh_hlsl)       # DXC to SPIR-V
+            add_subdirectory(tests/nv2a_combiners_hlsl)
+        endif()
     endif()
 endif()
 

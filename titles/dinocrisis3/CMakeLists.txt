@@ -10,7 +10,10 @@ cmake_minimum_required(VERSION 3.20)
 #   4. Add any game-specific compile definitions or link libraries
 # ============================================================================
 
-project(dinocrisis3_recomp C)
+# C and C++: the runtime's renderer has C++ in it (the DXC loader, VMA),
+# so the executable links with the C++ driver and its standard library.
+# The game's own sources are all C.
+project(dinocrisis3_recomp C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -86,10 +89,15 @@ set(GAME_SOURCES
 #   src/recomp/recomp_dispatch.h     - binary search dispatch table
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
-add_executable(${PROJECT_NAME} WIN32
+add_executable(${PROJECT_NAME}
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
 )
+# A windowed program on Windows (WinMain, no console); a plain executable
+# elsewhere, whose main() hands the title its own thread (host_main_posix).
+if(WIN32)
+    set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE ON)
+endif()
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
@@ -101,17 +109,25 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
 )
 
-# Windows SDK libraries needed at link time
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11
-    dxgi
-    dxguid
-    xinput
-    winmm
-    # Lets the fault handler resolve the host RIP back to the generated
-    # function's symbol, i.e. to the guest function that faulted.
-    dbghelp
-)
+# Host libraries needed at link time. Off Windows the runtime libraries
+# bring their own (pthreads, dl, SDL3 and its frameworks, OpenSSL).
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        d3d11
+        dxgi
+        dxguid
+        xinput
+        winmm
+        # Lets the fault handler resolve the host RIP back to the generated
+        # function's symbol, i.e. to the guest function that faulted.
+        dbghelp
+    )
+else()
+    # The same for the POSIX fault report, which names a host pc with
+    # dladdr: that sees only exported symbols, so export the generated
+    # functions (-rdynamic on Linux; a Mach-O executable exports them as is).
+    set_target_properties(${PROJECT_NAME} PROPERTIES ENABLE_EXPORTS ON)
+endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)

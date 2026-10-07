@@ -7,8 +7,14 @@
 #
 # Why it exists: the v0.9.0 upstream merge broke the MSVC build twice (a
 # dropped closing brace, and two bodies for one bridge function) and nothing
-# noticed, because no job compiled the C. The Linux job is the only thing
-# that proves the kernel library stays free of Windows and Direct3D headers.
+# noticed, because no job compiled the C. The Linux and macOS jobs are what
+# prove the runtime stays free of Windows and Direct3D headers.
+#
+# An implicit function declaration is an error on every job: the root
+# CMakeLists says so, and the POSIX jobs pass it again in CFLAGS so that a
+# CMake edit cannot quietly turn it back into a warning. Three Win32 calls
+# with no POSIX shim (SetWaitableTimer and friends) once landed because the
+# POSIX build only warned about them.
 
 name: CI
 
@@ -48,23 +54,102 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # SDL3 is built from its submodule; the others are not needed here.
-      - name: Fetch SDL3
-        run: git submodule update --init --depth 1 third_party/SDL
+      # SDL3 for the host layer, and the Vulkan renderer's headers. The
+      # renderer finds the Vulkan loader and DXC at run time, so none of
+      # these is a link dependency.
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/SDL third_party/Vulkan-Headers \
+            third_party/volk third_party/VulkanMemoryAllocator
 
+      # As on macOS: DXC's headers only. Without them the renderer is built
+      # with no Vulkan backend and the DXC shader tests are left out.
+      - name: Fetch DXC headers
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/microsoft/DirectXShaderCompiler.git "$RUNNER_TEMP/dxc"
+          git -C "$RUNNER_TEMP/dxc" sparse-checkout set include/dxc
+          mkdir -p third_party/dxc/inc
+          cp "$RUNNER_TEMP"/dxc/include/dxc/*.h third_party/dxc/inc/
+
+      # SDL3 will not configure on Linux without a video backend (X11 or
+      # Wayland), so their development headers, and its audio backends'
+      # (PulseAudio, ALSA) for the SDL3 audio output. Headers only: nothing
+      # here opens a window or a device.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config libepoxy-dev libssl-dev
+            ninja-build pkg-config libssl-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxfixes-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl-dev libdrm-dev libgbm-dev \
+            libpulse-dev libasound2-dev libudev-dev
 
       - name: Configure
+        env:
+          CFLAGS: -Werror=implicit-function-declaration
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
         run: cmake --build build --parallel
 
+      # Muted, and the tests that want a Vulkan device or an audio device
+      # report themselves skipped on a runner that has neither.
       - name: Test
+        env:
+          RECOMP_MUTE: "1"
+        run: ctest --test-dir build --output-on-failure
+
+  macos:
+    name: Build and test (macOS, Apple Silicon, clang)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # SDL3 for the host layer, and the Vulkan renderer's headers. The
+      # renderer finds the Vulkan loader and DXC at run time, so none of
+      # these is a link dependency.
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/SDL third_party/Vulkan-Headers \
+            third_party/volk third_party/VulkanMemoryAllocator
+
+      # DXC's headers (dxcapi.h and the WinAdapter.h it needs off Windows),
+      # without the rest of the repository. If this fails the renderer is
+      # built without its Vulkan backend, which still compiles and links.
+      - name: Fetch DXC headers
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/microsoft/DirectXShaderCompiler.git "$RUNNER_TEMP/dxc"
+          git -C "$RUNNER_TEMP/dxc" sparse-checkout set include/dxc
+          mkdir -p third_party/dxc/inc
+          cp "$RUNNER_TEMP"/dxc/include/dxc/*.h third_party/dxc/inc/
+
+      - name: Install build dependencies
+        run: brew install ninja openssl@3
+
+      - name: Configure
+        env:
+          CFLAGS: -Werror=implicit-function-declaration
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # No game data here, so no title is linked; the unit tests run muted
+      # (tests/audio_output forces RECOMP_MUTE and skips with no device),
+      # and the replay test skips without a Vulkan device. Nothing opens a
+      # window: tests/host_window is not a ctest.
+      - name: Test
+        env:
+          RECOMP_MUTE: "1"
         run: ctest --test-dir build --output-on-failure
 
   windows:

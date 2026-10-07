@@ -22,6 +22,9 @@ void rhi_shader_cache_put(const RhiShaderSource *src, const char *backend,
 /* A file named `name` in the backend's cache directory, for other caches
  * (the Vulkan pipeline cache). 0 if there is none or caching is off. */
 int  rhi_cache_file_path(const char *backend, const char *name, char *out, size_t n);
+/* Write `n` bytes to `path` through a temporary renamed into place, so a
+ * reader never sees half a file. 1 on success. */
+int  rhi_cache_file_write(const char *path, const void *data, size_t n);
 
 #ifdef __cplusplus
 }

@@ -10,22 +10,22 @@ only about building and running the *game*:
 
 | | Pipeline | Game build | Graphics backend |
 |---|---|---|---|
-| **Windows 10/11** | yes | MSVC | D3D11, the complete path |
-| **Linux** | yes | GCC/Clang | OpenGL 3.3 (`d3d8_gl.c`), less complete |
-| **macOS** | yes | Clang | OpenGL 3.3, least exercised |
+| **Windows 10/11** | yes | MSVC | D3D11 (default) or Vulkan, the complete path |
+| **Linux** | yes | GCC/Clang | Vulkan, the same renderer; least exercised |
+| **macOS** | yes (Apple Silicon) | Clang | Vulkan on MoltenVK, the same renderer; TimeSplitters 2 and BLiNX run |
 
-Start on Windows if you have the choice — the D3D11 backend is six files of
-translation against one for OpenGL, so a title that renders there may not
-render elsewhere yet. If you are on Linux or macOS you can still do the whole
-analysis half, and reports of what breaks on the OpenGL path are welcome.
+Every platform runs the same renderer (`src/d3d`, through `rhi.h`); only the
+graphics API under it differs (`docs/technical/vulkan-backend.md`). Windows is
+still where titles are proven first.
 
 - **Python 3.10+** with `capstone` installed (`pip install capstone`)
 - **CMake 3.20+**
 - A C compiler: **Visual Studio 2022** (MSVC, C/C++ desktop workload) on
   Windows; GCC or Clang elsewhere
-- **Linux**: `bash tools/linux/install_deps.sh` installs SDL2, libepoxy,
-  OpenSSL and ffmpeg for the OpenGL backend (apt/pacman/dnf, needs sudo)
-- **macOS**: `brew install sdl2 libepoxy`
+- **Linux**: `bash tools/linux/install_deps.sh` installs the system libraries
+  (apt/pacman/dnf, needs sudo), plus a Vulkan SDK for the renderer
+- **macOS**: the [Vulkan SDK](https://vulkan.lunarg.com/) (MoltenVK, the loader,
+  DXC). Installed system-wide it is found on its own; otherwise set `VULKAN_SDK`
 - An original Xbox game disc image (ISO/XISO) — you must own the game
 
 > **On the `py -3` in every command below.** That is the Windows Python
@@ -288,6 +288,43 @@ them into your `.exe`. If you get libraries and no `.exe`, you are building the
 toolkit's `CMakeLists.txt` instead of your project's.
 
 **It will crash.** That's expected and normal. The stderr log tells you what happened.
+
+### Running it: never from a build step
+
+No CMake target, custom command, post-build step or ctest may start a title.
+A title run is a game run: it opens a window, plays sound, and writes saves
+(into the game folder's `UDATA`, which is the console's E: drive, and into the
+per-user partition images). Run titles only from a shell, or in automation
+through the harness that mutes them, keeps them in the background and gives
+them a throwaway copy of the game folder and their own saves (on this
+project's agents' Macs, `run-title.sh`). This rule exists because a bundling
+target once had an empty variable for its interpreter, so its command became
+the title itself, and building it ran the game, unmuted and in front, on a
+player's real saves. `scripts/make_macos_app.py` now refuses to start any
+program but `otool`, `install_name_tool`, `codesign` and `cp`, and has a
+`--dry-run`.
+
+### macOS: an application bundle (for your own machine)
+
+```bash
+cmake -S . -B build-mac -G Ninja -DXBOXRECOMP_MACOS_APP=ON -DXBOXRECOMP_APP_NAME="My Game"
+cmake --build build-mac              # also builds build-mac/My Game.app
+# or, for an executable you already have:
+python3 <toolkit>/scripts/make_macos_app.py build-mac/my_game --name "My Game" [--dry-run]
+```
+
+`-DXBOXRECOMP_MACOS_APP_DRY_RUN=ON` makes the target print what it would do.
+The `.app` carries the Vulkan loader, MoltenVK and its driver manifest, DXC,
+and every non-system library the title links (Homebrew's `libcrypto`), signed
+ad hoc. Put the game folder (the one with `default.xbe`) beside it, named
+`game`; `Contents/Resources/game` also works, but the title writes its saves
+into its game folder, and writing inside the bundle breaks its signature. A
+run started from the Finder logs to `~/Library/Logs/xboxrecomp/<exe>.log`.
+FFmpeg is not bundled (Homebrew's is a GPL build); XMV movies play when one is
+installed and are skipped otherwise.
+
+**The `.app` contains the title's recompiled code. It is for your machine
+only: never put one in CI artifacts or a release, never share it.**
 
 ## Step 8: Debug Iteratively
 

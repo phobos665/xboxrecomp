@@ -98,6 +98,14 @@ static const char g_vs_source[] =
     "    float4 tex3     : TEXCOORD3;\n"
     "    float  fog      : TEXCOORD4;\n"
     "    float4 viewpos  : TEXCOORD5;\n"   /* view-space position (per-pixel fog) */
+    /* Vulkan: a vertex stage feeding a point list must write the point
+     * size, where D3D11 has none (every point is one pixel). __spirv__ is
+     * DXC's own macro for a SPIR-V compile, so D3DCompile never sees this,
+     * and a builtin takes no varying location, so the pixel stages'
+     * matching interface is unchanged. One pixel, as under D3D11. */
+    "#ifdef __spirv__\n"
+    "    [[vk::builtin(\"PointSize\")]] float vk_point_size : VK_POINT_SIZE;\n"
+    "#endif\n"
     "};\n"
     "\n"
     "// Flags: bit0=pretransformed, bit1=hasDiffuse, bit2=hasSpecular, bit3=hasNormal\n"
@@ -152,6 +160,9 @@ static const char g_vs_source[] =
     "\n"
     "VS_OUT main(VS_IN input) {\n"
     "    VS_OUT o;\n"
+    "#ifdef __spirv__\n"
+    "    o.vk_point_size = 1.0;\n"
+    "#endif\n"
     "    o.fog = 1.0;\n"
     "    o.specular = float4(0, 0, 0, 0);\n"
     "    o.viewpos = float4(0, 0, 0, 1);\n"
@@ -747,7 +758,7 @@ static RhiVertexLayout *get_or_create_layout(DWORD fvf)
         RhiVertexLayout *layout = rhi_vertex_layout_create(elems, elem_count, g_vs);
 
         if (!layout)
-            fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX\n", fvf);
+            fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX\n", (unsigned long)fvf);
 
         if (g_layout_cache_count < MAX_LAYOUT_CACHE) {
             g_layout_cache[g_layout_cache_count].fvf = fvf;

@@ -371,6 +371,18 @@ static void pump(Stream *s, uint64_t now)
 
     if (!s->output || s->paused || !s->resumed_ms)
         return;
+    /* Behind the clock: the host refused this stream's sound for longer than
+     * the lead -- a device that was still opening (audio_output_sdl.c opens
+     * it on a thread of its own) or none at all. Sending from here would play
+     * it late, and the first play position read afterwards would anchor the
+     * clock that far back, holding the packets for as long as the sound was
+     * refused. Start the voice again at the clock instead, as refeed does. */
+    if (s->sent < consumed(s, now)) {
+        recomp_audio_output_reset_voice(slot_of(s));
+        s->sent = consumed(s, now);
+        s->play_origin = s->sent;
+        s->play_anchored = 0;
+    }
     target = consumed(s, now) + ms_to_bytes(s, LEAD_MS);
     if (target > s->queued)
         target = s->queued;

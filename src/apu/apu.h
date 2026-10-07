@@ -137,11 +137,26 @@ int mcpx_ac97_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
  * It lives beside the APU handler because that is where the x86-64 store
  * decoder is, not because it has anything to do with audio.
  */
-#define XBOX_NV2A_PCRTC_PAGE  0x00600000u   /* 0xFD600000, one 4 KB page */
-
 int nv2a_intr_handle_write(struct _CONTEXT *ctx, uintptr_t host_addr,
                            uint32_t nv2a_offset, uintptr_t aperture);
 #endif
+
+#ifndef XBOX_NV2A_PCRTC_PAGE
+#define XBOX_NV2A_PCRTC_PAGE  0x00600000u   /* 0xFD600000, one 4 KB page */
+#endif
+
+/* The AC'97 DSP reset bit dropped from a write to the bus-master control
+ * registers; mcpx_offset is from the MCPX base (0xFE800000). Both fault paths
+ * apply it -- see mcpx_ac97_handle_write. */
+uint64_t mcpx_ac97_apply_mask(uint32_t mcpx_offset, uint64_t value);
+
+/* Register the trapped device pages -- the NV2A PCRTC interrupt page, the
+ * APU's registers and the AC'97 page -- with the runtime's fault route
+ * (platform/fault_emulate.h, apu_fault.c). Call once at start-up, after the
+ * memory layout is up; the title's route (xbox_fault_route) then services
+ * them on every host. Registering a page that is never trapped is harmless:
+ * it simply never faults. */
+void apu_fault_register(void);
 
 #ifdef __cplusplus
 }

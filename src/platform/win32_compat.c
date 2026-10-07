@@ -14,6 +14,8 @@
 #define _GNU_SOURCE
 
 #include "win32_compat.h"
+#include "recomp_fault.h"   /* recomp_fault_thread_init */
+#include "posix_memory.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -276,6 +278,11 @@ typedef struct w32_object {
     int             exited;
     DWORD           exit_code;
     int             suspend_count;
+    int             running;      /* past the start gate, not yet exited */
+#if defined(__APPLE__)
+    mach_port_t     mach;         /* for SuspendThread on a running thread */
+    int             mach_stopped; /* thread_suspend()ed by SuspendThread */
+#endif
     pthread_cond_t  gate;
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
@@ -294,6 +301,7 @@ typedef struct w32_object {
     /* file mapping / fd-backed file handle */
     int             fd;
     SIZE_T          map_size;
+    struct pm_object *pm;
     char           *file_path;
 } w32_object;
 
@@ -311,6 +319,18 @@ DWORD GetCurrentThreadId(void)
     if (t_tid == 0)
         t_tid = (DWORD)InterlockedIncrement(&s_next_tid);
     return t_tid;
+}
+
+/* The id GetCurrentThreadId returns on that thread; 0 for a handle that is
+ * not a thread this layer created. */
+DWORD GetThreadId(HANDLE h)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (h == PSEUDO_CURRENT_THREAD && !o)
+        return GetCurrentThreadId();
+    if (!o || o->kind != K_THREAD)
+        return 0;
+    return o->tid;
 }
 
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
@@ -336,7 +356,7 @@ static void obj_release(w32_object *o)
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
-        if (o->fd >= 0) close(o->fd);
+        pm_object_release(o->pm);   /* live views keep their memory */
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
@@ -425,11 +445,23 @@ static int drain_apcs(void)
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
  */
+static DWORD wait_single_until(w32_object *o, const struct timespec *deadline);
+
 static DWORD wait_single(w32_object *o, DWORD ms)
 {
     struct timespec ts;
-    int timed = (ms != INFINITE);
-    if (timed) deadline_from_ms(ms, &ts);
+    if (ms == INFINITE)
+        return wait_single_until(o, NULL);
+    deadline_from_ms(ms, &ts);
+    return wait_single_until(o, &ts);
+}
+
+/* The same, to a CLOCK_REALTIME deadline (NULL for none). */
+static DWORD wait_single_until(w32_object *o, const struct timespec *deadline)
+{
+    struct timespec ts;
+    int timed = (deadline != NULL);
+    if (timed) ts = *deadline;
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
@@ -469,6 +501,23 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
     return wait_single((w32_object *)h, ms);
+}
+
+/* WaitForSingleObject to the microsecond, for host_timer's event-or-time
+ * wait (src/platform/host_timer.c). The millisecond API cannot express the
+ * flip gate's sub-millisecond slots, and WaitForMultipleObjects polls. */
+DWORD w32_wait_single_us(HANDLE h, long long us)
+{
+    struct timespec ts;
+    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return WAIT_OBJECT_0;
+    if (us < 0)
+        us = 0;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += (time_t)(us / 1000000);
+    ts.tv_nsec += (long)(us % 1000000) * 1000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    return wait_single_until((w32_object *)h, &ts);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -662,21 +711,32 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+#define W32_DEFAULT_STACK ((size_t)8 << 20)
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
+    /* First: a guest thread can fault, and a fault on an exhausted stack is
+     * reported only from an alternate signal stack (fault_posix.c). */
+    recomp_fault_thread_init();
     t_self_obj = o;
     t_tid      = o->tid;
 
-    /* CREATE_SUSPENDED gate */
+    /* CREATE_SUSPENDED gate. Past it the thread is "running", and from then
+     * on a SuspendThread stops it for real (where the host can). */
     pthread_mutex_lock(&o->lock);
+#if defined(__APPLE__)
+    o->mach = pthread_mach_thread_np(pthread_self());
+#endif
     while (o->suspend_count > 0)
         pthread_cond_wait(&o->gate, &o->lock);
+    o->running = 1;
     pthread_mutex_unlock(&o->lock);
 
     DWORD rc = o->start ? o->start(o->start_param) : 0;
 
     pthread_mutex_lock(&o->lock);
+    o->running   = 0;
     o->exit_code = rc;
     o->exited    = 1;
     o->signaled  = 1;
@@ -699,10 +759,26 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
     o->suspend_count = (flags & CREATE_SUSPENDED) ? 1 : 0;
     o->refcount      = 2;   /* one for caller, one for the trampoline */
 
+    /* The stack, as Windows sizes it. There a size is a *commit* unless
+     * STACK_SIZE_PARAM_IS_A_RESERVATION says otherwise, and the reservation
+     * stays the executable's default (1 MB) -- so the kernel's 16 KB
+     * KernelStackSize still gets a megabyte to grow into. POSIX has no
+     * commit/reserve split and its defaults are smaller (512 KB for a
+     * secondary thread on macOS), and lifted code recurses on the host
+     * stack, so: at least 8 MB of reservation unless the caller asked for an
+     * exact one. Address space only; pages are touched as the stack grows. */
+    {
+        size_t want = (size_t)stackSize;
+        if (!(flags & STACK_SIZE_PARAM_IS_A_RESERVATION) && want < W32_DEFAULT_STACK)
+            want = W32_DEFAULT_STACK;
+        if (want < 65536)
+            want = 65536;
+        want = (want + 16383) & ~(size_t)16383;   /* a multiple of any page size */
+        stackSize = want;
+    }
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    if (stackSize)
-        pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
+    pthread_attr_setstacksize(&attr, stackSize);
 
     if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&attr);
@@ -723,6 +799,7 @@ VOID ExitThread(DWORD exitCode)
     w32_object *o = t_self_obj;
     if (o) {
         pthread_mutex_lock(&o->lock);
+        o->running   = 0;
         o->exit_code = exitCode;
         o->exited    = 1;
         o->signaled  = 1;
@@ -743,27 +820,69 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
     return TRUE;
 }
 
+/* Suspend and resume, with Win32's counting: the thread stops when the count
+ * goes from 0 to 1 and runs again when it comes back to 0.
+ *
+ * Before the thread has passed its CREATE_SUSPENDED gate the count is all
+ * there is: the trampoline waits on it. A thread suspending itself waits on
+ * the same gate. Any other running thread is stopped, on macOS, with
+ * thread_suspend() -- wherever it is, holding whatever it holds, which is
+ * what Windows does. Guest code uses this (NtSuspendThread). Other POSIX
+ * hosts have no way to stop a running thread from outside, so there it stays
+ * a count, as it always was.
+ *
+ * The object's lock is held across thread_suspend so that a ResumeThread
+ * racing with it cannot resume first and leave the thread stopped with a
+ * count of 0. */
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (!o || o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return (DWORD)-1;
+    }
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
-    if (o->suspend_count > 0 && --o->suspend_count == 0)
+    if (o->suspend_count > 0 && --o->suspend_count == 0) {
+#if defined(__APPLE__)
+        if (o->mach_stopped) {
+            o->mach_stopped = 0;
+            thread_resume(o->mach);
+        }
+#endif
         pthread_cond_broadcast(&o->gate);
+    }
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (!o || o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return (DWORD)-1;
+    }
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    if (prev == 0 && o->running) {
+        if (o == t_self_obj) {
+            /* Stops here until a ResumeThread brings the count back to 0. */
+            while (o->suspend_count > 0)
+                pthread_cond_wait(&o->gate, &o->lock);
+        }
+#if defined(__APPLE__)
+        else if (thread_suspend(o->mach) == KERN_SUCCESS) {
+            o->mach_stopped = 1;
+        } else {
+            o->suspend_count--;
+            pthread_mutex_unlock(&o->lock);
+            SetLastError(ERROR_INVALID_HANDLE);
+            return (DWORD)-1;
+        }
+#endif
+    }
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -969,76 +1088,9 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 }
 
 /* ===================================================================== */
-/* Virtual memory                                                        */
+/* Virtual memory: VirtualAlloc, VirtualFree, VirtualProtect and          */
+/* VirtualQuery live in posix_memory.c, with the guest arena.             */
 /* ===================================================================== */
-
-static int prot_from_page(DWORD protect)
-{
-    switch (protect & 0xFF) {
-    case PAGE_NOACCESS:          return PROT_NONE;
-    case PAGE_READONLY:          return PROT_READ;
-    case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
-    case PAGE_EXECUTE:           return PROT_EXEC;
-    case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
-    default:                     return PROT_READ | PROT_WRITE;
-    }
-}
-
-LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
-{
-    int prot  = prot_from_page(protect);
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-
-    /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
-     * just adjust protection. */
-    if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
-        if (mprotect(address, size, prot) == 0)
-            return address;
-        /* fall through to a fresh mapping */
-    }
-
-#if defined(MAP_FIXED_NOREPLACE)
-    if (address) flags |= MAP_FIXED_NOREPLACE;
-#elif defined(__APPLE__)
-    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
-     * or a mach_vm_region probe before an MAP_FIXED call. */
-#endif
-    void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
-                   flags, -1, 0);
-    if (p == MAP_FAILED) { SetLastError(8); return NULL; }
-    /* Getting a different address means the range was taken, which Windows
-     * reports as a failure rather than quietly relocating the allocation. An
-     * older kernel without MAP_FIXED_NOREPLACE ignores the flag and places it
-     * elsewhere, so this check is what makes the two behave alike -- and it
-     * never destroys an existing mapping to get there, which is why the flag
-     * is a hint here and never bare MAP_FIXED. */
-    if (address && p != address) {
-        munmap(p, size);
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return NULL;
-    }
-    return p;
-}
-
-BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
-{
-    if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0; we can't know the length, so this
-         * path is only safe when callers pass the real size. */
-        if (size == 0) return TRUE;
-        return munmap(address, size) == 0;
-    }
-    if (freeType & MEM_DECOMMIT)
-        return mprotect(address, size, PROT_NONE) == 0;
-    return TRUE;
-}
-
-BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
-{
-    if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot_from_page(newProtect)) == 0;
-}
 
 /* ===================================================================== */
 /* Time                                                                  */
@@ -1295,8 +1347,8 @@ int MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type)
     return 1;   /* IDOK */
 }
 
-/* Message-loop stubs: no Win32 messages on POSIX (SDL events drive the
- * d3d8_gl backend; this layer is just for the game's Win32 message pump). */
+/* Message-loop stubs: no Win32 messages on POSIX (the window's events are
+ * src/host's, on the main thread; this is only for a Win32 message pump). */
 BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 { (void)m; (void)w; (void)a; (void)b; (void)f; return FALSE; }
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
@@ -1393,62 +1445,23 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 }
 
 /* ===================================================================== */
-/* File mapping (memfd-backed) -- true aliased mirror views              */
+/* File mapping -- true aliased views of one shared-memory object.        */
+/* The object and the views are posix_memory.c's; a handle wraps one.     */
 /* ===================================================================== */
-
-/* Registry of active views: UnmapViewOfFile takes no length, so we must
- * recover the mapping length here for munmap. */
-typedef struct { void *addr; size_t len; } w32_view;
-static w32_view        s_views[512];
-static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void view_register(void *addr, size_t len)
-{
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (!s_views[i].addr) { s_views[i].addr = addr; s_views[i].len = len; break; }
-    pthread_mutex_unlock(&s_views_lock);
-}
-
-static size_t view_take(const void *addr)
-{
-    size_t len = 0;
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (s_views[i].addr == addr) { len = s_views[i].len; s_views[i].addr = NULL; break; }
-    pthread_mutex_unlock(&s_views_lock);
-    return len;
-}
-
-/* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
- * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
-static int anon_map_fd(const char *name)
-{
-#if defined(__APPLE__)
-    // TODO: use shm_open on macOS 10.12+ or mkstemp + unlink for older versions
-    return 0;
-#else
-    return memfd_create(name ? name : "xbox_map", 0);
-#endif
-}
 
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
 {
-    (void)file; (void)sa; (void)protect;
+    (void)file; (void)sa; (void)protect; (void)name;
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
-    int fd = anon_map_fd(name);
-    if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    if (ftruncate(fd, (off_t)size) != 0) {
-        close(fd);
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return NULL;
-    }
+    pm_object *pm = pm_object_create(size);
+    if (!pm) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
 
     w32_object *o = obj_alloc(K_FILEMAP);
-    o->fd       = fd;
+    o->fd       = -1;
+    o->pm       = pm;
     o->map_size = size;
     return (HANDLE)o;
 }
@@ -1460,50 +1473,17 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     return CreateFileMappingA(file, sa, protect, maxSizeHigh, maxSizeLow, NULL);
 }
 
+/* A requested address is honoured exactly or refused, never by replacing
+ * what is already there: xbox_memory_layout.c depends on a failed placement
+ * failing (see posix_memory.c). */
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
     w32_object *o = (w32_object *)mapping;
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
-    off_t  off = ((off_t)offHigh << 32) | offLow;
-    SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
-    int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED;
-
-    /* A requested address must either be honoured exactly or refused.
-     *
-     * This used to pass bare MAP_FIXED, which does the opposite of what the
-     * caller wants: it silently unmaps whatever already lives there and
-     * reports success. Windows fails instead, and the runtime depends on that
-     * failing -- xbox_memory_layout.c tries a list of preferred bases for the
-     * 64 MB view and checks which one it got, and maps up to 28 mirror views
-     * plus the contiguous, tiled, NV2A, MCPX and flash apertures at fixed
-     * offsets, printing "Mirror N: FAILED" when one cannot be placed. With
-     * MAP_FIXED those never fail; they quietly destroy a live mapping and
-     * carry on, and the damage surfaces later as memory that changed by
-     * itself.
-     *
-     * MAP_FIXED_NOREPLACE (Linux 4.17+) asks for exactly this. Without it,
-     * pass the address as a hint only and check what came back, which never
-     * destroys anything -- the cost is that a hint may be ignored, and the
-     * check below turns that into the same clean failure. */
-#if defined(MAP_FIXED_NOREPLACE)
-    if (baseAddr) flags |= MAP_FIXED_NOREPLACE;
-#endif
-
-    void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
-    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    if (baseAddr && p != baseAddr) {
-        /* The range was taken. An older kernel ignores MAP_FIXED_NOREPLACE
-         * and places it elsewhere, so this check is what makes the behaviour
-         * the same on both. */
-        munmap(p, len);
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return NULL;
-    }
-    view_register(p, len);
-    return p;
+    size_t off = ((size_t)offHigh << 32) | offLow;
+    return pm_map_view(o->pm, off, count, access != FILE_MAP_READ, baseAddr);
 }
 
 LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, SIZE_T count)
@@ -1513,26 +1493,7 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
-    size_t len = view_take(baseAddr);
-    if (len == 0) return FALSE;
-    return munmap((void *)baseAddr, len) == 0;
-}
-
-/* ===================================================================== */
-/* VirtualQuery                                                           */
-/* ===================================================================== */
-
-SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length)
-{
-    if (!buffer || length < sizeof(*buffer)) return 0;
-    memset(buffer, 0, sizeof(*buffer));
-    buffer->BaseAddress    = (PVOID)address;
-    buffer->AllocationBase = NULL;       /* != address -> freed via _aligned_free */
-    buffer->RegionSize     = 0x1000;
-    buffer->State          = MEM_COMMIT;
-    buffer->Protect        = PAGE_READWRITE;
-    buffer->Type           = 0x20000;    /* MEM_PRIVATE */
-    return sizeof(*buffer);
+    return pm_unmap_view(baseAddr) ? TRUE : FALSE;
 }
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
@@ -1675,5 +1636,281 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
 { (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
 ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+
+/* ===================================================================== */
+/* Fibers and stack limits                                               */
+/* ===================================================================== */
+/*
+ * Win32 fibers, as far as a title's own scheduler uses them (MKDA's
+ * mk_tasks.c: CreateFiberEx, SwitchToFiber, ConvertThreadToFiber, DeleteFiber,
+ * IsThreadAFiber, GetCurrentFiber, and GetCurrentThreadStackLimits from inside
+ * a fiber). A fiber is a stack and the callee-saved registers; switching saves
+ * one set and loads the other, in a few instructions and no system call --
+ * ucontext's swapcontext would cost a sigprocmask each way, and it is
+ * deprecated on macOS.
+ *
+ * As on Windows, GetCurrentThreadStackLimits answers for the stack the thread
+ * is running on now: the fiber's, while on one. The runtime relies on that to
+ * tell whether a guest longjmp's buffer was armed on this stack.
+ *
+ * Not modelled: fiber-local storage, FIBER_FLAG_FLOAT_SWITCH (the floating
+ * point control registers are shared, as Windows does by default), and
+ * ConvertFiberToThread.
+ */
+
+typedef struct w32_fiber {
+    void                 *sp;          /* saved stack pointer while switched out */
+    LPFIBER_START_ROUTINE start;
+    LPVOID                param;
+    uintptr_t             stack_lo, stack_hi;
+    void                 *map;         /* mmap'd stack, NULL for a converted thread */
+    size_t                map_len;
+    int                   is_thread;   /* made by ConvertThreadToFiber */
+} w32_fiber;
+
+static __thread w32_fiber *t_fiber;    /* the fiber running on this thread */
+
+/* xr_fiber_switch(&from->sp, to->sp): push the callee-saved registers, store
+ * the stack pointer, load the other one, pop and return into it. A new fiber's
+ * stack is laid out as if it had switched out at the top of xr_fiber_boot,
+ * which hands the fiber (in a callee-saved register) to xr_fiber_entry. */
+void xr_fiber_switch(void **save_sp, void *new_sp);
+void xr_fiber_boot(void);
+
+#if defined(__APPLE__)
+#define XR_SYM(name) "_" #name
+#else
+#define XR_SYM(name) #name
+#endif
+
+#if defined(__aarch64__)
+/* AAPCS64: x19-x28, x29 (fp), x30 (lr), d8-d15. 160 bytes, 16-aligned. */
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".globl " XR_SYM(xr_fiber_switch) "\n"
+    XR_SYM(xr_fiber_switch) ":\n"
+    "    sub  sp, sp, #160\n"
+    "    stp  x19, x20, [sp, #0]\n"
+    "    stp  x21, x22, [sp, #16]\n"
+    "    stp  x23, x24, [sp, #32]\n"
+    "    stp  x25, x26, [sp, #48]\n"
+    "    stp  x27, x28, [sp, #64]\n"
+    "    stp  x29, x30, [sp, #80]\n"
+    "    stp  d8,  d9,  [sp, #96]\n"
+    "    stp  d10, d11, [sp, #112]\n"
+    "    stp  d12, d13, [sp, #128]\n"
+    "    stp  d14, d15, [sp, #144]\n"
+    "    mov  x2, sp\n"
+    "    str  x2, [x0]\n"
+    "    mov  sp, x1\n"
+    "    ldp  x19, x20, [sp, #0]\n"
+    "    ldp  x21, x22, [sp, #16]\n"
+    "    ldp  x23, x24, [sp, #32]\n"
+    "    ldp  x25, x26, [sp, #48]\n"
+    "    ldp  x27, x28, [sp, #64]\n"
+    "    ldp  x29, x30, [sp, #80]\n"
+    "    ldp  d8,  d9,  [sp, #96]\n"
+    "    ldp  d10, d11, [sp, #112]\n"
+    "    ldp  d12, d13, [sp, #128]\n"
+    "    ldp  d14, d15, [sp, #144]\n"
+    "    add  sp, sp, #160\n"
+    "    ret\n"
+    ".p2align 2\n"
+    ".globl " XR_SYM(xr_fiber_boot) "\n"
+    XR_SYM(xr_fiber_boot) ":\n"
+    "    mov  x0, x19\n"
+    "    mov  x29, #0\n"
+    "    mov  x30, #0\n"
+    "    bl   " XR_SYM(xr_fiber_entry) "\n"
+    "    brk  #0\n"
+);
+#define XR_FRAME_BYTES 160
+#elif defined(__x86_64__)
+/* System V: rbx, rbp, r12-r15. Six pushes and the return address. */
+__asm__(
+    ".text\n"
+    ".p2align 4\n"
+    ".globl " XR_SYM(xr_fiber_switch) "\n"
+    XR_SYM(xr_fiber_switch) ":\n"
+    "    pushq %rbp\n"
+    "    pushq %rbx\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq  %rsp, (%rdi)\n"
+    "    movq  %rsi, %rsp\n"
+    "    popq  %r15\n"
+    "    popq  %r14\n"
+    "    popq  %r13\n"
+    "    popq  %r12\n"
+    "    popq  %rbx\n"
+    "    popq  %rbp\n"
+    "    ret\n"
+    ".p2align 4\n"
+    ".globl " XR_SYM(xr_fiber_boot) "\n"
+    XR_SYM(xr_fiber_boot) ":\n"
+    "    movq  %rbx, %rdi\n"
+    "    xorl  %ebp, %ebp\n"
+    "    callq " XR_SYM(xr_fiber_entry) "\n"
+    "    ud2\n"
+);
+#define XR_FRAME_BYTES (7 * 8)
+#else
+#error "fibers: no context switch for this CPU"
+#endif
+
+/* The first frame of every fiber. Win32 ends the thread when a fiber's start
+ * routine returns; so does this. */
+void xr_fiber_entry(w32_fiber *f) __attribute__((used, noreturn));
+void xr_fiber_entry(w32_fiber *f)
+{
+    f->start(f->param);
+    ExitThread(0);
+    abort();
+}
+
+static void thread_stack_limits(uintptr_t *lo, uintptr_t *hi)
+{
+#if defined(__APPLE__)
+    pthread_t self = pthread_self();
+    uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);
+    *hi = top;
+    *lo = top - (uintptr_t)pthread_get_stacksize_np(self);
+#else
+    pthread_attr_t attr;
+    void *base = NULL;
+    size_t size = 0;
+    *lo = *hi = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        pthread_attr_getstack(&attr, &base, &size);
+        pthread_attr_destroy(&attr);
+        *lo = (uintptr_t)base;
+        *hi = (uintptr_t)base + size;
+    }
+#endif
+}
+
+VOID GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high)
+{
+    uintptr_t lo, hi;
+    if (t_fiber && !t_fiber->is_thread) {
+        lo = t_fiber->stack_lo;
+        hi = t_fiber->stack_hi;
+    } else {
+        thread_stack_limits(&lo, &hi);
+    }
+    if (low)  *low = lo;
+    if (high) *high = hi;
+}
+
+LPVOID ConvertThreadToFiber(LPVOID param)
+{
+    w32_fiber *f;
+    if (t_fiber) {
+        SetLastError(ERROR_ALREADY_FIBER);
+        return NULL;
+    }
+    f = (w32_fiber *)calloc(1, sizeof *f);
+    if (!f) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    f->param = param;
+    f->is_thread = 1;
+    thread_stack_limits(&f->stack_lo, &f->stack_hi);
+    t_fiber = f;
+    return f;
+}
+
+LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags,
+                     LPFIBER_START_ROUTINE start, LPVOID param)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t len = reserve ? reserve : (commit > (1u << 20) ? commit : (1u << 20));
+    w32_fiber *f;
+    uint8_t *map, *top;
+    void **sp;
+
+    (void)flags;
+    if (!start) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    len = (len + page - 1) & ~(page - 1);
+    f = (w32_fiber *)calloc(1, sizeof *f);
+    if (!f) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    /* One guard page below the stack, so an overflow faults instead of
+     * writing into whatever was mapped there. */
+    map = (uint8_t *)mmap(NULL, len + page, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (map == (uint8_t *)MAP_FAILED) {
+        free(f);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    mprotect(map, page, PROT_NONE);
+    f->map = map;
+    f->map_len = len + page;
+    f->stack_lo = (uintptr_t)(map + page);
+    f->stack_hi = (uintptr_t)(map + page + len);
+    f->start = start;
+    f->param = param;
+
+    /* The saved frame xr_fiber_switch pops on the first switch in. */
+    top = (uint8_t *)(f->stack_hi & ~(uintptr_t)15);
+#if defined(__aarch64__)
+    sp = (void **)(top - XR_FRAME_BYTES);
+    memset(sp, 0, XR_FRAME_BYTES);
+    sp[0]  = f;                       /* x19: the fiber, for xr_fiber_boot */
+    sp[11] = (void *)xr_fiber_boot;   /* x30: where the first ret lands */
+#else
+    /* After the ret, rsp must be 16-aligned so that xr_fiber_boot's call
+     * enters xr_fiber_entry the way any call would (rsp = 8 mod 16). */
+    sp = (void **)(top - XR_FRAME_BYTES);
+    memset(sp, 0, XR_FRAME_BYTES);
+    sp[4] = f;                        /* rbx */
+    sp[6] = (void *)xr_fiber_boot;    /* the return address */
+#endif
+    f->sp = sp;
+    return f;
+}
+
+LPVOID CreateFiber(SIZE_T stackSize, LPFIBER_START_ROUTINE start, LPVOID param)
+{
+    return CreateFiberEx(stackSize, 0, 0, start, param);
+}
+
+VOID SwitchToFiber(LPVOID fiber)
+{
+    w32_fiber *to = (w32_fiber *)fiber, *from = t_fiber;
+    if (!to || !from || to == from)
+        return;     /* Win32 crashes on these; ignoring is kinder */
+    t_fiber = to;
+    xr_fiber_switch(&from->sp, to->sp);
+}
+
+VOID DeleteFiber(LPVOID fiber)
+{
+    w32_fiber *f = (w32_fiber *)fiber;
+    if (!f)
+        return;
+    if (f == t_fiber) {
+        /* Win32: deleting the running fiber ends the thread. */
+        ExitThread(0);
+        return;
+    }
+    if (f->map)
+        munmap(f->map, f->map_len);
+    free(f);
+}
+
+BOOL   IsThreadAFiber(void)   { return t_fiber != NULL; }
+LPVOID GetCurrentFiber(void)  { return t_fiber; }
+LPVOID GetFiberData(void)     { return t_fiber ? t_fiber->param : NULL; }
 
 #endif /* !_WIN32 */

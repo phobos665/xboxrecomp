@@ -12,15 +12,6 @@
 #define COBJMACROS
 #include "d3d8_xbox.h"
 
-/* Portable: D3D8 device accessor used by recompiled code on both backends
- * (d3d8_device.c on Windows, d3d8_gl.c on POSIX). */
-IDirect3DDevice8 *d3d8_GetDevice(void);
-
-#if defined(_WIN32)
-/* === Everything below is the rhi.h renderer. The POSIX d3d8_compat
- * library (d3d8_gl.c) implements its own internal state and does not
- * need any of these declarations. === */
-
 #include "rhi.h"
 
 /* ================================================================
@@ -48,6 +39,15 @@ RhiView  *d3d8_GetDefaultTargetView(void);
  * projection. Only matters in widescreen, where the two need different
  * horizontal treatment. */
 void d3d8_SetTwoDSqueeze(BOOL on);
+
+/* Clear with rectangles (d3d8_clear.c): each rectangle, in the target's
+ * host pixels, clipped to width x height, cleared through a draw -- colour,
+ * depth and stencil as asked, the scissor and viewport ignored. 0 done (or
+ * nothing to do), -1 if the pass could not be made. */
+int  d3d8_clear_rects(RhiView *rtv, RhiView *dsv, UINT width, UINT height,
+                      const RhiRect *rects, UINT count, int color, int depth, int stencil,
+                      const float rgba[4], float z, uint8_t stencil_value);
+void d3d8_clear_shutdown(void);
 
 /* Runtime shader compiles, timed (d3d8_compile.c). kind: 0 combiner pixel
  * shader, 1 fixed-function pixel shader, 2 vertex program. Reported every
@@ -390,6 +390,5 @@ void    d3d8_states_apply(void);
 /* Create sampler state from TSS and apply to slot */
 void    d3d8_states_apply_sampler(DWORD stage);
 
-#endif /* _WIN32 -- end of D3D11 backend section */
 
 #endif /* BURNOUT3_D3D8_INTERNAL_H */

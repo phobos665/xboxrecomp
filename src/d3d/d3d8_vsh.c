@@ -742,6 +742,15 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float  oPts : PSIZE;\n"
         "    float4 oB0  : TEXCOORD6;\n"
         "    float4 oB1  : TEXCOORD7;\n"
+        /* Vulkan: a vertex stage feeding a point list must write the point
+         * size; D3D11 has none (oPts above goes nowhere, every point is one
+         * pixel). __spirv__ is DXC's macro for a SPIR-V compile, so
+         * D3DCompile never sees this, and a builtin takes no varying
+         * location. One pixel, as under D3D11, not oPts: a program that
+         * never writes oPts would make its points vanish. */
+        "#ifdef __spirv__\n"
+        "    [[vk::builtin(\"PointSize\")]] float vk_point_size : VK_POINT_SIZE;\n"
+        "#endif\n"
         "};\n\n");
 
     /* Main function */
@@ -864,6 +873,9 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    o.oPts = oPts.x;\n"
         "    o.oB0  = saturate(oB0);\n"
         "    o.oB1  = saturate(oB1);\n"
+        "#ifdef __spirv__\n"
+        "    o.vk_point_size = 1.0;\n"
+        "#endif\n"
         "    return o;\n"
         "}\n");
 
@@ -1354,7 +1366,7 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
         static int logged;
         if (logged < 64) {
             fprintf(stderr, "D3D8 VSH: Created shader handle 0x%lX (%d instructions)%s\n",
-                    *out_handle, num_insns,
+                    (unsigned long)*out_handle, num_insns,
                     ++logged == 64 ? " (further creates not logged)" : "");
         }
     }
@@ -1657,6 +1669,27 @@ BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
 BOOL d3d8_vsh_is_programmable(DWORD handle)
 {
     return (handle >= 0x10000) ? TRUE : FALSE;
+}
+
+uint16_t d3d8_vsh_inputs_read(DWORD handle)
+{
+    int slot = (int)(handle - 0x10000);
+    NV2AVshSlot *vsh;
+    VshCacheEntry *entry;
+    NV2AVshProgram program;
+
+    if (!d3d8_vsh_is_programmable(handle) || slot < 0 || slot >= NV2A_VS_MAX_SLOTS)
+        return 0xFFFFu;
+    vsh = &g_vsh_slots[slot];
+    if (!vsh->in_use || vsh->length <= 0)
+        return 0xFFFFu;
+    entry = cache_lookup(vsh->hash);
+    if (entry)
+        return entry->inputs_read;
+    /* Not compiled yet (its first draw has not been made): parse only. */
+    memset(&program, 0, sizeof program);
+    nv2a_vsh_parse((const uint32_t *)vsh->microcode, vsh->length, &program);
+    return program.inputs_read;
 }
 
 BOOL d3d8_vsh_prepare_draw(DWORD handle)

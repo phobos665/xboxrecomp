@@ -42,7 +42,6 @@
 #include <string.h>
 #include "hle.h"
 
-#ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
 #include "hle_d3d8_record.h"
@@ -1421,27 +1420,22 @@ static void report(void)
         last = now;
     }
 }
-#endif /* _WIN32 */
 
 HLE_ORIGINAL(D3DDevice_SetTexture);
 
-#ifdef _WIN32
 static void shadow_set_texture(uint32_t stage, uint32_t texture);
 static void op_set_texture(const void *arg)
 {
     const uint32_t *a = (const uint32_t *)arg;
     shadow_set_texture(a[0], a[1]);
 }
-#endif
 
 /* HRESULT D3DDevice_SetTexture(DWORD Stage, IDirect3DBaseTexture8 *pTexture) */
 HLE_EXPORT(D3DDevice_SetTexture)
 {
     static int seen;
     uint32_t stage = HLE_ARG(0);
-#ifdef _WIN32
     uint32_t texture = HLE_ARG(1);
-#endif
 
     if (!seen) {
         seen = 1;
@@ -1452,7 +1446,6 @@ HLE_EXPORT(D3DDevice_SetTexture)
         HLE_RETURN(0x80004005u);
     }
     HLE_CALL_ORIGINAL(D3DDevice_SetTexture);
-#ifdef _WIN32
     /* Deferred (RECOMP_HLE_D3D8_DEFER), the host side runs when the frame is
      * executed, so the texels are read then -- as the NV2A reads them when it
      * reaches the draw, not when the title issued it. */
@@ -1464,7 +1457,6 @@ HLE_EXPORT(D3DDevice_SetTexture)
     } else {
         shadow_set_texture(stage, texture);
     }
-#endif
 }
 
 /* void __fastcall D3DDevice_SwitchTexture(DWORD Method, DWORD Data,
@@ -1488,9 +1480,7 @@ HLE_ORIGINAL(D3DDevice_SwitchTexture);
 HLE_EXPORT(D3DDevice_SwitchTexture)
 {
     static int seen;
-#ifdef _WIN32
     uint32_t method = g_ecx, data = g_edx, format = HLE_ARG(0);
-#endif
 
     if (!seen) {
         seen = 1;
@@ -1501,7 +1491,6 @@ HLE_EXPORT(D3DDevice_SwitchTexture)
         return;
     }
     HLE_CALL_ORIGINAL(D3DDevice_SwitchTexture);
-#ifdef _WIN32
     {
         uint32_t m = method & 0x1FFCu, stage, va = 0;
         int i;
@@ -1540,10 +1529,8 @@ HLE_EXPORT(D3DDevice_SwitchTexture)
             shadow_set_texture(stage, va);
         }
     }
-#endif
 }
 
-#ifdef _WIN32
 static void shadow_set_texture(uint32_t stage, uint32_t texture)
 {
     {
@@ -1628,7 +1615,6 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
         report();
     }
 }
-#endif
 
 /* Does the draw about to be made sample the title's own frame at stage 0?
  *
@@ -1665,9 +1651,7 @@ HLE_ORIGINAL(D3DDevice_SetPalette);
 HLE_EXPORT(D3DDevice_SetPalette)
 {
     static int seen;
-#ifdef _WIN32
     uint32_t stage = HLE_ARG(0), palette_va = HLE_ARG(1);
-#endif
 
     if (!seen) {
         seen = 1;
@@ -1681,7 +1665,6 @@ HLE_EXPORT(D3DDevice_SetPalette)
         return;
     }
     HLE_CALL_ORIGINAL(D3DDevice_SetPalette);
-#ifdef _WIN32
     {
         IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
         uint32_t data;
@@ -1707,5 +1690,4 @@ HLE_EXPORT(D3DDevice_SetPalette)
         }
         set_pal_data(stage, data);
     }
-#endif
 }

@@ -16,6 +16,8 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #define RECOMP_MKDIR(p) _mkdir(p)
 #else
 #include <sys/stat.h>
@@ -125,34 +127,133 @@ static void parse(FILE *f)
 
 /* Per-user, beside the input bindings, because a setting is a judgement
  * about this machine rather than about this copy of the game. */
-static int user_dir(char *out, size_t n)
+/* <base>/xboxrecomp, where base is the environment variable `var` if it is
+ * set, else $HOME/<home_rel> (POSIX). 0 if neither gives a base. */
+static int dir_from(char *out, size_t n, const char *var, const char *home_rel)
 {
+    const char *base = var ? getenv(var) : NULL;
+    int len;
+
 #if defined(_WIN32)
-    const char *home = getenv("APPDATA");
-    const char *tail = "\\xboxrecomp";
+    (void)home_rel;
+    if (!base || !*base)
+        return 0;
+    len = snprintf(out, n, "%s\\xboxrecomp", base);
 #else
-    const char *home = getenv("XDG_CONFIG_HOME");
-    const char *tail = "/xboxrecomp";
-    char buf[512];
-
-    if (!home || !*home) {
+    if (base && *base) {
+        len = snprintf(out, n, "%s/xboxrecomp", base);
+    } else {
         const char *h = getenv("HOME");
-
-        if (!h)
+        if (!h || !*h || !home_rel)
             return 0;
-        snprintf(buf, sizeof buf, "%s/.config", h);
-        home = buf;
+        len = snprintf(out, n, "%s/%s/xboxrecomp", h, home_rel);
     }
 #endif
-    if (!home || !*home)
+    return len > 0 && (size_t)len < n;
+}
+
+/* RECOMP_USER_DIR=<dir> stands in for all three: settings and saves in it,
+ * caches under it. For tests and scripted runs, which must not read or
+ * write the player's own (RECOMP_SAVE_DIR still decides the saves).
+ *
+ * 1 when it gave the directory, 0 when it is unset, -1 when it is set but
+ * does not fit. The last must not fall through to the player's directory --
+ * that is the one thing the switch exists to prevent -- so the helpers
+ * report no directory at all instead. */
+static int override_dir(char *out, size_t n, const char *tail)
+{
+    const char *v = getenv("RECOMP_USER_DIR");
+    int len;
+    if (!v || !*v)
         return 0;
-    snprintf(out, n, "%s%s", home, tail);
-    return 1;
+    len = snprintf(out, n, "%s%s", v, tail);
+    if (len > 0 && (size_t)len < n)
+        return 1;
+    if (n)
+        out[0] = '\0';
+    return -1;
+}
+
+static int user_dir(char *out, size_t n)
+{
+    int o;
+    if ((o = override_dir(out, n, "")) != 0)
+        return o > 0;
+#if defined(_WIN32)
+    return dir_from(out, n, "APPDATA", NULL);
+#elif defined(__APPLE__)
+    return dir_from(out, n, NULL, "Library/Application Support");
+#else
+    return dir_from(out, n, "XDG_CONFIG_HOME", ".config");
+#endif
 }
 
 int recomp_config_user_dir(char *out, size_t n)
 {
     return user_dir(out, n);
+}
+
+int recomp_data_dir(char *out, size_t n)
+{
+    int o;
+    if ((o = override_dir(out, n, "")) != 0)
+        return o > 0;
+#if defined(_WIN32)
+    return dir_from(out, n, "LOCALAPPDATA", NULL);
+#elif defined(__APPLE__)
+    return dir_from(out, n, NULL, "Library/Application Support");
+#else
+    return dir_from(out, n, "XDG_DATA_HOME", ".local/share");
+#endif
+}
+
+int recomp_cache_dir(char *out, size_t n)
+{
+#if defined(_WIN32)
+    int o = override_dir(out, n, "\\cache");
+#else
+    int o = override_dir(out, n, "/cache");
+#endif
+    if (o != 0)
+        return o > 0;
+#if defined(_WIN32)
+    return user_dir(out, n);
+#elif defined(__APPLE__)
+    return dir_from(out, n, NULL, "Library/Caches");
+#else
+    return dir_from(out, n, "XDG_CACHE_HOME", ".cache");
+#endif
+}
+
+int recomp_make_dirs(const char *path)
+{
+    char buf[1024];
+    size_t len = path ? strlen(path) : 0;
+    size_t i;
+
+    if (!len || len >= sizeof buf)
+        return 0;
+    memcpy(buf, path, len + 1);
+    /* Each prefix ending at a separator, then the whole path. A drive root
+     * ("C:\") or "/" fails to mkdir harmlessly: it exists. */
+    for (i = 1; i < len; i++) {
+        if (buf[i] == '/' || buf[i] == '\\') {
+            char c = buf[i];
+            buf[i] = '\0';
+            RECOMP_MKDIR(buf);
+            buf[i] = c;
+        }
+    }
+    RECOMP_MKDIR(buf);
+    {
+#if defined(_WIN32)
+        struct _stat st;
+        return _stat(buf, &st) == 0 && (st.st_mode & _S_IFDIR);
+#else
+        struct stat st;
+        return stat(buf, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+    }
 }
 
 static void title_file(char *out, size_t n, const char *dir)
