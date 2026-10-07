@@ -70,6 +70,9 @@ int recomp_host_loop_run(void)
 {
     int code;
 
+    /* Here rather than when the window opens: a run with no window can be
+     * napped too, once its terminal is hidden. */
+    host_mac_keep_awake();
     pthread_mutex_lock(&g_lock);
     g_main_thread = pthread_self();
     g_running = 1;
@@ -111,16 +114,45 @@ void recomp_host_loop_quit(int code)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* Called with g_lock held. */
+static int on_main_thread_locked(void)
+{
+#ifdef __APPLE__
+    return pthread_main_np() != 0;
+#else
+    return g_running && pthread_equal(pthread_self(), g_main_thread);
+#endif
+}
+
 void recomp_host_call_main(void (*fn)(void *), void *arg)
 {
     host_call c;
 
     pthread_mutex_lock(&g_lock);
-    if (!g_running || pthread_equal(pthread_self(), g_main_thread)) {
+    if (on_main_thread_locked()) {
         pthread_mutex_unlock(&g_lock);
         fn(arg);
         return;
     }
+#ifdef __APPLE__
+    /* AppKit only works on the main thread, so a call is queued even before
+     * the loop has started (the title thread is created first and may get
+     * here before main() reaches recomp_host_loop_run), and dropped once the
+     * loop has quit: run on this thread it would throw inside AppKit and
+     * turn a clean exit into an abort. A dropped call leaves its result
+     * as the caller initialised it (no window, size 0). */
+    if (g_quit) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+#else
+    /* No main-thread rule here: without a running loop, run it in place. */
+    if (!g_running) {
+        pthread_mutex_unlock(&g_lock);
+        fn(arg);
+        return;
+    }
+#endif
     c.fn = fn;
     c.arg = arg;
     c.done = 0;
@@ -183,7 +215,6 @@ static int start_video(int background)
     }
     if (background)
         host_mac_set_accessory();
-    host_mac_keep_awake();
     g_wake_event = SDL_RegisterEvents(1);
     pthread_mutex_lock(&g_lock);
     g_video = 1;

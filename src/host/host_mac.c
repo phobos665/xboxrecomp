@@ -49,9 +49,12 @@ void host_mac_keep_awake(void)
     reason = ((msg_id_ptr)objc_msgSend)((id)str_cls, sel_registerName("stringWithUTF8String:"),
                                         "a game is running");
     /* NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical:
-     * no App Nap, no timer coalescing, for a window that is often covered
-     * (a background run sits below everything). A napped process has its
-     * timers stretched, which would change a run's pacing. */
+     * no App Nap for a process whose window is often covered (a background
+     * run sits below everything) or that has no window at all; a napped
+     * process has its timers stretched by seconds, which changes a run's
+     * pacing. It does not make a wake precise -- mach_wait_until still wakes
+     * about 25% late with this held (measured by mac-platform: 8 ms -> +2 ms,
+     * 1 ms -> +256 us) -- which is what src/platform's host_timer is for. */
     token = ((msg_activity)objc_msgSend)(pi, sel_registerName("beginActivityWithOptions:reason:"),
                                          0x00EFFFFFull | 0xFF00000000ull, reason);
     if (token)

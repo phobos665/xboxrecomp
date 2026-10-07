@@ -38,9 +38,10 @@ int  recomp_host_loop_run(void);
 /* From any thread: make recomp_host_loop_run return `code`. */
 void recomp_host_loop_quit(int code);
 
-/* Run fn(arg) on the main thread and wait for it. Runs it directly when
- * called on the main thread, or when no loop is running (a host that has no
- * main-thread rule, or a program that never started the loop). */
+/* Run fn(arg) on the main thread and wait for it; directly when called on
+ * the main thread. On Apple a call from another thread is queued even before
+ * the loop starts and dropped (fn never runs) after it has quit. Elsewhere,
+ * with no loop running, fn runs on the calling thread. */
 void recomp_host_call_main(void (*fn)(void *arg), void *arg);
 
 /* ---------------------------------------------------------------- window */
