@@ -134,6 +134,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(tests/host_timer)          # portable: the sub-millisecond timer
     if(NOT WIN32)
         add_subdirectory(tests/host_window)     # needs a display; run by hand
+        add_subdirectory(tests/guest_memory)    # POSIX memory backend semantics
         add_subdirectory(tests/compat_threads)  # POSIX thread and fiber shims
     endif()
     if(WIN32)
