@@ -124,8 +124,11 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
  *   1. <exe dir>\\game\\               -- what a distributed build looks like
  *   2. <exe dir>\\YOUR_GAME_DIR     -- the development tree, where the build
  *                                     sits several levels under the repo
+ *                                     (titles/<title>/build/<Config>/)
+ *   3. the same one level up        -- a single-configuration build
+ *                                     (Ninja: titles/<title>/build-mac/)
  *
- * RECOMP_GAME_DIR overrides both, for running one build against another copy
+ * RECOMP_GAME_DIR overrides all of them, for running one build against another copy
  * of the game files.
  * ============================================================ */
 
@@ -166,11 +169,15 @@ static BOOL find_game(char *tried, size_t tried_bytes)
     snprintf(dir, sizeof dir, "%s", exe);
     host_path_dirname(dir);
 
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 3; i++) {
         if (i == 0)
             snprintf(candidate, sizeof candidate, "%s\\game", dir);
-        else
+        else if (i == 1)
             snprintf(candidate, sizeof candidate, "%s\\%s", dir, YOUR_GAME_DIR);
+        else if (strncmp(YOUR_GAME_DIR, "..\\", 3) == 0)
+            snprintf(candidate, sizeof candidate, "%s\\%s", dir, YOUR_GAME_DIR + 3);
+        else
+            break;
         snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\default.xbe", candidate);
         xbox_path_normalize(candidate);
         xbox_path_normalize(g_xbe_path);
