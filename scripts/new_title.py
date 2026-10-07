@@ -88,8 +88,8 @@ def main(argv=None):
     # CMakeLists: the project name, and the path back to the engine. The
     # template assumes a sibling checkout; titles/<name>/ is two levels down.
     text = (TEMPLATE / "CMakeLists.txt").read_text(encoding="utf-8")
-    text = text.replace("project(your_game_recomp C)",
-                        "project(%s_recomp C)" % args.name)
+    text = text.replace("project(your_game_recomp C CXX)",
+                        "project(%s_recomp C CXX)" % args.name)
     text = text.replace(
         'set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH',
         'set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH')
