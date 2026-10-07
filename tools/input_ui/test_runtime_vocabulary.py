@@ -102,9 +102,13 @@ class Vocabulary(unittest.TestCase):
                 base = env[var] if var != "NULL" else os.path.join(home, *rel.split("/"))
                 self.assertEqual(bindings.user_dir(platform, env, home),
                                  os.path.join(base, "xboxrecomp"))
-        # The fallback when the variable is unset, where there is one.
+        # The fallback when the variable is unset, where there is one; on
+        # Windows dir_from(out, n, "APPDATA", NULL) has none and gives no
+        # directory, and so does the UI.
         self.assertEqual(bindings.user_dir("linux", {}, home),
                          os.path.join(home, ".config", "xboxrecomp"))
+        self.assertEqual(branches["win32"][1], "NULL")
+        self.assertIsNone(bindings.user_dir("win32", {}, home))
 
     def test_both_sides_honour_recomp_user_dir(self):
         with open(os.path.join(ROOT, "src", "config", "recomp_config.c"),
