@@ -28,11 +28,20 @@ void host_path_dirname(char *path);
 /* 1 when `path` names a file (not a directory). */
 int host_file_exists(const char *path);
 
+/* macOS: when the executable is the one inside an application bundle
+ * (<name>.app/Contents/MacOS/<exe>), the bundle's own path ("<...>/<name>.app")
+ * in `buf`, and 1. 0 for a plain executable, and always 0 off Apple. A
+ * bundle looks for its game beside itself and in Contents/Resources, and logs
+ * to ~/Library/Logs/xboxrecomp rather than into itself. */
+int host_app_bundle_dir(char *buf, size_t bytes);
+
 /* Where the diagnostics go. A program started by double-click (Windows) or
  * from the Finder (macOS) has nowhere to print, so:
  *   1. output already redirected (a script capturing it, a pipe): left alone;
  *   2. started from a terminal: written there;
- *   3. otherwise: <executable>.log beside the program, truncated each run.
+ *   3. otherwise: <executable>.log beside the program, truncated each run
+ *      (for an executable inside a macOS .app: ~/Library/Logs/xboxrecomp/
+ *      <executable>.log, so a run never writes into its signed bundle).
  * In case 3 the log's path is written to `log_path` (else it is set to ""),
  * so a failure can name it: "it did not start" is not a bug report, and the
  * file is. */

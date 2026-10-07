@@ -119,6 +119,8 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
  * neither case is the working directory anything in particular. So the game
  * is looked for beside the executable rather than beside the caller:
  *
+ *   0. macOS, when the executable is inside a .app: <folder of the .app>/game,
+ *      then <the .app>/Contents/Resources/game
  *   1. <exe dir>\\game\\               -- what a distributed build looks like
  *   2. <exe dir>\\YOUR_GAME_DIR     -- the development tree, where the build
  *                                     sits several levels under the repo
@@ -161,6 +163,36 @@ static BOOL find_game(char *tried, size_t tried_bytes)
         snprintf(tried, tried_bytes, "RECOMP_GAME_DIR: %s", g_xbe_path);
         return FALSE;
     }
+
+#ifdef __APPLE__
+    /* A macOS application bundle (scripts/make_macos_app.py): the game
+     * folder beside the .app first, then one inside it. */
+    {
+        char app[MAX_PATH];
+
+        if (host_app_bundle_dir(app, sizeof app)) {
+            for (i = 0; i < 2; i++) {
+                snprintf(candidate, sizeof candidate, "%s", app);
+                if (i == 0) {
+                    host_path_dirname(candidate);
+                    strncat(candidate, "/game", sizeof candidate - strlen(candidate) - 1);
+                } else {
+                    strncat(candidate, "/Contents/Resources/game",
+                            sizeof candidate - strlen(candidate) - 1);
+                }
+                snprintf(g_xbe_path, sizeof g_xbe_path, "%s/default.xbe", candidate);
+                if (file_exists(g_xbe_path)) {
+                    snprintf(g_game_dir, sizeof g_game_dir, "%s", candidate);
+                    return TRUE;
+                }
+                {
+                    size_t n = strlen(tried);
+                    snprintf(tried + n, tried_bytes - n, "%s%s", n ? "\n" : "", g_xbe_path);
+                }
+            }
+        }
+    }
+#endif
 
     if (!host_exe_path(exe, sizeof exe))
         return FALSE;
