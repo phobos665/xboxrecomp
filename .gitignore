@@ -34,6 +34,8 @@ titles/
 
 # Per-machine notes for Claude Code (toolchain paths, what is installed where)
 CLAUDE.local.md
+# Claude Code's agent worktrees (each a full checkout of a working branch)
+.claude/worktrees/
 
 # OS
 Thumbs.db
