@@ -123,6 +123,32 @@ static void test_wait_or_event(host_timer *t)
     CloseHandle(g_event);
 }
 
+/* A real-time thread (host_thread_realtime): its waits are one sleep, and
+ * still on time. Where the policy does not exist the test says so. */
+static DWORD WINAPI realtime_thread(LPVOID param)
+{
+    host_timer *t = (host_timer *)param;
+    int64_t worst = 0;
+    int k;
+
+    if (!host_thread_realtime(16667, 500, 2000)) {
+        printf("real-time policy: not on this host\n");
+        return 0;
+    }
+    for (k = 0; k < 20; k++) {
+        int64_t t0 = host_time_ns(), took_us;
+        host_timer_wait_us(t, 4000, 1000);
+        took_us = (host_time_ns() - t0) / 1000;
+        CHECK(took_us >= 3950, "real-time wait_us(4000) woke after %lld us",
+              (long long)took_us);
+        if (took_us - 4000 > worst)
+            worst = took_us - 4000;
+    }
+    printf("real-time wait_us( 4000): worst overshoot %lld us\n", (long long)worst);
+    CHECK(worst < SLACK_US, "real-time wait overshot by %lld us", (long long)worst);
+    return 0;
+}
+
 int main(void)
 {
     host_timer *t = host_timer_create(HOST_TIMER_ANY);
@@ -134,6 +160,11 @@ int main(void)
     test_wait_us(t);
     test_wait_until(t);
     test_wait_or_event(t);
+    {
+        HANDLE th = CreateThread(NULL, 0, realtime_thread, t, 0, NULL);
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+    }
     host_timer_destroy(t);
 
     if (g_failures) {

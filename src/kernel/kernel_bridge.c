@@ -3137,6 +3137,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         host_timer *hires = host_timer_create(HOST_TIMER_HIGH_RES_ONLY);
         if (!hires && vblank_clock_wait_us() >= 0)
             host_sleep_precision_1ms();
+        /* A thread that wakes each vblank and does little: real-time where
+         * the host has it (macOS), so its sleeps are on time without the
+         * stepped wait's spin. Nothing on Windows. */
+        if (hires && host_thread_realtime(16667, 1000, 3000))
+            fprintf(stderr, "  [NV2A] vblank clock thread is real-time\n");
 
         for (;;) {
             long long now;
