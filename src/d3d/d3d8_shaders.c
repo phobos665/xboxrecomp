@@ -107,6 +107,7 @@ static const char g_vs_source[] =
     "#define FLAG_HAS_SPECULAR   0x04u\n"
     "#define FLAG_HAS_NORMAL     0x08u\n"
     "#define FLAG_LIGHTING       0x10u\n"
+    "#define FLAG_FOG_SPECULAR   0x20u\n"
     "\n"
     "// D3DFOGMODE: 0=NONE, 1=EXP, 2=EXP2, 3=LINEAR\n"
     "float compute_fog(float dist) {\n"
@@ -171,6 +172,10 @@ static const char g_vs_source[] =
     "        o.tex3 = input.tex3;\n"
     "        o.diffuse = (Flags & FLAG_HAS_DIFFUSE) ? input.diffuse.bgra : float4(1,1,1,1);\n"
     "        if (Flags & FLAG_HAS_SPECULAR) o.specular = input.specular.bgra;\n"
+    /* Vertices the title transformed itself carry their own fog factor, in
+     * the specular alpha, and a format with no specular reads as 0 there
+     * (FLAG_FOG_SPECULAR, set where the fog constants are). */
+    "        if (Flags & FLAG_FOG_SPECULAR) o.fog = o.specular.a;\n"
     "        return o;\n"
     "    }\n"
     "\n"
@@ -489,6 +494,16 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
                         "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
     }
     off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
+}
+
+/* A behaviour that is on unless its variable says "0", "off", "no" or
+ * "false": the way back to the old answer while a change is new. */
+static int switch_on(const char *name)
+{
+    const char *v = getenv(name);
+
+    return !(v && (!strcmp(v, "0") || !_stricmp(v, "off") || !_stricmp(v, "no") ||
+                   !_stricmp(v, "false")));
 }
 
 /* ================================================================
@@ -946,6 +961,24 @@ static void ff_vs_prepare_draw(DWORD fvf)
              * renders larger than the guest asked (d3d8_GetGuestWidth). */
             cb->screen_w = (float)d3d8_GetGuestWidth();
             cb->screen_h = (float)d3d8_GetGuestHeight();
+            /* ...and in a render-target texture's pixels when one is bound:
+             * a 320x240 quad drawn into a 320x240 target, measured against
+             * the 640x480 screen, filled the target's top-left quarter only.
+             * Need for Speed: Most Wanted's blur and grading chain is such
+             * passes, and its graded frame showed a seam through the
+             * middle. Offscreen targets are made at the size the title
+             * asked for, so their size is already in its pixels. */
+            {
+                static int on = -1;
+                UINT tw, th;
+
+                if (on < 0)
+                    on = switch_on("RECOMP_D3D8_RHW_TARGET_SIZE");
+                if (on && d3d8_target_size(&tw, &th)) {
+                    cb->screen_w = (float)tw;
+                    cb->screen_h = (float)th;
+                }
+            }
             cb->flags = 0x01; /* pre-transformed */
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];
@@ -1010,6 +1043,21 @@ static void ff_vs_prepare_draw(DWORD fvf)
                 cb->fog_params[3] = (float)D3DFOG_NONE;
             } else {
                 cb->fog_params[3] = (float)rs[D3DRS_FOGVERTEXMODE];
+                /* Pre-transformed vertices with fog on and no table fog: the
+                 * fog factor is the specular alpha, 0 when the format has no
+                 * specular -- the D3D rule, and the NV2A's under the XDK's
+                 * fog setup. It was a constant 1 (no fog). A title can lean
+                 * on it: Need for Speed: Most Wanted's colour grading draws an
+                 * XYZRHW quad with fog on and no specular, and its final
+                 * combiner is fog.a * grey + (1 - fog.a) * the graded scene,
+                 * so with 1 every frame in a race was flat grey.
+                 * RECOMP_D3D8_RHW_FOG=0 for the old constant. */
+                static int rhw_fog = -1;
+
+                if (rhw_fog < 0)
+                    rhw_fog = switch_on("RECOMP_D3D8_RHW_FOG");
+                if (rhw_fog && (cb->flags & 0x01))
+                    cb->flags |= 0x20;
             }
         }
 

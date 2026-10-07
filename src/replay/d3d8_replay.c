@@ -1311,6 +1311,35 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
     case D3D8CAP_PALETTE:
         do_palette(r, c);
         break;
+    case D3D8CAP_SCREEN_COPY: {
+        const D3D8CapScreenCopy *p = c->data;
+        ReplayTexture *slot;
+
+        if (c->bytes < sizeof *p) {
+            r->malformed++;
+            break;
+        }
+        slot = texture_slot(r, p->texture_id, 0);
+        if (!slot || !slot->tex || slot->is_cube) {
+            r->unmapped++;
+            break;
+        }
+        if (g_list_draws)
+            fprintf(stderr, "[screen copy after %ld draws] texture %u%s\n", g_draw_index,
+                    p->texture_id, p->has_rect ? " (rectangle)" : "");
+        if (p->has_rect) {
+            RECT src;
+            POINT at;
+
+            src.left = p->left; src.top = p->top;
+            src.right = p->right; src.bottom = p->bottom;
+            at.x = p->at_x; at.y = p->at_y;
+            xbox_D3D8CopyBackBufferRectToTexture((IDirect3DTexture8 *)slot->tex, &src, &at);
+        } else {
+            xbox_D3D8CopyBackBufferToTexture((IDirect3DTexture8 *)slot->tex);
+        }
+        break;
+    }
     case D3D8CAP_DEPTH_SURFACE:
         do_depth_surface(r, c);
         break;

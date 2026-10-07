@@ -1,0 +1,62 @@
+[
+ {
+  "start": "0x002B3BB2",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002BC727",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0031055D",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002DD31E",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002DFFBF",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x003C1FBE",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002C0646",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002D1194",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002D1885",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002D013E",
+  "observed": false,
+  "note": "VP6 movie decoder routine table entry, stored by the table setup at 0x002CDDxx; called through [0x4EE180+n]."
+ },
+ {
+  "start": "0x002D0A84",
+  "observed": false,
+  "note": "VP6 movie decoder routine table entry, stored by the table setup at 0x002CDDxx; called through [0x4EE180+n]."
+ },
+ {
+  "start": "0x002DB62E",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ }
+]

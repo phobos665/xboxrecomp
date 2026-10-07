@@ -286,6 +286,9 @@ UINT        d3d8_row_pitch(D3DFORMAT fmt, UINT width);
 BOOL d3d8_format_is_depth(D3DFORMAT fmt);
 /* d3d8_device.c: draws go to the screen, not a render-target texture. */
 BOOL d3d8_target_is_screen(void);
+/* d3d8_device.c: the bound render-target texture's size; FALSE (and nothing
+ * written) when draws go to the screen. */
+BOOL d3d8_target_size(UINT *width, UINT *height);
 
 /* bpp of the data actually uploaded to D3D11 (post-conversion). */
 UINT d3d8_upload_bpp(D3DFORMAT fmt);

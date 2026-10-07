@@ -27,6 +27,8 @@ IDirect3DBaseTexture8 *d3d8_GetStageTexture(DWORD stage) { return textures[stage
  * back buffer's size is the fallback, and here they are the same. */
 UINT d3d8_GetGuestWidth(void) { return 1; }
 UINT d3d8_GetGuestHeight(void) { return 1; }
+/* Draws go to the screen here: no render-target texture is ever bound. */
+BOOL d3d8_target_size(UINT *width, UINT *height) { (void)width; (void)height; return FALSE; }
 UINT d3d8_GetBackbufferWidth(void) { return 1; }
 UINT d3d8_GetBackbufferHeight(void) { return 1; }
 const D3DMATRIX *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type) { (void)type; return &identity; }

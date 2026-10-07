@@ -105,8 +105,9 @@ extern "C" {
  * things here. Version 3 added render targets and input current values,
  * version 4 cube textures and the face a render target names, version 6
  * fixed-function lights and the material, version 7 the texels of cubes
- * filled from memory and the stage palettes P8 textures are expanded with. */
-#define D3D8CAP_VERSION      7u
+ * filled from memory and the stage palettes P8 textures are expanded with,
+ * version 8 the copies of the frame into a texture (SCREEN_COPY). */
+#define D3D8CAP_VERSION      8u
 /* The oldest version the reader still accepts. A bump that only adds chunk
  * kinds leaves an older file a valid newer one that happens not to contain
  * them (version 6 added three; version 5 one), so it leaves this alone. A
@@ -153,7 +154,8 @@ enum {
     D3D8CAP_TWOD_PLACEMENT      = 28, /* D3D8CapTwoDPlacement (version 6) */
     D3D8CAP_CUBE_LEVEL          = 29, /* D3D8CapCubeLevel + bytes (version 7) */
     D3D8CAP_PALETTE             = 30, /* D3D8CapPalette (version 7) */
-    D3D8CAP_CHUNK_KINDS         = 31  /* one past the last, for per-kind counters */
+    D3D8CAP_SCREEN_COPY         = 31, /* D3D8CapScreenCopy (version 8) */
+    D3D8CAP_CHUNK_KINDS         = 32  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -284,6 +286,19 @@ typedef struct { uint32_t id, face, level, pitch, rows, bytes; } D3D8CapCubeLeve
  * that stage is expanded through when it is uploaded. The snapshot carries
  * all four stages, before the textures. */
 typedef struct { uint32_t stage; uint32_t entries[256]; } D3D8CapPalette;
+
+/* The host frame so far, copied into a texture: what a title that reads its
+ * own screen samples (a frame-buffer texture, CopyRects of the screen). The
+ * copy is made from the frame as drawn at that point, so without this chunk a
+ * replay showed that texture as its snapshot -- black, or a frame old -- and
+ * Need for Speed: Most Wanted's colour grading, which reads the scene that
+ * way, drew grey in replay for a different reason than it did live. has_rect
+ * 0 is the whole frame scaled to the whole texture; 1 is src (title pixels)
+ * copied unscaled to (at_x, at_y). */
+typedef struct {
+    uint32_t texture_id, has_rect;
+    int32_t  left, top, right, bottom, at_x, at_y;
+} D3D8CapScreenCopy;
 
 /* SetRenderTarget. texture_id 0 is the back buffer; otherwise level `level`
  * of that texture, which was created with D3DUSAGE_RENDERTARGET. `face` is

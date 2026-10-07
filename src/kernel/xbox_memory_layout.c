@@ -3440,7 +3440,7 @@ static void contig_remove(int i)
     g_contig_block_count--;
 }
 
-uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+static uint32_t xbox_ContiguousAlloc_unlocked(uint32_t size, uint32_t alignment)
 {
     uint32_t result, span;
     int i;
@@ -3509,7 +3509,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 /* MmFreeContiguousMemory. Returns 0 when `xbox_va` is not the start of a live
  * block this arena handed out (a pinned MmAllocateContiguousMemoryEx address,
  * say), which the caller may then treat as not contiguous at all. */
-int xbox_ContiguousFree(uint32_t xbox_va)
+static int xbox_ContiguousFree_unlocked(uint32_t xbox_va)
 {
     int i;
 
@@ -3587,7 +3587,7 @@ static int contig_take_free(int i, uint32_t lo, uint32_t hi)
     return i + 1;
 }
 
-void xbox_ContiguousPin(uint32_t xbox_va, uint32_t size)
+static void xbox_ContiguousPin_unlocked(uint32_t xbox_va, uint32_t size)
 {
     uint32_t lo = xbox_va & ~(XBOX_CONTIG_PAGE - 1u);
     uint32_t hi = contig_round(xbox_va + (size ? size : 1u));
@@ -3646,7 +3646,7 @@ void xbox_ContiguousPin(uint32_t xbox_va, uint32_t size)
  * Returns 0 when `index` is past the end, so a caller can just count up. A
  * freed block reads as size 0.
  */
-int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size)
+static int xbox_ContiguousBlock_unlocked(int index, uint32_t *addr, uint32_t *size)
 {
     if (index < 0 || index >= g_contig_block_count)
         return 0;
@@ -3660,13 +3660,13 @@ int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size)
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
  * a surface offset is physical, and only the window makes it addressable. */
-uint32_t xbox_ContiguousAllocatedBytes(void)
+static uint32_t xbox_ContiguousAllocatedBytes_unlocked(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
 }
 
 
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+static uint32_t xbox_HeapAlloc_unlocked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -3809,7 +3809,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
-uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+static uint32_t xbox_HeapBlockSize_unlocked(uint32_t xbox_va)
 {
     int i;
 
@@ -3836,7 +3836,7 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+static void xbox_HeapFree_unlocked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
@@ -3878,6 +3878,88 @@ void xbox_HeapFree(uint32_t xbox_va)
         }
         return;
     }
+}
+
+/* One lock over both block tables.
+
+   The guest lock is off in the configuration that ships, so guest threads run
+   on host cores at once, and every kernel bridge that allocates -- 
+   NtAllocateVirtualMemory, MmAllocateContiguousMemory, a new worker's stack
+   and TIB -- can reach these tables from two threads together. The tables are
+   arrays edited with memmove, and a reused block is zero-filled, so two
+   threads handed the same block is the failure: Need for Speed: Most Wanted's
+   fifth worker started with fs:[4] = 0, its TIB wiped by the zero-fill of a
+   second allocation over the same memory, and faulted in XAPI's SetLastError
+   at guest 0xFFFFFF6C one run in two. None of these functions calls another,
+   so a non-recursive lock is enough. */
+static SRWLOCK g_alloc_lock = SRWLOCK_INIT;
+
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_ContiguousAlloc_unlocked(size, alignment);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+int xbox_ContiguousFree(uint32_t xbox_va)
+{
+    int r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_ContiguousFree_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+void xbox_ContiguousPin(uint32_t xbox_va, uint32_t size)
+{
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    xbox_ContiguousPin_unlocked(xbox_va, size);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+}
+
+int xbox_ContiguousBlock(int index, uint32_t *addr, uint32_t *size)
+{
+    int r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_ContiguousBlock_unlocked(index, addr, size);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+uint32_t xbox_ContiguousAllocatedBytes(void)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_ContiguousAllocatedBytes_unlocked();
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_HeapAlloc_unlocked(size, alignment);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    r = xbox_HeapBlockSize_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
+    return r;
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    AcquireSRWLockExclusive(&g_alloc_lock);
+    xbox_HeapFree_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_alloc_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)

@@ -159,10 +159,34 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      * the failure as fatal. Redirecting to the directory that holds the image
      * gives a handle that is valid for exactly what the caller is going to do
      * with it, which is NtQueryVolumeInformationFile. */
+    /* A partition's root directory -- "\Device\Harddisk0\PartitionN\", or a
+     * drive letter the title linked there, with the trailing separator that
+     * makes it the root rather than the volume -- is that partition's own
+     * folder, whatever the open options say: not the image, and not the save
+     * root that holds the images. A title that clears the partition deletes
+     * whatever a listing of this handle returns (xbox_partition_root_dir says
+     * what happened when it was the save root). The folder exists, so the
+     * device-as-directory rule below opens it as a directory handle. */
+    {
+        static int said;
+        const char *xbox_path = get_xbox_path(ObjectAttributes);
+        size_t len = xbox_path ? strlen(xbox_path) : 0;
+        WCHAR folder[MAX_PATH];
+
+        if (len && (xbox_path[len - 1] == '\\' || xbox_path[len - 1] == '/') &&
+            xbox_partition_root_dir(win_path, folder, MAX_PATH)) {
+            wcscpy_s(win_path, MAX_PATH, folder);
+            if (said++ < 8)
+                fprintf(stderr, "  [FILE] %s is the partition's root directory -> %S\n",
+                        xbox_path, win_path);
+        }
+    }
+
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
         WCHAR *slash = wcsrchr(win_path, L'\\');
+
         if (slash && slash != win_path) {
             *slash = 0;
             xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
@@ -379,8 +403,16 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %S", win_path);
+    if (xbox_path_is_protected(win_path)) {
+        fprintf(stderr, "  [FILE] refused to delete %S: the runtime's own, "
+                        "not the title's\n", win_path);
+        return STATUS_ACCESS_DENIED;
+    }
     if (DeleteFileW(win_path))    return STATUS_SUCCESS;
-    if (RemoveDirectoryW(win_path)) return STATUS_SUCCESS;
+    if (RemoveDirectoryW(win_path)) {
+        fprintf(stderr, "  [FILE] NtDeleteFile removed the directory %S\n", win_path);
+        return STATUS_SUCCESS;
+    }
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
@@ -528,6 +560,17 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
+            if (fdi.DeleteFile) {
+                WCHAR host[MAX_PATH];
+                DWORD n = GetFinalPathNameByHandleW(FileHandle, host, MAX_PATH, 0);
+                if (n && n < MAX_PATH && xbox_path_is_protected(host)) {
+                    fprintf(stderr, "  [FILE] refused to delete %S: the runtime's own, "
+                                    "not the title's\n", host);
+                    fflush(stderr);
+                    IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
             if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi))) {
                 /* stderr, like the unhandled-class case below: a delete that
                  * did not happen is how a title's next save finds its own old
@@ -540,7 +583,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
                                                                     : STATUS_UNSUCCESSFUL;
                 return IoStatusBlock->Status;
             }
-            fprintf(stderr, "  [FILE] delete-on-close set for handle %p\n", FileHandle);
+            {
+                WCHAR host[MAX_PATH];
+                DWORD n = GetFinalPathNameByHandleW(FileHandle, host, MAX_PATH, 0);
+                fprintf(stderr, "  [FILE] delete-on-close set for handle %p (%S)\n",
+                        FileHandle, n && n < MAX_PATH ? host : L"?");
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }

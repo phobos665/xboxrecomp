@@ -568,6 +568,17 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+#if defined(_WIN32)
+/* A partition's root directory, given the PartitionN.img path its device
+ * translated to: the folder that partition's files live in (kernel_path.c
+ * says why). FALSE for any other path, and for partition 0, which has no
+ * folder. */
+BOOL xbox_partition_root_dir(const WCHAR *image_path, WCHAR *out, DWORD n);
+/* TRUE for the save root, the game folder and the partition images: things
+ * the runtime owns and no title delete may remove. */
+BOOL xbox_path_is_protected(const WCHAR *host_path);
+#endif
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

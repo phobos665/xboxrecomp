@@ -106,6 +106,15 @@ BOOL d3d8_target_is_screen(void)
 {
     return g_cur_rt == NULL;
 }
+
+BOOL d3d8_target_size(UINT *width, UINT *height)
+{
+    if (!g_cur_rt || !g_cur_rt->width || !g_cur_rt->height)
+        return FALSE;
+    *width = g_cur_rt->width;
+    *height = g_cur_rt->height;
+    return TRUE;
+}
 static D3D8Surface *g_cur_ds = NULL;
 /* The device's own depth buffer as a surface object, so SetRenderTarget can
  * name it: a NULL depth surface means no depth, as in D3D8. */

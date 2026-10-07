@@ -104,6 +104,10 @@ static texture_entry *g_bound_entry[MAX_STAGES];
 static uint32_t g_pal_data[MAX_STAGES];
 static uint32_t g_pal_sum[MAX_STAGES];
 static unsigned long g_pal_variants, g_pal_switches, g_pal_rebakes, g_pal_first;
+/* D3DDevice_SetPalette calls, and how many named a palette other than the
+ * last one: a title that keeps drawing P8 under one palette either has one, or
+ * sets the rest some way this replacement does not see. */
+static unsigned long g_pal_calls, g_pal_changes;
 static unsigned long g_midframe_changes;
 
 /* Stage 0 currently holds the title's own frame; see SetTexture below and
@@ -1416,8 +1420,10 @@ static void report(void)
         if (g_pal_variants || g_pal_switches || g_pal_first)
             fprintf(stderr, "[HLE-D3D8] shadow palettes: %lu baked after upload, "
                     "%lu more made for another palette, %lu draws switched to "
-                    "one, %lu re-baked for new texels\n",
-                    g_pal_first, g_pal_variants, g_pal_switches, g_pal_rebakes);
+                    "one, %lu re-baked for new texels; SetPalette %lu calls, "
+                    "%lu to a different palette\n",
+                    g_pal_first, g_pal_variants, g_pal_switches, g_pal_rebakes,
+                    g_pal_calls, g_pal_changes);
         last = now;
     }
 }
@@ -1704,6 +1710,15 @@ HLE_EXPORT(D3DDevice_SetPalette)
                 fflush(stderr);
             }
             return;
+        }
+        {
+            static uint32_t last[4];
+
+            g_pal_calls++;
+            if (last[stage] != data) {
+                last[stage] = data;
+                g_pal_changes++;
+            }
         }
         set_pal_data(stage, data);
     }

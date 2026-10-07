@@ -440,14 +440,10 @@ const wchar_t *xbox_LastHostPath(void)
 }
 
 
+static BOOL translate_by_rules(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
-    const char*  remainder = NULL;
-    const WCHAR* base_dir  = NULL;
-    const char*  sub_dir   = NULL;
-    char         sub_buf[64];   /* cache_sub_dir */
-    int          skip;
-
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
 
@@ -465,6 +461,92 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         fflush(stderr);
         return TRUE;
     }
+    return translate_by_rules(xbox_path, host_path_buf, buf_size);
+}
+
+/* A partition's root opened as a directory: the folder that partition's files
+ * live in, never the image or the folder holding it.
+ *
+ * "\Device\Harddisk0\PartitionN\" is two things on a console: the raw volume
+ * to a device query, and the root directory of its filesystem to anything that
+ * lists or deletes. The path layer maps it to PartitionN.img for the first,
+ * and NtCreateFile used to answer a directory open of that image with the
+ * folder holding it -- the save root -- which was enough for Half-Life 2's
+ * free-space probe. Need for Speed: Most Wanted clears the utility drive at
+ * start-up the way XAPI does: it opens Partition5\ as a directory, lists it
+ * and deletes every entry, then the directory. Given the save root, it deleted
+ * every partition image, TitleData, Cache and the save folder itself -- with
+ * the default save location, every title's saves.
+ *
+ * The rules table already says where each partition's files go (Partition5 ->
+ * Cache\<title id>, the same place Z: goes), so the root is that folder.
+ * Partition 0 is the whole disk and has no folder; it returns FALSE and keeps
+ * the old answer, which only volume queries ever use. */
+BOOL xbox_partition_root_dir(const WCHAR *image_path, WCHAR *out, DWORD n)
+{
+    WCHAR image[MAX_PATH];
+    char root[48];
+    const WCHAR *p = image_path;
+
+    if (!p)
+        return FALSE;
+    if (!wcsncmp(p, L"\\\\?\\", 4))
+        p += 4;
+    /* Keyed on what the path resolved to, not on how the title spelled it:
+     * Most Wanted reaches the same root a second time as "Z:\", through a
+     * link it made itself to \Device\Harddisk0\Partition5. */
+    for (int d = 1; d <= 9; d++) {
+        swprintf_s(image, MAX_PATH, L"%s\\Partition%d.img", s_save_dir, d);
+        if (_wcsicmp(p, image))
+            continue;
+        snprintf(root, sizeof root, "\\Device\\Harddisk0\\Partition%d\\", d);
+        if (!translate_by_rules(root, out, n))
+            return FALSE;
+        SHCreateDirectoryExW(NULL, out, NULL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Files and folders the runtime owns: the save root, the game folder and the
+ * partition images. No title has a reason to delete them, and the one way it
+ * happened (above) took every title's saves with it, so a delete of any of
+ * them is refused whatever path led there. */
+BOOL xbox_path_is_protected(const WCHAR *host_path)
+{
+    WCHAR full[MAX_PATH], image[MAX_PATH];
+    const WCHAR *p = host_path;
+    size_t len;
+
+    if (!p)
+        return FALSE;
+    if (!wcsncmp(p, L"\\\\?\\", 4))
+        p += 4;
+    if (!GetFullPathNameW(p, MAX_PATH, full, NULL))
+        return FALSE;
+    len = wcslen(full);
+    while (len > 3 && (full[len - 1] == L'\\' || full[len - 1] == L'/'))
+        full[--len] = L'\0';
+
+    if (!_wcsicmp(full, s_save_dir))
+        return TRUE;
+    if (GetFullPathNameW(s_game_dir, MAX_PATH, image, NULL) && !_wcsicmp(full, image))
+        return TRUE;
+    for (int i = 0; i <= 5; i++) {
+        swprintf_s(image, MAX_PATH, L"%s\\Partition%d.img", s_save_dir, i);
+        if (!_wcsicmp(full, image))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL translate_by_rules(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
+{
+    const char*  remainder = NULL;
+    const WCHAR* base_dir  = NULL;
+    const char*  sub_dir   = NULL;
+    char         sub_buf[64];   /* cache_sub_dir */
+    int          skip;
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
         skip = match_prefix(xbox_path, s_rules[i].prefix);
