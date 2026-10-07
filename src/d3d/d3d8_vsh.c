@@ -1671,6 +1671,27 @@ BOOL d3d8_vsh_is_programmable(DWORD handle)
     return (handle >= 0x10000) ? TRUE : FALSE;
 }
 
+uint16_t d3d8_vsh_inputs_read(DWORD handle)
+{
+    int slot = (int)(handle - 0x10000);
+    NV2AVshSlot *vsh;
+    VshCacheEntry *entry;
+    NV2AVshProgram program;
+
+    if (!d3d8_vsh_is_programmable(handle) || slot < 0 || slot >= NV2A_VS_MAX_SLOTS)
+        return 0xFFFFu;
+    vsh = &g_vsh_slots[slot];
+    if (!vsh->in_use || vsh->length <= 0)
+        return 0xFFFFu;
+    entry = cache_lookup(vsh->hash);
+    if (entry)
+        return entry->inputs_read;
+    /* Not compiled yet (its first draw has not been made): parse only. */
+    memset(&program, 0, sizeof program);
+    nv2a_vsh_parse((const uint32_t *)vsh->microcode, vsh->length, &program);
+    return program.inputs_read;
+}
+
 BOOL d3d8_vsh_prepare_draw(DWORD handle)
 {
     int slot;

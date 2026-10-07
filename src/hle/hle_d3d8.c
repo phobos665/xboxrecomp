@@ -868,7 +868,13 @@ struct shadow_program {
     int      from_slot;                  /* host belongs to g_slot_host, not this entry */
     /* From the declaration (shadow_read_declaration), host programs only. */
     int      has_declaration;            /* the host has its vertex layout */
-    UINT     extent;                     /* bytes of a vertex it reads */
+    UINT     extent;                     /* bytes of a vertex its declaration covers */
+    /* Where each register's data ends in the stream 0 vertex (0: not there).
+     * The host layout holds only the registers the program reads
+     * (d3d8_vsh.c, create_vsh_input_layout_decl), so those are the bytes a
+     * draw must supply: NFSU2 declares an element at +16..+24 for 16-byte
+     * vertices, and was skipped twice a frame for it. */
+    UINT     reg_end[16];
     /* Registers in a format the host cannot read as it is (xbox_vsdt_expanded).
      * Each draw copies its vertices with these unpacked to floats in a prefix
      * of expanded_bytes; the rest of the vertex follows unchanged. */
@@ -1441,16 +1447,39 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
             g_draws_program++;           /* no vertex layout for the host */
             return 0;
         }
-        if (stride < p->extent) {        /* the layout would read past a vertex */
-            static int said;
-            /* Named, the first few: a "stride" count alone does not say
-             * which shader or by how much (NFSU2 skips two draws a frame). */
-            if (said++ < 4)
-                fprintf(stderr, "[HLE-D3D8] skipped (stride): vertex program 0x%08X, slot %d: "
-                        "stride %u, but its declaration reads %u bytes of a vertex\n",
-                        (unsigned)g_shadow_vs, g_shadow_vs_slot, (unsigned)stride, (unsigned)p->extent);
-            g_draws_stride++;
-            return 0;
+        if (stride < p->extent) {        /* the declaration covers more than a vertex */
+            /* What matters is what the program reads: the host layout leaves
+             * the other registers out, so only they must fit the stride. */
+            uint16_t reads = d3d8_vsh_inputs_read(p->host);
+            UINT need = 0, r;
+
+            for (r = 0; r < 16u; r++)
+                if ((reads & (1u << r)) && p->reg_end[r] > need)
+                    need = p->reg_end[r];
+            if (reads == 0xFFFFu)
+                need = p->extent;            /* unknown program: as before */
+            if (stride < need) {
+                static int said;
+                /* Named, the first few: a "stride" count alone does not say
+                 * which shader or by how much. */
+                if (said++ < 4)
+                    fprintf(stderr, "[HLE-D3D8] skipped (stride): vertex program 0x%08X, slot %d: "
+                            "stride %u, but the registers it reads (mask 0x%04X) need %u "
+                            "bytes of a vertex (declaration %u)\n",
+                            (unsigned)g_shadow_vs, g_shadow_vs_slot, (unsigned)stride,
+                            (unsigned)reads, (unsigned)need, (unsigned)p->extent);
+                g_draws_stride++;
+                return 0;
+            }
+            {
+                static int said;
+                if (said++ < 4)
+                    fprintf(stderr, "[HLE-D3D8] drawn: vertex program 0x%08X, stride %u: its "
+                            "declaration covers %u bytes, but the registers it reads "
+                            "(mask 0x%04X) end at %u\n", (unsigned)g_shadow_vs,
+                            (unsigned)stride, (unsigned)p->extent, (unsigned)reads,
+                            (unsigned)need);
+            }
         }
         shadow_use_viewport(1);
     } else {
@@ -2678,6 +2707,7 @@ static void shadow_read_declaration(int slot, uint32_t handle)
 
     p->has_declaration = 0;
     p->extent = 0;
+    memset(p->reg_end, 0, sizeof p->reg_end);
     p->packed_count = 0;
     p->other_streams = 0;
     p->expanded_bytes = 0;
@@ -2773,8 +2803,12 @@ static void shadow_read_declaration(int slot, uint32_t handle)
         in[n].reg = (int)i;
         if (stream != base)
             p->other_streams = 1;
-        else if (offset + size > p->extent)
-            p->extent = offset + size;
+        else {
+            if (offset + size > p->extent)
+                p->extent = offset + size;
+            if (i < 16u)
+                p->reg_end[i] = offset + size;
+        }
         n++;
     }
 

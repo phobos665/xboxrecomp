@@ -245,6 +245,10 @@ BOOL d3d8_vsh_get_slot(int slot, DWORD *handle, const DWORD **microcode,
  * @return TRUE if a programmable VS was bound, FALSE on fallback
  */
 BOOL d3d8_vsh_prepare_draw(DWORD handle);
+/* The input registers (bit n = vN) host program `handle` reads, from its
+ * microcode; 0xFFFF when the handle names no loaded program. Lets a caller
+ * ignore declaration entries the program never reads. */
+uint16_t d3d8_vsh_inputs_read(DWORD handle);
 
 /* Whether the program bound by the last prepare_draw transforms through
  * the projection's first column. False means it draws in screen
