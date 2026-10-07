@@ -322,7 +322,14 @@ static uint64_t dry_at(void *dev, uint32_t va, int size, int op,
                        uint64_t operand, uint64_t expected, int *status)
 {
     dry_run *d = t_dry;
+    void *bd = w32_backdoor((const void *)(s_guest_base + va));
     (void)operand; (void)expected;
+    /* An atomic needs one naturally aligned backdoor address (an aligned
+     * element never crosses a 4 KB page). The hardware faults an unaligned
+     * one too, so refuse it here, before anything is done, rather than let
+     * the commit half-complete it. */
+    if (!bd || ((uintptr_t)bd & (uintptr_t)(size - 1)))
+        d->refused = 1;
     if (!d->allow(s_guest_base + va, size, 0, d->arg) ||
         (op != MMIO_AT_LDX && !d->allow(s_guest_base + va, size, 1, d->arg)))
         d->refused = 1;
