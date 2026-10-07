@@ -400,11 +400,20 @@ static void on_window_close(void *user)
     g_window_closed = 1;
 }
 
+/* The drawable's size, at open and after every change: the device resizes
+ * its swap chain to it at the next present. */
+static void on_window_resize(void *user, int width, int height)
+{
+    (void)user;
+    if (width > 0 && height > 0)
+        xbox_D3D8SetWindowSize((UINT)width, (UINT)height);
+}
+
 static HWND replay_window(UINT width, UINT height)
 {
-    static const host_window_callbacks cb = { .on_close = on_window_close };
+    static const host_window_callbacks cb = { .on_close = on_window_close,
+                                              .on_resize = on_window_resize };
     void *layer;
-    int pw = 0, ph = 0;
 
     if (!g_window)
         return NULL;
@@ -414,9 +423,6 @@ static HWND replay_window(UINT width, UINT height)
                 g_host_window ? " layer (Metal layers are macOS only)" : "");
         return NULL;
     }
-    host_window_drawable_size(g_host_window, &pw, &ph);
-    if (pw > 0 && ph > 0)
-        xbox_D3D8SetWindowSize((UINT)pw, (UINT)ph);
     return (HWND)layer;
 }
 #else
