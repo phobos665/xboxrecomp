@@ -234,6 +234,8 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     const uint8_t silence = bits_per_sample == 8 ? 0x80 : 0;
 
     recomp_audio_output_initialize();
+    /* Read outside the lock: g_device is written once, under it, inside
+     * the initialize just above, before any submission can see it. */
     if (!g_device || bytes == 0)
         return 0;
     pthread_mutex_lock(&g_lock);

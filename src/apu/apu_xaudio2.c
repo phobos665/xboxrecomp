@@ -208,6 +208,16 @@ int xa2_init(void)
         fprintf(stderr, "[XA2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return 0;
     }
+    /* Muted before anything is bound, and no output at all if muting fails:
+     * a run that asked for silence must never be heard. */
+    mute = getenv("RECOMP_MUTE");
+    if (mute && *mute && strcmp(mute, "0") != 0 &&
+        !SDL_SetAudioDeviceGain(g_sdl_device, 0.0f)) {
+        fprintf(stderr, "[XA2] RECOMP_MUTE: could not mute the device (%s); no audio output\n",
+                SDL_GetError());
+        xa2_shutdown();
+        return 0;
+    }
     g_sdl_stream = SDL_CreateAudioStream(&spec, NULL);
     if (!g_sdl_stream || !SDL_BindAudioStream(g_sdl_device, g_sdl_stream)) {
         fprintf(stderr, "[XA2] SDL audio stream failed: %s\n", SDL_GetError());
@@ -215,9 +225,6 @@ int xa2_init(void)
         xa2_shutdown();
         return 0;
     }
-    mute = getenv("RECOMP_MUTE");
-    if (mute && *mute && strcmp(mute, "0") != 0)
-        SDL_SetAudioDeviceGain(g_sdl_device, 0.0f);
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
     fprintf(stderr, "[XA2] SDL3 %s audio initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
