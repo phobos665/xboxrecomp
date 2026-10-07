@@ -29,7 +29,8 @@ import sys
 import tempfile
 
 from .cases import CASES
-from .harness import (MARK, _MARK_BYTES, harness_source, native_source)
+from .harness import (MARK, _MARK_BYTES, harness_source, native_source,
+                      parse_gold_lines)
 from . import corpus_run, xbe_run
 from .corpus import CORPUS
 
@@ -180,7 +181,18 @@ def main_with_args(argv):
                          "against their own machine code")
     ap.add_argument("--xbe-limit", type=int, default=40,
                     help="how many candidate functions to take (default 40)")
+    ap.add_argument("--record", metavar="JSON",
+                    help="also write the native results (and the assembled "
+                         "bytes) of the snippets to JSON, for --golden on a "
+                         "machine without MSVC or without x86")
+    ap.add_argument("--golden", metavar="JSON", nargs="?", const=GOLDEN_DEFAULT,
+                    help="check the lifted snippets against recorded native "
+                         "results instead of running them natively; needs only "
+                         "a C compiler (default file: %(const)s)")
     args = ap.parse_args(argv)
+
+    if args.golden:
+        return run_golden(args.golden, args.k, args.verbose, args.keep)
 
     vcvars = _find_vcvars()
     if not vcvars:
@@ -225,9 +237,10 @@ def main_with_args(argv):
         cod = f.read()
 
     # 2. Lift those bytes with the real pipeline.
-    prepared, unlifted = [], []
+    prepared, unlifted, codes = [], [], {}
     for c in cases:
         code = _bytes_from_listing(cod, c["name"])
+        codes[c["name"]] = code
         lines, mnemonics = _lift(code)
         dropped = [l for l in lines if l.strip().startswith("/*")]
         if dropped:
@@ -238,7 +251,7 @@ def main_with_args(argv):
 
     # 3. Run both and compare.
     with open(os.path.join(workdir, "harness.c"), "w") as f:
-        f.write(harness_source(prepared, _WHY, _TOL))
+        f.write(harness_source(prepared, _WHY, _TOL, record=bool(args.record)))
     r = _cl(vcvars, workdir,
             f'/W3 /I"{runtime_inc}" harness.c native.obj /Feharness.exe')
     if r.returncode != 0:
@@ -246,7 +259,10 @@ def main_with_args(argv):
         return 1
     run = subprocess.run([os.path.join(workdir, "harness.exe")],
                          capture_output=True, text=True)
-    print(run.stdout.strip())
+    if args.record:
+        _write_golden(args.record, cases, codes, run.stdout)
+    print("\n".join(l for l in run.stdout.splitlines()
+                    if not l.startswith("@GOLD")).strip())
     if run.returncode < 0 or run.returncode > 1:
         # A snippet faulted on the native side (idiv overflow, a bad memory
         # operand). Say so -- otherwise the run looks like a silent pass.
@@ -428,6 +444,117 @@ def _run_xbe(vcvars, workdir, runtime_inc, args):
               f"(0x{run.returncode & 0xFFFFFFFF:08X})", file=sys.stderr)
         return 1
     return run.returncode
+
+
+# ── golden values ───────────────────────────────────────────────────────────
+
+GOLDEN_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "golden", "snippets.json")
+
+
+def _write_golden(path, cases, codes, stdout):
+    """Save what the native side did, case by case, with the bytes MSVC
+    assembled and the inputs, so --golden needs neither MSVC nor x86."""
+    import json
+    base, got = parse_gold_lines(stdout)
+    out = {"version": 1, "scratch_va": base, "cases": {}}
+    for c in cases:
+        vecs = got.get(c["name"])
+        if not vecs or len(vecs) != len(c["inputs"]):
+            continue                    # the harness died before it, or partway
+        out["cases"][c["name"]] = {
+            "kind": c["kind"], "why": c["why"], "tol": c.get("tol", 0.0),
+            "code": codes[c["name"]].hex(), "inputs": [list(i) for i in c["inputs"]],
+            "vectors": vecs}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(out, f, indent=1, sort_keys=True)
+    print(f"recorded {len(out['cases'])} of {len(cases)} cases to {path}")
+
+
+def _host_cc():
+    import shutil
+    for cc in ("cc", "clang", "gcc"):
+        p = shutil.which(cc)
+        if p:
+            return p
+    return None
+
+
+def run_golden(path, k=None, verbose=False, keep=False):
+    """Lift the recorded bytes and compare against the recorded results.
+
+    The cases come from the recording, not from cases.py: the recording is
+    the evidence, and a case edited since then has no evidence yet (it is
+    listed as stale and skipped, rather than compared against old results)."""
+    import json
+    import shutil
+    if not os.path.exists(path):
+        print(f"no golden values at {path}; record them on Windows with "
+              f"`py -3 -m tools.conformance --only snippets --record {path}`",
+              file=sys.stderr)
+        return 2
+    with open(path) as f:
+        gold = json.load(f)
+    now = {c["name"]: c for c in CASES}
+    names = [n for n in sorted(gold["cases"]) if not k or k in n]
+    stale = [n for n in names if n in now and
+             (now[n]["kind"] != gold["cases"][n]["kind"] or
+              [list(i) for i in now[n]["inputs"]] != gold["cases"][n]["inputs"])]
+    names = [n for n in names if n not in stale]
+    if not names:
+        print(f"no recorded cases match {k!r}", file=sys.stderr)
+        return 2
+    cc = _host_cc()
+    if not cc:
+        print("no C compiler on PATH", file=sys.stderr)
+        return 2
+
+    prepared, unlifted, why, tol = [], [], {}, {}
+    for n in names:
+        g = gold["cases"][n]
+        lines, mnemonics = _lift(bytes.fromhex(g["code"]))
+        dropped = [l for l in lines if l.strip().startswith("/*")]
+        if dropped:
+            unlifted.append((n, mnemonics, dropped))
+        inputs = [tuple(i) for i in g["inputs"]]
+        prepared.append((n, g["kind"], lines, inputs))
+        why[n] = g["why"].replace("\\", "\\\\").replace('"', "'")
+        tol[n] = g.get("tol", 0.0)
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    runtime_inc = os.path.join(os.path.dirname(root), "templates", "runtime")
+    workdir = tempfile.mkdtemp(prefix="xboxrecomp-golden-")
+    try:
+        src = os.path.join(workdir, "harness.c")
+        exe = os.path.join(workdir, "harness")
+        with open(src, "w") as f:
+            f.write(harness_source(prepared, why, tol, golden=gold))
+        built = subprocess.run([cc, "-std=gnu11", "-O1", "-w", "-I", runtime_inc,
+                                src, "-o", exe, "-lm"], capture_output=True, text=True)
+        if built.returncode != 0:
+            print("golden harness build failed:\n" + built.stdout + built.stderr,
+                  file=sys.stderr)
+            return 1
+        run = subprocess.run([exe], capture_output=True, text=True)
+        print(run.stdout.strip())
+        if stale:
+            print(f"\n{len(stale)} recorded case(s) no longer match cases.py and "
+                  f"were skipped (re-record on Windows): {', '.join(stale)}")
+        if unlifted:
+            print("\nInstructions that lifted to a comment:")
+            for n, mnemonics, dropped in unlifted:
+                print(f"  {n:<20} {' '.join(mnemonics)}")
+        if run.returncode < 0 or run.returncode > 1:
+            print(f"\ngolden harness terminated abnormally: exit {run.returncode}",
+                  file=sys.stderr)
+            return 1
+        return run.returncode or (1 if unlifted else 0)
+    finally:
+        if keep or verbose:
+            print(f"workdir: {workdir}")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def main():

@@ -21,6 +21,7 @@ against both spellings is testing nothing.
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -42,6 +43,10 @@ HEADERS = """#include <string.h>
 # failure mode is a preprocessor expansion rather than a redeclaration.
 SHARP = ("isnan", "isinf", "isfinite", "isnormal", "signbit", "fpclassify",
          "round", "trunc", "onexit", "div", "exit", "abs")
+# onexit is an MSVC/glibc extension: macOS's headers do not declare it, so
+# there it is reserved for Windows' sake and compiles clean unmangled.
+if sys.platform == "darwin":
+    SHARP = tuple(n for n in SHARP if n != "onexit")
 
 
 def _find_cc():
