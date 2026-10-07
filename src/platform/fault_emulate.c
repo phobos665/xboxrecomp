@@ -19,6 +19,15 @@
 #include "mmio_decode.h"
 #include "mmio_decode_a64.h"
 
+/* Losing the ucontext glue would not fail the build, it would quietly drop
+ * every trapped access to "not handled". Make that a build error instead. */
+#if defined(__linux__) && defined(MMIO_X86_DECODER) && !defined(MMIO_X86_HAVE_UCONTEXT)
+#error "fault_emulate.c: x86-64 Linux ucontext glue missing (_GNU_SOURCE must precede every include)"
+#endif
+#if defined(__aarch64__) && !defined(_WIN32) && !defined(MMIO_A64_HAVE_UCONTEXT)
+#error "fault_emulate.c: no arm64 ucontext glue for this OS (mmio_decode_a64.h)"
+#endif
+
 #if defined(_WIN32)
 #include <windows.h>
 #else

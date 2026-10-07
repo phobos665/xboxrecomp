@@ -49,6 +49,11 @@
  * named function in two runs, provided the failure is deterministic.
  */
 
+/* dladdr and Dl_info are GNU extensions in glibc. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
