@@ -81,9 +81,16 @@ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
     int len = 1;
 
     if (mod == 3) return 1;
-    if ((rm & 7) == 4) len += 1;                    /* SIB    */
-    if (mod == 0 && (rm & 7) == 5) len += 4;        /* disp32 */
-    else if (mod == 1) len += 1;
+    if ((rm & 7) == 4) {
+        len += 1;                                   /* SIB    */
+        /* mod 0 with SIB base 5 has no base register and a disp32 instead;
+         * missing it left RIP inside the operand (apu_mmio_hook.c's copy had
+         * this fixed, this one did not). */
+        if (mod == 0 && (ip[1] & 7) == 5) len += 4;
+    }
+    else if (mod == 0 && (rm & 7) == 5) len += 4;   /* disp32 / RIP-relative */
+    /* The displacement for mod 1/2 applies with or without a SIB byte. */
+    if (mod == 1) len += 1;
     else if (mod == 2) len += 4;
     return len;
 }
@@ -140,11 +147,23 @@ static inline int mmio_emulate(mmio_x86_ctx *ctx, uint32_t off, void *dev,
         ctx->Rip += prefix + 1 + mlen;
         return 1;
 
-    case 0xC7:                                       /* MOV r/m, imm32       */
+    case 0xC7: {                                     /* MOV r/m, imm16/32    */
+        /* The immediate is 16-bit under 0x66 and 32-bit otherwise -- never
+         * 64-bit: REX.W sign-extends the imm32. Reading four bytes for the
+         * 16-bit form took two bytes of the next instruction into the value
+         * and resumed RIP two bytes past it (GCC emits `movw $imm, (reg)` for
+         * a 16-bit MEM store; found on x86-64 Linux). */
+        uint64_t imm;
+        int ilen = has66 ? 2 : 4;
         mlen = mmio_modrm_len(op + 1, rex_b);
-        wr(dev, off, *(const uint32_t *)(op + 1 + mlen), size);
-        ctx->Rip += prefix + 1 + mlen + 4;
+        imm = has66 ? (uint64_t)*(const uint16_t *)(op + 1 + mlen)
+                    : (uint64_t)(int64_t)*(const int32_t *)(op + 1 + mlen);
+        if (size < 8)
+            imm &= (1ULL << (size * 8)) - 1;
+        wr(dev, off, imm, size);
+        ctx->Rip += prefix + 1 + mlen + ilen;
         return 1;
+    }
 
     case 0xC6:                                       /* MOV r/m8, imm8       */
         mlen = mmio_modrm_len(op + 1, rex_b);
