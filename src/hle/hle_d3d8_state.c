@@ -61,7 +61,6 @@ HLE_IMPORT_VAR(D3D_g_DeferredRenderState);
 HLE_IMPORT_VAR(D3D_g_ComplexRenderState);
 HLE_IMPORT_VAR(D3D_g_DeferredTextureState);
 
-#ifdef _WIN32
 #include "d3d8_xbox.h"
 #include "hle_d3d8_record.h"
 
@@ -983,7 +982,6 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
     }
     g_prev_valid = 1;
 }
-#endif /* _WIN32 */
 
 /* void __fastcall D3DDevice_SetRenderState_Simple(DWORD Method, DWORD Value)
  *

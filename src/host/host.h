@@ -40,8 +40,10 @@ void recomp_host_loop_quit(int code);
 
 /* Run fn(arg) on the main thread and wait for it; directly when called on
  * the main thread. On Apple a call from another thread is queued even before
- * the loop starts and dropped (fn never runs) after it has quit. Elsewhere,
- * with no loop running, fn runs on the calling thread. */
+ * the loop starts and dropped (fn never runs) after it has quit, or when no
+ * loop has started within 10 seconds (a main.c that never runs one: the log
+ * says so once, rather than the title hanging). Elsewhere, with no loop
+ * running, fn runs on the calling thread. */
 void recomp_host_call_main(void (*fn)(void *arg), void *arg);
 
 /* ---------------------------------------------------------------- window */
@@ -63,6 +65,11 @@ typedef struct {
     /* A shell key went down while the window had the focus. Main thread.
      * HOST_KEY_FULLSCREEN is handled before this is called. */
     void (*on_key)(void *user, int host_key);
+    /* The drawable's size in pixels: once when the window opens (before
+     * host_window_open returns) and after every change. Main thread. */
+    void (*on_resize)(void *user, int width, int height);
+    /* The window went fullscreen (1) or back (0), by key or by call. */
+    void (*on_fullscreen)(void *user, int on);
     void *user;
 } host_window_callbacks;
 
@@ -95,6 +102,10 @@ int  host_window_is_fullscreen(host_window *w);
 int  host_window_has_focus(host_window *w);
 
 void host_window_set_title(host_window *w, const char *utf8);
+
+/* Destroy the window (its Metal layer with it). A later host_window_open
+ * makes a new one. */
+void host_window_close(host_window *w);
 
 /* macOS: whether this process is the active application (the one in front).
  * 0 elsewhere. For tests that prove background mode keeps out of the way. */

@@ -65,7 +65,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
 
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
@@ -982,4 +981,3 @@ void hle_d3d8_interp_report(void)
     g_redraws = g_matched_frames = 0;
 }
 
-#endif /* _WIN32 */

@@ -48,14 +48,14 @@ target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 # Host device choice and per-control bindings (src/input/input_bindings.c),
 # shared with the USB gamepad so one config file covers both input paths.
 target_link_libraries(xbox_hle PUBLIC xbox_input)
+# The D3D8 replacements drive the host renderer in src/d3d, on every
+# platform, and open a window of their own for it: Win32 on Windows, the host
+# shell (src/host) elsewhere.
+target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video)
 if(WIN32)
-    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
-    # The D3D8 replacements drive the host renderer in src/d3d, and open a
-    # window of their own for it.
-    target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)
-endif()
-if(NOT WIN32)
-    # The host shell (src/host): the main-thread loop a title's main.c runs,
-    # and the game window. PUBLIC so a title gets it through this library.
+    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0 user32)
+else()
+    # The host shell: the main-thread loop a title's main.c runs, and the
+    # game window. PUBLIC so a title gets it through this library.
     target_link_libraries(xbox_hle PUBLIC xbox_host)
 endif()

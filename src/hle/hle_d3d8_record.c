@@ -38,7 +38,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
 
 #include "d3d8_xbox.h"
 #include "d3d8_internal.h"
@@ -2006,4 +2005,3 @@ void hle_d3d8_interp_snapshot(void)
     }
 }
 
-#endif /* _WIN32 */
