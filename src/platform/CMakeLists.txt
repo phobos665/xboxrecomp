@@ -43,6 +43,7 @@ if(WIN32)
 else()
     add_library(platform STATIC
         win32_compat.c
+        posix_memory.c
         host_timer.c
         fault_common.c
         fault_posix.c
