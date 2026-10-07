@@ -1015,6 +1015,7 @@ void xbox_GuestLockInit(void)
  * xbox_GuestLockEnterForCall knows to wait as a guest does rather than as an
  * interrupt does. */
 static RECOMP_TLS int g_guest_thread;
+static volatile DWORD g_guest_owner_tid;    /* for diagnosis only */
 
 /* Fairness: the quantum, and who is waiting.
  *
@@ -1144,6 +1145,14 @@ static int32_t guest_my_priority(void)
     int i;
     if (!g_guest_thread)
         return GL_PRIO_HOST;
+    {
+        /* RECOMP_GUEST_PRIORITY=0: every guest thread equal (round robin). */
+        static int use = -1;
+        if (use < 0)
+            use = xbox_EnvSwitch("RECOMP_GUEST_PRIORITY", 1);
+        if (!use)
+            return 0;
+    }
     obj = xbox_CurrentThreadObject();
     for (i = 0; obj && i < GL_PRIO_SLOTS && s_gl_prio[i].obj; i++)
         if (s_gl_prio[i].obj == obj)
@@ -1164,7 +1173,7 @@ static void guest_wait_end(int32_t prio)
 }
 
 /* Should the holder let go now? Only asked when somebody is waiting. */
-static int guest_should_hand_over(int64_t now)
+static int guest_should_hand_over(int64_t now, int at_backedge)
 {
     int32_t mine = guest_my_priority(), top;
     int64_t held = now - g_guest_since_ns, q = guest_quantum_ns();
@@ -1172,6 +1181,22 @@ static int guest_should_hand_over(int64_t now)
     for (top = GL_PRIO_HOST; top >= GL_PRIO_MIN; top--)
         if (s_gl_waiting_at[top - GL_PRIO_MIN] > 0)
             break;
+    {
+        /* RECOMP_GUESTLOCK_TRACE=1: the first decisions, for diagnosis. */
+        static int trace = -1;
+        static volatile LONG shown[2];
+        if (trace < 0)
+            trace = xbox_EnvSwitch("RECOMP_GUESTLOCK_TRACE", 0);
+        if (trace && InterlockedIncrement(&shown[at_backedge != 0]) <= 8) {
+            fprintf(stderr, "  [GUESTLOCK] tid %lu decide (%s): mine %d, top waiter %d, held "
+                            "%.2f ms, waiters %d, owner %lu takes %ld depth %d\n", (unsigned long)GetCurrentThreadId(),
+                    at_backedge ? "back edge" : "kernel",
+                    (int)mine, (int)top,
+                    (double)held / 1e6, (int)g_guest_lock_waiters,
+                    (unsigned long)g_guest_owner_tid, (long)g_guest_takes, g_guest_depth);
+            fflush(stderr);
+        }
+    }
     if (top < GL_PRIO_MIN)
         return 0;
     if (top > mine)
@@ -1181,9 +1206,118 @@ static int guest_should_hand_over(int64_t now)
     return held >= 20 * q;
 }
 
+/* Suspending a guest thread, safely.
+ *
+ * SuspendThread stops a thread wherever it is. With the guest lock that can be
+ * while it holds the lock, and then no guest thread runs again. On the console
+ * a thread being suspended is never running -- the CPU is busy suspending it
+ * -- so it never holds anything a uniprocessor would.
+ *
+ * With the lock on, a guest thread suspending another one asks instead: the
+ * target parks itself at its next safe point -- coming back from a kernel
+ * call, or at a loop's back edge -- with the lock let go, and stays parked
+ * until its suspend count is back to 0. Until it parks, the request counts as
+ * a waiter, so the target's next back edge takes the slow path and sees it.
+ * The counts are Win32's: the previous count is returned, and a resume at 0
+ * does nothing. With the lock off, SuspendThread is used as before. */
+typedef struct guest_rec {
+    volatile DWORD     tid;
+    volatile LONG      suspend;      /* the guest's suspend count */
+    volatile LONG      req;          /* a park requested, not yet taken */
+    CRITICAL_SECTION   cs;
+    CONDITION_VARIABLE cv;
+} guest_rec;
+#define GUEST_RECS 64
+static guest_rec             s_recs[GUEST_RECS];
+static RECOMP_TLS guest_rec *t_rec;
+
+static void guest_rec_register(void)
+{
+    DWORD me = GetCurrentThreadId();
+    int i;
+    if (t_rec)
+        return;
+    for (i = 0; i < GUEST_RECS; i++)
+        if (InterlockedCompareExchange((volatile LONG *)&s_recs[i].tid, (LONG)me, 0) == 0) {
+            InitializeCriticalSection(&s_recs[i].cs);
+            InitializeConditionVariable(&s_recs[i].cv);
+            t_rec = &s_recs[i];
+            return;
+        }
+}
+
+static guest_rec *guest_rec_find(DWORD tid)
+{
+    int i;
+    for (i = 0; tid && i < GUEST_RECS; i++)
+        if (s_recs[i].tid == tid)
+            return &s_recs[i];
+    return NULL;
+}
+
+/* At a safe point, not holding the lock: park while suspended. */
+static void guest_park_if_asked(void)
+{
+    guest_rec *r = t_rec;
+    if (!r || !r->req)
+        return;
+    EnterCriticalSection(&r->cs);
+    if (r->req) {
+        r->req = 0;
+        InterlockedDecrement((volatile LONG *)&g_guest_lock_waiters);
+    }
+    while (r->suspend > 0)
+        SleepConditionVariableCS(&r->cv, &r->cs, INFINITE);
+    LeaveCriticalSection(&r->cs);
+}
+
+int xbox_GuestThreadSuspend(HANDLE thread, DWORD *prev)
+{
+    guest_rec *r;
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready)
+        return 0;
+    r = guest_rec_find(GetThreadId(thread));
+    if (!r || r == t_rec)
+        return 0;                   /* not a running guest thread, or itself */
+    EnterCriticalSection(&r->cs);
+    *prev = (DWORD)r->suspend++;
+    if (*prev == 0 && !r->req) {
+        r->req = 1;
+        InterlockedIncrement((volatile LONG *)&g_guest_lock_waiters);
+    }
+    LeaveCriticalSection(&r->cs);
+    return 1;
+}
+
+int xbox_GuestThreadResume(HANDLE thread, DWORD *prev)
+{
+    guest_rec *r;
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready)
+        return 0;
+    r = guest_rec_find(GetThreadId(thread));
+    if (!r || r == t_rec)
+        return 0;
+    EnterCriticalSection(&r->cs);
+    if (r->suspend == 0) {
+        LeaveCriticalSection(&r->cs);
+        return 0;                   /* not suspended by us: ResumeThread's */
+    }
+    *prev = (DWORD)r->suspend--;
+    if (r->suspend == 0) {
+        if (r->req) {               /* resumed before it ever parked */
+            r->req = 0;
+            InterlockedDecrement((volatile LONG *)&g_guest_lock_waiters);
+        }
+        WakeAllConditionVariable(&r->cv);
+    }
+    LeaveCriticalSection(&r->cs);
+    return 1;
+}
+
 /* depth 0 -> 1: this thread now holds it. */
 static void guest_took(void)
 {
+    g_guest_owner_tid = GetCurrentThreadId();
     InterlockedIncrement(&g_guest_takes);
     g_guest_since_ns = host_time_ns();
 }
@@ -1192,6 +1326,7 @@ static void guest_took(void)
 static void guest_cs_enter(void)
 {
     if (g_guest_depth == 0) {
+        guest_park_if_asked();
         if (!TryEnterCriticalSection(&g_guest_cs)) {
             int32_t prio = guest_my_priority();
             guest_wait_begin(prio);
@@ -1228,6 +1363,7 @@ static void guest_handoff_wait(LONG takes_before)
 void xbox_GuestLockEnter(void)
 {
     g_guest_thread = 1;
+    guest_rec_register();
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return;
     guest_cs_enter();
@@ -1311,7 +1447,8 @@ int xbox_GuestLockEnterTimed(DWORD ms)
         if (InterlockedIncrement(&said) == 1) {
             fprintf(stderr, "  [THREAD] a host thread waited %lu ms for the guest "
                             "lock and ran guest code without it (a guest thread is "
-                            "spinning in lifted code?)\n", (unsigned long)ms);
+                            "spinning in lifted code?); last taken by tid %lu\n",
+                    (unsigned long)ms, (unsigned long)g_guest_owner_tid);
             fflush(stderr);
         }
     }
@@ -1348,7 +1485,7 @@ void xbox_GuestLockRestore(int held)
     if (held > 0 && g_guest_lock_waiters > 0 &&
         g_guest_takes == g_guest_takes_at_drop) {
         int64_t now = host_time_ns();
-        if (guest_should_hand_over(now)) {
+        if (guest_should_hand_over(now, 0)) {
             InterlockedIncrement(&s_gl_handoff_kernel);
             guest_handoff_wait(g_guest_takes_at_drop);
             guest_lock_report(now);
@@ -1369,15 +1506,37 @@ void recomp_guest_backedge_yield(void)
     int held;
     LONG takes;
 
-    if (g_guest_depth <= 0)
+    if (t_rec && t_rec->req && g_guest_depth > 0) {
+        held = xbox_GuestLockDrop();     /* suspended: park, then carry on */
+        while (held-- > 0)
+            guest_cs_enter();            /* parks before it takes the lock */
         return;
+    }
+    if (g_guest_depth <= 0) {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) == 1 && xbox_EnvSwitch("RECOMP_GUESTLOCK_TRACE", 0))
+            fprintf(stderr, "  [GUESTLOCK] back edge on tid %lu, not holding the lock\n",
+                    (unsigned long)GetCurrentThreadId());
+        return;
+    }
     now = host_time_ns();
-    if (!guest_should_hand_over(now))
+    if (!guest_should_hand_over(now, 1))
         return;
     takes = g_guest_takes;
     held = xbox_GuestLockDrop();
     InterlockedIncrement(&s_gl_handoff_backedge);
     guest_handoff_wait(takes);
+    {
+        static int trace = -1;
+        static volatile LONG shown;
+        if (trace < 0)
+            trace = xbox_EnvSwitch("RECOMP_GUESTLOCK_TRACE", 0);
+        if (trace && InterlockedIncrement(&shown) <= 40)
+            fprintf(stderr, "  [GUESTLOCK] tid %lu handed over at a back edge: takes %ld -> %ld, "
+                            "waiters %d, %.2f ms\n", (unsigned long)GetCurrentThreadId(),
+                    (long)takes, (long)g_guest_takes, (int)g_guest_lock_waiters,
+                    (double)(host_time_ns() - now) / 1e6);
+    }
     guest_lock_report(now);
     while (held-- > 0)
         guest_cs_enter();

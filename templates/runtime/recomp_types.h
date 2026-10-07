@@ -343,10 +343,16 @@ void recomp_int_divide_fault(uint32_t code);
  * iteration even of a loop that touches no other memory. */
 extern volatile int32_t g_guest_lock_waiters;
 void recomp_guest_backedge_yield(void);
+#ifdef RECOMP_NO_BACKEDGE
+/* For measuring what the check costs; a build without it can deadlock a
+ * title with the guest lock on. */
+#define RECOMP_BACKEDGE() ((void)0)
+#else
 #define RECOMP_BACKEDGE() do {                                           \
         if (RECOMP_UNLIKELY(g_guest_lock_waiters))                       \
             recomp_guest_backedge_yield();                               \
     } while (0)
+#endif
 
 /* SSE float-to-int conversions, as x86 does them.
  *

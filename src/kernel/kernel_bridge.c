@@ -466,6 +466,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     xbox_GuestLockEnter();
     xbox_GuestLiftedEnter();
     xbox_NameCurrentThread(L"guest worker");
+    if (xbox_EnvSwitch("RECOMP_GUESTLOCK_TRACE", 0))
+        fprintf(stderr, "  [THREAD] guest worker tid %lu (ctx 0x%08X)\n",
+                (unsigned long)GetCurrentThreadId(), ctx1);
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -8007,8 +8010,11 @@ static void bridge_KeResumeThread(void)
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
-    if (hThread)
-        g_eax = (uint32_t)ResumeThread(hThread);
+    if (hThread) {
+        DWORD prev;
+        g_eax = xbox_GuestThreadResume(hThread, &prev)
+                    ? (uint32_t)prev : (uint32_t)ResumeThread(hThread);
+    }
     else
         g_eax = 0;
 }
@@ -8020,8 +8026,11 @@ static void bridge_KeSuspendThread(void)
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
-    if (hThread)
-        g_eax = (uint32_t)SuspendThread(hThread);
+    if (hThread) {
+        DWORD prev;
+        g_eax = xbox_GuestThreadSuspend(hThread, &prev)
+                    ? (uint32_t)prev : (uint32_t)SuspendThread(hThread);
+    }
     else
         g_eax = 0;
 }
