@@ -335,7 +335,14 @@ static void *arena_place_at(pm_object *obj, size_t off, uintptr_t at, size_t len
     }
     slot = s_nplaces;
     if (slot >= ARENA_MAX_PLACES) {
+        static int said;
         pthread_mutex_unlock(&s_arena_lock);
+        /* Slots are never reused (the fault path reads them unlocked), so
+         * placements that churn run out here. Say so, or it reads as an
+         * address that would not map. */
+        if (!said++)
+            fprintf(stderr, "[MEM] guest arena: all %d placement slots used; "
+                    "placement at %p refused\n", ARENA_MAX_PLACES, (void *)lo);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
@@ -682,11 +689,23 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
         const arena_place *p = prot ? find_place(lo) : NULL;
         uintptr_t limit = p ? p->hi : s_arena_hi;
 
+        /* A free run ends at the next placement; finding that from the
+         * placement list keeps this from walking up to 1 MB of side table. */
+        if (!p) {
+            int n = __atomic_load_n(&s_nplaces, __ATOMIC_ACQUIRE);
+            for (int i = 0; i < n; i++)
+                if (s_places[i].live && s_places[i].lo > lo && s_places[i].lo < limit)
+                    limit = s_places[i].lo;
+        }
+
         /* A run of guest pages with the same protection (or, unplaced, the
          * free run up to the next placement). */
-        for (g = lo + GPAGE; g < limit; g += GPAGE)
-            if (s_gprot[(g - s_arena_lo) / GPAGE] != prot)
-                break;
+        if (!p)
+            g = limit;          /* free all the way to the next placement */
+        else
+            for (g = lo + GPAGE; g < limit; g += GPAGE)
+                if (s_gprot[(g - s_arena_lo) / GPAGE] != prot)
+                    break;
         buffer->BaseAddress = (PVOID)lo;
         buffer->RegionSize  = g - lo;
         if (p) {
