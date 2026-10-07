@@ -2428,6 +2428,27 @@ static void frame_end_shadow(void)
 HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
+    /* D3DSWAP_BYPASSCOPY (0x2) without D3DSWAP_FINISH (0x4) is the first half
+     * of a frame, not a flip: the title finishes the image itself and then
+     * calls Swap(D3DSWAP_FINISH). Forza draws its world, swaps with BYPASSCOPY,
+     * builds the shown frame (bloom composite, HUD) and swaps with FINISH;
+     * presenting both halves showed the world and the finished frame on
+     * alternate refreshes, and gating both paced the race at two vblanks a
+     * frame. Future Perfect draws its whole frame inside the bypass Swap's own
+     * body and then finishes, which presents the same image as before. A
+     * bypass Swap that is not followed by a FINISH before the next one
+     * presents as it always did. */
+    static int bypass_pending;
+    uint32_t swap_flags = HLE_ARG(0);
+    int half = (swap_flags & 0x2u) && !(swap_flags & 0x4u) && !bypass_pending;
+
+    bypass_pending = half;
+    if (half) {
+        if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
+            HLE_RETURN(0x80004005u);
+        HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        return;
+    }
 
     /* Counted before anything else here runs, so RECOMP_FPS means the same
      * thing whatever is switched on below. */
@@ -4015,13 +4036,20 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             } else {
                 kind = 2;
             }
-        } else if (is_swap_data(HLE_MEM32(rt + 4))) {
+        } else if (is_swap_data(HLE_MEM32(rt + 4)) &&
+                   w >= g_shadow_width && h >= g_shadow_height) {
             /* The surface's memory is a frame buffer, so this is the screen
              * even when the surface hangs off a texture the title made over
              * that memory (see g_swap_data). Measured on Future Perfect,
              * frame 900 of a capture: all 110 draws of its front end went to
              * a surface of texture 0x00563154, whose data is the frame
-             * buffer 0x00204000, and none to either swap surface. */
+             * buffer 0x00204000, and none to either swap surface.
+             *
+             * Only a surface the size of the screen, though. Forza borrows
+             * the idle front buffer (0x0211C000) as a 320x240 scratch target
+             * for its bloom downsample; taken for the screen, that pass and
+             * the next were drawn over the top-left of the frame, and the
+             * composite that reads the scratch back painted the race black. */
             kind = 0;
         } else if (depth_texture_of(rt)) {
             /* A colour surface over a depth texture's memory. Xbox titles
