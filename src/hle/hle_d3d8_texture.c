@@ -627,6 +627,19 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     uint32_t data = obj_field(va, 4), format = obj_field(va, 12), size = obj_field(va, 16);
     int i;
 
+    /* Memory the title rendered into as a bare surface: the host's drawing
+     * is the content (hle_d3d8_render_surface). First, even over frame-buffer
+     * memory: Forza borrows its idle front buffer as a 320x240 scratch target
+     * for its bloom, and the pass after reads it back as a texture of that
+     * shape. Taken for the title's own frame, that read got the screen, not
+     * the downsample. A match needs this exact memory, format and size drawn
+     * into as an offscreen surface, which a title reading its real frame
+     * (Future Perfect, XGRA) never does. */
+    {
+        IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
+        if (rs)
+            return rs;
+    }
     /* Before the ordinary lookup, because these are not identified by
      * their texels -- they have none of their own -- and because they
      * must be refreshed every frame, which a cache hit would skip. */
@@ -634,13 +647,6 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
         IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
         if (fb)
             return fb;
-    }
-    /* Memory the title rendered into as a bare surface: the host's drawing
-     * is the content (hle_d3d8_render_surface). */
-    {
-        IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
-        if (rs)
-            return rs;
     }
 
     for (i = 0; i < g_texture_count; i++) {
