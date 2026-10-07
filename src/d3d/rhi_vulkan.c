@@ -37,6 +37,12 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 #include "volk.h"
 #include "vk_mem_alloc.h"
@@ -211,7 +217,7 @@ static struct {
     uint32_t                 qfamily;
     VmaAllocator             vma;
     VkFormat                 depth24;       /* D24S8, or D32S8 where there is none */
-    int feat_depth_clamp, feat_fill, feat_bias_clamp, feat_aniso, feat_border;
+    int feat_depth_clamp, feat_fill, feat_bias_clamp, feat_aniso, feat_border, feat_lod_bias;
     int                      validation;
 
     VkDescriptorSetLayout    set_layout;
@@ -385,6 +391,63 @@ static int format_ok(VkFormat f, VkFormatFeatureFlags need)
     return (p.optimalTilingFeatures & need) == need;
 }
 
+/* Section 4.9's other half: the format table is the same on every device,
+ * what a device can do with each entry is not. Said once at device creation,
+ * and only what is missing: a format a title's texture maps to that cannot
+ * be sampled draws nothing and fails no call, which is the hardest kind of
+ * picture bug to trace back. Vertex-only formats are checked as vertex
+ * input, and depth formats as depth attachments. RECOMP_VK_FORMATS=1 lists
+ * every entry. */
+static int env_on(const char *name);
+
+static void audit_formats(void)
+{
+    static const RhiFormat vertex_only[] = { RHI_FORMAT_R32G32B32_FLOAT, RHI_FORMAT_R32G32B32A32_SINT };
+    char missing[512] = "", no_target[512] = "";
+    int all = env_on("RECOMP_VK_FORMATS");
+    int f;
+
+    for (f = 1; f < 128; f++) {
+        VkFormat vf = vk_format((RhiFormat)f);
+        VkFormatProperties p;
+        VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        int vertex = 0;
+        size_t k;
+        char item[16];
+
+        if (vf == VK_FORMAT_UNDEFINED)
+            continue;
+        for (k = 0; k < sizeof vertex_only / sizeof vertex_only[0]; k++)
+            vertex |= vertex_only[k] == (RhiFormat)f;
+        if (vertex)
+            need = VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+        else if (is_depth_format(vf))
+            need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        vkGetPhysicalDeviceFormatProperties(V.pd, vf, &p);
+        if (all)
+            fprintf(stderr, "[RHI] vulkan: format %d -> VkFormat %d: optimal 0x%X buffer 0x%X\n",
+                    f, (int)vf, (unsigned)p.optimalTilingFeatures, (unsigned)p.bufferFeatures);
+        snprintf(item, sizeof item, " %d", f);
+        if (((vertex ? p.bufferFeatures : p.optimalTilingFeatures) & need) != need) {
+            if (strlen(missing) + strlen(item) < sizeof missing)
+                strcat(missing, item);
+        } else if (!vertex && !is_depth_format(vf) && vf != VK_FORMAT_BC1_RGBA_UNORM_BLOCK &&
+                   vf != VK_FORMAT_BC2_UNORM_BLOCK && vf != VK_FORMAT_BC3_UNORM_BLOCK &&
+                   vf != VK_FORMAT_BC5_UNORM_BLOCK &&
+                   vf != VK_FORMAT_R32_UINT && vf != VK_FORMAT_R16_UINT &&     /* never blended */
+                   !(p.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) {
+            if (strlen(no_target) + strlen(item) < sizeof no_target)
+                strcat(no_target, item);
+        }
+    }
+    if (*missing)
+        fprintf(stderr, "[RHI] vulkan: %s cannot use these formats (DXGI numbers) at all:%s\n",
+                V.props.deviceName, missing);
+    if (*no_target)
+        fprintf(stderr, "[RHI] vulkan: %s cannot render and blend into (DXGI numbers):%s\n",
+                V.props.deviceName, no_target);
+}
+
 /* ---- deferred destruction ---------------------------------------------------------- */
 
 /* A handle the GPU may still be reading goes here with the serial of the
@@ -448,7 +511,11 @@ static void wait_serial(uint64_t s)
     wi.semaphoreCount = 1;
     wi.pSemaphores = &V.timeline;
     wi.pValues = &s;
-    vkWaitSemaphores(V.dev, &wi, UINT64_MAX);
+    {
+        int h = rhi_wait_begin();
+        vkWaitSemaphores(V.dev, &wi, UINT64_MAX);
+        rhi_wait_end(h);
+    }
     update_completed();
 }
 
@@ -798,7 +865,11 @@ static int recreate_swapchain(void)
         flush_wait();
         SC.acquired = 0;
     }
-    vkDeviceWaitIdle(V.dev);
+    {
+        int h = rhi_wait_begin();
+        vkDeviceWaitIdle(V.dev);
+        rhi_wait_end(h);
+    }
     update_completed();
     return create_swapchain(SC.extent.width, SC.extent.height);
 }
@@ -818,8 +889,14 @@ static int acquire(void)
         /* The frame's acquire semaphore is free: its last wait was in a
          * submission begin_recording has already waited for. */
         cmd();
-        r = vkAcquireNextImageKHR(V.dev, SC.sc, UINT64_MAX, V.frames[V.fi].acquire,
-                                  VK_NULL_HANDLE, &SC.index);
+        {
+            /* Can sleep until the window system hands an image back: on
+             * macOS, at the display's rate even in IMMEDIATE mode. */
+            int h = rhi_wait_begin();
+            r = vkAcquireNextImageKHR(V.dev, SC.sc, UINT64_MAX, V.frames[V.fi].acquire,
+                                      VK_NULL_HANDLE, &SC.index);
+            rhi_wait_end(h);
+        }
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             SC.stale = 1;
             continue;
@@ -996,10 +1073,47 @@ static int trace_on(void)
     return lines++ < limit;
 }
 
-static int create_instance(int want_validation)
+static int has_instance_ext(const char *name)
+{
+    uint32_t n = 0, i;
+    VkExtensionProperties *p;
+    int found = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+    p = calloc(n ? n : 1, sizeof *p);
+    if (!p)
+        return 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &n, p);
+    for (i = 0; i < n; i++)
+        if (!strcmp(p[i].extensionName, name))
+            found = 1;
+    free(p);
+    return found;
+}
+
+/* The surface the swap chain presents to: the window's (an HWND on
+ * Windows, a CAMetalLayer on Apple -- RhiDeviceDesc.window), or with no
+ * window a headless one (VK_EXT_headless_surface), whose swap chain is
+ * drawn and read back exactly like a window's and shown nowhere. That is
+ * what the replay tool and the tests run on: the whole present path, with
+ * no window to open. */
+static const char *surface_ext(int headless)
+{
+    if (headless)
+        return VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME;
+#if defined(_WIN32)
+    return VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#elif defined(VK_USE_PLATFORM_METAL_EXT)
+    return VK_EXT_METAL_SURFACE_EXTENSION_NAME;
+#else
+    return NULL;
+#endif
+}
+
+static int create_instance(int want_validation, int headless)
 {
     const char *layer = "VK_LAYER_KHRONOS_validation";
-    const char *exts[4];
+    const char *exts[6];
+    const char *surf = surface_ext(headless);
     uint32_t next = 0;
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
@@ -1008,9 +1122,22 @@ static int create_instance(int want_validation)
     V.validation = want_validation && has_instance_layer(layer);
     if (want_validation && !V.validation)
         fprintf(stderr, "[RHI] vulkan: validation asked for, but the layer is not installed\n");
+    if (!surf || !has_instance_ext(surf)) {
+        fprintf(stderr, "[RHI] vulkan: the loader has no %s, so there is nothing to present to\n",
+                surf ? surf : "window surface for this platform");
+        return -1;
+    }
     exts[next++] = VK_KHR_SURFACE_EXTENSION_NAME;
-#if defined(_WIN32)
-    exts[next++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+    exts[next++] = surf;
+#if defined(__APPLE__)
+    /* MoltenVK is a "portability" driver: since loader 1.3.216 it is only
+     * enumerated for an instance that says it can cope with one. Apple only,
+     * so that elsewhere the device list -- and so the device chosen -- is
+     * what it always was. */
+    if (has_instance_ext(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        exts[next++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
 #endif
     if (V.validation)
         exts[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
@@ -1037,29 +1164,81 @@ static int create_instance(int want_validation)
     return 0;
 }
 
+/* How much a device is preferred when RECOMP_VK_DEVICE does not say: a
+ * discrete GPU first, then an integrated one. On Apple, of two drivers for
+ * the same GPU (the Vulkan SDK installs MoltenVK and Mesa's KosmicKrisp side
+ * by side), MoltenVK, because it is the one a build ships with; the order
+ * the loader lists them in is not something to depend on. */
+static int device_rank(const VkPhysicalDeviceProperties *p, const VkPhysicalDeviceDriverProperties *d)
+{
+    int r = p->deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 20 :
+            p->deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 10 : 0;
+#if defined(__APPLE__)
+    if (d->driverID == VK_DRIVER_ID_MOLTENVK)
+        r += 1;
+#else
+    (void)d;
+#endif
+    return r;
+}
+
+static int ci_contains(const char *hay, const char *needle)
+{
+    size_t i, j, n = strlen(needle);
+    for (i = 0; hay[i]; i++) {
+        for (j = 0; j < n && hay[i + j] &&
+                    tolower((unsigned char)hay[i + j]) == tolower((unsigned char)needle[j]); j++)
+            ;
+        if (j == n)
+            return 1;
+    }
+    return 0;
+}
+
 static int pick_physical_device(void)
 {
     VkPhysicalDevice pds[8];
     uint32_t n = 8, i, pick = 0;
+    int best = -1, wanted = -1;
+    /* RECOMP_VK_DEVICE=<index>, or part of a device or driver name
+     * ("moltenvk", "kosmickrisp"): which device, when there is a choice. */
     const char *want = getenv("RECOMP_VK_DEVICE");
+    int want_index = want && *want && isdigit((unsigned char)want[0]);
 
     VKCHECK(vkEnumeratePhysicalDevices(V.instance, &n, pds), "vkEnumeratePhysicalDevices");
     if (!n) {
         fprintf(stderr, "[RHI] vulkan: no Vulkan device\n");
         return -1;
     }
-    if (want && *want && (uint32_t)atoi(want) < n) {
-        pick = (uint32_t)atoi(want);
-    } else {
-        for (i = 0; i < n; i++) {
-            VkPhysicalDeviceProperties p;
-            vkGetPhysicalDeviceProperties(pds[i], &p);
-            if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-                pick = i;
-                break;
-            }
+    for (i = 0; i < n; i++) {
+        VkPhysicalDeviceDriverProperties drv = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+        VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        int rank;
+
+        /* The driver's name and ID are Vulkan 1.2; an older device (which
+         * is refused below anyway) is asked only for what 1.0 has. */
+        vkGetPhysicalDeviceProperties(pds[i], &p2.properties);
+        if (p2.properties.apiVersion >= VK_API_VERSION_1_2) {
+            p2.pNext = &drv;
+            vkGetPhysicalDeviceProperties2(pds[i], &p2);
         }
+        rank = device_rank(&p2.properties, &drv);
+        if (rank > best) {
+            best = rank;
+            pick = i;
+        }
+        if (wanted < 0 && want && *want &&
+            (want_index ? (uint32_t)atoi(want) == i
+                        : ci_contains(p2.properties.deviceName, want) || ci_contains(drv.driverName, want)))
+            wanted = (int)i;
+        if (n > 1)
+            fprintf(stderr, "[RHI] vulkan: device %u: %s (%s %s)\n", i, p2.properties.deviceName,
+                    drv.driverName, drv.driverInfo);
     }
+    if (want && *want && wanted < 0)
+        fprintf(stderr, "[RHI] vulkan: RECOMP_VK_DEVICE=%s matches no device\n", want);
+    if (wanted >= 0)
+        pick = (uint32_t)wanted;
     V.pd = pds[pick];
     vkGetPhysicalDeviceProperties(V.pd, &V.props);
     if (V.props.apiVersion < VK_API_VERSION_1_3) {
@@ -1086,9 +1265,13 @@ static int create_device(void)
     VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
     VkPhysicalDeviceCustomBorderColorFeaturesEXT fcb = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT };
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-    const char *exts[3];
+    const char *exts[4];
     uint32_t next = 0;
     int border_ext = has_device_ext(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    /* A portability driver (MoltenVK) lists VK_KHR_portability_subset and
+     * must have it enabled; its features say what it cannot do. */
+    int portability = has_device_ext(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR have_ps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR };
 
     if (!has_device_ext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
         fprintf(stderr, "[RHI] vulkan: %s has no push descriptors, which this backend needs\n",
@@ -1114,7 +1297,17 @@ static int create_device(void)
     have.pNext = &have12;
     have12.pNext = &have13;
     have13.pNext = border_ext ? &have_cb : NULL;
+    if (portability) {
+        have_ps.pNext = have13.pNext;
+        have13.pNext = &have_ps;
+    }
     vkGetPhysicalDeviceFeatures2(V.pd, &have);
+    /* Of the portability subset's gaps, one reaches this renderer: a
+     * sampler's LOD bias (D3DTSS_MIPMAPLODBIAS), which Metal has no per-
+     * sampler equivalent for. It is left at zero there, said once at the
+     * first sampler that asks. The rest (triangle fans, point fill, the
+     * tessellation modes) are things the renderer never asks for. */
+    V.feat_lod_bias = !portability || have_ps.samplerMipLodBias;
     if (!have13.dynamicRendering || !have13.synchronization2 || !have13.maintenance4 ||
         !have12.timelineSemaphore) {
         fprintf(stderr, "[RHI] vulkan: %s lacks dynamic rendering, synchronization2, "
@@ -1138,6 +1331,8 @@ static int create_device(void)
     f12.pNext = &f13;
     exts[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     exts[next++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+    if (portability)
+        exts[next++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
     if (border_ext && have_cb.customBorderColors && have_cb.customBorderColorWithoutFormat) {
         fcb.customBorderColors = VK_TRUE;
         fcb.customBorderColorWithoutFormat = VK_TRUE;
@@ -1157,6 +1352,7 @@ static int create_device(void)
     /* Section 4.9: AMD has no D24S8, so the depth format is the device's. */
     V.depth24 = format_ok(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
                 ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    audit_formats();
     return 0;
 }
 
@@ -1253,11 +1449,9 @@ static void *pcache_load(size_t *bytes)
 
 static void pcache_save(void)
 {
-    char path[1024], tmp[1100];
+    char path[1024];
     size_t n = 0;
     void *data;
-    FILE *f;
-    int ok;
 
     if (!V.pcache || !rhi_cache_file_path(PIPELINE_CACHE_DIR, PIPELINE_CACHE_FILE,
                                           path, sizeof path))
@@ -1271,14 +1465,7 @@ static void pcache_save(void)
         free(data);
         return;
     }
-    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
-    f = fopen(tmp, "wb");
-    if (f) {
-        ok = fwrite(data, 1, n, f) == n;
-        ok = (fclose(f) == 0) && ok;
-        if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
-            DeleteFileA(tmp);
-    }
+    rhi_cache_file_write(path, data, n);
     free(data);
 }
 
@@ -1413,12 +1600,86 @@ static int create_dummies(void)
     return 0;
 }
 
+/* The Vulkan loader. RECOMP_VULKAN_LIBRARY names one outright; on Apple a
+ * loader shipped beside the executable, or in an app bundle's Frameworks
+ * folder, comes next, because dlopen does not look there by itself; then
+ * volk's own search (libvulkan.dylib, libvulkan.1.dylib, /usr/local/lib,
+ * libMoltenVK.dylib, ...), which finds a Vulkan SDK installed system-wide.
+ * A loader finds its drivers through its ICD manifests: a bundle ships
+ * MoltenVK_icd.json under Contents/Resources/vulkan/icd.d, and in
+ * development VK_ICD_FILENAMES / VK_DRIVER_FILES points at a manifest. */
+static int load_vulkan(void)
+{
+#if !defined(_WIN32)
+    static const char *const beside[] = {
+#if defined(__APPLE__)
+        "libvulkan.1.dylib", "../Frameworks/libvulkan.1.dylib",
+#else
+        "libvulkan.so.1",
+#endif
+    };
+    const char *named = getenv("RECOMP_VULKAN_LIBRARY");
+    char path[1200];
+    void *m = NULL;
+    size_t i;
+
+    if (named && *named && !(m = dlopen(named, RTLD_NOW | RTLD_LOCAL)))
+        fprintf(stderr, "[RHI] vulkan: RECOMP_VULKAN_LIBRARY=%s: %s\n", named, dlerror());
+    for (i = 0; !m && i < sizeof beside / sizeof beside[0]; i++) {
+        char dir[1024];
+        char *slash;
+#if defined(__APPLE__)
+        uint32_t size = sizeof dir;
+        if (_NSGetExecutablePath(dir, &size) != 0)
+            break;
+#else
+        ssize_t len = readlink("/proc/self/exe", dir, sizeof dir - 1);
+        if (len <= 0)
+            break;
+        dir[len] = 0;
+#endif
+        if (!(slash = strrchr(dir, '/')))
+            break;
+        slash[1] = 0;
+        snprintf(path, sizeof path, "%s%s", dir, beside[i]);
+        m = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    }
+    if (m) {
+        PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
+        if (gipa) {
+            volkInitializeCustom(gipa);
+            return 0;
+        }
+    }
+    if (volkInitialize() == VK_SUCCESS)
+        return 0;
+    /* Last, an SDK that was unpacked rather than installed: its loader is
+     * in $VULKAN_SDK/lib. Its drivers then come from VK_DRIVER_FILES (the
+     * SDK's setup-env.sh sets it), since that loader's own search paths do
+     * not include the SDK. */
+    if (getenv("VULKAN_SDK")) {
+        snprintf(path, sizeof path, "%s/lib/%s", getenv("VULKAN_SDK"), beside[0]);
+        if ((m = dlopen(path, RTLD_NOW | RTLD_LOCAL)) != NULL) {
+            PFN_vkGetInstanceProcAddr gipa =
+                (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
+            if (gipa) {
+                volkInitializeCustom(gipa);
+                return 0;
+            }
+        }
+    }
+    return -1;
+#else
+    return volkInitialize() == VK_SUCCESS ? 0 : -1;
+#endif
+}
+
 static int v_device_create(const RhiDeviceDesc *dd)
 {
     VkSurfaceFormatKHR formats[64];
     uint32_t nf = 64, i;
 
-    if (volkInitialize() != VK_SUCCESS) {
+    if (load_vulkan() != 0) {
         fprintf(stderr, "[RHI] vulkan: no Vulkan loader on this machine\n");
         return -1;
     }
@@ -1426,19 +1687,28 @@ static int v_device_create(const RhiDeviceDesc *dd)
     memset(&SC, 0, sizeof SC);
     V.sample_mask = 0xFFFFFFFFu;
     V.topology = RHI_TOPOLOGY_TRIANGLES;
-    if (create_instance(dd->debug || env_on("RECOMP_VK_VALIDATION")) != 0)
+    if (create_instance(dd->debug || env_on("RECOMP_VK_VALIDATION"), dd->window == NULL) != 0)
         return -1;
+    if (!dd->window) {
+        VkHeadlessSurfaceCreateInfoEXT hci = { VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
+        VKCHECK(vkCreateHeadlessSurfaceEXT(V.instance, &hci, NULL, &V.surface), "headless surface");
+    } else {
 #if defined(_WIN32)
-    {
         VkWin32SurfaceCreateInfoKHR wci = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
         wci.hinstance = GetModuleHandleA(NULL);
         wci.hwnd = (HWND)dd->window;
         VKCHECK(vkCreateWin32SurfaceKHR(V.instance, &wci, NULL, &V.surface), "window surface");
-    }
+#elif defined(VK_USE_PLATFORM_METAL_EXT)
+        /* The window's owner made the layer on the main thread (AppKit's
+         * rule); the surface only retains it, so this may be any thread. */
+        VkMetalSurfaceCreateInfoEXT mci = { VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT };
+        mci.pLayer = (const CAMetalLayer *)dd->window;
+        VKCHECK(vkCreateMetalSurfaceEXT(V.instance, &mci, NULL, &V.surface), "window surface");
 #else
-    fprintf(stderr, "[RHI] vulkan: no window surface on this platform yet\n");
-    return -1;
+        fprintf(stderr, "[RHI] vulkan: no window surface on this platform yet\n");
+        return -1;
 #endif
+    }
     if (pick_physical_device() != 0 || create_device() != 0 || create_allocator() != 0 ||
         create_layouts() != 0 || create_frames() != 0)
         return -1;
@@ -1607,7 +1877,11 @@ static int32_t v_present(uint32_t interval)
     pi.swapchainCount = 1;
     pi.pSwapchains = &SC.sc;
     pi.pImageIndices = &idx;
-    r = vkQueuePresentKHR(V.queue, &pi);
+    {
+        int h = rhi_wait_begin();
+        r = vkQueuePresentKHR(V.queue, &pi);
+        rhi_wait_end(h);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         SC.stale = 1;
     SC.acquired = 0;
@@ -2673,6 +2947,14 @@ static RhiSampler *v_sampler_create(const RhiSamplerDesc *d)
         si.mipLodBias = V.props.limits.maxSamplerLodBias;
     if (si.mipLodBias < -V.props.limits.maxSamplerLodBias)
         si.mipLodBias = -V.props.limits.maxSamplerLodBias;
+    if (!V.feat_lod_bias && si.mipLodBias != 0.0f) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[RHI] vulkan: this device has no sampler LOD bias (portability "
+                            "subset); a texture stage's MIPMAPLODBIAS of %.2f is ignored\n",
+                    si.mipLodBias);
+        si.mipLodBias = 0.0f;
+    }
     si.minLod = d->min_lod;
     si.maxLod = d->max_lod >= FLT_MAX ? VK_LOD_CLAMP_NONE : d->max_lod;
     if (V.feat_border) {

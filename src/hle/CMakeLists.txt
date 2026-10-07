@@ -34,13 +34,13 @@ add_library(xbox_hle STATIC
     input_host.c
 )
 
-# Host audio. XAudio2 exists only on Windows. Elsewhere audio_output_none.c
-# behaves as the XAudio2 path does when it opens no device
-# (RECOMP_AUDIO_GAIN=0) until an SDL3 output replaces it.
+# Host audio: XAudio2 on Windows, SDL3 elsewhere, with the same switches
+# (RECOMP_MUTE, RECOMP_AUDIO_GAIN) and the same play-position clock.
 if(WIN32)
     target_sources(xbox_hle PRIVATE audio_output_xaudio2.cpp)
 else()
-    target_sources(xbox_hle PRIVATE audio_output_none.c)
+    target_sources(xbox_hle PRIVATE audio_output_sdl.c)
+    target_link_libraries(xbox_hle PRIVATE SDL3::SDL3)
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_config)
@@ -48,14 +48,14 @@ target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 # Host device choice and per-control bindings (src/input/input_bindings.c),
 # shared with the USB gamepad so one config file covers both input paths.
 target_link_libraries(xbox_hle PUBLIC xbox_input)
+# The D3D8 replacements drive the host renderer in src/d3d, on every
+# platform, and open a window of their own for it: Win32 on Windows, the host
+# shell (src/host) elsewhere.
+target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video)
 if(WIN32)
-    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
-    # The D3D8 replacements drive the host renderer in src/d3d, and open a
-    # window of their own for it.
-    target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)
-endif()
-if(NOT WIN32)
-    # The host shell (src/host): the main-thread loop a title's main.c runs,
-    # and the game window. PUBLIC so a title gets it through this library.
+    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0 user32)
+else()
+    # The host shell: the main-thread loop a title's main.c runs, and the
+    # game window. PUBLIC so a title gets it through this library.
     target_link_libraries(xbox_hle PUBLIC xbox_host)
 endif()

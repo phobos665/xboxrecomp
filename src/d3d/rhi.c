@@ -12,8 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The default: Direct3D 11 on Windows (Vulkan there is asked for with
+ * RECOMP_D3D8_BACKEND=vulkan), Vulkan everywhere else, and nothing in a
+ * build that has neither -- then rhi_device_create fails and says why. */
 #if defined(_WIN32)
 const RhiBackend *g_rhi = &rhi_d3d11_backend;
+#elif defined(RHI_HAVE_VULKAN)
+const RhiBackend *g_rhi = &rhi_vulkan_backend;
 #else
 const RhiBackend *g_rhi = NULL;
 #endif
@@ -28,6 +33,18 @@ static const RhiBackend *const g_backends[] = {
 #endif
     NULL
 };
+
+static int  (*g_rhi_wait_begin)(void);
+static void (*g_rhi_wait_end)(int);
+
+void rhi_set_wait_hooks(int (*begin)(void), void (*end)(int))
+{
+    g_rhi_wait_begin = begin;
+    g_rhi_wait_end = end;
+}
+
+int  rhi_wait_begin(void)  { return g_rhi_wait_begin ? g_rhi_wait_begin() : 0; }
+void rhi_wait_end(int h)   { if (g_rhi_wait_end) g_rhi_wait_end(h); }
 
 int rhi_select_backend(const char *name)
 {
@@ -56,8 +73,11 @@ const char *rhi_backend_name(void) { return g_rhi ? g_rhi->name : "none"; }
  * than leaving the title with no picture at all. */
 int rhi_device_create(const RhiDeviceDesc *d)
 {
-    if (!g_rhi)
+    if (!g_rhi) {
+        fprintf(stderr, "[RHI] this build has no renderer backend (built without Vulkan)\n");
+        fflush(stderr);
         return -1;
+    }
     if (g_rhi->device_create(d) == 0)
         return 0;
     if (g_rhi != g_backends[0] && g_backends[0]) {

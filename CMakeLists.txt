@@ -117,10 +117,8 @@ endif()
 add_subdirectory(src/hle)
 
 # Frame replay tool: replays a D3D8 capture into the host renderer with no
-# game running (src/hle/d3d8_capture.h). Windows only, like the D3D11 backend.
-if(WIN32)
-    add_subdirectory(src/replay)
-endif()
+# game running (src/hle/d3d8_capture.h). Windowless off Windows.
+add_subdirectory(src/replay)
 
 # ── Tests ─────────────────────────────────────────────────────
 
@@ -134,15 +132,20 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     add_subdirectory(tests/host_timer)          # portable: the sub-millisecond timer
     if(NOT WIN32)
         add_subdirectory(tests/host_window)     # needs a display; run by hand
+        add_subdirectory(tests/audio_output)    # muted; skips with no device
+        add_subdirectory(tests/d3d8_replay)     # the renderer, headless (needs a Vulkan device)
         add_subdirectory(tests/guest_memory)    # POSIX memory backend semantics
         add_subdirectory(tests/mmio_decode_a64) # arm64 fault emulation vs hardware
         add_subdirectory(tests/guest_faults)    # trapped pages via the signal path
         add_subdirectory(tests/memory_layout)   # the real layout, 64 and 128 MB maps
+        add_subdirectory(tests/compat_threads)  # POSIX thread and fiber shims
     endif()
+    # Built under src/d3d (tests/d3d8_smoke); pure parsing, no device.
+    add_test(NAME d3d8_final_default COMMAND d3d8_final_default)
     if(WIN32)
         add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
-        # Built under src/d3d (tests/d3d8_smoke); pure parsing, no device.
-        add_test(NAME d3d8_final_default COMMAND d3d8_final_default)
+    else()
+        add_test(NAME d3d8_smoke COMMAND d3d8_smoke)    # the format layer
     endif()
 endif()
 
