@@ -1,5 +1,5 @@
 /*
- * d3d8_capture -- round-trip the frame capture container (format version 6).
+ * d3d8_capture -- round-trip the frame capture container (format version 8).
  *
  * Writes a synthetic host-level capture -- a snapshot and a frame, using every
  * chunk kind -- reads it back, and asserts every field and every payload byte
@@ -13,7 +13,9 @@
  * builds at run time and deletes.
  *
  * The frame is built to be worth replaying (see --write below): a textured
- * fixed-function quad on the left, and on the right a quad drawn by an NV2A
+ * fixed-function quad on the left, a copy of the screen as it then is drawn
+ * small below it (a screen copy, as a title reads its own frame back), and
+ * on the right a quad drawn by an NV2A
  * vertex program with a declaration, whose colour comes from a NORMPACKED3
  * normal expanded exactly as shadow mode expands it, under the screen-space
  * undo and a register combiner token. Every value is a host value, as shadow
@@ -60,6 +62,7 @@ enum {
     PT_TRIANGLELIST = 4, PT_TRIANGLESTRIP = 5,
     FMT_INDEX16 = 101,
     FMT_LIN_A8R8G8B8 = 0x12,
+    FMT_A8R8G8B8 = 0x06,           /* swizzled: addressed 0..1, unlike LIN_ */
     CLEAR_TARGET = 1, CLEAR_ZBUFFER = 2,
     DXGI_R32G32B32_FLOAT = 6,
     FVF_XYZRHW_DIFFUSE_TEX1 = 0x004 | 0x040 | 0x100
@@ -165,6 +168,12 @@ static void fvf_vertex(uint8_t *out, float x, float y, float u, float v)
 }
 
 static uint8_t g_fvf_quad[4 * FVF_STRIDE];
+static uint8_t g_copy_quad[4 * FVF_STRIDE];     /* the screen copy, drawn below */
+/* The screen copy's texture: 64x64, swizzled A8R8G8B8, made a render target
+ * and starting black (alpha 0 too), which is what a replay that skipped the
+ * copy would show. */
+#define COPY_EDGE 64u
+static uint8_t g_copy_texels[COPY_EDGE * COPY_EDGE * 4];
 static uint8_t g_program_quad[4 * PROGRAM_STRIDE];
 static const uint16_t QUAD_INDICES[6] = { 0, 1, 2, 0, 2, 3 };
 
@@ -177,6 +186,10 @@ static void build_data(void)
 {
     uint32_t x, y;
 
+    fvf_vertex(g_copy_quad + 0 * FVF_STRIDE,  40.0f, 300.0f, 0.0f, 0.0f);
+    fvf_vertex(g_copy_quad + 1 * FVF_STRIDE, 280.0f, 300.0f, 1.0f, 0.0f);
+    fvf_vertex(g_copy_quad + 2 * FVF_STRIDE,  40.0f, 460.0f, 0.0f, 1.0f);
+    fvf_vertex(g_copy_quad + 3 * FVF_STRIDE, 280.0f, 460.0f, 1.0f, 1.0f);
     fvf_vertex(g_fvf_quad + 0 * FVF_STRIDE,  40.0f,  40.0f, 0.0f, 0.0f);
     fvf_vertex(g_fvf_quad + 1 * FVF_STRIDE, 280.0f,  40.0f, 1.0f, 0.0f);
     fvf_vertex(g_fvf_quad + 2 * FVF_STRIDE,  40.0f, 280.0f, 0.0f, 1.0f);
@@ -264,7 +277,7 @@ static const float IDENTITY[16] = {
 /* How many chunks write_capture emits, for the read-back and truncation
  * checks. */
 #define SNAPSHOT_CHUNKS 27
-#define FRAME_CHUNKS    22
+#define FRAME_CHUNKS    27
 
 static int write_capture(const char *path)
 {
@@ -276,6 +289,9 @@ static int write_capture(const char *path)
     D3D8CapTexture tex = { 1, FMT_LIN_A8R8G8B8, 4, 4, 3, 0 };
     D3D8CapTexture scratch_tex = { 2, FMT_LIN_A8R8G8B8, 1, 1, 1, 0 };
     D3D8CapLevel scratch_level = { 4, 1, 4 };
+    D3D8CapTexture copy_tex = { 5, FMT_A8R8G8B8, COPY_EDGE, COPY_EDGE, 1, USAGE_RENDERTARGET };
+    D3D8CapLevel copy_level = { COPY_EDGE * 4, COPY_EDGE, COPY_EDGE * COPY_EDGE * 4 };
+    D3D8CapScreenCopy copy = { 5, 0, 0, 0, 0, 0, 0, 0 };
     static const uint8_t scratch_texel[4] = { 1, 2, 3, 4 };
     D3D8CapTextureLevel refill = { 1, 0, 16, 4, 64 };
     D3D8CapTexture target_tex = { 3, FMT_LIN_A8R8G8B8, 1, 1, 1, USAGE_RENDERTARGET };
@@ -372,6 +388,16 @@ static int write_capture(const char *path)
     w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 10 */
     d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
                   g_fvf_quad, sizeof g_fvf_quad, NULL, 0);                   /* 8 */
+    /* The frame so far -- the clear and the left quad -- copied into a
+     * 64x64 texture and drawn below the quad. */
+    d3d8cap_chunk(w, D3D8CAP_TEXTURE, &copy_tex, sizeof copy_tex,
+                  &copy_level, sizeof copy_level,
+                  g_copy_texels, sizeof g_copy_texels);
+    d3d8cap_chunk(w, D3D8CAP_SCREEN_COPY, &copy, sizeof copy, NULL, 0, NULL, 0);
+    w_set_texture(w, 0, 5);
+    d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
+                  g_copy_quad, sizeof g_copy_quad, NULL, 0);
+    w_set_texture(w, 0, 1);
     d3d8cap_chunk(w, D3D8CAP_TEXTURE_LEVEL, &refill, sizeof refill,
                   g_refill, sizeof g_refill, NULL, 0);                       /* 9 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE, &scratch_tex, sizeof scratch_tex,
@@ -422,7 +448,7 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 7 && D3D8CAP_VERSION == 7, "the version is 7");
+    check(h->version == 8 && D3D8CAP_VERSION == 8, "the version is 8");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 
@@ -552,6 +578,25 @@ static void read_capture(void)
               d->stride == FVF_STRIDE && d->vertex_bytes == 4 * FVF_STRIDE, "draw_up fields");
         check(v && !memcmp(v, g_fvf_quad, sizeof g_fvf_quad), "draw_up vertex bytes");
     }
+    if (next_of(r, &c, D3D8CAP_TEXTURE, "screen copy texture")) {
+        const D3D8CapTexture *p = c.data;
+        check(p->id == 5 && p->format == FMT_A8R8G8B8 && p->width == COPY_EDGE &&
+              p->usage == USAGE_RENDERTARGET, "screen copy texture fields");
+    }
+    if (next_of(r, &c, D3D8CAP_SCREEN_COPY, "screen_copy")) {
+        const D3D8CapScreenCopy *p = c.data;
+        check(c.bytes == sizeof *p && p->texture_id == 5 && p->has_rect == 0,
+              "screen copy fields");
+    }
+    if (next_of(r, &c, D3D8CAP_SET_TEXTURE, "the copy bound"))
+        check(((const D3D8CapSetTexture *)c.data)->texture_id == 5, "copy bound to stage 0");
+    if (next_of(r, &c, D3D8CAP_DRAW_UP, "the copy drawn")) {
+        const D3D8CapDrawUp *d = c.data;
+        const uint8_t *v = d3d8cap_tail(&c, sizeof *d, d->vertex_bytes);
+        check(v && !memcmp(v, g_copy_quad, sizeof g_copy_quad), "copy quad vertex bytes");
+    }
+    if (next_of(r, &c, D3D8CAP_SET_TEXTURE, "the checker bound again"))
+        check(((const D3D8CapSetTexture *)c.data)->texture_id == 1, "checker back on stage 0");
     if (next_of(r, &c, D3D8CAP_TEXTURE_LEVEL, "texture_level")) {
         const D3D8CapTextureLevel *t = c.data;
         const uint8_t *b = d3d8cap_tail(&c, sizeof *t, t->bytes);
@@ -761,7 +806,9 @@ int main(int argc, char **argv)
      *   d3d8_replay synthetic.d3dcap --out synthetic --loops 3 --dump-every
      *
      * The image should show, on a dark blue clear, a red square on the left
-     * (fixed function, texture) and an orange square on the right (vertex
+     * (fixed function, texture), below it a small copy of the screen as it
+     * was after that square (blue with a red patch, a screen copy), and an
+     * orange square on the right (vertex
      * program, declaration, NORMPACKED3 normal, screen-space undo,
      * combiners), and every loop's image should be byte-identical. The left
      * one is solid red, not the red/green checker the texture holds: the

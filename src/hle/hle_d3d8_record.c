@@ -1857,8 +1857,34 @@ static void op_screen_copy(const void *arg)
         host_CopyBackBufferToTexture(p->dst);
 }
 
+/* A screen copy, as the capture's own call: the destination's contents are
+ * written first (texture_id), as for a bind, so replay has the texture to
+ * copy into. A destination the capture cannot hold is counted with the
+ * binds it could not record, and its copy left out. */
+static void rec_screen_copy(IDirect3DTexture8 *dst, const RECT *src, const POINT *at)
+{
+    D3D8CapScreenCopy c;
+
+    memset(&c, 0, sizeof c);
+    c.texture_id = texture_id((IDirect3DBaseTexture8 *)dst);
+    if (!c.texture_id)
+        return;
+    if (src) {
+        c.has_rect = 1;
+        c.src_left = src->left;
+        c.src_top = src->top;
+        c.src_right = src->right;
+        c.src_bottom = src->bottom;
+        c.at_x = at ? at->x : 0;
+        c.at_y = at ? at->y : 0;
+    }
+    chunk(D3D8CAP_SCREEN_COPY, &c, sizeof c, NULL, 0, NULL, 0);
+}
+
 HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 {
+    if (g_cap && dst)
+        rec_screen_copy(dst, NULL, NULL);
     if (hle_d3d8_interp_rec) {
         dq_screen_copy p;
         memset(&p, 0, sizeof p);
@@ -1871,6 +1897,8 @@ HRESULT host_CopyBackBufferToTexture(IDirect3DTexture8 *dst)
 HRESULT host_CopyBackBufferRectToTexture(IDirect3DTexture8 *dst, const RECT *src,
                                          const POINT *at)
 {
+    if (g_cap && dst && src)
+        rec_screen_copy(dst, src, at);
     if (hle_d3d8_interp_rec && src) {
         dq_screen_copy p;
         memset(&p, 0, sizeof p);
