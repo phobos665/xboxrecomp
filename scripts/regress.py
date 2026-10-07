@@ -123,6 +123,19 @@ def title_running():
     return "_recomp.exe" in out
 
 
+def check_nobody_playing(run_lock, why):
+    """Stop if someone is playing. With --run-lock, a title that runs while
+    the lock is held is a scripted run, and every run of this pass takes the
+    same lock (as the agents' run-title.sh does), so the pass carries on and
+    its runs queue behind it; a title running with the lock free is a person."""
+    if not title_running():
+        return
+    if run_lock and Path(run_lock).exists():
+        log("a scripted title run holds the run lock; this pass's runs will wait for it")
+        return
+    sys.exit(why)
+
+
 # ── worktrees ──────────────────────────────────────────────────────────────
 
 def _is_link(p):
@@ -377,8 +390,8 @@ def main():
     prefix = shlex.split(args.build_prefix)
     jobs = args.jobs or None
 
-    if title_running():
-        sys.exit("A title is running -- someone is playing. Not starting.")
+    check_nobody_playing(args.run_lock,
+                         "A title is running -- someone is playing. Not starting.")
     wanted = [n.strip() for n in args.titles.split(",") if n.strip()]
     titles = cm.discover(wanted)
     for t in titles:                       # game data lives in the main checkout
@@ -416,8 +429,8 @@ def main():
     if args.no_run:
         return
 
-    if title_running():
-        sys.exit("A title started while building -- someone is playing. Not running.")
+    check_nobody_playing(args.run_lock,
+                         "A title started while building -- someone is playing. Not running.")
     out_root = REGRESS / "runs" / time.strftime("%Y%m%d-%H%M%S")
     out_root.mkdir(parents=True)
     for t in titles:
