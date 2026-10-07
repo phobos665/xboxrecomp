@@ -107,8 +107,8 @@ extern "C" {
  * fixed-function lights and the material, version 7 the texels of cubes
  * filled from memory and the stage palettes P8 textures are expanded with,
  * version 8 the screen copies (a title reading its own frame back into a
- * texture). */
-#define D3D8CAP_VERSION      8u
+ * texture), version 9 the scene's pixels as the frame begins. */
+#define D3D8CAP_VERSION      9u
 /* The oldest version the reader still accepts. A bump that only adds chunk
  * kinds leaves an older file a valid newer one that happens not to contain
  * them (version 6 added three; version 5 one), so it leaves this alone. A
@@ -156,7 +156,8 @@ enum {
     D3D8CAP_CUBE_LEVEL          = 29, /* D3D8CapCubeLevel + bytes (version 7) */
     D3D8CAP_PALETTE             = 30, /* D3D8CapPalette (version 7) */
     D3D8CAP_SCREEN_COPY         = 31, /* D3D8CapScreenCopy (version 8) */
-    D3D8CAP_CHUNK_KINDS         = 32  /* one past the last, for per-kind counters */
+    D3D8CAP_SCENE               = 32, /* D3D8CapScene + rows (version 9) */
+    D3D8CAP_CHUNK_KINDS         = 33  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -301,6 +302,20 @@ typedef struct {
     int32_t  src_left, src_top, src_right, src_bottom;
     int32_t  at_x, at_y;
 } D3D8CapScreenCopy;
+
+/* The scene -- what the device calls the back buffer, at the size the host
+ * renders it -- as the frame begins: `height` rows of `pitch` bytes, each
+ * `width` 32-bit pixels exactly as the back buffer surface's LockRect hands
+ * them out, which is R8G8B8A8 under every backend (d3d8_device.c makes the
+ * scene image in that format) and is written back the same way. In the
+ * snapshot, before anything else. A title whose screen copy or blend reads
+ * the frame before it -- TimeSplitters 2 copies its screen before it
+ * clears, for its blur -- replays from what the run had there, and every
+ * loop of a replay from the same pixels; without it (before version 9) the
+ * first loop read the device's zeroed scene and each later one the loop
+ * before. Left out when the scene is larger than D3D8CAP_SCENE_MAX_BYTES. */
+typedef struct { uint32_t width, height, pitch; } D3D8CapScene;
+#define D3D8CAP_SCENE_MAX_BYTES (64u << 20)
 
 /* SetRenderTarget. texture_id 0 is the back buffer; otherwise level `level`
  * of that texture, which was created with D3DUSAGE_RENDERTARGET. `face` is

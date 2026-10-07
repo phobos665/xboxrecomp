@@ -57,6 +57,8 @@ else()
     )
     find_package(Threads REQUIRED)
     # dl: dladdr / dl_iterate_phdr for the fault report (host_main_posix.c).
-    target_link_libraries(platform PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    # m: fenv and libm (_clearfp's feclearexcept here, cosf in the renderer),
+    # which glibc keeps out of libc; part of libSystem on macOS, so harmless.
+    target_link_libraries(platform PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

@@ -1,5 +1,5 @@
 /*
- * d3d8_capture -- round-trip the frame capture container (format version 8).
+ * d3d8_capture -- round-trip the frame capture container (format version 9).
  *
  * Writes a synthetic host-level capture -- a snapshot and a frame, using every
  * chunk kind -- reads it back, and asserts every field and every payload byte
@@ -14,8 +14,10 @@
  *
  * The frame is built to be worth replaying (see --write below): a textured
  * fixed-function quad on the left, a copy of the screen as it then is drawn
- * small below it (a screen copy, as a title reads its own frame back), and
- * on the right a quad drawn by an NV2A
+ * small below it (a screen copy, as a title reads its own frame back), beside
+ * that a copy taken before the frame's clear, which shows the scene as the
+ * frame began (a version 9 snapshot -- TimeSplitters 2 copies its screen
+ * before it clears), and on the right a quad drawn by an NV2A
  * vertex program with a declaration, whose colour comes from a NORMPACKED3
  * normal expanded exactly as shadow mode expands it, under the screen-space
  * undo and a register combiner token. Every value is a host value, as shadow
@@ -174,6 +176,12 @@ static uint8_t g_copy_quad[4 * FVF_STRIDE];     /* the screen copy, drawn below 
  * copy would show. */
 #define COPY_EDGE 64u
 static uint8_t g_copy_texels[COPY_EDGE * COPY_EDGE * 4];
+/* The scene as the frame begins (D3D8CAP_SCENE): 640x480 R8G8B8A8, all
+ * green 0xC0. A screen copy before the frame's clear reads it. */
+#define SCENE_W 640u
+#define SCENE_H 480u
+static uint8_t g_scene[SCENE_W * SCENE_H * 4];
+static uint8_t g_early_quad[4 * FVF_STRIDE];   /* that copy, drawn bottom right */
 static uint8_t g_program_quad[4 * PROGRAM_STRIDE];
 static const uint16_t QUAD_INDICES[6] = { 0, 1, 2, 0, 2, 3 };
 
@@ -186,6 +194,10 @@ static void build_data(void)
 {
     uint32_t x, y;
 
+    fvf_vertex(g_early_quad + 0 * FVF_STRIDE, 360.0f, 300.0f, 0.0f, 0.0f);
+    fvf_vertex(g_early_quad + 1 * FVF_STRIDE, 600.0f, 300.0f, 1.0f, 0.0f);
+    fvf_vertex(g_early_quad + 2 * FVF_STRIDE, 360.0f, 460.0f, 0.0f, 1.0f);
+    fvf_vertex(g_early_quad + 3 * FVF_STRIDE, 600.0f, 460.0f, 1.0f, 1.0f);
     fvf_vertex(g_copy_quad + 0 * FVF_STRIDE,  40.0f, 300.0f, 0.0f, 0.0f);
     fvf_vertex(g_copy_quad + 1 * FVF_STRIDE, 280.0f, 300.0f, 1.0f, 0.0f);
     fvf_vertex(g_copy_quad + 2 * FVF_STRIDE,  40.0f, 460.0f, 0.0f, 1.0f);
@@ -276,8 +288,8 @@ static const float IDENTITY[16] = {
 
 /* How many chunks write_capture emits, for the read-back and truncation
  * checks. */
-#define SNAPSHOT_CHUNKS 27
-#define FRAME_CHUNKS    27
+#define SNAPSHOT_CHUNKS 28
+#define FRAME_CHUNKS    31
 
 static int write_capture(const char *path)
 {
@@ -292,6 +304,9 @@ static int write_capture(const char *path)
     D3D8CapTexture copy_tex = { 5, FMT_A8R8G8B8, COPY_EDGE, COPY_EDGE, 1, USAGE_RENDERTARGET };
     D3D8CapLevel copy_level = { COPY_EDGE * 4, COPY_EDGE, COPY_EDGE * COPY_EDGE * 4 };
     D3D8CapScreenCopy copy = { 5, 0, 0, 0, 0, 0, 0, 0 };
+    D3D8CapScene scene = { SCENE_W, SCENE_H, SCENE_W * 4 };
+    D3D8CapTexture early_tex = { 6, FMT_A8R8G8B8, COPY_EDGE, COPY_EDGE, 1, USAGE_RENDERTARGET };
+    D3D8CapScreenCopy early_copy = { 6, 0, 0, 0, 0, 0, 0, 0 };
     static const uint8_t scratch_texel[4] = { 1, 2, 3, 4 };
     D3D8CapTextureLevel refill = { 1, 0, 16, 4, 64 };
     D3D8CapTexture target_tex = { 3, FMT_LIN_A8R8G8B8, 1, 1, 1, USAGE_RENDERTARGET };
@@ -322,9 +337,17 @@ static int write_capture(const char *path)
     mov_input_to_output(g_microcode + 0, 0, 0, 0);     /* MOV oPos, v0 */
     mov_input_to_output(g_microcode + 4, 2, 3, 1);     /* MOV oD0, v2  */
 
-    /* ---- snapshot: 27 chunks, in the writer's documented order, less the
+    /* ---- snapshot: 28 chunks, in the writer's documented order, less the
      * sixteen input current values the real writer puts after the
      * screen-space chunk (the frame below carries one) */
+    for (i = 0; i < SCENE_W * SCENE_H; i++) {
+        g_scene[i * 4 + 0] = 0x00;
+        g_scene[i * 4 + 1] = 0xC0;
+        g_scene[i * 4 + 2] = 0x00;
+        g_scene[i * 4 + 3] = 0xFF;
+    }
+    d3d8cap_chunk(w, D3D8CAP_SCENE, &scene, sizeof scene,
+                  g_scene, sizeof g_scene, NULL, 0);                         /* 0 */
     w_vs_create(w, PROGRAM, g_microcode, 2);                                 /* 1 */
     d3d8cap_chunk(w, D3D8CAP_VS_DECLARATION, &decl, sizeof decl,
                   DECL, sizeof DECL, NULL, 0);                               /* 2 */
@@ -367,6 +390,11 @@ static int write_capture(const char *path)
      * green and one cube face blue, then go back to the back buffer, so a
      * replay that forgot either switch shows that colour instead of the two
      * quads. */
+    /* Before anything is drawn: the scene as the frame began, copied. */
+    d3d8cap_chunk(w, D3D8CAP_TEXTURE, &early_tex, sizeof early_tex,
+                  &copy_level, sizeof copy_level,
+                  g_copy_texels, sizeof g_copy_texels);
+    d3d8cap_chunk(w, D3D8CAP_SCREEN_COPY, &early_copy, sizeof early_copy, NULL, 0, NULL, 0);
     d3d8cap_chunk(w, D3D8CAP_CLEAR, &clear, sizeof clear, NULL, 0, NULL, 0); /* 1 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE, &target_tex, sizeof target_tex,
                   &scratch_level, sizeof scratch_level,
@@ -397,6 +425,9 @@ static int write_capture(const char *path)
     w_set_texture(w, 0, 5);
     d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
                   g_copy_quad, sizeof g_copy_quad, NULL, 0);
+    w_set_texture(w, 0, 6);
+    d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
+                  g_early_quad, sizeof g_early_quad, NULL, 0);
     w_set_texture(w, 0, 1);
     d3d8cap_chunk(w, D3D8CAP_TEXTURE_LEVEL, &refill, sizeof refill,
                   g_refill, sizeof g_refill, NULL, 0);                       /* 9 */
@@ -448,11 +479,17 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 8 && D3D8CAP_VERSION == 8, "the version is 8");
+    check(h->version == 9 && D3D8CAP_VERSION == 9, "the version is 9");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 
-    if (next_of(r, &c, D3D8CAP_VS_CREATE, "vs_create first")) {
+    if (next_of(r, &c, D3D8CAP_SCENE, "the scene first")) {
+        const D3D8CapScene *p = c.data;
+        const uint8_t *px = d3d8cap_tail(&c, sizeof *p, sizeof g_scene);
+        check(p->width == SCENE_W && p->height == SCENE_H && p->pitch == SCENE_W * 4 && px &&
+              !memcmp(px, g_scene, sizeof g_scene), "scene fields and pixels");
+    }
+    if (next_of(r, &c, D3D8CAP_VS_CREATE, "vs_create next")) {
         const D3D8CapVsCreate *p = c.data;
         const uint32_t *code = d3d8cap_tail(&c, sizeof *p, 2 * 16);
         uint32_t w3;
@@ -533,6 +570,10 @@ static void read_capture(void)
         check(c.bytes == 0 && c.data == NULL, "frame_start has no payload");
 
     /* The frame. */
+    if (next_of(r, &c, D3D8CAP_TEXTURE, "the early copy's texture"))
+        check(((const D3D8CapTexture *)c.data)->id == 6, "early copy texture id");
+    if (next_of(r, &c, D3D8CAP_SCREEN_COPY, "the copy before the clear"))
+        check(((const D3D8CapScreenCopy *)c.data)->texture_id == 6, "early copy into 6");
     if (next_of(r, &c, D3D8CAP_CLEAR, "clear")) {
         const D3D8CapClear *p = c.data;
         check(p->rect_count == 0 && p->flags == 3 && p->color == CLEAR_COLOR &&
@@ -595,6 +636,9 @@ static void read_capture(void)
         const uint8_t *v = d3d8cap_tail(&c, sizeof *d, d->vertex_bytes);
         check(v && !memcmp(v, g_copy_quad, sizeof g_copy_quad), "copy quad vertex bytes");
     }
+    if (next_of(r, &c, D3D8CAP_SET_TEXTURE, "the early copy bound"))
+        check(((const D3D8CapSetTexture *)c.data)->texture_id == 6, "early copy on stage 0");
+    next_of(r, &c, D3D8CAP_DRAW_UP, "the early copy drawn");
     if (next_of(r, &c, D3D8CAP_SET_TEXTURE, "the checker bound again"))
         check(((const D3D8CapSetTexture *)c.data)->texture_id == 1, "checker back on stage 0");
     if (next_of(r, &c, D3D8CAP_TEXTURE_LEVEL, "texture_level")) {

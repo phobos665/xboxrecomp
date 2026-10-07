@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int g_failures;
 
@@ -19,8 +20,21 @@ static int g_failures;
         }                                                             \
     } while (0)
 
-/* Generous: a loaded CI runner can be late by a scheduler quantum or two. */
-#define SLACK_US 20000
+/* How late a wake may be. Locally 20 ms, which a working timer never comes
+ * near (the worst measured on this project's Macs is under 0.2 ms): a
+ * regression to scheduler-tick sleeps fails here. On a CI runner -- a shared,
+ * often overloaded VM, where GitHub's macOS one has been seen to wake 46 ms
+ * late for an 8 ms wait -- only gross errors fail: 100 ms late, a wait that
+ * returns early (checked everywhere, at the same bound), or an event that
+ * never wakes the wait. The numbers are printed either way. */
+static int64_t SLACK_US = 20000;
+
+static int on_ci(void)
+{
+    const char *ci = getenv("CI"), *gha = getenv("GITHUB_ACTIONS");
+    return (ci && *ci && strcmp(ci, "0") != 0 && strcmp(ci, "false") != 0) ||
+           (gha && *gha && strcmp(gha, "false") != 0);
+}
 
 static HANDLE g_event;
 
@@ -153,6 +167,11 @@ int main(void)
 {
     host_timer *t = host_timer_create(HOST_TIMER_ANY);
 
+    if (on_ci()) {
+        SLACK_US = 100000;
+        printf("CI runner: only gross errors fail (100 ms late, an early wake, "
+               "an event that does not wake)\n");
+    }
     CHECK(t != NULL, "host_timer_create(ANY) returned NULL");
     if (!t)
         return 1;

@@ -200,8 +200,11 @@ push buffers through `BeginPush`, whose draws no replacement ever sees.
 - A render target texture replays as zeros: its contents are drawn, never in
   the guest's memory, so a capture that samples one without drawing into it
   first shows nothing. Screen copies (the title reading its own frame back)
-  are recorded since capture format 8 and made again on replay; a copy taken
-  in an earlier frame is still not in the capture.
+  are recorded since capture format 8 and made again on replay, and since
+  format 9 the scene's pixels as the frame begins are too, so a frame that
+  reads its predecessor (a copy before the clear) replays as it ran. A
+  render target texture drawn in an earlier frame is still not in the
+  capture.
 - Lights and material are not forwarded, so lighting stays off.
 - Three render state layouts are read: XDK 4627+ (deferred states at slot 92,
   complex at 136), XDK 4034-4431 (82 and 117) and XDK builds before 4034 (82
