@@ -154,9 +154,9 @@ void d3d8_compile_note(int kind, long long started)
         g_compile_last_report = now.QuadPart;
         fprintf(stderr, "[D3D8] runtime shader compiles so far: combiner %ld (%.0f ms), "
                 "fixed-function %ld (%.0f ms), vertex program %ld (%.0f ms)\n",
-                g_compiles[0], g_compile_ticks[0] * 1000.0 / g_compile_qpf,
-                g_compiles[1], g_compile_ticks[1] * 1000.0 / g_compile_qpf,
-                g_compiles[2], g_compile_ticks[2] * 1000.0 / g_compile_qpf);
+                (long)g_compiles[0], g_compile_ticks[0] * 1000.0 / g_compile_qpf,
+                (long)g_compiles[1], g_compile_ticks[1] * 1000.0 / g_compile_qpf,
+                (long)g_compiles[2], g_compile_ticks[2] * 1000.0 / g_compile_qpf);
         fflush(stderr);
     }
 }

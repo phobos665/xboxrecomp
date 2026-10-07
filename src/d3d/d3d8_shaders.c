@@ -747,7 +747,7 @@ static RhiVertexLayout *get_or_create_layout(DWORD fvf)
         RhiVertexLayout *layout = rhi_vertex_layout_create(elems, elem_count, g_vs);
 
         if (!layout)
-            fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX\n", fvf);
+            fprintf(stderr, "D3D8: CreateInputLayout failed for FVF 0x%lX\n", (unsigned long)fvf);
 
         if (g_layout_cache_count < MAX_LAYOUT_CACHE) {
             g_layout_cache[g_layout_cache_count].fvf = fvf;

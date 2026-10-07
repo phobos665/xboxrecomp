@@ -1354,7 +1354,7 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
         static int logged;
         if (logged < 64) {
             fprintf(stderr, "D3D8 VSH: Created shader handle 0x%lX (%d instructions)%s\n",
-                    *out_handle, num_insns,
+                    (unsigned long)*out_handle, num_insns,
                     ++logged == 64 ? " (further creates not logged)" : "");
         }
     }

@@ -1296,6 +1296,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     return STATUS_SUCCESS;
 }
 
+/* The Windows branch records the Win32 error of a failed open for the
+ * bridge's [FILE] line; this branch does not yet, so the line says 0. */
+uint32_t xbox_LastFileError(void)
+{
+    return 0;
+}
+
 #endif /* _WIN32 */
 
 /* ======================================================================== */

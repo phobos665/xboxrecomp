@@ -117,11 +117,10 @@ elseif(NOT WIN32)
                     "headers missing), so this build has no renderer")
 endif()
 
-if(WIN32)
-    # Offline smoke test for the pure format layer (no D3D11 device needed).
-    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
-                     ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
-endif()
+# Offline smoke tests for the pure format layer (no device needed); off
+# Windows only the two that need no D3D11.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
+                 ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # Whatever links this has the whole renderer (src/hle keys its shadow path on
