@@ -133,6 +133,8 @@ static unsigned long      g_shadow_map_big_sets, g_shadow_map_big_draws;   /* 25
  * alone (another method, or no vertex size). */
 static unsigned long      g_push_count, g_push_draws, g_push_other, g_push_nostride;
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
+static int                g_target_is_screen = 1;   /* the bound target is the screen */
+static unsigned long      g_screen_changes;          /* draws and clears that reached it */
 static HWND               g_shadow_hwnd;
 static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
@@ -1534,7 +1536,17 @@ states:
     hle_d3d8_shadow_apply_states(g_shadow);
     hle_d3d8_sync_palettes(g_shadow);
     g_frame_draws++;
+    if (g_target_is_screen)
+        g_screen_changes++;
     return 1;
+}
+
+/* How many times the screen has been drawn into or cleared, ever. The
+ * texture layer refills a texture over the title's own frame when this has
+ * moved since its last copy (hle_d3d8_texture.c, framebuffer_texture). */
+unsigned long hle_d3d8_screen_changes(void)
+{
+    return g_screen_changes;
 }
 
 /* ------------------------------------------------------------ frame dumps */
@@ -2129,11 +2141,13 @@ HLE_EXPORT(D3DDevice_Clear)
                 done += n;
             }
         }
+        if (g_target_is_screen)
+            g_screen_changes++;
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())
-            fprintf(stderr, "[TRACE swap %lu] Clear flags 0x%X color 0x%08X\n",
-                    g_shadow_swaps, flags, color);
+            fprintf(stderr, "[TRACE swap %lu] (after %lu draws) Clear flags 0x%X color 0x%08X\n",
+                    g_shadow_swaps, g_frame_draws, flags, color);
     }
 }
 
@@ -2446,6 +2460,12 @@ HLE_EXPORT(D3DDevice_Swap)
     if (half) {
         if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
             HLE_RETURN(0x80004005u);
+#ifdef _WIN32
+        /* The frame so far, for the half that composites it. */
+        if (shadow_trace_on())
+            fprintf(stderr, "[TRACE swap %lu] (after %lu draws) Swap flags 0x%X: first half of a frame\n",
+                    g_shadow_swaps, g_frame_draws, swap_flags);
+#endif
         HLE_CALL_ORIGINAL(D3DDevice_Swap);
         return;
     }
@@ -4108,8 +4128,8 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             g_target_scratch++;
         }
         if (shadow_trace_on())
-            fprintf(stderr, "[TRACE swap %lu] SetRenderTarget 0x%08X data 0x%08X parent 0x%08X "
-                    "%ux%u zs 0x%08X -> %s\n", g_shadow_swaps, rt, HLE_MEM32(rt + 4),
+            fprintf(stderr, "[TRACE swap %lu] (after %lu draws) SetRenderTarget 0x%08X data 0x%08X parent 0x%08X "
+                    "%ux%u zs 0x%08X -> %s\n", g_shadow_swaps, g_frame_draws, rt, HLE_MEM32(rt + 4),
                     parent, w, h, zs,
                     kind == 0 ? "back buffer" : kind == 1 ? "render target texture"
                                   : kind == 3 ? "cube face" : "scratch target");
@@ -4236,6 +4256,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         g_target_shadow_map = 0;
     }
 
+    g_target_is_screen = kind == 0;
     if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : target, level, face,
                                     depth))) {
         IDirect3DTexture8 *scratch = kind != 0 ? scratch_target(w, h) : NULL;
