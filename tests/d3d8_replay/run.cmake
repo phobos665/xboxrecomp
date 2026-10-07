@@ -69,7 +69,7 @@ endfunction()
 
 foreach(img syn000.bmp syn000_present.bmp)
     # The clear, 0xFF203060.
-    expect_pixel(${WORK}/${img} 10 10 0x20 0x30 0x60 "the clear colour")
+    expect_pixel(${WORK}/${img} 320 10 0x20 0x30 0x60 "the clear colour")
     expect_pixel(${WORK}/${img} 320 400 0x20 0x30 0x60 "the clear colour")
     # Left: the fixed-function quad over a LIN_A8R8G8B8 checker. Linear
     # textures are texel-addressed on the NV2A (shadow-mode.md, Future
@@ -90,5 +90,25 @@ foreach(img syn000.bmp syn000_present.bmp)
     # 0xC0), drawn at 360..600 x 300..460. Black here means the snapshot was
     # not restored, blue that the copy came after the clear.
     expect_pixel(${WORK}/${img} 480 380 0 0xC0 0 "the scene the frame began with")
+    # The bottom-right corner, 600..640 x 440..480: a Clear with that one
+    # rectangle, cyan. Just outside it the frame's clear colour stays -- a
+    # Clear that ignored its rectangle would have turned the screen cyan.
+    expect_pixel(${WORK}/${img} 620 470 0 0xFF 0xFF "the rectangle clear")
+    expect_pixel(${WORK}/${img} 590 470 0x20 0x30 0x60 "beside the rectangle clear")
+    expect_pixel(${WORK}/${img} 620 430 0x20 0x30 0x60 "above the rectangle clear")
+    # A draw right after that clear, still under the scissor (0..100 square)
+    # set before it: drawn where the scissor lets it (green, the early copy's
+    # texture) and nowhere else -- the clear left the title's state alone.
+    expect_pixel(${WORK}/${img} 20 20 0 0xC0 0 "the draw after the rectangle clear")
+    expect_pixel(${WORK}/${img} 150 20 0x20 0x30 0x60 "the scissor, kept through the clear")
+    # Depth/stencil-only rectangle clears: z 0.5 and stencil 7 at 290..330 x
+    # 310..350, z 0.5 and stencil 3 at 290..330 x 380..420, colour magenta
+    # (must not land). Then a red quad at z 0.5 over 282..352 x 300..450
+    # under ZFUNC EQUAL and stencil EQUAL 7: red exactly in the first, the
+    # clear colour in the second (stencil 3) and around both (z 1).
+    expect_pixel(${WORK}/${img} 310 330 255 0 0 "z 0.5 and stencil 7, exactly")
+    expect_pixel(${WORK}/${img} 310 400 0x20 0x30 0x60 "stencil 3, and no colour written")
+    expect_pixel(${WORK}/${img} 285 330 0x20 0x30 0x60 "outside the depth rectangles")
+    expect_pixel(${WORK}/${img} 345 330 0x20 0x30 0x60 "outside the depth rectangles")
 endforeach()
 message("d3d8_replay: the synthetic frame replays, identically each loop, with its colours")
