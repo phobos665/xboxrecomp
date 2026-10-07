@@ -636,6 +636,15 @@ static void d3d8_init_default_states(D3D8DeviceState *state)
     state->render_states[D3DRS_FOGENABLE]         = FALSE;
     state->render_states[D3DRS_STENCILENABLE]     = FALSE;
     state->render_states[D3DRS_COLORWRITEENABLE]  = 0x0F;
+    /* Lit vertices take their diffuse and specular colours from the vertex
+     * unless told otherwise: D3D's defaults, which a title that never sets
+     * them is relying on. Zero (material) for all four drew Max Payne's
+     * graphic novel under opaque covers. */
+    state->render_states[D3DRS_COLORVERTEX]              = TRUE;
+    state->render_states[D3DRS_DIFFUSEMATERIALSOURCE]    = 1;   /* D3DMCS_COLOR1 */
+    state->render_states[D3DRS_SPECULARMATERIALSOURCE]   = 2;   /* D3DMCS_COLOR2 */
+    state->render_states[D3DRS_AMBIENTMATERIALSOURCE]    = 0;   /* D3DMCS_MATERIAL */
+    state->render_states[D3DRS_EMISSIVEMATERIALSOURCE]   = 0;
 
     /* Default viewport. In guest pixels, like every viewport a title sets
      * and reads back: the conversion to host pixels happens in
