@@ -225,9 +225,14 @@ Vulkan backend is not built) and compiles the generated HLSL with
 `-HV 2018`: the generators rely on HLSL 2018's implicit conversions, so do not move them
 to 2021 without fixing those first. MoltenVK gaps the RHI works around: no D24S8 (D32S8
 instead), B4G4R4A4 is not a blendable target, no sampler LOD bias, strips always restart
-at 0xFFFF. Capture format 8 records screen copies, and a replayed TS2 frame is
-byte-identical to the live one; a capture with `RECOMP_FRAME_INTERP` on records twice,
-so capture with it off.
+at 0xFFFF. Capture format 9 records screen copies and the scene as each frame begins, and
+a replayed TS2 frame (menus and in-level) is byte-identical to the live one; a capture
+named N holds the frame drawn after swap N, so it pairs with frame dump N+1, and a capture
+with `RECOMP_FRAME_INTERP` on records twice, so capture with it off. Two renderer fixes from
+this work change what Windows shows too: the display resolve sampled half a pixel off (every
+presented frame was slightly blurred, D3D11 included), and a `Clear` with rectangles cleared
+the whole target (`src/d3d/d3d8_clear.c` now clears only the rectangles). The Vulkan path
+asks DXC for `-HV 2018`; a `third_party\dxc` too old to know the flag fails every shader.
 
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
