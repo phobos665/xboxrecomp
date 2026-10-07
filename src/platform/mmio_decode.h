@@ -89,7 +89,8 @@ static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
         if (mod == 0 && (ip[1] & 7) == 5) len += 4;
     }
     else if (mod == 0 && (rm & 7) == 5) len += 4;   /* disp32 / RIP-relative */
-    else if (mod == 1) len += 1;
+    /* The displacement for mod 1/2 applies with or without a SIB byte. */
+    if (mod == 1) len += 1;
     else if (mod == 2) len += 4;
     return len;
 }

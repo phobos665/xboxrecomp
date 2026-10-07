@@ -191,6 +191,19 @@ int main(void)
     { const uint8_t c4[] = { 0x89, 0x0C, 0x25, 0x44, 0x33, 0x22, 0x11 };
       CHECK("SIB disp32 handled", run(c4, sizeof c4, &ctx)); }
 
+    /* SIB plus a displacement: mov [rsp+8], eax -- 89 44 24 08 (mod 1), and
+     * mov [rax+rcx*4+0x100], eax -- 89 84 88 00 01 00 00 (mod 2). */
+    { const uint8_t c5[] = { 0x89, 0x44, 0x24, 0x08 };
+      CHECK("SIB disp8 handled", run(c5, sizeof c5, &ctx)); }
+    { const uint8_t c6[] = { 0x89, 0x84, 0x88, 0x00, 0x01, 0x00, 0x00 };
+      CHECK("SIB disp32 (mod 2) handled", run(c6, sizeof c6, &ctx)); }
+    /* And without SIB: mov [rax+0x10], ecx -- 89 48 10; mov [rax+0x1000],
+     * ecx -- 89 88 00 10 00 00. */
+    { const uint8_t c7[] = { 0x89, 0x48, 0x10 };
+      CHECK("disp8 handled", run(c7, sizeof c7, &ctx)); }
+    { const uint8_t c8[] = { 0x89, 0x88, 0x00, 0x10, 0x00, 0x00 };
+      CHECK("disp32 handled", run(c8, sizeof c8, &ctx)); }
+
     /* mov word [rax], 0xBEEF -- 66 C7 00 EF BE. A 16-bit immediate: two
      * bytes, not four. GCC emits this for a 16-bit MEM16 store of a
      * constant, and reading four took the next instruction's bytes. */
