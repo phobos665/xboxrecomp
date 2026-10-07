@@ -128,14 +128,27 @@ void host_sleep_precision_1ms(void)
     timeBeginPeriod(1);
 }
 
+int host_thread_realtime(uint32_t period_us, uint32_t computation_us,
+                         uint32_t constraint_us)
+{
+    (void)period_us;
+    (void)computation_us;
+    (void)constraint_us;
+    return 0;
+}
+
 #else
 /* ===================================================================== */
 /* POSIX                                                                 */
 /* ===================================================================== */
 #include <errno.h>
 #include <time.h>
+#include <stdio.h>
 #ifdef __APPLE__
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
 #endif
 #include "win32_compat.h"   /* w32_wait_single_us, for the event wait */
 
@@ -226,11 +239,67 @@ static void sleep_until_ns(int64_t deadline_ns)
 }
 #endif
 
+/* A thread host_thread_realtime made real-time, while its wakes are on
+ * time: 1 real-time, 0 not (or demoted). */
+static __thread int t_realtime;
+static __thread int t_realtime_late;
+
+int host_thread_realtime(uint32_t period_us, uint32_t computation_us,
+                         uint32_t constraint_us)
+{
+#ifdef __APPLE__
+    thread_time_constraint_policy_data_t p;
+    double ns_to_ticks;
+    kern_return_t kr;
+
+    if (!g_timebase.denom)
+        mach_timebase_info(&g_timebase);
+    ns_to_ticks = (double)g_timebase.denom / (double)g_timebase.numer;
+    p.period      = (uint32_t)((double)period_us * 1000.0 * ns_to_ticks);
+    p.computation = (uint32_t)((double)computation_us * 1000.0 * ns_to_ticks);
+    p.constraint  = (uint32_t)((double)constraint_us * 1000.0 * ns_to_ticks);
+    p.preemptible = TRUE;
+    kr = thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                           THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p,
+                           THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    t_realtime = kr == KERN_SUCCESS;
+    t_realtime_late = 0;
+    return t_realtime;
+#else
+    (void)period_us;
+    (void)computation_us;
+    (void)constraint_us;
+    return 0;
+#endif
+}
+
 /* To the deadline, as precisely as the host allows (the comment above). */
 static void sleep_precisely_until(int64_t deadline_ns)
 {
     int64_t left;
 
+    if (t_realtime) {
+        /* One sleep, which a real-time thread is woken from on time. Three
+         * late wakes in a row mean the scheduler has demoted it: step from
+         * then on, as any other thread does. */
+        int64_t late;
+
+        sleep_until_ns(deadline_ns);
+        late = host_time_ns() - deadline_ns;
+        if (late > WAIT_SPIN_NS) {
+            if (++t_realtime_late >= 3) {
+                t_realtime = 0;
+                fprintf(stderr, "[TIMER] a real-time thread's wakes are late "
+                                "(%lld us): stepping its waits from now on\n",
+                        (long long)(late / 1000));
+            }
+        } else {
+            t_realtime_late = 0;
+        }
+        while (host_time_ns() < deadline_ns)
+            ;
+        return;
+    }
     while ((left = deadline_ns - host_time_ns()) > WAIT_SPIN_NS)
         sleep_until_ns(deadline_ns - left + WAIT_STEP(left));
     while (host_time_ns() < deadline_ns)
