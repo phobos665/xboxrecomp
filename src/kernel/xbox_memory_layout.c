@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "recomp_config.h"
 #include "xbox_watchpoint.h"
+#include "platform/host_timer.h"   /* the flip gate's and the ack thread's waits */
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
  *
@@ -34,6 +35,9 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
+#endif
+#ifdef __APPLE__
+#include <pthread.h>  /* pthread_set_qos_class_self_np (RECOMP_GUEST_ONE_CPU) */
 #endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -817,6 +821,7 @@ static void park_enter(void)
  * logical processor's EfficiencyClass (higher is faster); the pick is the
  * highest-numbered processor of the highest class, which also keeps the
  * guest off CPU 0. */
+#ifdef _WIN32
 typedef BOOL (WINAPI *GetSystemCpuSetInformation_t)(PVOID, ULONG, PULONG, HANDLE, ULONG);
 
 static DWORD_PTR fastest_core_mask(DWORD_PTR proc)
@@ -890,16 +895,51 @@ static DWORD_PTR guest_cpu_mask(void)
     return mask;
 }
 
+static void guest_cpu_pin(void)
+{
+    DWORD_PTR m = guest_cpu_mask();
+    if (m)
+        SetThreadAffinityMask(GetCurrentThread(), m);
+}
+#else
+/* No POSIX host here can pin a thread to a core: Linux could
+ * (pthread_setaffinity_np) but has never been asked to, and macOS has only
+ * hints -- THREAD_AFFINITY_POLICY is ignored on Apple Silicon. What macOS
+ * does take is a QoS class, and USER_INTERACTIVE keeps a thread on the
+ * performance cores, which is the half of the switch that was about speed
+ * (the E-core measurement above). The half that was about running one guest
+ * thread at a time is RECOMP_GUEST_LOCK's job. */
+static void guest_cpu_pin(void)
+{
+    static int said;
+    const char *v = getenv("RECOMP_GUEST_ONE_CPU");
+
+    if (!v || strtol(v, NULL, 0) <= 0)
+        return;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[THREAD] RECOMP_GUEST_ONE_CPU: no core pinning on this host%s\n",
+#ifdef __APPLE__
+                "; guest threads get QOS_CLASS_USER_INTERACTIVE instead"
+#else
+                "; ignored"
+#endif
+                );
+    }
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+#endif
+
 void xbox_GuestLiftedEnter(void)
 {
     LONG n;
     {
         static RECOMP_TLS int pinned;
         if (!pinned) {
-            DWORD_PTR m = guest_cpu_mask();
             pinned = 1;
-            if (m)
-                SetThreadAffinityMask(GetCurrentThread(), m);
+            guest_cpu_pin();
         }
     }
     park_enter();
@@ -1087,27 +1127,21 @@ void xbox_Nv2aFlipGateSetIdle(xbox_FlipGateIdleFn fn)
  * TRUE if the vblank came (the gate is released). */
 static BOOL flip_gate_lend(void)
 {
-    static HANDLE timer;
-    HANDLE both[2];
+    static host_timer *timer;
 
     if (!g_flip_gate_period)
         return FALSE;
     if (!timer) {
         /* High resolution: a slot a few milliseconds away has to be met to
          * well under a millisecond, which the default timer cannot do. */
-        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
-                                       TIMER_ALL_ACCESS);
-        if (!timer)
-            timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+        timer = host_timer_create(HOST_TIMER_ANY);
         if (!timer)
             return FALSE;
     }
-    both[0] = g_flip_gate_event;
-    both[1] = timer;
     for (;;) {
-        LARGE_INTEGER now, due;
-        LONGLONG want;
-        DWORD r;
+        LARGE_INTEGER now;
+        LONGLONG want, due_us;
+        int r;
 
         if (WaitForSingleObject(g_flip_gate_event, 0) == WAIT_OBJECT_0)
             return TRUE;
@@ -1118,17 +1152,14 @@ static BOOL flip_gate_lend(void)
         QueryPerformanceCounter(&now);
         if (want <= now.QuadPart)
             continue;
-        /* Relative, in 100 ns units. */
-        due.QuadPart = -(LONGLONG)((double)(want - now.QuadPart) * 1e7 /
-                                   (double)g_flip_gate_qpf);
-        if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
-            return FALSE;
-        r = WaitForMultipleObjects(2, both, FALSE, 250);
-        if (r == WAIT_OBJECT_0) {
-            CancelWaitableTimer(timer);
-            return TRUE;
-        }
-        if (r != WAIT_OBJECT_0 + 1)
+        /* Relative, in microseconds; host_timer_wait_us_or_event arms the
+         * timer in the host's own units (100 ns on Windows). */
+        due_us = (LONGLONG)((double)(want - now.QuadPart) * 1e6 /
+                            (double)g_flip_gate_qpf);
+        r = host_timer_wait_us_or_event(timer, due_us, g_flip_gate_event, 250);
+        if (r == HOST_WAIT_EVENT)
+            return TRUE;                                /* the vblank came */
+        if (r != HOST_WAIT_ELAPSED)
             return FALSE;                               /* the plain wait reports it */
     }
 }
@@ -1284,11 +1315,11 @@ static void framebuffer_probe_tick(void)
  * later. */
 static void nv2a_ack_wait(void)
 {
-    static int      idle_us = -1;
-    static HANDLE   timer;
-    static LONG     seen;
-    static LONGLONG quiet_since, qpf;
-    LARGE_INTEGER   now, due;
+    static int        idle_us = -1;
+    static host_timer *timer;
+    static LONG       seen;
+    static LONGLONG   quiet_since, qpf;
+    LARGE_INTEGER     now;
 
     if (idle_us < 0) {
         const char *v = getenv("RECOMP_NV2A_ACK_IDLE_US");
@@ -1298,10 +1329,7 @@ static void nv2a_ack_wait(void)
         if (idle_us < 0)
             idle_us = 0;
         if (idle_us) {
-            timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
-                                           TIMER_ALL_ACCESS);
-            if (!timer)
-                timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+            timer = host_timer_create(HOST_TIMER_ANY);
             if (!timer)
                 idle_us = 0;
         }
@@ -1324,10 +1352,7 @@ static void nv2a_ack_wait(void)
         Sleep(0);   /* busy: a waiter is spinning on another core */
         return;
     }
-    due.QuadPart = -(LONGLONG)idle_us * 10;   /* relative, 100 ns units */
-    if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
-        WaitForSingleObject(timer, 50);
-    else
+    if (host_timer_wait_us(timer, idle_us, 50) == HOST_WAIT_NOT_ARMED)
         Sleep(1);
 }
 

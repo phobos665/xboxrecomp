@@ -28,9 +28,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
-#ifdef _WIN32
-#include <mmsystem.h>      /* timeBeginPeriod, for the vblank clock's fallback */
-#endif
+#include "platform/host_timer.h"   /* the vblank clock's precise sleep */
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -3084,11 +3082,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
      * fires within about 0.5 ms. Where it is unavailable, timeBeginPeriod(1)
      * gets Sleep close to 1 ms at the cost of a system-wide 1 kHz tick. */
     {
-        HANDLE hires = CreateWaitableTimerExW(NULL, NULL,
-                                              0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
-                                              TIMER_ALL_ACCESS);
+        host_timer *hires = host_timer_create(HOST_TIMER_HIGH_RES_ONLY);
         if (!hires && vblank_clock_wait_us() >= 0)
-            timeBeginPeriod(1);
+            host_sleep_precision_1ms();
 
         for (;;) {
             long long now;
@@ -3103,10 +3099,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 if (wait_us > 10000)
                     wait_us = 10000;
                 if (hires) {
-                    LARGE_INTEGER due;
-                    due.QuadPart = -(wait_us * 10);
-                    SetWaitableTimer(hires, &due, 0, NULL, NULL, FALSE);
-                    WaitForSingleObject(hires, INFINITE);
+                    host_timer_wait_us(hires, wait_us, INFINITE);
                 } else {
                     Sleep((DWORD)((wait_us + 999) / 1000));
                 }
