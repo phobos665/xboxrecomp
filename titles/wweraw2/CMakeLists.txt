@@ -10,7 +10,10 @@ cmake_minimum_required(VERSION 3.20)
 #   4. Add any game-specific compile definitions or link libraries
 # ============================================================================
 
-project(wweraw2_recomp C)
+# C and C++: the runtime's renderer has C++ in it (the DXC loader, VMA),
+# so the executable links with the C++ driver and its standard library.
+# The game's own sources are all C.
+project(wweraw2_recomp C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
