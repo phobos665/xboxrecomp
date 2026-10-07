@@ -3150,7 +3150,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
                     " (aliases the contiguous window)\n",
-                    (unsigned)(g_memory_size / (1024 * 1024)),
+                    (unsigned)(tiled_size / (1024 * 1024)),   /* what was mapped, capped at the window */
                     XBOX_TILED_BASE);
         } else {
             fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
