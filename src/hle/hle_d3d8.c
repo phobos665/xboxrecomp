@@ -1402,9 +1402,16 @@ static int ff_from_declaration(uint32_t handle, uint32_t stride)
 }
 
 /* Common checks for a draw under the current vertex shader. */
+/* Bytes of each stream 0 vertex this draw's program reads when that is more
+ * than the draw's stride (0 otherwise): set by shadow_can_draw, used by
+ * shadow_expand_vertices. */
+static UINT g_draw_overread;
+static unsigned long g_draws_overread;
+
 static int shadow_can_draw(uint32_t xpt, uint32_t stride)
 {
     g_ff_active = 0;
+    g_draw_overread = 0;
     if (g_target_shadow_map) {
         g_shadow_map_draws++;
         if (g_target_width >= 256) {
@@ -1460,18 +1467,22 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
                 need = p->extent;            /* unknown program: as before */
             if (stride < need) {
                 static int said;
-                /* Named, the first few: a "stride" count alone does not say
-                 * which shader or by how much. */
+                /* Drawn as the NV2A draws it: an attribute past the stride
+                 * reads the next vertex's bytes. The host gets each vertex
+                 * copied out to `need` bytes (shadow_expand_vertices), so no
+                 * attribute lies past the host stride -- which MoltenVK may
+                 * not allow (vertexAttributeAccessBeyondStride). NFSU2 reads
+                 * v2 at +16..+24 of 16-byte vertices, two draws a frame. */
                 if (said++ < 4)
-                    fprintf(stderr, "[HLE-D3D8] skipped (stride): vertex program 0x%08X, slot %d: "
-                            "stride %u, but the registers it reads (mask 0x%04X) need %u "
-                            "bytes of a vertex (declaration %u)\n",
+                    fprintf(stderr, "[HLE-D3D8] drawn past the stride: vertex program 0x%08X, "
+                            "slot %d: stride %u, but the registers it reads (mask 0x%04X) "
+                            "need %u bytes of a vertex (declaration %u); each vertex reads "
+                            "into the next, as on the console\n",
                             (unsigned)g_shadow_vs, g_shadow_vs_slot, (unsigned)stride,
                             (unsigned)reads, (unsigned)need, (unsigned)p->extent);
-                g_draws_stride++;
-                return 0;
-            }
-            {
+                g_draw_overread = need;
+                g_draws_overread++;
+            } else {
                 static int said;
                 if (said++ < 4)
                     fprintf(stderr, "[HLE-D3D8] drawn: vertex program 0x%08X, stride %u: its "
@@ -2369,13 +2380,14 @@ static void frame_end_shadow(void)
                     "%lu indexed buffer drawn (%lu of them fixed function by "
                     "declaration); skipped %lu program without layout, %lu "
                     "declaration shader, %lu unknown shader, %lu stride, %lu "
-                    "primitive, %lu failed; %lu off the swapping thread\n",
+                    "primitive, %lu failed; %lu off the swapping thread; %lu drawn past "
+                    "the stride\n",
                     g_shadow_swaps, g_shadow_clears, g_shadow_last_color,
                     g_draws_up, g_draws_indexed_up, g_draws_vb, g_draws_indexed_vb,
                     g_draws_ff_declaration,
                     g_draws_program, g_draws_declaration, g_draws_unknown_vs,
                     g_draws_stride, g_draws_primitive, g_draws_failed,
-                    g_draws_off_thread);
+                    g_draws_off_thread, g_draws_overread);
             if (g_inline_begin || g_inline_vdata)
                 fprintf(stderr, "[HLE-D3D8] inline vertex path: %lu Begin, %lu End, "
                         "%lu SetVertexData4f; %lu drawn, %lu under a vertex program "
@@ -4578,8 +4590,28 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     if (!g_shadow_vs_is_program || g_shadow_vs_slot < 0)
         return NULL;
     p = &g_programs[g_shadow_vs_slot];
-    if (!p->packed_count)
+    if (!p->packed_count && !g_draw_overread)
         return NULL;
+    /* Bytes of the draw's data from vertex v on, which bounds what an
+     * over-reading vertex may copy: past the draw's last vertex the copy is
+     * zero, where the console would read whatever followed in memory. */
+#define AVAIL(v) ((size_t)(vertices - (v)) * in_stride)
+    if (!p->packed_count) {
+        UINT span = g_draw_overread;
+
+        out_stride = (span + 3u) & ~3u;
+        out = calloc((size_t)vertices, out_stride);
+        if (!out) {
+            *failed = 1;
+            return NULL;
+        }
+        for (v = 0; v < vertices; v++) {
+            size_t n = AVAIL(v) < span ? AVAIL(v) : span;
+            memcpy(out + (size_t)v * out_stride, (const uint8_t *)verts + (size_t)v * in_stride, n);
+        }
+        *stride = out_stride;
+        return out;
+    }
     /* Where each register's vertices are: stream 0 is what the draw was
      * handed, any other stream is looked up at the same first vertex. A UP
      * draw has no other streams to read, so it cannot feed this program. */
@@ -4600,7 +4632,10 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
     shift = p->expanded_bytes;
     /* Rounded up, so the host stride is a multiple of four even when the
      * title's is not (Dino Crisis 3's skinned vertex is 50 bytes). */
-    out_stride = shift + ((in_stride + 3u) & ~3u);
+    {
+        UINT span = g_draw_overread > in_stride ? g_draw_overread : in_stride;
+        out_stride = shift + ((span + 3u) & ~3u);
+    }
     out = calloc((size_t)vertices, out_stride);
     if (!out) {
         *failed = 1;
@@ -4645,8 +4680,12 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
             }
             memcpy(dst + p->packed_out[k], n, (size_t)count * sizeof n[0]);
         }
-        memcpy(dst + shift, src, in_stride);
+        {
+            size_t span = g_draw_overread > in_stride ? g_draw_overread : in_stride;
+            memcpy(dst + shift, src, AVAIL(v) < span ? AVAIL(v) : span);
+        }
     }
+#undef AVAIL
     *stride = out_stride;
     return out;
 }
