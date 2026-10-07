@@ -51,6 +51,14 @@ SHARP = ("isnan", "isinf", "isfinite", "isnormal", "signbit", "fpclassify",
 # sys.platform, which got macOS wrong once already.
 HOST_DECLARED = ("onexit",)
 
+# The same for the C99 classification macros under GCC. glibc defines them as
+# __builtin_isnan(x) and friends, so `void isnan(void);` becomes a
+# redeclaration of a builtin, which GCC accepts and clang and MSVC reject.
+# Generated code is built with clang or MSVC; under GCC these are left to the
+# positive sweep and to the set itself.
+GCC_TOLERATES = ("isnan", "isinf", "isfinite", "isnormal", "signbit",
+                 "fpclassify")
+
 
 def _find_cc():
     cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
@@ -69,6 +77,13 @@ def _compile(body):
         r = subprocess.run([cc, "-c", src, "-o", os.path.join(tmp, "t.o")],
                            capture_output=True, text=True)
         return r.returncode, r.stderr
+
+
+def _is_gcc():
+    """GCC proper, not clang (which also defines __GNUC__)."""
+    rc, _ = _compile("#if defined(__GNUC__) && !defined(__clang__)\n"
+                     "#error gcc\n#endif\n")
+    return rc != 0
 
 
 def _declared_here(name):
@@ -108,6 +123,8 @@ class ReservedIdentTest(unittest.TestCase):
                               f"{name} is missing from the reserved set")
                 if name in HOST_DECLARED and not _declared_here(name):
                     continue      # reserved for another host's headers
+                if name in GCC_TOLERATES and _is_gcc():
+                    continue      # a builtin redeclaration GCC lets through
                 rc, _ = _compile(f"void {name}(void);\nvoid {name}(void) {{ }}")
                 self.assertNotEqual(
                     rc, 0,
