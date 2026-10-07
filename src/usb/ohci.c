@@ -6,6 +6,11 @@
  * plus a trace of every register access, because what the driver does after
  * that decides how the rest gets built.
  */
+/* glibc names the x86-64 ucontext registers (REG_RIP, ...) that
+ * mmio_decode.h reads only with _GNU_SOURCE, before the first header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
