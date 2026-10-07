@@ -1176,10 +1176,20 @@ void xbox_GuestLockNotePriority(DWORD tid, int32_t prio)
     }
 }
 
+int xbox_GuestLockQueryPriority(DWORD tid, int32_t *prio)
+{
+    int i;
+    for (i = 0; tid && i < GL_PRIO_SLOTS && s_gl_prio[i].tid; i++)
+        if (s_gl_prio[i].tid == tid) {
+            *prio = s_gl_prio[i].prio;
+            return 1;
+        }
+    return 0;
+}
+
 static int32_t guest_my_priority(void)
 {
-    DWORD me;
-    int i;
+    int32_t p = 0;
     if (!g_guest_thread)
         return GL_PRIO_HOST;
     {
@@ -1190,11 +1200,8 @@ static int32_t guest_my_priority(void)
         if (!use)
             return 0;
     }
-    me = GetCurrentThreadId();
-    for (i = 0; i < GL_PRIO_SLOTS && s_gl_prio[i].tid; i++)
-        if (s_gl_prio[i].tid == me)
-            return s_gl_prio[i].prio;
-    return 0;
+    xbox_GuestLockQueryPriority(GetCurrentThreadId(), &p);
+    return p;
 }
 
 static void guest_wait_begin(int32_t prio)

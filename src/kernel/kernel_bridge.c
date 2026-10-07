@@ -5104,10 +5104,24 @@ static void bridge_KeDisconnectInterrupt(void)
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
  * missing, so the thunk fell through to the fallback and returned 0. */
+static DWORD bridge_thread_object_tid(uint32_t obj);
+
+/* The thread's own base priority, as last set.
+ *
+ * xbox_KeQueryBasePriorityThread underneath passes the guest thread object to
+ * Win32 GetThreadPriority as if it were a host handle. It is not one, the call
+ * fails, and the failure maps to 0: every title on every host got 0 for every
+ * thread. A title that saves a priority and restores it later (XAPI's
+ * GetThreadPriority/SetThreadPriority pair -- BLiNX's CRI ADX lock does it
+ * around every lock) put each thread it ran on back to normal. The answer
+ * now comes from the record KeSetBasePriorityThread keeps by host thread id
+ * (bridge_thread_object_tid resolves the object, including the pseudo-handle
+ * one every NtCurrentThread shares); 0 for a thread never set, as before. */
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    int32_t prio = 0;
+    xbox_GuestLockQueryPriority(bridge_thread_object_tid(STACK_ARG(0)), &prio);
+    g_eax = (uint32_t)prio;
 }
 
 /* The host thread a guest thread object stands for, for the guest lock's
@@ -5132,16 +5146,22 @@ static DWORD bridge_thread_object_tid(uint32_t obj)
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    /* Also for the guest lock, which hands over by priority. */
-    xbox_GuestLockNotePriority(bridge_thread_object_tid(STACK_ARG(0)),
-                               (int32_t)STACK_ARG(1));
+    DWORD tid = bridge_thread_object_tid(STACK_ARG(0));
+    int32_t prev = 0;
+
+    /* The previous increment comes from the same record
+     * KeQueryBasePriorityThread reads (see there; the host call's answer was
+     * 0 for the same reason), and the new one goes into it -- also for the
+     * guest lock, which hands over by priority. */
+    xbox_GuestLockQueryPriority(tid, &prev);
+    xbox_GuestLockNotePriority(tid, (int32_t)STACK_ARG(1));
     if (bridge_thread_trace())
-        fprintf(stderr, "  [THREADS] tid %lu sets tid %lu priority %d\n",
-                (unsigned long)GetCurrentThreadId(),
-                (unsigned long)bridge_thread_object_tid(STACK_ARG(0)),
-                (int)(int32_t)STACK_ARG(1));
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+        fprintf(stderr, "  [THREADS] tid %lu sets tid %lu priority %d (was %d)\n",
+                (unsigned long)GetCurrentThreadId(), (unsigned long)tid,
+                (int)(int32_t)STACK_ARG(1), (int)prev);
+    (void)xbox_KeSetBasePriorityThread(XBOX_TO_NATIVE(STACK_ARG(0)),
+                                       (LONG)STACK_ARG(1));
+    g_eax = (uint32_t)prev;
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
