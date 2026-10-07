@@ -1643,6 +1643,22 @@ static int load_vulkan(void)
         slash[1] = 0;
         snprintf(path, sizeof path, "%s%s", dir, beside[i]);
         m = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+#if defined(__APPLE__)
+        /* An app bundle's own loader (scripts/make_macos_app.py): its driver
+         * is the MoltenVK in the bundle, named by the manifest in
+         * Contents/Resources/vulkan/icd.d. The loader would also add every
+         * manifest installed system-wide (a Vulkan SDK's MoltenVK and
+         * KosmicKrisp), and a second MoltenVK in the process duplicates its
+         * Objective-C classes ("implemented in both ... mysterious
+         * crashes"). So the bundle's manifest only, unless the person
+         * running it chose drivers themselves. */
+        if (m && i == 1 && !getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES")) {
+            char icd[1200];
+            snprintf(icd, sizeof icd, "%s../Resources/vulkan/icd.d/MoltenVK_icd.json", dir);
+            if (access(icd, R_OK) == 0)
+                setenv("VK_DRIVER_FILES", icd, 1);
+        }
+#endif
     }
     if (m) {
         PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
