@@ -188,9 +188,7 @@ void sub_001DFB40(void)
  * thread's exit path as before.
  */
 extern void sub_001FFFF0_gen(void);
-void xbox_GuestLiftedEnter(void);
-void xbox_GuestLiftedLeave(void);
-__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+void xbox_GuestSleep(uint32_t ms);   /* src/kernel/xbox_memory_layout.c */
 
 #define MVC2_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(va) + g_xbox_mem_offset))
 
@@ -198,9 +196,10 @@ void sub_001FFFF0(void)
 {
     while (!MVC2_MEM32(0x00593BC8u)) {
         MVC2_MEM32(0x00593BB0u) += 1;
-        xbox_GuestLiftedLeave();
-        Sleep(1);
-        xbox_GuestLiftedEnter();
+        /* Not holding the guest lock while it sleeps (RECOMP_GUEST_LOCK, on
+         * by default on ARM hosts): Sleep is a host call, so nothing else
+         * would release it, and every other guest thread would wait. */
+        xbox_GuestSleep(1);
     }
     sub_001FFFF0_gen();
 }
