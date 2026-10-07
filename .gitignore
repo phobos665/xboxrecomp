@@ -8,6 +8,7 @@ tools/disasm/output/
 tools/func_id/output/
 tools/recomp/output/
 tools/abi_analysis/output/
+tools/regression-results
 
 
 #xbox-specific
@@ -61,3 +62,6 @@ d3d8_capture_*.tmp
 third_party/ffmpeg/
 # DXC release build, HLSL -> SPIR-V for the Vulkan backend (fetched, not committed; see docs/technical/vulkan-backend.md)
 third_party/dxc/
+
+# Local Python environment for the pipeline (capstone)
+.venv/
