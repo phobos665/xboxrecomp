@@ -140,9 +140,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     # Built under src/d3d (tests/d3d8_smoke); pure parsing, no device.
     add_test(NAME d3d8_final_default COMMAND d3d8_final_default)
     if(WIN32)
-        add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
+        add_subdirectory(tests/nv2a_vsh_hlsl)       # D3DCompile
+        add_subdirectory(tests/nv2a_combiners_hlsl)
     else()
         add_test(NAME d3d8_smoke COMMAND d3d8_smoke)    # the format layer
+        if(XBOXRECOMP_DXC_INCLUDE)
+            add_subdirectory(tests/nv2a_vsh_hlsl)       # DXC to SPIR-V
+            add_subdirectory(tests/nv2a_combiners_hlsl)
+        endif()
     endif()
 endif()
 

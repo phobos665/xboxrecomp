@@ -112,7 +112,15 @@ if(XBOXRECOMP_VULKAN)
                                     PROPERTIES COMPILE_OPTIONS "-w")
     endif()
     message(STATUS "xbox_d3d8: Vulkan backend on (DXC headers: ${XBR_DXC_INCLUDE})")
-elseif(NOT WIN32)
+    # For tests/nv2a_vsh_hlsl and tests/nv2a_combiners_hlsl, which compile
+    # the generators' output with the backend's own DXC call.
+    set(XBOXRECOMP_DXC_INCLUDE "${XBR_DXC_INCLUDE}" CACHE INTERNAL "")
+    set(XBOXRECOMP_DXC_LIBRARY "${XBR_DXC_LIB}" CACHE INTERNAL "")
+else()
+    set(XBOXRECOMP_DXC_INCLUDE "" CACHE INTERNAL "")
+    set(XBOXRECOMP_DXC_LIBRARY "" CACHE INTERNAL "")
+endif()
+if(NOT XBOXRECOMP_VULKAN AND NOT WIN32)
     message(WARNING "xbox_d3d8: no Vulkan backend (vendored Vulkan headers, volk, VMA or DXC's "
                     "headers missing), so this build has no renderer")
 endif()
