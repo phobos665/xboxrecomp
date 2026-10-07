@@ -56,10 +56,14 @@
 
 #include "xbox_memory_layout.h"
 #include "xbox_watchpoint.h"
+#include "platform/fault_emulate.h"
 
 #ifdef _WIN32
-
 #include <dbghelp.h>
+#else
+#include <dlfcn.h>
+#include "win32_compat.h"
+#endif
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
@@ -83,12 +87,14 @@ static int     g_disarmed;
 static char    g_arm_on[128];       /* RECOMP_WATCH_ARM_ON, until it fires */
 static long    g_arm_on_nth = 1;    /* ...on the Nth matching open ("text#N") */
 
+#ifdef _WIN32
 /* Single-step state is per thread: two threads can be mid-step at once, and
  * each has to put back its own page. */
 static RECOMP_TLS void    *g_step_page;
 static RECOMP_TLS uint32_t g_step_va;
 static RECOMP_TLS uint32_t g_step_before;
 static RECOMP_TLS int      g_step_pending;
+#endif
 
 static uint8_t *guest_base(void)
 {
@@ -116,7 +122,13 @@ static uint32_t guest_read32(uint32_t va)
 {
     if (!guest_in_ram(va, 4))
         return 0;
+#ifdef _WIN32
     return *(const volatile uint32_t *)(guest_base() + va);
+#else
+    /* Through the backdoor: this runs in the fault handler, where the page
+     * may be the trapped one and a second fault would be fatal. */
+    return (uint32_t)recomp_guest_read(NULL, va, 4);
+#endif
 }
 
 /* The page a guest VA lives on, as a host pointer. */
@@ -186,6 +198,17 @@ static int on_watched_page(uint32_t va)
     return 0;
 }
 
+#ifndef _WIN32
+static void print_symbol(uintptr_t pc)
+{
+    Dl_info info;
+    if (dladdr((void *)pc, &info) && info.dli_sname)
+        fprintf(stderr, "%s+0x%llX", info.dli_sname,
+                (unsigned long long)(pc - (uintptr_t)info.dli_saddr));
+    else
+        fprintf(stderr, "pc 0x%llX", (unsigned long long)pc);
+}
+#else
 static void print_symbol(uintptr_t rip)
 {
     char buf[sizeof(SYMBOL_INFO) + 256];
@@ -200,6 +223,7 @@ static void print_symbol(uintptr_t rip)
     else
         fprintf(stderr, "RIP 0x%llX", (unsigned long long)rip);
 }
+#endif
 
 /* The guest return-address chain, as the crash handler recovers it: lifted
  * calls push the guest return address, so scanning up from esp for values
@@ -352,6 +376,30 @@ void xbox_watch_note_path(const char *xbox_path)
     fflush(stderr);
 }
 
+/* The report for a watched access: who, where, the guest registers and the
+ * callers. Shared by the Windows step and the POSIX completion. */
+static void report_access(int is_write, uint32_t va, uintptr_t pc, const char *insn)
+{
+    /* The host thread too: two writers of one structure on different
+     * threads is a race the uniprocessor console never had. */
+    fprintf(stderr, "[WATCH] %s to 0x%08X (thread %lu) from ",
+            is_write ? "write" : "read", va,
+            (unsigned long)GetCurrentThreadId());
+    print_symbol(pc);
+    fprintf(stderr, "\n");
+    /* The host bytes of the storing instruction. Lifted code is compiled C,
+     * so one guest store can become several host instructions and the
+     * symbol offset alone does not say which line did it; the encoding names
+     * the operand size and the base register, which does. */
+    fprintf(stderr, "[WATCH]   host insn: %s\n", insn);
+    fprintf(stderr, "[WATCH]   guest esp=0x%08X eax=0x%08X ecx=0x%08X "
+                    "edx=0x%08X esi=0x%08X edi=0x%08X\n",
+            g_esp, g_eax, g_ecx, g_edx, g_esi, g_edi);
+    print_callers();
+    print_stack();
+}
+
+#ifdef _WIN32
 int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
                          int is_write)
 {
@@ -380,31 +428,15 @@ int xbox_watch_handle_av(PEXCEPTION_POINTERS ep, uintptr_t fault_addr,
             disarm_all("report budget exhausted (RECOMP_WATCH_BUDGET)");
             return 1;
         }
-        /* The host thread too: two writers of one structure on different
-         * threads is a race the uniprocessor console never had. */
-        fprintf(stderr, "[WATCH] %s to 0x%08X (thread %lu) from ",
-                is_write ? "write" : "read", va,
-                (unsigned long)GetCurrentThreadId());
-        print_symbol((uintptr_t)ep->ContextRecord->Rip);
-        fprintf(stderr, "\n");
         {
-            /* The host bytes of the storing instruction. Lifted code is
-             * compiled C, so one guest store can become several host
-             * instructions and the symbol offset alone does not say which
-             * line did it; the encoding names the operand size and the
-             * base register, which does. */
             const uint8_t *ip = (const uint8_t *)ep->ContextRecord->Rip;
-            int b;
-            fprintf(stderr, "[WATCH]   host insn:");
+            char insn[64];
+            int b, used = 0;
             for (b = 0; b < 12; b++)
-                fprintf(stderr, " %02X", ip[b]);
-            fprintf(stderr, "\n");
+                used += snprintf(insn + used, sizeof insn - used, "%s%02X",
+                                 b ? " " : "", ip[b]);
+            report_access(is_write, va, (uintptr_t)ep->ContextRecord->Rip, insn);
         }
-        fprintf(stderr, "[WATCH]   guest esp=0x%08X eax=0x%08X ecx=0x%08X "
-                        "edx=0x%08X esi=0x%08X edi=0x%08X\n",
-                g_esp, g_eax, g_ecx, g_edx, g_esi, g_edi);
-        print_callers();
-        print_stack();
         g_step_before = guest_read32(g_watch[idx].va);
         g_step_va = g_watch[idx].va;
     } else {
@@ -449,12 +481,114 @@ int xbox_watch_handle_step(PEXCEPTION_POINTERS ep)
     return 1;
 }
 
+int xbox_watch_handle_fault(recomp_fault *f)
+{
+    if (f->kind != RECOMP_FAULT_ACCESS || !f->native)
+        return 0;
+    return xbox_watch_handle_av((PEXCEPTION_POINTERS)f->native, f->host_addr,
+                                f->is_write == 1);
+}
+
+int xbox_watch_handle_trap(recomp_fault *f)
+{
+    if (f->kind != RECOMP_FAULT_SINGLE_STEP || !f->native)
+        return 0;
+    return xbox_watch_handle_step((PEXCEPTION_POINTERS)f->native);
+}
+
+#else /* POSIX */
+
+/* An element of a watched access may go ahead if its page is one the watch
+ * protected, or one the guest itself left accessible. */
+static int watch_allows(uintptr_t host, int size, int is_write, void *arg)
+{
+    uintptr_t p, end = host + (uintptr_t)(size > 0 ? size : 1);
+    (void)arg;
+    for (p = host & ~(uintptr_t)0xFFF; p < end; p += 0x1000) {
+        DWORD prot = w32_page_protection((const void *)p) & 0xFF;
+        if (on_watched_page((uint32_t)(p - (uintptr_t)guest_base())))
+            continue;
+        if (prot == 0 || prot == PAGE_NOACCESS || prot == PAGE_EXECUTE)
+            return 0;
+        if (is_write && (prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ))
+            return 0;
+    }
+    return 1;
+}
+
+/* The POSIX watch completes the trapped access itself, through the arena's
+ * backdoor, instead of opening the page and single-stepping. So there is no
+ * window in which the page is writable -- another thread's write cannot slip
+ * past -- and nothing depends on a trap flag, which arm64 user space does
+ * not have. The before/after values are read either side of it. */
+int xbox_watch_handle_fault(recomp_fault *f)
+{
+    uint32_t va, before = 0;
+    int idx, report;
+    char insn[64];
+
+    if (f->kind != RECOMP_FAULT_ACCESS || !g_n_watch || g_disarmed
+        || !xbox_GetMemoryOffset())
+        return 0;
+    if (f->host_addr < (uintptr_t)guest_base()
+        || f->host_addr - (uintptr_t)guest_base() > 0xFFFFFFFFu)
+        return 0;
+    va = (uint32_t)(f->host_addr - (uintptr_t)guest_base());
+    if (!on_watched_page(va))
+        return 0;
+
+    idx = watch_covering(va);
+    /* -1 (direction unknown) counts as a write: with reads not watched the
+     * page is read-only and only a write can fault on it. */
+    report = idx >= 0 && (f->is_write != 0 || g_watch_reads);
+    if (report) {
+        if (g_watch_budget-- <= 0) {
+            disarm_all("report budget exhausted (RECOMP_WATCH_BUDGET)");
+            return 1;              /* the page is open again: just retry */
+        }
+        recomp_fault_insn_text(f, insn, sizeof insn);
+        report_access(f->is_write != 0, va, f->pc, insn);
+        before = guest_read32(g_watch[idx].va);
+    }
+
+    if (!recomp_fault_complete_guest(f, watch_allows, NULL)) {
+        recomp_fault_insn_text(f, insn, sizeof insn);
+        fprintf(stderr, "[WATCH] could not complete the access to 0x%08X "
+                        "(host insn %s); letting it fault\n", va, insn);
+        fflush(stderr);
+        return 0;
+    }
+
+    if (report) {
+        uint32_t now = guest_read32(g_watch[idx].va);
+        fprintf(stderr, "[WATCH]   0x%08X -> 0x%08X%s\n", before, now,
+                now == before ? "  (unchanged)" : "");
+    }
+    fflush(stderr);
+    return 1;
+}
+
+int xbox_watch_handle_trap(recomp_fault *f)
+{
+    (void)f;
+    return 0;                      /* nothing here sets a trap flag */
+}
+
 #endif /* _WIN32 */
 
 void xbox_watch_scan_value(uint32_t value)
 {
     const uint32_t *mem = (const uint32_t *)xbox_GetMemoryOffset();
     size_t words = xbox_GetMappedSize() / 4;
+
+#ifndef _WIN32
+    /* The RAM object's backdoor view is the whole of RAM, contiguous and
+     * never protected: the scan runs inside the crash handler, where a
+     * second fault (RECOMP_TRAP_NULL's page zero, a watched page) would be
+     * fatal on POSIX. */
+    if (mem && w32_backdoor(mem))
+        mem = (const uint32_t *)w32_backdoor(mem);
+#endif
     size_t i;
     int hits = 0;
 
