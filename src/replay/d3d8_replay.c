@@ -19,7 +19,9 @@
  *                    its snapshot.
  *   --dump-every     write a BMP after every loop, not just the last, so a
  *                    frame that is not idempotent shows itself.
- *   --hold           leave the window up until it is closed.
+ *   --hold           leave the window up until it is closed (Windows only:
+ *                    elsewhere there is no window -- the frame is drawn to
+ *                    a headless swap chain and only the BMPs show it).
  *   --quiet          only errors.
  *   --no-combiners   draw with the fixed-function pixel path whatever the
  *                    capture's combiner token says.
@@ -298,6 +300,7 @@ static void note(const char *fmt, ...)
 
 /* ------------------------------------------------------------------ window */
 
+#if defined(_WIN32)
 static LRESULT CALLBACK replay_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_DESTROY) {
@@ -357,6 +360,15 @@ static void pump(void)
         DispatchMessageA(&msg);
     }
 }
+#else
+/* No window anywhere else: the device is given none, and the Vulkan
+ * backend presents to a headless surface (rhi.h, RhiDeviceDesc.window).
+ * That is what a tool run by the dozen from a script wants -- nothing on
+ * screen, nothing to take the focus -- and the images are the BMPs. */
+static HWND replay_window(UINT width, UINT height) { (void)width; (void)height; return NULL; }
+static void replay_show(HWND hwnd, int hold)       { (void)hwnd; (void)hold; }
+static void pump(void)                             { }
+#endif
 
 /* -------------------------------------------------------------------- dump */
 
@@ -1537,11 +1549,18 @@ int main(int argc, char **argv)
     r.height = h->height ? h->height : 480;
 
     hwnd = replay_window(r.width, r.height);
+#if defined(_WIN32)
     if (!hwnd) {
         fprintf(stderr, "[replay] CreateWindow failed (%lu)\n", GetLastError());
         d3d8cap_close_read(cap);
         return 1;
     }
+#else
+    if (hold) {
+        note("[replay] --hold: there is no window off Windows; ignored\n");
+        hold = 0;
+    }
+#endif
     replay_show(hwnd, hold);
 
     /* As hle_d3d8.c's shadow_create. */
@@ -1554,7 +1573,11 @@ int main(int argc, char **argv)
     pp.EnableAutoDepthStencil = TRUE;
 
     if (backend)
+#if defined(_WIN32)
         _putenv_s("RECOMP_D3D8_BACKEND", backend);
+#else
+        setenv("RECOMP_D3D8_BACKEND", backend, 1);
+#endif
     d3d = xbox_Direct3DCreate8(0);
     hr = d3d ? d3d->lpVtbl->CreateDevice(d3d, 0, 1 /* HAL */, hwnd, 0, &pp, &r.dev)
              : E_FAIL;
@@ -1605,6 +1628,7 @@ int main(int argc, char **argv)
         }
     }
 
+#if defined(_WIN32)
     if (hold) {
         MSG msg;
         note("[replay] holding the window open; close it to exit\n");
@@ -1613,6 +1637,7 @@ int main(int argc, char **argv)
             DispatchMessageA(&msg);
         }
     }
+#endif
 
     free(r.textures);
     d3d8cap_close_read(cap);

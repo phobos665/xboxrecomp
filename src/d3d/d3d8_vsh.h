@@ -29,7 +29,7 @@
 #define XBOXRECOMP_D3D8_VSH_H
 
 #include <stdint.h>
-#include <windows.h>
+#include "platform/xbox_winnt.h"   /* <windows.h> on Windows */
 
 #include "rhi.h"
 

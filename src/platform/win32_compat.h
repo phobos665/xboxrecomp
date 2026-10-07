@@ -153,6 +153,8 @@ BOOL   ReleaseMutex(HANDLE h);
 /* ---- Waiting ---------------------------------------------------------- */
 DWORD WaitForSingleObject(HANDLE h, DWORD ms);
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable);
+/* Not Win32: WaitForSingleObject with a microsecond timeout (host_timer.c). */
+DWORD w32_wait_single_us(HANDLE h, long long us);
 DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, DWORD ms);
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable);
@@ -204,6 +206,28 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem);
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect);
 BOOL   VirtualFree(LPVOID address, SIZE_T size, DWORD freeType);
 BOOL   VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect);
+
+/* ---- The guest arena (posix_memory.c; no Windows equivalent) ------------
+ *
+ * Windows places the guest's memory at fixed host addresses one call at a
+ * time. Here the whole guest span is reserved first, as one inaccessible
+ * range, and every fixed-address VirtualAlloc / MapViewOfFileEx inside it is
+ * placed with Windows semantics: exactly at the address, or a failure if any
+ * part of the range is already placed. See posix_memory.h. */
+size_t w32_host_page_size(void);
+/* Reserve size bytes aligned to align (a power of two). Once only; returns
+ * the base, or NULL. */
+void  *w32_reserve_arena(size_t size, size_t align);
+int    w32_in_arena(const void *addr);
+/* The protection last asked for on the 4 KB page holding addr (PAGE_*), or 0
+ * when nothing is placed there. A host page larger than 4 KB is protected as
+ * its most restrictive 4 KB page, so this, not the host page, says whether
+ * an access is one the guest is allowed to make. Safe in a signal handler. */
+DWORD  w32_page_protection(const void *addr);
+/* An always-readable, always-writable host address for the same byte, for
+ * completing an access the host page refused. NULL outside the arena's
+ * placements. Safe in a signal handler. */
+void  *w32_backdoor(const void *addr);
 
 /* ---- Time ------------------------------------------------------------- */
 VOID  GetSystemTimeAsFileTime(LPFILETIME ft);

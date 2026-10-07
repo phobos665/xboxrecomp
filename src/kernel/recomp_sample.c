@@ -825,6 +825,8 @@ void xbox_NameCurrentThread(const wchar_t *name)
 
 #else  /* !_WIN32 */
 
+#include <wchar.h>
+
 void xbox_SamplerStart(void) {}
 void xbox_NameCurrentThread(const wchar_t *name) { (void)name; }
 
