@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 
 #include "win32_compat.h"
+#include "recomp_fault.h"   /* recomp_fault_thread_init */
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -694,6 +695,9 @@ BOOL ReleaseMutex(HANDLE h)
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
+    /* First: a guest thread can fault, and a fault on an exhausted stack is
+     * reported only from an alternate signal stack (fault_posix.c). */
+    recomp_fault_thread_init();
     t_self_obj = o;
     t_tid      = o->tid;
 
