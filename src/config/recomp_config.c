@@ -152,8 +152,33 @@ static int dir_from(char *out, size_t n, const char *var, const char *home_rel)
     return len > 0 && (size_t)len < n;
 }
 
+/* RECOMP_USER_DIR=<dir> stands in for all three: settings and saves in it,
+ * caches under it. For tests and scripted runs, which must not read or
+ * write the player's own (RECOMP_SAVE_DIR still decides the saves).
+ *
+ * 1 when it gave the directory, 0 when it is unset, -1 when it is set but
+ * does not fit. The last must not fall through to the player's directory --
+ * that is the one thing the switch exists to prevent -- so the helpers
+ * report no directory at all instead. */
+static int override_dir(char *out, size_t n, const char *tail)
+{
+    const char *v = getenv("RECOMP_USER_DIR");
+    int len;
+    if (!v || !*v)
+        return 0;
+    len = snprintf(out, n, "%s%s", v, tail);
+    if (len > 0 && (size_t)len < n)
+        return 1;
+    if (n)
+        out[0] = '\0';
+    return -1;
+}
+
 static int user_dir(char *out, size_t n)
 {
+    int o;
+    if ((o = override_dir(out, n, "")) != 0)
+        return o > 0;
 #if defined(_WIN32)
     return dir_from(out, n, "APPDATA", NULL);
 #elif defined(__APPLE__)
@@ -170,6 +195,9 @@ int recomp_config_user_dir(char *out, size_t n)
 
 int recomp_data_dir(char *out, size_t n)
 {
+    int o;
+    if ((o = override_dir(out, n, "")) != 0)
+        return o > 0;
 #if defined(_WIN32)
     return dir_from(out, n, "LOCALAPPDATA", NULL);
 #elif defined(__APPLE__)
@@ -181,6 +209,13 @@ int recomp_data_dir(char *out, size_t n)
 
 int recomp_cache_dir(char *out, size_t n)
 {
+#if defined(_WIN32)
+    int o = override_dir(out, n, "\\cache");
+#else
+    int o = override_dir(out, n, "/cache");
+#endif
+    if (o != 0)
+        return o > 0;
 #if defined(_WIN32)
     return user_dir(out, n);
 #elif defined(__APPLE__)
