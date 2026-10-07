@@ -52,9 +52,14 @@ typedef struct recomp_fault {
                            * NULL for recomp_fault_raise */
 } recomp_fault;
 
-/* 1: handled, resume where `ctx` now says. 0: not mine. */
+/* 1: handled, resume where `ctx` now says. 0: not mine. Sees every
+ * exception, breakpoints and first-chance C++ throws included, so it must
+ * decline what it does not recognise. */
 typedef int  (*recomp_fault_route_fn)(recomp_fault *f);
-/* Report a fault nobody handled. Must not assume it can allocate. */
+/* Report a fault nobody handled. Must not assume it can allocate, and must
+ * not end the process: on Windows a kind other than ACCESS may be a first-
+ * chance exception that a handler further down catches (a C++ throw), and
+ * the host half decides what happens next. */
 typedef void (*recomp_crash_fn)(const recomp_fault *f);
 
 /* Install the host handler, first in line, for the whole process. Either

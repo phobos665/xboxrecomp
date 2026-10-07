@@ -18,6 +18,7 @@
 
 #include "recomp_fault.h"
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,23 +113,44 @@ static void on_signal(int sig, siginfo_t *si, void *ucv)
     raise(sig);
 }
 
-void recomp_fault_thread_init(void)
+/* The alternate stack goes when its thread does. */
+static pthread_key_t  g_altstack_key;
+static pthread_once_t g_altstack_once = PTHREAD_ONCE_INIT;
+
+static void altstack_free(void *mem)
 {
-    static __thread int done;
     stack_t ss;
 
-    if (done)
+    memset(&ss, 0, sizeof ss);
+    ss.ss_flags = SS_DISABLE;
+    sigaltstack(&ss, NULL);
+    free(mem);
+}
+
+static void altstack_key_init(void)
+{
+    pthread_key_create(&g_altstack_key, altstack_free);
+}
+
+void recomp_fault_thread_init(void)
+{
+    stack_t ss;
+
+    pthread_once(&g_altstack_once, altstack_key_init);
+    if (pthread_getspecific(g_altstack_key))
         return;
-    done = 1;
     memset(&ss, 0, sizeof ss);
     /* Enough for the report, which prints and symbolises but does not
-     * recurse. Kept for the life of the thread. */
+     * recurse. */
     ss.ss_size = 256 * 1024;
     ss.ss_sp = malloc(ss.ss_size);
     if (!ss.ss_sp)
         return;
-    if (sigaltstack(&ss, NULL) != 0)
+    if (sigaltstack(&ss, NULL) != 0) {
         free(ss.ss_sp);
+        return;
+    }
+    pthread_setspecific(g_altstack_key, ss.ss_sp);
 }
 
 void recomp_fault_install(recomp_fault_route_fn route, recomp_crash_fn crash)

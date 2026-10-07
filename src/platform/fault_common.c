@@ -27,13 +27,16 @@ recomp_crash_fn       recomp_fault_crash_cb(void) { return g_crash; }
 void recomp_fault_raise(int kind, uint32_t code, uintptr_t pc)
 {
     recomp_fault f;
+    volatile char here = 0;
 
     f.host_addr = 0;
     f.is_write  = -1;
     f.kind      = kind;
     f.code      = code;
     f.pc        = pc;
-    f.sp        = (uintptr_t)__builtin_frame_address(0);
+    /* This frame's stack, near enough for a scan of return addresses, and
+     * portable (MSVC has no __builtin_frame_address). */
+    f.sp        = (uintptr_t)&here;
     f.native    = NULL;
     f.ctx       = NULL;
     if (g_route && g_route(&f))
