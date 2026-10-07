@@ -1230,11 +1230,17 @@ static int32_t guest_my_priority(void)
 /* The thread that last started waiting at each priority, for the starvation
  * valve's report only. */
 static volatile DWORD s_gl_waiter_tid[GL_PRIO_HOST - GL_PRIO_MIN + 1];
+/* When a thread last started waiting at each priority: a kernel call that
+ * readies a higher-priority thread (a resume, an event it was waiting on) is
+ * preempted at its return, as on the console (xbox_GuestLockRestoreForKernel). */
+static volatile int64_t s_gl_wait_since[GL_PRIO_HOST - GL_PRIO_MIN + 1];
 
 static void guest_wait_begin(int32_t prio)
 {
-    if (prio < GL_PRIO_HOST)
+    if (prio < GL_PRIO_HOST) {
         s_gl_waiter_tid[prio - GL_PRIO_MIN] = GetCurrentThreadId();
+        s_gl_wait_since[prio - GL_PRIO_MIN] = host_time_ns();
+    }
     InterlockedIncrement(&s_gl_waiting_at[prio - GL_PRIO_MIN]);
     InterlockedIncrement((volatile LONG *)&g_guest_lock_waiters);
 }
@@ -1503,6 +1509,7 @@ static volatile int64_t  s_gl_resv_until;
 static RECOMP_TLS int     t_resv;           /* this thread holds the reservation */
 static RECOMP_TLS int64_t t_resv_since;     /* its g_guest_since_ns at the drop */
 static RECOMP_TLS uint32_t t_resv_ordinal;
+static RECOMP_TLS int64_t  t_resv_at;       /* when the call began */
 static int64_t            g_guest_reserve_ns = -1;
 
 static int64_t guest_reserve_ns(void)
@@ -1814,6 +1821,7 @@ int xbox_GuestLockDropForKernel(int may_block, uint32_t ordinal)
         int64_t now = host_time_ns();
         t_resv_since = g_guest_since_ns;
         t_resv_ordinal = ordinal;
+        t_resv_at = now;
         s_gl_resv_until = now + r;
         InterlockedExchange((volatile LONG *)&s_gl_resv_tid, (LONG)GetCurrentThreadId());
         t_resv = 1;
@@ -1847,8 +1855,16 @@ void xbox_GuestLockRestoreForKernel(int held)
         return;
     }
     /* Not a reschedule, so not a handoff to another guest thread either --
-     * its next back edge is. An interrupt waiting (a host thread) is the
-     * exception, as on the console: it gets the lock here, while the
+     * its next back edge is -- with two exceptions, both the console's.
+     *
+     * A higher-priority guest thread that became ready DURING this call (it
+     * resumed one, set the event one waited on) preempts at its return; NT
+     * does. One that was already waiting before the call does not: it is
+     * owed the lock at the next back edge, and handing it over here instead
+     * is how BLiNX's file server got into the ADX lock's window, which has
+     * seven kernel calls and no back edge.
+     *
+     * An interrupt waiting (a host thread) gets the lock here, while the
      * reservation still keeps the guest threads out.
      *
      * The lock is taken back BEFORE the reservation goes: cleared first, a
@@ -1856,6 +1872,24 @@ void xbox_GuestLockRestoreForKernel(int held)
      * server between the main thread's ResumeThread and the count's
      * increment. The quantum runs on from before the call. */
     takes = g_guest_takes_at_drop;
+    {
+        int32_t mine = guest_my_priority(), p;
+        for (p = GL_PRIO_MAX; p > mine; p--)
+            if (s_gl_waiting_at[p - GL_PRIO_MIN] > 0 &&
+                s_gl_wait_since[p - GL_PRIO_MIN] >= t_resv_at)
+                break;
+        if (p > mine && held > 0) {
+            /* Readied by this call: give up the turn as a blocking call
+             * would, and come back in by priority. */
+            InterlockedCompareExchange((volatile LONG *)&s_gl_resv_tid, 0,
+                                       (LONG)GetCurrentThreadId());
+            InterlockedIncrement(&s_gl_handoff_kernel);
+            guest_handoff_wait(takes);
+            while (held-- > 0)
+                guest_cs_enter();
+            return;
+        }
+    }
     if (held > 0 && s_gl_waiting_at[GL_PRIO_HOST - GL_PRIO_MIN] > 0 &&
         g_guest_takes == takes) {
         InterlockedIncrement(&s_gl_handoff_kernel);
