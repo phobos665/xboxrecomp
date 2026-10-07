@@ -1531,6 +1531,23 @@ void xbox_GuestLockRestore(int held)
         guest_cs_enter();
 }
 
+/* A host sleep from guest context -- a title override that waits on a flag
+ * between passes. Sleep() is a host call, not a kernel call, so nothing else
+ * releases the guest lock around it, and no back edge is reached while it
+ * sleeps: open-coded without the drop, the sleeping thread kept the lock and
+ * every other guest thread waited on it (MvC2's ADX idle thread, macOS). This
+ * is a blocking point exactly as a kernel bridge is: the lock is dropped, the
+ * lifted-code count left, and on the way back Restore hands over by priority
+ * when the quantum is up. Where the lock is off it is Sleep(ms). */
+void xbox_GuestSleep(DWORD ms)
+{
+    int held = xbox_GuestLockDrop();
+    xbox_GuestLiftedLeave();
+    Sleep(ms);
+    xbox_GuestLockRestore(held);
+    xbox_GuestLiftedEnter();
+}
+
 /* RECOMP_BACKEDGE's slow path: another thread is waiting and this one is at
  * a loop header in lifted code. Hand over if its quantum is up. Called only
  * when g_guest_lock_waiters is non-zero, so the clock read is off the common

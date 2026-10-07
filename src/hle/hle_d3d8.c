@@ -1442,12 +1442,23 @@ static int shadow_can_draw(uint32_t xpt, uint32_t stride)
             return 0;
         }
         if (stride < p->extent) {        /* the layout would read past a vertex */
+            static int said;
+            /* Named, the first few: a "stride" count alone does not say
+             * which shader or by how much (NFSU2 skips two draws a frame). */
+            if (said++ < 4)
+                fprintf(stderr, "[HLE-D3D8] skipped (stride): vertex program 0x%08X, slot %d: "
+                        "stride %u, but its declaration reads %u bytes of a vertex\n",
+                        (unsigned)g_shadow_vs, g_shadow_vs_slot, (unsigned)stride, (unsigned)p->extent);
             g_draws_stride++;
             return 0;
         }
         shadow_use_viewport(1);
     } else {
         if (fvf_stride(g_shadow_vs) != stride) {
+            static int said;
+            if (said++ < 4)
+                fprintf(stderr, "[HLE-D3D8] skipped (stride): FVF 0x%08X wants stride %u, "
+                        "the draw gives %u\n", (unsigned)g_shadow_vs, (unsigned)fvf_stride(g_shadow_vs), (unsigned)stride);
             g_draws_stride++;
             return 0;
         }

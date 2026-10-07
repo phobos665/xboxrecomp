@@ -35,7 +35,10 @@ static int failures;
 
 static uintptr_t s_base;
 
-static struct { uint32_t last_off; uint64_t last_val; int reads, writes; } dev;
+/* Volatile: the fault handler changes these behind the compiler's back, and
+ * without it GCC -O2 reads them before the store that faults (a volatile
+ * store orders only against other volatile accesses). */
+static volatile struct { uint32_t last_off; uint64_t last_val; int reads, writes; } dev;
 
 static uint64_t dev_rd(void *d, uint32_t va, int size)
 {
@@ -59,7 +62,7 @@ static int dev_fault(recomp_fault *f, uint32_t va)
     return recomp_fault_emulate(f, s_base, NULL, dev_rd, dev_wr);
 }
 
-static int wo_writes;
+static volatile int wo_writes;
 static void wo_wr(void *d, uint32_t va, uint64_t v, int size)
 {
     wo_writes++;

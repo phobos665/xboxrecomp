@@ -12,7 +12,7 @@ only about building and running the *game*:
 |---|---|---|---|
 | **Windows 10/11** | yes | MSVC | D3D11 (default) or Vulkan, the complete path |
 | **Linux** | yes | GCC/Clang | Vulkan, the same renderer; least exercised |
-| **macOS** | yes | Clang | Vulkan on MoltenVK, the same renderer; being brought up |
+| **macOS** | yes (Apple Silicon) | Clang | Vulkan on MoltenVK, the same renderer; TimeSplitters 2 and BLiNX run |
 
 Every platform runs the same renderer (`src/d3d`, through `rhi.h`); only the
 graphics API under it differs (`docs/technical/vulkan-backend.md`). Windows is
