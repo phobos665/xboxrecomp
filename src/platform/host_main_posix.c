@@ -130,7 +130,9 @@ int host_module_range(uintptr_t *lo, uintptr_t *hi)
         const struct load_command *lc = (const struct load_command *)p;
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
-            if (strcmp(seg->segname, SEG_PAGEZERO) != 0 && seg->vmsize) {
+            /* Code only: a data word that happens to point at a global
+             * (g_xbox_mem_offset, say) is not a return address. */
+            if (strcmp(seg->segname, SEG_TEXT) == 0 && seg->vmsize) {
                 if (seg->vmaddr < min)
                     min = seg->vmaddr;
                 if (seg->vmaddr + seg->vmsize > max)
@@ -156,8 +158,8 @@ static int first_object(struct dl_phdr_info *info, size_t size, void *data)
     range[1] = 0;
     for (i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type != PT_LOAD)
-            continue;
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X))
+            continue;           /* code only, as on macOS */
         if (info->dlpi_addr + ph->p_vaddr < range[0])
             range[0] = info->dlpi_addr + ph->p_vaddr;
         if (info->dlpi_addr + ph->p_vaddr + ph->p_memsz > range[1])

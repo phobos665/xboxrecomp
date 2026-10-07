@@ -86,7 +86,7 @@ int recomp_fault_dispatch_ranges(recomp_fault *f, uint32_t va)
 /* Run the instruction at f's pc against rd/wr; commit says whether the
  * registers are written back. 1 when the decoder knew the instruction. */
 static int emulate(recomp_fault *f, uintptr_t dev_base, void *dev,
-                   mmio_read_fn rd, mmio_write_fn wr, int commit)
+                   mmio_read_fn rd, mmio_write_fn wr, mmio_atomic_fn at, int commit)
 {
     if (!f->ctx)
         return 0;                         /* a raised fault has no context */
@@ -94,7 +94,8 @@ static int emulate(recomp_fault *f, uintptr_t dev_base, void *dev,
     {
         mmio_a64_ctx c;
         mmio_a64_from_ucontext(&c, (ucontext_t *)f->ctx);
-        if (!mmio_a64_emulate(&c, *(const uint32_t *)(uintptr_t)c.pc, dev_base, dev, rd, wr))
+        if (!mmio_a64_emulate_ex(&c, *(const uint32_t *)(uintptr_t)c.pc, dev_base, dev,
+                                 rd, wr, at))
             return 0;
         if (commit) {
             mmio_a64_to_ucontext(&c, (ucontext_t *)f->ctx);
@@ -103,6 +104,7 @@ static int emulate(recomp_fault *f, uintptr_t dev_base, void *dev,
         return 1;
     }
 #elif defined(MMIO_X86_DECODER) && defined(_WIN32)
+    (void)at;
     {
         mmio_x86_ctx copy, *c = (mmio_x86_ctx *)f->ctx;
         if (!commit) {
@@ -116,6 +118,7 @@ static int emulate(recomp_fault *f, uintptr_t dev_base, void *dev,
         return 1;
     }
 #elif defined(MMIO_X86_DECODER) && defined(MMIO_X86_HAVE_UCONTEXT)
+    (void)at;
     {
         mmio_x86_ctx c;
         mmio_x86_from_ucontext(&c, (ucontext_t *)f->ctx);
@@ -128,7 +131,7 @@ static int emulate(recomp_fault *f, uintptr_t dev_base, void *dev,
         return 1;
     }
 #else
-    (void)dev_base; (void)dev; (void)rd; (void)wr; (void)commit;
+    (void)dev_base; (void)dev; (void)rd; (void)wr; (void)at; (void)commit;
     return 0;
 #endif
 }
@@ -136,7 +139,7 @@ static int emulate(recomp_fault *f, uintptr_t dev_base, void *dev,
 int recomp_fault_emulate(recomp_fault *f, uintptr_t dev_base, void *dev,
                          mmio_read_fn rd, mmio_write_fn wr)
 {
-    return emulate(f, dev_base, dev, rd, wr, 1);
+    return emulate(f, dev_base, dev, rd, wr, NULL, 1);
 }
 
 /* ---- guest memory without faulting --------------------------------------- */
@@ -191,6 +194,96 @@ void recomp_guest_write(void *dev, uint32_t va, uint64_t val, int size)
 #endif
 }
 
+/* ---- atomics through the backdoor ---------------------------------------- */
+
+#if !defined(_WIN32)
+/* The exclusive monitor, as far as an emulated LDXR/STXR pair needs one: the
+ * value this thread's LDXR saw, so its STXR can be a compare-and-swap
+ * against it -- a lost race then fails the STXR, as the hardware would,
+ * instead of overwriting the winner. */
+static __thread struct { int valid; uint32_t va; int size; uint64_t value; } t_excl;
+
+static uint64_t mask_of(int size) { return size >= 8 ? ~0ULL : ((1ULL << (size * 8)) - 1); }
+
+/* A real atomic on the backdoor alias, which is ordinary shared memory:
+ * atomic against the guest's own accesses through the trapped view and
+ * every other alias, because they are the same bytes. */
+static uint64_t backdoor_atomic(void *dev, uint32_t va, int size, int op,
+                                uint64_t operand, uint64_t expected, int *status)
+{
+    void *p = w32_backdoor((const void *)(s_guest_base + va));
+    uint64_t old = 0, m = mask_of(size);
+    (void)dev;
+
+    if (!p || ((uintptr_t)p & (uintptr_t)(size - 1)))
+        return 0;      /* unaligned atomics fault on the hardware too */
+    operand &= m;
+
+#define AT_CASE(T) do {                                                       \
+        T *q = (T *)p;                                                        \
+        switch (op) {                                                         \
+        case MMIO_AT_ADD: old = __atomic_fetch_add(q, (T)operand, __ATOMIC_SEQ_CST); break; \
+        case MMIO_AT_CLR: old = __atomic_fetch_and(q, (T)~operand, __ATOMIC_SEQ_CST); break; \
+        case MMIO_AT_EOR: old = __atomic_fetch_xor(q, (T)operand, __ATOMIC_SEQ_CST); break; \
+        case MMIO_AT_SET: old = __atomic_fetch_or(q, (T)operand, __ATOMIC_SEQ_CST); break; \
+        case MMIO_AT_SWP: old = __atomic_exchange_n(q, (T)operand, __ATOMIC_SEQ_CST); break; \
+        case MMIO_AT_CAS: {                                                   \
+            T e = (T)expected;                                                \
+            __atomic_compare_exchange_n(q, &e, (T)operand, 0,                 \
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);  \
+            old = (uint64_t)e;                                                \
+            break; }                                                          \
+        case MMIO_AT_LDX:                                                     \
+            old = __atomic_load_n(q, __ATOMIC_SEQ_CST);                       \
+            t_excl.valid = 1; t_excl.va = va; t_excl.size = size;             \
+            t_excl.value = old;                                               \
+            break;                                                            \
+        case MMIO_AT_STX: {                                                   \
+            int ok;                                                           \
+            if (t_excl.valid && t_excl.va == va && t_excl.size == size) {     \
+                T e = (T)t_excl.value;                                        \
+                ok = __atomic_compare_exchange_n(q, &e, (T)operand, 0,        \
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);  \
+            } else {                                                          \
+                /* Its LDXR ran natively (the page was readable), so there is \
+                 * no value to compare against. Failing would loop for ever:  \
+                 * the store faults every time. Store and succeed; the window \
+                 * is the few instructions since that load. */                \
+                __atomic_store_n(q, (T)operand, __ATOMIC_SEQ_CST);            \
+                ok = 1;                                                       \
+            }                                                                 \
+            t_excl.valid = 0;                                                 \
+            if (status) *status = ok ? 0 : 1;                                 \
+            break; }                                                          \
+        default: { /* signed/unsigned max/min: a compare-and-swap loop */     \
+            T cur = __atomic_load_n(q, __ATOMIC_SEQ_CST), nv;                 \
+            do {                                                              \
+                uint64_t c64 = (uint64_t)cur & m;                             \
+                int64_t sc = mmio_a64_sext(c64, size * 8), so = mmio_a64_sext(operand, size * 8); \
+                switch (op) {                                                 \
+                case MMIO_AT_SMAX: nv = (T)(sc > so ? c64 : operand); break;  \
+                case MMIO_AT_SMIN: nv = (T)(sc < so ? c64 : operand); break;  \
+                case MMIO_AT_UMAX: nv = (T)(c64 > operand ? c64 : operand); break; \
+                default:           nv = (T)(c64 < operand ? c64 : operand); break; \
+                }                                                             \
+            } while (!__atomic_compare_exchange_n(q, &cur, nv, 0,             \
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)); \
+            old = (uint64_t)cur;                                              \
+            break; }                                                          \
+        }                                                                     \
+    } while (0)
+
+    switch (size) {
+    case 1:  AT_CASE(uint8_t);  break;
+    case 2:  AT_CASE(uint16_t); break;
+    case 4:  AT_CASE(uint32_t); break;
+    default: AT_CASE(uint64_t); break;
+    }
+#undef AT_CASE
+    return old & m;
+}
+#endif
+
 /* ---- checked completion through the backdoor ----------------------------- */
 
 #if !defined(_WIN32)
@@ -220,6 +313,36 @@ static void dry_wr(void *dev, uint32_t va, uint64_t val, int size)
     if (!d->allow(s_guest_base + va, size, 1, d->arg))
         d->refused = 1;
 }
+
+/* Every atomic may write, whatever the comparison would decide, so it is
+ * checked for writing unconditionally: a CAS that fails in the dry run can
+ * succeed a moment later for real. Nothing is stored, and LDX does not touch
+ * the monitor. */
+static uint64_t dry_at(void *dev, uint32_t va, int size, int op,
+                       uint64_t operand, uint64_t expected, int *status)
+{
+    dry_run *d = t_dry;
+    (void)operand; (void)expected;
+    if (!d->allow(s_guest_base + va, size, 0, d->arg) ||
+        (op != MMIO_AT_LDX && !d->allow(s_guest_base + va, size, 1, d->arg)))
+        d->refused = 1;
+    if (status) *status = 0;
+    return recomp_guest_read(dev, va, size);
+}
+
+void recomp_fault_emulate_thread_init(void)
+{
+    /* Touch the handler's thread-locals here, not first inside a signal
+     * handler: on Darwin a __thread variable's storage is made on its first
+     * use in a thread, by malloc, and a fault can land while this thread
+     * holds the malloc lock. */
+    t_dry = NULL;
+    t_excl.valid = 0;
+}
+#endif
+
+#if defined(_WIN32)
+void recomp_fault_emulate_thread_init(void) {}
 #endif
 
 int recomp_fault_complete_guest(recomp_fault *f, recomp_allow_fn allow, void *arg)
@@ -237,12 +360,13 @@ int recomp_fault_complete_guest(recomp_fault *f, recomp_allow_fn allow, void *ar
     d.arg = arg;
     d.refused = 0;
     t_dry = &d;
-    if (!emulate(f, base, NULL, dry_rd, dry_wr, 0) || d.refused) {
+    if (!emulate(f, base, NULL, dry_rd, dry_wr, dry_at, 0) || d.refused) {
         t_dry = NULL;
         return 0;
     }
     t_dry = NULL;
-    return emulate(f, base, NULL, recomp_guest_read, recomp_guest_write, 1);
+    return emulate(f, base, NULL, recomp_guest_read, recomp_guest_write,
+                   backdoor_atomic, 1);
 #endif
 }
 

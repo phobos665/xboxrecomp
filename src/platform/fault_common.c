@@ -9,6 +9,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -50,6 +51,18 @@ void recomp_fault_raise(int kind, uint32_t code, uintptr_t pc)
 #ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), code);
 #else
-    _exit((int)(code & 0xFF) ? (int)(code & 0xFF) : 1);
+    /* By the signal the hardware would have raised, so whatever waits on the
+     * process (a shell, the harness) sees a fault and not an exit status. */
+    {
+        int sig = kind == RECOMP_FAULT_INT_DIVIDE || kind == RECOMP_FAULT_INT_OVERFLOW
+                      ? SIGFPE
+                  : kind == RECOMP_FAULT_ILLEGAL    ? SIGILL
+                  : kind == RECOMP_FAULT_ACCESS     ? SIGSEGV
+                  : kind == RECOMP_FAULT_BREAKPOINT ? SIGTRAP
+                                                    : SIGABRT;
+        signal(sig, SIG_DFL);
+        raise(sig);
+        _exit(128 + sig);       /* raise returned: the signal is blocked */
+    }
 #endif
 }

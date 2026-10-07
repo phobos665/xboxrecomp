@@ -161,6 +161,59 @@ int main(void)
         CHECK("memcpy beside the device did not reach it", dev.writes == 2);
     }
 
+    /* Atomics on collateral memory are real atomics through the backdoor:
+     * LSE add and CAS from C, and an LDXR/STXR loop by hand -- what the
+     * lifter's lowering of `lock` instructions compiles to. */
+    {
+        uint32_t a = WO_VA + 0x2000;
+        volatile uint32_t *p = (volatile uint32_t *)(s_base + a);
+        uint32_t expect = 7, old;
+        int i;
+
+        *p = 5;
+        for (i = 0; i < 100; i++)
+            __atomic_fetch_add(p, 1, __ATOMIC_SEQ_CST);
+        CHECK("LSE add on collateral", *p == 105);
+        expect = 105;
+        CHECK("CAS succeeds", __atomic_compare_exchange_n(p, &expect, 200, 0,
+                                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+                              && *p == 200);
+        expect = 105;
+        CHECK("CAS fails and reports the value",
+              !__atomic_compare_exchange_n(p, &expect, 300, 0,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+              && expect == 200 && *p == 200);
+#if defined(__aarch64__)
+        for (i = 0; i < 10; i++) {
+            uint32_t status;
+            __asm__ volatile(
+                "1: ldxr %w0, [%2]\n"
+                "   add  %w0, %w0, #3\n"
+                "   stxr %w1, %w0, [%2]\n"
+                "   cbnz %w1, 1b\n"
+                : "=&r"(old), "=&r"(status) : "r"(p) : "memory");
+        }
+        CHECK("LDXR/STXR loop on collateral", *p == 230);
+        /* Beside the null trap the host page is no-access, so the LDXR
+         * faults too and the STXR becomes a compare-and-swap against what
+         * it saw. */
+        p = (volatile uint32_t *)(s_base + 0x2000);
+        *p = 1;
+        for (i = 0; i < 10; i++) {
+            uint32_t status;
+            __asm__ volatile(
+                "1: ldaxr %w0, [%2]\n"
+                "   add   %w0, %w0, #2\n"
+                "   stlxr %w1, %w0, [%2]\n"
+                "   cbnz  %w1, 1b\n"
+                : "=&r"(old), "=&r"(status) : "r"(p) : "memory");
+        }
+        CHECK("LDAXR/STLXR loop beside the null trap", *p == 21);
+#else
+        (void)old;
+#endif
+    }
+
     /* A real bad access still crashes. */
     if (!sigsetjmp(s_crash_jmp, 1)) {
         volatile uint32_t v = G32(0x8);
