@@ -144,6 +144,213 @@ static const uintptr_t try_bases[] = {
 };
 ```
 
+## On macOS and Linux: one 4 GB arena
+
+The base list above is useless off Windows: every address in it is below
+4 GB, and an arm64 macOS process has a 4 GB `__PAGEZERO` there that cannot be
+shrunk. So on POSIX `xbox_MemoryLayoutInit` first reserves the whole guest
+span: 4 GB plus a 64 KB guard, aligned to 4 GB, as one inaccessible range
+(`w32_reserve_arena`, `src/platform/posix_memory.c`). Guest 0 is its base,
+which is `g_xbox_mem_offset`. RAM, the mirrors, the contiguous window, the
+tiled aperture and the device apertures are then placed inside it with the
+same `MapViewOfFileEx` and `VirtualAlloc` calls Windows uses. The arena keeps
+Windows' rule that a fixed placement lands exactly there or fails, because the
+code here depends on a failed placement failing. The shared objects are
+`memfd` on Linux and `shm_open` with an immediate `shm_unlink` on Darwin.
+
+Apple Silicon's pages are 16 KB and the Xbox's are 4 KB. The arena keeps
+every 4 KB page's requested protection in a side table and gives each host
+page the most restrictive protection among its four guest pages. An access the
+guest page allows but the host page refuses (the 12 KB beside a 4 KB trap
+such as the PCRTC page, the AC'97 page or `RECOMP_TRAP_NULL`'s page zero) is
+completed by the fault route through an always-writable second view of the
+same memory (`w32_backdoor`, `recomp_fault_passthrough`). The main TIB
+moved from 0x1000 to 0x4000 for this reason: on a 16 KB host, page zero's trap
+covers 0..0x3FFF. `tests/guest_memory`, `tests/memory_layout` (the real layout
+at 64 and 128 MB) and `tests/guest_faults` cover all of it.
+
+Mirrors stop at 0x80000000 on every host. That is where the console's kernel
+space starts (the contiguous window, then the tiled aperture and the
+devices), and none of it is a wrap of low RAM. 28 mirrors of a 64 MB map end
+at 0x74000000, so a retail map is unaffected. A 128 MB map (BLiNX) gets 15.
+
+### Faults off Windows
+
+On Windows a trapped page is serviced by the vectored exception handler. On
+POSIX it is a `SIGSEGV`/`SIGBUS` handler (`src/platform/fault_posix.c`) on a
+per-thread alternate stack. Every thread gets one through
+`recomp_fault_thread_init`, which also pre-touches the handler's
+thread-locals, because on Darwin the first use of a `__thread` variable
+allocates. Both handlers build a `recomp_fault` (`recomp_fault.h`) and hand
+it to the same route, `xbox_fault_route` (`src/kernel/xbox_fault_route.c`),
+which tries these in order:
+
+1. A single-step: Windows watchpoints only.
+2. A watched page (`RECOMP_WATCH_WRITE`).
+3. A registered device range. `apu_fault_register` adds the PCRTC interrupt
+   page, the APU registers and the AC'97 page.
+4. POSIX only: the 16 KB pass-through above.
+
+Anything the route declines reaches the title's crash report.
+
+"Completing" an access means decoding the host instruction, doing what it
+would have done against a device model or the backdoor, writing the result
+registers back into the signal context and stepping past it. The decoder is
+chosen by the host CPU, not the OS. `mmio_decode.h` handles x86-64 (Windows
+and Linux x86-64). `mmio_decode_a64.h` handles arm64, and is complete, not
+device-shaped: on a 16 KB host the collateral 12 KB is ordinary guest memory
+reached by whatever clang emitted. That covers every LDR/STR addressing mode,
+sign-extending loads, FP/SIMD up to Q, all four LDP/STP modes, LSE atomics,
+CAS, LDXR/STXR and DC ZVA. Guest-memory atomics are done as real atomics on
+the backdoor, and an emulated LDXR/STXR pair becomes a compare-and-swap, so
+they stay atomic against other threads. A dry run checks every element of an
+access against the 4 KB side table before anything is done, so a pair that
+straddles into a trapped page is refused whole rather than half-done.
+`tests/mmio_decode_a64` compares the emulator against the hardware on about
+100 assembled forms and on clang-compiled MEM-style code, memcpy, memmove and
+memset.
+
+### Measured (Gate A, 7 Oct 2026)
+
+On an Apple M4 (macOS 27, 16 KB pages) at exp `47b78dd`, `RECOMP_HLE_D3D8=off`,
+60 s:
+
+- **TimeSplitters 2** reaches its first `Swap` straight after
+  `Direct3D_CreateDevice` and runs 3569 Swaps in 60 s, about 59.5 fps. The
+  Windows baseline is 58-59. There were no faults and no unresolved indirect
+  calls, and 26,835 kernel calls. The PCRTC acknowledge, the APU start and
+  the DSP doorbell all go through the device ranges.
+- **BLiNX** maps 128 MB with 15/15 mirrors and takes no faults. It reaches its
+  first `Swap` only with `RECOMP_GUEST_LOCK=0` (2072 Swaps in 40 s). With the
+  guest lock on, the default on arm64, it starves before the first frame.
+  That is a lock-fairness problem, not a memory one (fixed since: see "Guest
+  threads" below).
+
+These counts are `[TRACE swap]` lines from `RECOMP_HLE_D3D8_TRACE_SWAPS=0-1`;
+`[FPS]` prints on POSIX too now.
+
+## Guest threads: one at a time, by strict priority
+
+With the guest lock on (`RECOMP_GUEST_LOCK`, the default on arm64), one guest
+thread runs lifted code at a time, as on the console's one CPU. Which one is
+the console's rule, and titles depend on it.
+
+**Preemption happens only at a loop back edge or a blocking call, never at the
+return of a kernel call that cannot block.** Put that first because it is the
+rule that bit twice. The rest:
+
+- The lock belongs to the highest-priority runnable guest thread. It keeps the
+  lock until it blocks (a wait, a delay, I/O, a contended critical section,
+  `xbox_GuestSleep`) or suspends itself.
+- A waiter of higher priority takes over at the holder's next back edge
+  (`RECOMP_BACKEDGE()`, at every loop header; the only preemption point lifted
+  code has) or when the holder blocks. A non-blocking kernel call is an
+  exception only when the call itself readied that waiter (a resume, the
+  event it waited on). It then preempts at the call's return, as NT does. A
+  waiter that was already waiting before the call does not.
+- Equal priorities take turns at a back edge or a blocking call once the
+  holder's quantum (`RECOMP_GUEST_QUANTUM_US`, 2000) is up.
+- A lower priority runs only when everything above it blocks. That starves
+  it, and the console starves it too.
+- When the lock comes free, it goes to the highest-priority waiter, not to
+  whichever wakes first (`guest_outranked`). A resumed thread counts as waiting
+  from the moment the resume makes it runnable, not from when it wakes.
+- Interrupts (the vblank ISR and DPCs, which run on host threads) outrank every
+  guest thread and get in wherever a guest thread lets go, a non-blocking
+  kernel call included.
+
+The lock's mutex still has to go down around every kernel call: the bridge
+cannot see whether a host call will block, and interrupts must get in. So a
+call that `bridge_may_block` (in `kernel_bridge.c`) does not list keeps
+ownership while the mutex is down (`xbox_GuestLockDropForKernel`): other guest
+threads wait for it to come back, and the caller retakes the mutex before it
+lets that ownership go. A thread suspending itself gives the ownership up
+there and then. Two bounds keep a mistake here from becoming a hang, and both
+say when they fire. A call that turns out to block hands over after
+`RECOMP_GUEST_RESERVE_US` (50 ms), and the log names its ordinal for
+`bridge_may_block`. A waiter starved for 500 ms (`GL_STARVE_QUANTA`) is let in
+anyway, logged once per pair of threads with both tids and priorities. On the
+console that would mean a priority here is wrong.
+
+Priorities are the increments from `KeSetBasePriorityThread` (and
+`KeSetPriorityThread` minus 8), kept by host thread id. `KeQueryBasePriorityThread`
+answers from the same record. It used to answer 0 for every thread on every
+host, including Windows, because it handed a guest object to `GetThreadPriority`.
+
+The `[GUESTLOCK]` line every five seconds counts the handoffs at back edges and
+blocking calls, how long interrupts waited, how often a non-blocking call kept
+a thread out (and ran past its bound), how often a thread stood aside for a
+higher priority, and how often the starvation valve let one in.
+`RECOMP_THREAD_TRACE=1` prints every suspend, resume and priority change by
+host tid, with the previous value. `RECOMP_GUEST_RESERVE_US=0` and
+`RECOMP_GUEST_RANKED=0` switch the two newest rules off for an A/B run.
+
+### Why: BLiNX's CRI ADX lock
+
+CRI's ADX/Sofdec middleware (BLiNX; MvC2 has it too) locks like this,
+`sub_000FA230`/`sub_000FA270` in BLiNX:
+
+```c
+lock:   if (count == 0) {                       /* [0x414AC4] */
+            saved = GetThreadPriority(self);    /* one slot, [0xAAC358] */
+            SetThreadPriority(self, 16);
+            ResumeThread(spinner);              /* a priority-2 busy loop */
+        }
+        count++;
+unlock: if (--count == 0) {
+            SuspendThread(spinner);
+            SetThreadPriority(self, saved);
+        }
+```
+
+The count and the saved priority are plain globals. The lock is only correct on
+a strict-priority uniprocessor. Nothing below 16 runs while the holder runs.
+While it blocks, the spinner at 2 takes the CPU, so the file server at 1 and the
+main thread at 0 stay out. Every one of these broke it here, each in its own
+run, read off `RECOMP_THREAD_TRACE`:
+
+1. Handing over at every kernel call. There are seven kernel calls between the
+   test and the increment, so the file server got in between, both threads
+   took the lock, and the spinner's suspend count ended at 2: it never ran
+   again. A `ResumeThread` at count 0 is a no-op, there as on the console.
+2. `KeQueryBasePriorityThread` answering 0. The server's first unlock
+   restored it to 0, level with the main thread.
+3. The mutex going to whichever waiter woke first. While the holder blocked,
+   the server beat the spinner to it.
+4. Clearing the reservation before retaking the mutex. A waiter took it in that
+   gap, between `ResumeThread` and the increment.
+5. Counting `SuspendThread` of another thread as blocking. A handoff
+   between unlock's suspend and its priority restore let the main thread
+   overwrite the saved slot.
+6. A 40 ms starvation bound. A long turn at 16 reached it.
+7. A resume and re-suspend before the thread woke. That left it counted as a
+   waiter at 2, so everything lower stood aside for nothing, and BLiNX ran at
+   1 fps.
+
+A title that stalls only with the lock on, or whose threads end up at the wrong
+priority, is the first thing to check against this list.
+
+### Measured (7 Oct 2026, mac/kl-prio)
+
+On a loaded Apple M4 (load average about 30 from other work):
+
+- **TimeSplitters 2**, in the level: 59-60 fps with the rules and with them
+  switched off (`RECOMP_GUEST_RESERVE_US=0 RECOMP_GUEST_RANKED=0`). The main
+  thread used 31.1 s of CPU in 95 s with them and 33.1 s without. The
+  starvation valve never fired.
+- **BLiNX**, with the rules: 58-60 fps once past the logos. The trace shows
+  the ADX lock intact for 90 s: the spinner's count only went 1, 0, 1; both
+  threads restored their own priorities; no bound or valve fired. Without a
+  trace, the valve fired once at boot, for the spinner behind the main thread
+  at 16. Interrupts waited at most 65 ms while loading, then 1-10 ms.
+- Both titles print one `a host thread waited 100 ms` warning at boot, with
+  the rules or without. That is the main thread holding the lock across
+  SDL's window and audio set-up, not scheduling.
+- **Not fixed:** BLiNX still issues no read after opening `artoon001.sfd`, its
+  second movie, now with the lock intact. An earlier run with the lock broken
+  did get past it, to `op01.sfd`. So the remaining stall is somewhere else, and
+  the Windows log is the comparison it needs.
+
 ## Section Initialization
 
 After mapping the 64 MB region, the XBE file's sections are copied to their original addresses:

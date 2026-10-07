@@ -8,7 +8,9 @@
  * C++ only because dxcapi.h is. The compiler is loaded at run time, not
  * linked, so a build without it still runs the Direct3D 11 backend: it is
  * looked for beside the executable (and on the search path), then where the
- * build found it (RHI_DXC_LIBRARY).
+ * build found it (RHI_DXC_LIBRARY). On Apple "beside the executable" is
+ * also the Frameworks folder of an app bundle, which is where a shipped
+ * build puts libdxcompiler.dylib; RECOMP_DXC_LIBRARY names one outright.
  *
  * The binding shifts here and the descriptor set layout in rhi_vulkan.c are
  * one convention: HLSL's b, t and s register spaces are separate and
@@ -26,7 +28,11 @@
 #include <oleauto.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #include "WinAdapter.h"
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 #include "dxcapi.h"
@@ -46,6 +52,29 @@ static IDxcCompiler3     *g_compiler;
 static IDxcUtils         *g_utils;
 static int                g_tried;
 
+#if !defined(_WIN32)
+/* The directory the executable is in, with a trailing '/'. */
+static int exe_dir(char *out, size_t n)
+{
+    char *slash;
+#if defined(__APPLE__)
+    uint32_t size = (uint32_t)n;
+    if (_NSGetExecutablePath(out, &size) != 0)
+        return 0;
+#else
+    ssize_t len = readlink("/proc/self/exe", out, n - 1);
+    if (len <= 0)
+        return 0;
+    out[len] = 0;
+#endif
+    slash = strrchr(out, '/');
+    if (!slash)
+        return 0;
+    slash[1] = 0;
+    return 1;
+}
+#endif
+
 static DxcCreateInstanceProc load_dxc(void)
 {
 #if defined(_WIN32)
@@ -56,7 +85,39 @@ static DxcCreateInstanceProc load_dxc(void)
 #endif
     return m ? (DxcCreateInstanceProc)(void *)GetProcAddress(m, "DxcCreateInstance") : NULL;
 #else
-    void *m = dlopen("libdxcompiler.so", RTLD_NOW);
+#if defined(__APPLE__)
+    static const char *const kName = "libdxcompiler.dylib";
+    /* Relative to the executable: beside it, then an app bundle's
+     * Contents/Frameworks (the executable is in Contents/MacOS). */
+    static const char *const kBeside[] = { "", "../Frameworks/" };
+#else
+    static const char *const kName = "libdxcompiler.so";
+    static const char *const kBeside[] = { "" };
+#endif
+    const char *named = getenv("RECOMP_DXC_LIBRARY");
+    void *m = NULL;
+    char exe[1024];
+    size_t i;
+
+    if (named && *named && !(m = dlopen(named, RTLD_NOW)))
+        fprintf(stderr, "[RHI] vulkan: RECOMP_DXC_LIBRARY=%s: %s\n", named, dlerror());
+    if (!m && exe_dir(exe, sizeof exe))
+        for (i = 0; !m && i < sizeof kBeside / sizeof kBeside[0]; i++) {
+            std::string path = std::string(exe) + kBeside[i] + kName;
+            m = dlopen(path.c_str(), RTLD_NOW);
+        }
+    if (!m)
+        m = dlopen(kName, RTLD_NOW);        /* the search path */
+#if defined(__APPLE__)
+    /* A Vulkan SDK installed system-wide puts it here, and macOS no longer
+     * searches /usr/local/lib by itself. */
+    if (!m)
+        m = dlopen("/usr/local/lib/libdxcompiler.dylib", RTLD_NOW);
+#endif
+    if (!m && getenv("VULKAN_SDK")) {
+        std::string path = std::string(getenv("VULKAN_SDK")) + "/lib/" + kName;
+        m = dlopen(path.c_str(), RTLD_NOW);
+    }
 #ifdef RHI_DXC_LIBRARY
     if (!m)
         m = dlopen(RHI_DXC_LIBRARY, RTLD_NOW);
@@ -138,6 +199,14 @@ extern "C" int rhi_vk_dxc_compile(uint32_t stage, const RhiShaderSource *src,
     keep.push_back(L"-E");
     keep.push_back(widen(src->entry ? src->entry : "main"));
     keep.push_back(src->optimize ? L"-O3" : L"-O1");
+    /* The language the generators are written in: D3DCompile's, where a
+     * ?: on vectors selects per component. HLSL 2021 (DXC's default since
+     * 1.7) refuses that, so without this the result depended on which DXC
+     * was found -- the Vulkan SDK's refused every combiner shader that
+     * reads a title's own texture modes (its dotmap helpers), and an older
+     * DXC took them. tests/nv2a_combiners_hlsl is what found it. */
+    keep.push_back(L"-HV");
+    keep.push_back(L"2018");
     /* D3D11's constant-buffer packing, exactly: the renderer fills its
      * constant buffers from C structs laid out for it. */
     keep.push_back(L"-fvk-use-dx-layout");

@@ -1580,6 +1580,8 @@ class Lifter:
             return self._lift_lea(insn, ops)
         if m == "xchg":
             return self._lift_xchg(insn, ops)
+        if m.startswith("lock ") and m[5:] in self._LOCKED_RMW:
+            return self._lift_locked_rmw(insn, ops, m[5:])
 
         # ── Stack ──
         if m == "push":
@@ -2058,6 +2060,17 @@ class Lifter:
     def _lift_xchg(self, insn, ops):
         if len(ops) < 2:
             return [f"/* xchg: bad operands */"]
+        # xchg with memory is locked whether or not it says so: an atomic
+        # exchange, at the operand's width.
+        mem = next((o for o in ops if o.type == "mem"), None)
+        reg = next((o for o in ops if o.type == "reg"), None)
+        if mem is not None and reg is not None and mem.mem_size in (1, 2, 4):
+            bits = mem.mem_size * 8
+            return [
+                f"{{ uint32_t _tmp = (uint32_t)RECOMP_ATOMIC_XCHG{bits}("
+                f"XBOX_PTR({_fmt_mem(mem)}), {_fmt_operand_read(reg)});",
+                _fmt_operand_write(reg, "_tmp") + " }  /* xchg (locked) */",
+            ]
         a = _fmt_operand_read(ops[0])
         b = _fmt_operand_read(ops[1])
         return [
@@ -2065,6 +2078,63 @@ class Lifter:
             _fmt_operand_write(ops[0], b),
             _fmt_operand_write(ops[1], "_tmp") + " }",
         ]
+
+    # The lock-prefixed read-modify-writes, other than xadd and cmpxchg (which
+    # have their own lowering further down).
+    _LOCKED_RMW = frozenset({"add", "sub", "and", "or", "xor",
+                             "inc", "dec", "not", "neg", "adc", "sbb"})
+
+    def _lift_locked_rmw(self, insn, ops, base):
+        """lock add/sub/and/or/xor/inc/dec/not/neg/adc/sbb on memory.
+
+        These reached RECOMP_UNIMPL: the instruction did nothing at all, on
+        every host. Now the unlocked lifting supplies the arithmetic and the
+        flags, and the memory update becomes a compare-and-swap loop:
+
+          _lo = old value; repeat { _ln = op(_lo) } until CAS(p, _lo, _ln)
+
+        then the flag statements the unlocked form computes, with the
+        destination read as _lo where they came before its write and as _ln
+        where they came after. So the flags are exactly the unlocked form's,
+        taken from the values the atomic update actually used.
+
+        adc and sbb write inside a block of their own, so they are lifted
+        unlocked (correct on one CPU, as the console is), with a note.
+        """
+        plain = self._lift_unlocked(insn, ops, base)
+        if not ops or ops[0].type != "mem" or ops[0].mem_size not in (1, 2, 4):
+            return plain                           # register forms: nothing shared
+        dst = _fmt_mem_read(ops[0])
+        write_prefix = f"{dst} = "
+        idx = [i for i, s in enumerate(plain) if s.startswith(write_prefix)]
+        if len(idx) != 1 or not plain[idx[0]].endswith(";"):
+            return plain + [f"/* lock {base}: not atomic (no single write to wrap) */"]
+        i = idx[0]
+        expr = plain[i][len(write_prefix):-1]
+        bits = ops[0].mem_size * 8
+        ctype = f"uint{bits}_t"
+        before = [s.replace(dst, "_lo") for s in plain[:i]]
+        after = [s.replace(dst, "_ln") for s in plain[i + 1:]]
+        return ([f"{{ volatile {ctype} *_lp = (volatile {ctype} *)XBOX_PTR({_fmt_mem(ops[0])});",
+                 f"  {ctype} _lo = *_lp, _ln;",
+                 f"  do {{ _ln = ({ctype})({expr.replace(dst, '_lo')}); }}"
+                 f" while (!RECOMP_ATOMIC_CASV{bits}(_lp, &_lo, _ln));  /* lock {base} */"]
+                + ["  " + s for s in before + after]
+                + ["}"])
+
+    def _lift_unlocked(self, insn, ops, base):
+        """What the instruction lifts to without its lock prefix."""
+        if base in ("add", "sub", "and", "or", "xor"):
+            return self._lift_alu_binop(insn, ops, base)
+        if base in ("inc", "dec"):
+            return self._lift_inc_dec(insn, ops, base)
+        if base == "neg":
+            return self._lift_neg(insn, ops)
+        if base == "not":
+            return self._lift_not(insn, ops)
+        if base == "adc":
+            return self._lift_adc(insn, ops)
+        return self._lift_sbb(insn, ops)
 
     # ── Stack ──
 
@@ -2306,17 +2376,62 @@ class Lifter:
                 f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
             ]
-        elif m == "div":
+        # div/idiv at the operand's width. x86 divides AX by a byte (quotient
+        # in AL, remainder in AH), DX:AX by a word, and EDX:EAX by a dword;
+        # every form used to be lifted as the dword one, so `div cl` divided
+        # edx:eax and overwrote both registers whole.
+        #
+        # The divisor is read once into a local and checked by
+        # RECOMP_DIV_CHECK / RECOMP_IDIV_CHECK: nothing on an x86 host, whose
+        # own division traps; elsewhere they raise the #DE the hardware would
+        # (recomp_types.h). A quotient that overflows its register is
+        # truncated, as Windows has always done (see the same place).
+        width = _operand_width(ops[0]) or 4
+        if m == "div":
+            if width == 1:
+                return [
+                    f"{{ uint32_t _dividend = LO16(eax); uint32_t _dv = (uint8_t){src};",
+                    "  RECOMP_DIV_CHECK(_dv);",
+                    "  SET_LO8(eax, _dividend / _dv); SET_HI8(eax, _dividend % _dv); }"
+                ]
+            if width == 2:
+                return [
+                    f"{{ uint32_t _dividend = ((uint32_t)LO16(edx) << 16) | LO16(eax);"
+                    f" uint32_t _dv = (uint16_t){src};",
+                    "  RECOMP_DIV_CHECK(_dv);",
+                    "  SET_LO16(eax, _dividend / _dv); SET_LO16(edx, _dividend % _dv); }"
+                ]
             return [
-                f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
-                f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
+                f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;"
+                f" uint32_t _dv = (uint32_t){src};",
+                "  RECOMP_DIV_CHECK(_dv);",
+                "  eax = (uint32_t)(_dividend / _dv);",
+                "  edx = (uint32_t)(_dividend % _dv); }"
             ]
         elif m == "idiv":
+            if width == 1:
+                return [
+                    f"{{ int32_t _dividend = (int16_t)LO16(eax); int32_t _dv = (int8_t){src};",
+                    "  RECOMP_DIV_CHECK(_dv);",
+                    "  SET_LO8(eax, (uint32_t)(_dividend / _dv));"
+                    " SET_HI8(eax, (uint32_t)(_dividend % _dv)); }"
+                ]
+            if width == 2:
+                # INT32_MIN / -1 cannot arise: the dividend is a sign-extended
+                # 32-bit value and the division is done in 64 bits.
+                return [
+                    f"{{ int64_t _dividend = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax));"
+                    f" int64_t _dv = (int16_t){src};",
+                    "  RECOMP_DIV_CHECK(_dv);",
+                    "  SET_LO16(eax, (uint32_t)(_dividend / _dv));"
+                    " SET_LO16(edx, (uint32_t)(_dividend % _dv)); }"
+                ]
             return [
-                f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
-                f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
+                f"{{ int64_t _dividend = (int64_t)(((uint64_t)edx << 32) | eax);"
+                f" int32_t _dv = (int32_t){src};",
+                "  RECOMP_IDIV_CHECK(_dividend, _dv);",
+                "  eax = (uint32_t)((int32_t)(_dividend / _dv));",
+                "  edx = (uint32_t)((int32_t)(_dividend % _dv)); }"
             ]
         return [f"/* {m}: unhandled */"]
 
@@ -3676,16 +3791,25 @@ class Lifter:
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
+        # The float-to-int conversions go through recomp_cvt*2si, which give
+        # x86's answer on every host: the rounding forms round (a cast
+        # truncated them), and NaN or out-of-range is 0x80000000 (a cast
+        # saturates on AArch64). recomp_types.h has the details.
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                return [_fmt_operand_write(ops[0], f"(uint32_t)recomp_{m}({_sse_read(ops[1])})")
+                        + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                # The source is a double: the register's low lane is d[0].
+                src = (f"{ops[1].reg}.d[0]" if _is_xmm(ops[1])
+                       else _sse_read(ops[1]))
+                return [_fmt_operand_write(ops[0], f"(uint32_t)recomp_{m}({src})")
+                        + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]

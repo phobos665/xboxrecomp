@@ -105,8 +105,10 @@ extern "C" {
  * things here. Version 3 added render targets and input current values,
  * version 4 cube textures and the face a render target names, version 6
  * fixed-function lights and the material, version 7 the texels of cubes
- * filled from memory and the stage palettes P8 textures are expanded with. */
-#define D3D8CAP_VERSION      7u
+ * filled from memory and the stage palettes P8 textures are expanded with,
+ * version 8 the screen copies (a title reading its own frame back into a
+ * texture), version 9 the scene's pixels as the frame begins. */
+#define D3D8CAP_VERSION      9u
 /* The oldest version the reader still accepts. A bump that only adds chunk
  * kinds leaves an older file a valid newer one that happens not to contain
  * them (version 6 added three; version 5 one), so it leaves this alone. A
@@ -153,7 +155,9 @@ enum {
     D3D8CAP_TWOD_PLACEMENT      = 28, /* D3D8CapTwoDPlacement (version 6) */
     D3D8CAP_CUBE_LEVEL          = 29, /* D3D8CapCubeLevel + bytes (version 7) */
     D3D8CAP_PALETTE             = 30, /* D3D8CapPalette (version 7) */
-    D3D8CAP_CHUNK_KINDS         = 31  /* one past the last, for per-kind counters */
+    D3D8CAP_SCREEN_COPY         = 31, /* D3D8CapScreenCopy (version 8) */
+    D3D8CAP_SCENE               = 32, /* D3D8CapScene + rows (version 9) */
+    D3D8CAP_CHUNK_KINDS         = 33  /* one past the last, for per-kind counters */
 };
 
 typedef struct {
@@ -284,6 +288,34 @@ typedef struct { uint32_t id, face, level, pitch, rows, bytes; } D3D8CapCubeLeve
  * that stage is expanded through when it is uploaded. The snapshot carries
  * all four stages, before the textures. */
 typedef struct { uint32_t stage; uint32_t entries[256]; } D3D8CapPalette;
+
+/* xbox_D3D8CopyBackBufferToTexture (has_rect 0) or ...RectToTexture: the
+ * frame drawn so far, copied into texture `texture_id` (created with
+ * D3DUSAGE_RENDERTARGET), whole and scaled, or the rectangle src_* (the
+ * title's pixels) to the same size at at_x, at_y. Recorded where the host
+ * made the copy, so a replay copies the same partly drawn frame. Without
+ * this (before version 8) a replay sampled the texture's stale memory copy
+ * instead, and a title that post-processes its own image -- TimeSplitters 2,
+ * three times a frame -- replayed darker than it ran. */
+typedef struct {
+    uint32_t texture_id, has_rect;
+    int32_t  src_left, src_top, src_right, src_bottom;
+    int32_t  at_x, at_y;
+} D3D8CapScreenCopy;
+
+/* The scene -- what the device calls the back buffer, at the size the host
+ * renders it -- as the frame begins: `height` rows of `pitch` bytes, each
+ * `width` 32-bit pixels exactly as the back buffer surface's LockRect hands
+ * them out, which is R8G8B8A8 under every backend (d3d8_device.c makes the
+ * scene image in that format) and is written back the same way. In the
+ * snapshot, before anything else. A title whose screen copy or blend reads
+ * the frame before it -- TimeSplitters 2 copies its screen before it
+ * clears, for its blur -- replays from what the run had there, and every
+ * loop of a replay from the same pixels; without it (before version 9) the
+ * first loop read the device's zeroed scene and each later one the loop
+ * before. Left out when the scene is larger than D3D8CAP_SCENE_MAX_BYTES. */
+typedef struct { uint32_t width, height, pitch; } D3D8CapScene;
+#define D3D8CAP_SCENE_MAX_BYTES (64u << 20)
 
 /* SetRenderTarget. texture_id 0 is the back buffer; otherwise level `level`
  * of that texture, which was created with D3DUSAGE_RENDERTARGET. `face` is

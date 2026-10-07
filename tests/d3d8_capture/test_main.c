@@ -1,5 +1,5 @@
 /*
- * d3d8_capture -- round-trip the frame capture container (format version 6).
+ * d3d8_capture -- round-trip the frame capture container (format version 9).
  *
  * Writes a synthetic host-level capture -- a snapshot and a frame, using every
  * chunk kind -- reads it back, and asserts every field and every payload byte
@@ -13,7 +13,13 @@
  * builds at run time and deletes.
  *
  * The frame is built to be worth replaying (see --write below): a textured
- * fixed-function quad on the left, and on the right a quad drawn by an NV2A
+ * fixed-function quad on the left, a copy of the screen as it then is drawn
+ * small below it (a screen copy, as a title reads its own frame back), beside
+ * that a copy taken before the frame's clear, which shows the scene as the
+ * frame began (a version 9 snapshot -- TimeSplitters 2 copies its screen
+ * before it clears), a small cyan square in the bottom-right corner cleared
+ * with a rectangle (Clear clears only its rectangles), and on the right a
+ * quad drawn by an NV2A
  * vertex program with a declaration, whose colour comes from a NORMPACKED3
  * normal expanded exactly as shadow mode expands it, under the screen-space
  * undo and a register combiner token. Every value is a host value, as shadow
@@ -51,6 +57,8 @@ enum {
     RS_ZENABLE = 7, RS_ALPHABLENDENABLE = 27, RS_CULLMODE = 22, RS_LIGHTING = 137,
     RS_PSFINALCOMBINERINPUTSABCD = 208, RS_PSFINALCOMBINERINPUTSEFG = 209,
     RS_PSCOMBINERCOUNT = 234,
+    RS_ZWRITEENABLE = 14, RS_ZFUNC = 23, RS_STENCILENABLE = 52, RS_STENCILFUNC = 56,
+    RS_STENCILREF = 57, RS_STENCILMASK = 58, CMP_EQUAL = 3,
     CULL_NONE = 1,
     TSS_COLOROP = 1, TSS_COLORARG1 = 2, TSS_COLORARG2 = 3,
     TSS_ALPHAOP = 4, TSS_ALPHAARG1 = 5,
@@ -60,7 +68,8 @@ enum {
     PT_TRIANGLELIST = 4, PT_TRIANGLESTRIP = 5,
     FMT_INDEX16 = 101,
     FMT_LIN_A8R8G8B8 = 0x12,
-    CLEAR_TARGET = 1, CLEAR_ZBUFFER = 2,
+    FMT_A8R8G8B8 = 0x06,           /* swizzled: addressed 0..1, unlike LIN_ */
+    CLEAR_TARGET = 1, CLEAR_ZBUFFER = 2, CLEAR_STENCIL = 4,
     DXGI_R32G32B32_FLOAT = 6,
     FVF_XYZRHW_DIFFUSE_TEX1 = 0x004 | 0x040 | 0x100
 };
@@ -69,6 +78,7 @@ enum {
 #define SCRATCH   0x10001u      /* created and deleted inside the frame */
 #define CLEAR_COLOR 0xFF203060u
 #define TARGET_COLOR 0xFF00FF00u
+#define RECT_CLEAR_COLOR 0xFF00FFFFu
 #define USAGE_RENDERTARGET 0x1u
 #define FMT_D24S8 0x2Au
 
@@ -165,6 +175,25 @@ static void fvf_vertex(uint8_t *out, float x, float y, float u, float v)
 }
 
 static uint8_t g_fvf_quad[4 * FVF_STRIDE];
+static uint8_t g_copy_quad[4 * FVF_STRIDE];     /* the screen copy, drawn below */
+/* The screen copy's texture: 64x64, swizzled A8R8G8B8, made a render target
+ * and starting black (alpha 0 too), which is what a replay that skipped the
+ * copy would show. */
+#define COPY_EDGE 64u
+static uint8_t g_copy_texels[COPY_EDGE * COPY_EDGE * 4];
+/* The scene as the frame begins (D3D8CAP_SCENE): 640x480 R8G8B8A8, all
+ * green 0xC0. A screen copy before the frame's clear reads it. */
+#define SCENE_W 640u
+#define SCENE_H 480u
+static uint8_t g_scene[SCENE_W * SCENE_H * 4];
+static uint8_t g_early_quad[4 * FVF_STRIDE];   /* that copy, drawn bottom right */
+/* Drawn after the rectangle clear, under its scissor: the clear must leave
+ * the title's state as it found it, so this draws as it would without it. */
+static uint8_t g_after_quad[4 * FVF_STRIDE];
+/* Drawn with z 0.5 under ZFUNC EQUAL and a stencil test EQUAL 7, after two
+ * depth/stencil-only rectangle clears: it shows exactly where a clear wrote
+ * z 0.5 and stencil 7, and nowhere a clear wrote colour. */
+static uint8_t g_depth_quad[4 * FVF_STRIDE];
 static uint8_t g_program_quad[4 * PROGRAM_STRIDE];
 static const uint16_t QUAD_INDICES[6] = { 0, 1, 2, 0, 2, 3 };
 
@@ -177,6 +206,22 @@ static void build_data(void)
 {
     uint32_t x, y;
 
+    fvf_vertex(g_after_quad + 0 * FVF_STRIDE,   0.0f,   0.0f, 0.0f, 0.0f);
+    fvf_vertex(g_after_quad + 1 * FVF_STRIDE, 200.0f,   0.0f, 1.0f, 0.0f);
+    fvf_vertex(g_after_quad + 2 * FVF_STRIDE,   0.0f, 200.0f, 0.0f, 1.0f);
+    fvf_vertex(g_after_quad + 3 * FVF_STRIDE, 200.0f, 200.0f, 1.0f, 1.0f);
+    fvf_vertex(g_depth_quad + 0 * FVF_STRIDE, 282.0f, 300.0f, 0.0f, 0.0f);
+    fvf_vertex(g_depth_quad + 1 * FVF_STRIDE, 352.0f, 300.0f, 1.0f, 0.0f);
+    fvf_vertex(g_depth_quad + 2 * FVF_STRIDE, 282.0f, 450.0f, 0.0f, 1.0f);
+    fvf_vertex(g_depth_quad + 3 * FVF_STRIDE, 352.0f, 450.0f, 1.0f, 1.0f);
+    fvf_vertex(g_early_quad + 0 * FVF_STRIDE, 360.0f, 300.0f, 0.0f, 0.0f);
+    fvf_vertex(g_early_quad + 1 * FVF_STRIDE, 600.0f, 300.0f, 1.0f, 0.0f);
+    fvf_vertex(g_early_quad + 2 * FVF_STRIDE, 360.0f, 460.0f, 0.0f, 1.0f);
+    fvf_vertex(g_early_quad + 3 * FVF_STRIDE, 600.0f, 460.0f, 1.0f, 1.0f);
+    fvf_vertex(g_copy_quad + 0 * FVF_STRIDE,  40.0f, 300.0f, 0.0f, 0.0f);
+    fvf_vertex(g_copy_quad + 1 * FVF_STRIDE, 280.0f, 300.0f, 1.0f, 0.0f);
+    fvf_vertex(g_copy_quad + 2 * FVF_STRIDE,  40.0f, 460.0f, 0.0f, 1.0f);
+    fvf_vertex(g_copy_quad + 3 * FVF_STRIDE, 280.0f, 460.0f, 1.0f, 1.0f);
     fvf_vertex(g_fvf_quad + 0 * FVF_STRIDE,  40.0f,  40.0f, 0.0f, 0.0f);
     fvf_vertex(g_fvf_quad + 1 * FVF_STRIDE, 280.0f,  40.0f, 1.0f, 0.0f);
     fvf_vertex(g_fvf_quad + 2 * FVF_STRIDE,  40.0f, 280.0f, 0.0f, 1.0f);
@@ -263,8 +308,8 @@ static const float IDENTITY[16] = {
 
 /* How many chunks write_capture emits, for the read-back and truncation
  * checks. */
-#define SNAPSHOT_CHUNKS 27
-#define FRAME_CHUNKS    22
+#define SNAPSHOT_CHUNKS 28
+#define FRAME_CHUNKS    52
 
 static int write_capture(const char *path)
 {
@@ -276,6 +321,25 @@ static int write_capture(const char *path)
     D3D8CapTexture tex = { 1, FMT_LIN_A8R8G8B8, 4, 4, 3, 0 };
     D3D8CapTexture scratch_tex = { 2, FMT_LIN_A8R8G8B8, 1, 1, 1, 0 };
     D3D8CapLevel scratch_level = { 4, 1, 4 };
+    D3D8CapTexture copy_tex = { 5, FMT_A8R8G8B8, COPY_EDGE, COPY_EDGE, 1, USAGE_RENDERTARGET };
+    D3D8CapLevel copy_level = { COPY_EDGE * 4, COPY_EDGE, COPY_EDGE * COPY_EDGE * 4 };
+    D3D8CapScreenCopy copy = { 5, 0, 0, 0, 0, 0, 0, 0 };
+    D3D8CapScene scene = { SCENE_W, SCENE_H, SCENE_W * 4 };
+    D3D8CapTexture early_tex = { 6, FMT_A8R8G8B8, COPY_EDGE, COPY_EDGE, 1, USAGE_RENDERTARGET };
+    D3D8CapScreenCopy early_copy = { 6, 0, 0, 0, 0, 0, 0, 0 };
+    /* Colour only, one rectangle in the corner, under a scissor elsewhere
+     * (Clear ignores the scissor), with z and stencil that must not land. */
+    D3D8CapClear rect_clear = { 1, CLEAR_TARGET, RECT_CLEAR_COLOR, 0.25f, 7 };
+    D3D8CapRect corner = { 600, 440, 640, 480 };
+    D3D8CapScissors scissor_on = { 1, 0, { 0, 0, 100, 100 } };
+    D3D8CapScissors scissor_off = { 0, 0, { 0, 0, 0, 0 } };
+    D3D8CapSetRenderTarget to_back_depth = { 0, 0, 0, D3D8CAP_DEPTH_DEVICE };
+    D3D8CapClear depth_full = { 0, CLEAR_ZBUFFER | CLEAR_STENCIL, 0, 1.0f, 0 };
+    /* Depth and stencil only: the colour, magenta, must not appear. */
+    D3D8CapClear depth_seven = { 1, CLEAR_ZBUFFER | CLEAR_STENCIL, 0xFFFF00FFu, 0.5f, 7 };
+    D3D8CapClear depth_three = { 1, CLEAR_ZBUFFER | CLEAR_STENCIL, 0xFFFF00FFu, 0.5f, 3 };
+    D3D8CapRect rect_seven = { 290, 310, 330, 350 };
+    D3D8CapRect rect_three = { 290, 380, 330, 420 };
     static const uint8_t scratch_texel[4] = { 1, 2, 3, 4 };
     D3D8CapTextureLevel refill = { 1, 0, 16, 4, 64 };
     D3D8CapTexture target_tex = { 3, FMT_LIN_A8R8G8B8, 1, 1, 1, USAGE_RENDERTARGET };
@@ -306,9 +370,17 @@ static int write_capture(const char *path)
     mov_input_to_output(g_microcode + 0, 0, 0, 0);     /* MOV oPos, v0 */
     mov_input_to_output(g_microcode + 4, 2, 3, 1);     /* MOV oD0, v2  */
 
-    /* ---- snapshot: 27 chunks, in the writer's documented order, less the
+    /* ---- snapshot: 28 chunks, in the writer's documented order, less the
      * sixteen input current values the real writer puts after the
      * screen-space chunk (the frame below carries one) */
+    for (i = 0; i < SCENE_W * SCENE_H; i++) {
+        g_scene[i * 4 + 0] = 0x00;
+        g_scene[i * 4 + 1] = 0xC0;
+        g_scene[i * 4 + 2] = 0x00;
+        g_scene[i * 4 + 3] = 0xFF;
+    }
+    d3d8cap_chunk(w, D3D8CAP_SCENE, &scene, sizeof scene,
+                  g_scene, sizeof g_scene, NULL, 0);                         /* 0 */
     w_vs_create(w, PROGRAM, g_microcode, 2);                                 /* 1 */
     d3d8cap_chunk(w, D3D8CAP_VS_DECLARATION, &decl, sizeof decl,
                   DECL, sizeof DECL, NULL, 0);                               /* 2 */
@@ -351,6 +423,11 @@ static int write_capture(const char *path)
      * green and one cube face blue, then go back to the back buffer, so a
      * replay that forgot either switch shows that colour instead of the two
      * quads. */
+    /* Before anything is drawn: the scene as the frame began, copied. */
+    d3d8cap_chunk(w, D3D8CAP_TEXTURE, &early_tex, sizeof early_tex,
+                  &copy_level, sizeof copy_level,
+                  g_copy_texels, sizeof g_copy_texels);
+    d3d8cap_chunk(w, D3D8CAP_SCREEN_COPY, &early_copy, sizeof early_copy, NULL, 0, NULL, 0);
     d3d8cap_chunk(w, D3D8CAP_CLEAR, &clear, sizeof clear, NULL, 0, NULL, 0); /* 1 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE, &target_tex, sizeof target_tex,
                   &scratch_level, sizeof scratch_level,
@@ -372,6 +449,47 @@ static int write_capture(const char *path)
     w_stage_state(w, 0, TSS_ALPHAOP, TOP_SELECTARG1);                        /* 10 */
     d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
                   g_fvf_quad, sizeof g_fvf_quad, NULL, 0);                   /* 8 */
+    /* The frame so far -- the clear and the left quad -- copied into a
+     * 64x64 texture and drawn below the quad. */
+    d3d8cap_chunk(w, D3D8CAP_TEXTURE, &copy_tex, sizeof copy_tex,
+                  &copy_level, sizeof copy_level,
+                  g_copy_texels, sizeof g_copy_texels);
+    d3d8cap_chunk(w, D3D8CAP_SCREEN_COPY, &copy, sizeof copy, NULL, 0, NULL, 0);
+    w_set_texture(w, 0, 5);
+    d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
+                  g_copy_quad, sizeof g_copy_quad, NULL, 0);
+    w_set_texture(w, 0, 6);
+    d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
+                  g_early_quad, sizeof g_early_quad, NULL, 0);
+    w_set_texture(w, 0, 1);
+    d3d8cap_chunk(w, D3D8CAP_SCISSORS, &scissor_on, sizeof scissor_on, NULL, 0, NULL, 0);
+    d3d8cap_chunk(w, D3D8CAP_CLEAR, &rect_clear, sizeof rect_clear,
+                  &corner, sizeof corner, NULL, 0);
+    w_set_texture(w, 0, 6);
+    d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
+                  g_after_quad, sizeof g_after_quad, NULL, 0);
+    w_set_texture(w, 0, 1);
+    d3d8cap_chunk(w, D3D8CAP_SCISSORS, &scissor_off, sizeof scissor_off, NULL, 0, NULL, 0);
+    /* Depth and stencil through rectangles, with the device's depth buffer. */
+    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_back_depth, sizeof to_back_depth,
+                  NULL, 0, NULL, 0);
+    d3d8cap_chunk(w, D3D8CAP_CLEAR, &depth_full, sizeof depth_full, NULL, 0, NULL, 0);
+    d3d8cap_chunk(w, D3D8CAP_CLEAR, &depth_seven, sizeof depth_seven,
+                  &rect_seven, sizeof rect_seven, NULL, 0);
+    d3d8cap_chunk(w, D3D8CAP_CLEAR, &depth_three, sizeof depth_three,
+                  &rect_three, sizeof rect_three, NULL, 0);
+    w_render_state(w, RS_ZENABLE, 1);
+    w_render_state(w, RS_ZWRITEENABLE, 0);
+    w_render_state(w, RS_ZFUNC, CMP_EQUAL);
+    w_render_state(w, RS_STENCILENABLE, 1);
+    w_render_state(w, RS_STENCILFUNC, CMP_EQUAL);
+    w_render_state(w, RS_STENCILREF, 7);
+    w_render_state(w, RS_STENCILMASK, 0xFF);
+    d3d8cap_chunk(w, D3D8CAP_DRAW_UP, &up, sizeof up,
+                  g_depth_quad, sizeof g_depth_quad, NULL, 0);
+    w_render_state(w, RS_ZENABLE, 0);
+    w_render_state(w, RS_STENCILENABLE, 0);
+    d3d8cap_chunk(w, D3D8CAP_SET_RENDER_TARGET, &to_back, sizeof to_back, NULL, 0, NULL, 0);
     d3d8cap_chunk(w, D3D8CAP_TEXTURE_LEVEL, &refill, sizeof refill,
                   g_refill, sizeof g_refill, NULL, 0);                       /* 9 */
     d3d8cap_chunk(w, D3D8CAP_TEXTURE, &scratch_tex, sizeof scratch_tex,
@@ -422,11 +540,17 @@ static void read_capture(void)
         return;
     }
     h = d3d8cap_header(r);
-    check(h->version == 7 && D3D8CAP_VERSION == 7, "the version is 7");
+    check(h->version == 9 && D3D8CAP_VERSION == 9, "the version is 9");
     check(h->frame == 7 && h->width == 640 && h->height == 480, "header fields");
     check(h->chunk_count == SNAPSHOT_CHUNKS + FRAME_CHUNKS, "chunk_count is patched in");
 
-    if (next_of(r, &c, D3D8CAP_VS_CREATE, "vs_create first")) {
+    if (next_of(r, &c, D3D8CAP_SCENE, "the scene first")) {
+        const D3D8CapScene *p = c.data;
+        const uint8_t *px = d3d8cap_tail(&c, sizeof *p, sizeof g_scene);
+        check(p->width == SCENE_W && p->height == SCENE_H && p->pitch == SCENE_W * 4 && px &&
+              !memcmp(px, g_scene, sizeof g_scene), "scene fields and pixels");
+    }
+    if (next_of(r, &c, D3D8CAP_VS_CREATE, "vs_create next")) {
         const D3D8CapVsCreate *p = c.data;
         const uint32_t *code = d3d8cap_tail(&c, sizeof *p, 2 * 16);
         uint32_t w3;
@@ -507,6 +631,10 @@ static void read_capture(void)
         check(c.bytes == 0 && c.data == NULL, "frame_start has no payload");
 
     /* The frame. */
+    if (next_of(r, &c, D3D8CAP_TEXTURE, "the early copy's texture"))
+        check(((const D3D8CapTexture *)c.data)->id == 6, "early copy texture id");
+    if (next_of(r, &c, D3D8CAP_SCREEN_COPY, "the copy before the clear"))
+        check(((const D3D8CapScreenCopy *)c.data)->texture_id == 6, "early copy into 6");
     if (next_of(r, &c, D3D8CAP_CLEAR, "clear")) {
         const D3D8CapClear *p = c.data;
         check(p->rect_count == 0 && p->flags == 3 && p->color == CLEAR_COLOR &&
@@ -551,6 +679,61 @@ static void read_capture(void)
         check(d->prim_type == PT_TRIANGLESTRIP && d->prim_count == 2 &&
               d->stride == FVF_STRIDE && d->vertex_bytes == 4 * FVF_STRIDE, "draw_up fields");
         check(v && !memcmp(v, g_fvf_quad, sizeof g_fvf_quad), "draw_up vertex bytes");
+    }
+    if (next_of(r, &c, D3D8CAP_TEXTURE, "screen copy texture")) {
+        const D3D8CapTexture *p = c.data;
+        check(p->id == 5 && p->format == FMT_A8R8G8B8 && p->width == COPY_EDGE &&
+              p->usage == USAGE_RENDERTARGET, "screen copy texture fields");
+    }
+    if (next_of(r, &c, D3D8CAP_SCREEN_COPY, "screen_copy")) {
+        const D3D8CapScreenCopy *p = c.data;
+        check(c.bytes == sizeof *p && p->texture_id == 5 && p->has_rect == 0,
+              "screen copy fields");
+    }
+    if (next_of(r, &c, D3D8CAP_SET_TEXTURE, "the copy bound"))
+        check(((const D3D8CapSetTexture *)c.data)->texture_id == 5, "copy bound to stage 0");
+    if (next_of(r, &c, D3D8CAP_DRAW_UP, "the copy drawn")) {
+        const D3D8CapDrawUp *d = c.data;
+        const uint8_t *v = d3d8cap_tail(&c, sizeof *d, d->vertex_bytes);
+        check(v && !memcmp(v, g_copy_quad, sizeof g_copy_quad), "copy quad vertex bytes");
+    }
+    if (next_of(r, &c, D3D8CAP_SET_TEXTURE, "the early copy bound"))
+        check(((const D3D8CapSetTexture *)c.data)->texture_id == 6, "early copy on stage 0");
+    next_of(r, &c, D3D8CAP_DRAW_UP, "the early copy drawn");
+    if (next_of(r, &c, D3D8CAP_SET_TEXTURE, "the checker bound again"))
+        check(((const D3D8CapSetTexture *)c.data)->texture_id == 1, "checker back on stage 0");
+    if (next_of(r, &c, D3D8CAP_SCISSORS, "a scissor elsewhere"))
+        check(((const D3D8CapScissors *)c.data)->count == 1, "scissor on");
+    if (next_of(r, &c, D3D8CAP_CLEAR, "the rectangle clear")) {
+        const D3D8CapClear *p = c.data;
+        const D3D8CapRect *rc = d3d8cap_tail(&c, sizeof *p, sizeof *rc);
+        check(p->rect_count == 1 && p->flags == CLEAR_TARGET && p->color == RECT_CLEAR_COLOR &&
+              rc && rc->x1 == 600 && rc->y2 == 480, "rectangle clear fields");
+    }
+    next_of(r, &c, D3D8CAP_SET_TEXTURE, "the after-clear probe's texture");
+    if (next_of(r, &c, D3D8CAP_DRAW_UP, "the draw after the rectangle clear")) {
+        const D3D8CapDrawUp *d = c.data;
+        const uint8_t *v = d3d8cap_tail(&c, sizeof *d, d->vertex_bytes);
+        check(v && !memcmp(v, g_after_quad, sizeof g_after_quad), "after-clear quad bytes");
+    }
+    next_of(r, &c, D3D8CAP_SET_TEXTURE, "the checker again");
+    if (next_of(r, &c, D3D8CAP_SCISSORS, "the scissor off again"))
+        check(((const D3D8CapScissors *)c.data)->count == 0, "scissor off");
+    {
+        static const uint32_t depth_part[] = {
+            D3D8CAP_SET_RENDER_TARGET, D3D8CAP_CLEAR, D3D8CAP_CLEAR, D3D8CAP_CLEAR,
+            D3D8CAP_RENDER_STATE, D3D8CAP_RENDER_STATE, D3D8CAP_RENDER_STATE,
+            D3D8CAP_RENDER_STATE, D3D8CAP_RENDER_STATE, D3D8CAP_RENDER_STATE,
+            D3D8CAP_RENDER_STATE, D3D8CAP_DRAW_UP, D3D8CAP_RENDER_STATE,
+            D3D8CAP_RENDER_STATE, D3D8CAP_SET_RENDER_TARGET
+        };
+        size_t k;
+        for (k = 0; k < sizeof depth_part / sizeof depth_part[0]; k++)
+            if (next_of(r, &c, depth_part[k], "the depth and stencil rectangles") && k == 2) {
+                const D3D8CapClear *p = c.data;
+                check(p->rect_count == 1 && p->stencil == 7 && p->z == 0.5f,
+                      "the depth rectangle clear's fields");
+            }
     }
     if (next_of(r, &c, D3D8CAP_TEXTURE_LEVEL, "texture_level")) {
         const D3D8CapTextureLevel *t = c.data;
@@ -760,10 +943,17 @@ int main(int argc, char **argv)
      *   d3d8_capture_test --write synthetic.d3dcap
      *   d3d8_replay synthetic.d3dcap --out synthetic --loops 3 --dump-every
      *
-     * The image should show, on a dark blue clear, a red/green checker on the
-     * left (fixed function, texture) and an orange square on the right
-     * (vertex program, declaration, NORMPACKED3 normal, screen-space undo,
-     * combiners), and every loop's image should be byte-identical. */
+     * The image should show, on a dark blue clear, a red square on the left
+     * (fixed function, texture), below it a small copy of the screen as it
+     * was after that square (blue with a red patch, a screen copy), and an
+     * orange square on the right (vertex
+     * program, declaration, NORMPACKED3 normal, screen-space undo,
+     * combiners), and every loop's image should be byte-identical. The left
+     * one is solid red, not the red/green checker the texture holds: the
+     * texture is LIN_A8R8G8B8, linear textures are addressed in texels on
+     * the NV2A (docs/technical/shadow-mode.md, Future Perfect item 5), so
+     * the quad's 0..1 coordinates reach only the first texel, which is red.
+     * tests/d3d8_replay checks exactly this picture. */
     if (argc == 3 && strcmp(argv[1], "--write") == 0) {
         if (write_capture(argv[2]) != 0) {
             printf("could not write %s\n", argv[2]);

@@ -51,19 +51,38 @@ if(WIN32)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler xbox_config)
 endif()
 
-if(WIN32)
-    # Pure parsing of a pixel shader definition: no device, so it can run
-    # under ctest. Links the same sources as d3d8_a8 because d3d8_combiners.c
-    # reaches into the device layer for state it does not use here.
-    add_executable(d3d8_final_default
-        test_final_default.c
-        ../../src/d3d/d3d8_resources.c
-        ../../src/d3d/d3d8_shaders.c
-        ../../src/d3d/d3d8_combiners.c
+if(NOT WIN32)
+    # The two that need no device, off Windows: the interface with no backend
+    # behind it is enough to link them.
+    set(D3D8_SMOKE_RHI
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/rhi_shader_cache.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_compile.c
+    )
+    add_executable(d3d8_smoke
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_main.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/d3d8_resources.c
         ${D3D8_SMOKE_RHI}
     )
-    target_include_directories(d3d8_final_default PRIVATE ../../src/d3d ../../src/config)
-    target_link_libraries(d3d8_final_default PRIVATE platform d3d11 dxgi dxguid d3dcompiler xbox_config)
-    # Registered with ctest from the root CMakeLists: this directory is
-    # entered from src/d3d, before the root calls enable_testing().
+    target_include_directories(d3d8_smoke PRIVATE ../../src/d3d ../../src/config)
+    target_link_libraries(d3d8_smoke PRIVATE platform xbox_config)
 endif()
+
+# Every platform.
+# Pure parsing of a pixel shader definition: no device, so it can run
+# under ctest. Links the same sources as d3d8_a8 because d3d8_combiners.c
+# reaches into the device layer for state it does not use here.
+add_executable(d3d8_final_default
+    test_final_default.c
+    ../../src/d3d/d3d8_resources.c
+    ../../src/d3d/d3d8_shaders.c
+    ../../src/d3d/d3d8_combiners.c
+    ${D3D8_SMOKE_RHI}
+)
+target_include_directories(d3d8_final_default PRIVATE ../../src/d3d ../../src/config)
+target_link_libraries(d3d8_final_default PRIVATE platform xbox_config)
+if(WIN32)
+    target_link_libraries(d3d8_final_default PRIVATE d3d11 dxgi dxguid d3dcompiler)
+endif()
+# Registered with ctest from the root CMakeLists: this directory is
+# entered from src/d3d, before the root calls enable_testing().

@@ -153,6 +153,8 @@ BOOL   ReleaseMutex(HANDLE h);
 /* ---- Waiting ---------------------------------------------------------- */
 DWORD WaitForSingleObject(HANDLE h, DWORD ms);
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable);
+/* Not Win32: WaitForSingleObject with a microsecond timeout (host_timer.c). */
+DWORD w32_wait_single_us(HANDLE h, long long us);
 DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, DWORD ms);
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable);
@@ -167,6 +169,7 @@ DWORD  ResumeThread(HANDLE h);
 DWORD  SuspendThread(HANDLE h);
 BOOL   TerminateThread(HANDLE h, DWORD exitCode);
 DWORD  GetCurrentThreadId(void);
+DWORD  GetThreadId(HANDLE h);
 HANDLE GetCurrentThread(void);
 HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
@@ -204,6 +207,28 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem);
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect);
 BOOL   VirtualFree(LPVOID address, SIZE_T size, DWORD freeType);
 BOOL   VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect);
+
+/* ---- The guest arena (posix_memory.c; no Windows equivalent) ------------
+ *
+ * Windows places the guest's memory at fixed host addresses one call at a
+ * time. Here the whole guest span is reserved first, as one inaccessible
+ * range, and every fixed-address VirtualAlloc / MapViewOfFileEx inside it is
+ * placed with Windows semantics: exactly at the address, or a failure if any
+ * part of the range is already placed. See posix_memory.h. */
+size_t w32_host_page_size(void);
+/* Reserve size bytes aligned to align (a power of two). Once only; returns
+ * the base, or NULL. */
+void  *w32_reserve_arena(size_t size, size_t align);
+int    w32_in_arena(const void *addr);
+/* The protection last asked for on the 4 KB page holding addr (PAGE_*), or 0
+ * when nothing is placed there. A host page larger than 4 KB is protected as
+ * its most restrictive 4 KB page, so this, not the host page, says whether
+ * an access is one the guest is allowed to make. Safe in a signal handler. */
+DWORD  w32_page_protection(const void *addr);
+/* An always-readable, always-writable host address for the same byte, for
+ * completing an access the host page refused. NULL outside the arena's
+ * placements. Safe in a signal handler. */
+void  *w32_backdoor(const void *addr);
 
 /* ---- Time ------------------------------------------------------------- */
 VOID  GetSystemTimeAsFileTime(LPFILETIME ft);
@@ -572,6 +597,23 @@ static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
 { (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+
+/* ---- Fibers and stack limits ------------------------------------------
+ * Win32 fibers on a small native context switch (win32_compat.c). While a
+ * thread runs on a fiber, GetCurrentThreadStackLimits reports that fiber's
+ * stack, as on Windows. */
+typedef VOID (WINAPI *LPFIBER_START_ROUTINE)(LPVOID lpFiberParameter);
+#define ERROR_ALREADY_FIBER 1280u
+VOID   GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high);
+LPVOID ConvertThreadToFiber(LPVOID param);
+LPVOID CreateFiber(SIZE_T stackSize, LPFIBER_START_ROUTINE start, LPVOID param);
+LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags,
+                     LPFIBER_START_ROUTINE start, LPVOID param);
+VOID   SwitchToFiber(LPVOID fiber);
+VOID   DeleteFiber(LPVOID fiber);
+BOOL   IsThreadAFiber(void);
+LPVOID GetCurrentFiber(void);
+LPVOID GetFiberData(void);
 
 #ifdef __cplusplus
 }

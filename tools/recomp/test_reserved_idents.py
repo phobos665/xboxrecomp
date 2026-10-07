@@ -43,6 +43,22 @@ HEADERS = """#include <string.h>
 SHARP = ("isnan", "isinf", "isfinite", "isnormal", "signbit", "fpclassify",
          "round", "trunc", "onexit", "div", "exit", "abs")
 
+# Reserved because one host's headers declare them, not every host's: MSVC's
+# stdlib.h declares onexit, glibc's does not, and Apple's does. Generated code
+# has to build on all of them, so the reserved set keeps these; but the
+# negative control can only require a clash where the compiler running it
+# sees the declaration. Asked of the headers themselves rather than of
+# sys.platform, which got macOS wrong once already.
+HOST_DECLARED = ("onexit",)
+
+# The same for the C99 classification macros under GCC. glibc defines them as
+# __builtin_isnan(x) and friends, so `void isnan(void);` becomes a
+# redeclaration of a builtin, which GCC accepts and clang and MSVC reject.
+# Generated code is built with clang or MSVC; under GCC these are left to the
+# positive sweep and to the set itself.
+GCC_TOLERATES = ("isnan", "isinf", "isfinite", "isnormal", "signbit",
+                 "fpclassify")
+
 
 def _find_cc():
     cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
@@ -61,6 +77,20 @@ def _compile(body):
         r = subprocess.run([cc, "-c", src, "-o", os.path.join(tmp, "t.o")],
                            capture_output=True, text=True)
         return r.returncode, r.stderr
+
+
+def _is_gcc():
+    """GCC proper, not clang (which also defines __GNUC__)."""
+    rc, _ = _compile("#if defined(__GNUC__) && !defined(__clang__)\n"
+                     "#error gcc\n#endif\n")
+    return rc != 0
+
+
+def _declared_here(name):
+    """Do this host's headers declare `name`? Taking its address compiles
+    only if they do."""
+    rc, _ = _compile(f"void *probe_{name}(void) {{ return (void *){name}; }}")
+    return rc == 0
 
 
 class ReservedIdentTest(unittest.TestCase):
@@ -91,6 +121,10 @@ class ReservedIdentTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, _FUNC_RESERVED_IDENT,
                               f"{name} is missing from the reserved set")
+                if name in HOST_DECLARED and not _declared_here(name):
+                    continue      # reserved for another host's headers
+                if name in GCC_TOLERATES and _is_gcc():
+                    continue      # a builtin redeclaration GCC lets through
                 rc, _ = _compile(f"void {name}(void);\nvoid {name}(void) {{ }}")
                 self.assertNotEqual(
                     rc, 0,

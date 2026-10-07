@@ -24,6 +24,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+/* POSIX: the same code over win32_compat, with the few 64-bit interlocked
+ * operations it uses spelled as builtins. */
+#include "win32_compat.h"
+typedef int64_t LONG64;
+#define InterlockedIncrement64(p) __atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST)
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -200,17 +207,25 @@ static DWORD WINAPI fps_reporter(LPVOID param)
     prev_vblanks = base_vblanks = InterlockedCompareExchange64(&s_vblanks, 0, 0);
 
     /* Sleep is only a wake-up call here; the window is measured, not assumed. */
+#ifdef _WIN32
     timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+#else
+    timer = NULL;   /* POSIX Sleep is already as good as a timer */
+    (void)timer;
+#endif
     for (;;) {
         LONG64 swaps, vblanks;
         double window, elapsed;
 
+#ifdef _WIN32
         if (timer) {
             LARGE_INTEGER due;
             due.QuadPart = -(LONGLONG)(secs * 10000000.0);
             SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
             WaitForSingleObject(timer, INFINITE);
-        } else {
+        } else
+#endif
+        {
             Sleep((DWORD)(secs * 1000.0));
         }
 
@@ -230,9 +245,9 @@ static DWORD WINAPI fps_reporter(LPVOID param)
                 (double)swaps / elapsed,
                 (double)(vblanks - base_vblanks) / elapsed, elapsed);
         fprintf(stderr, "[FPS]   vblanks per frame: 0:%ld 1:%ld 2:%ld 3:%ld 4+:%ld\n",
-                InterlockedExchange(&s_span[0], 0), InterlockedExchange(&s_span[1], 0),
-                InterlockedExchange(&s_span[2], 0), InterlockedExchange(&s_span[3], 0),
-                InterlockedExchange(&s_span[4], 0));
+                (long)InterlockedExchange(&s_span[0], 0), (long)InterlockedExchange(&s_span[1], 0),
+                (long)InterlockedExchange(&s_span[2], 0), (long)InterlockedExchange(&s_span[3], 0),
+                (long)InterlockedExchange(&s_span[4], 0));
         if (wp_on()) {
             double ms_per_tick = 1000.0 / (double)qpf.QuadPart;
             EnterCriticalSection(&s_wp_cs);
@@ -244,10 +259,10 @@ static DWORD WINAPI fps_reporter(LPVOID param)
                 fprintf(stderr, "[WAITPROF] KeSetEvent on 0x%08X (type %u): %ld in this "
                         "window (%ld of them on an event already set), vblanks %lld; "
                         "waits on it from other threads %ld (last tid %ld)\n",
-                        s_wp_hot, type, InterlockedExchange(&s_wp_hot_sets, 0),
-                        InterlockedExchange(&s_wp_hot_sets_nonzero, 0),
+                        s_wp_hot, type, (long)InterlockedExchange(&s_wp_hot_sets, 0),
+                        (long)InterlockedExchange(&s_wp_hot_sets_nonzero, 0),
                         vblanks - prev_vblanks,
-                        InterlockedExchange(&s_wp_hot_other_waits, 0),
+                        (long)InterlockedExchange(&s_wp_hot_other_waits, 0),
                         (long)s_wp_hot_other_tid);
             }
             {
@@ -326,14 +341,3 @@ void xbox_FpsCountVblank(void)
     InterlockedIncrement64(&s_vblanks);
 }
 
-#else  /* !_WIN32 */
-
-void xbox_FpsCountSwap(void)   {}
-int  xbox_FpsWaitProfileOn(void) { return 0; }
-void xbox_FpsNoteKernel(unsigned ordinal, long long ticks, uint32_t object)
-{ (void)ordinal; (void)ticks; (void)object; }
-void xbox_FpsNoteSet(uint32_t object, int was_signalled)
-{ (void)object; (void)was_signalled; }
-void xbox_FpsCountVblank(void) {}
-
-#endif

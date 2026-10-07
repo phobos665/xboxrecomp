@@ -4,6 +4,11 @@
     py -3 scripts/replay_ab.py --a <replay.exe> --b-arg=--backend --b-arg=vulkan
     py -3 scripts/replay_ab.py --a <replay.exe> --b-env RECOMP_D3D8_BACKEND=vulkan --arg=--present
 
+    # across machines: keep one side's images, compare another build against them
+    py -3 scripts/replay_ab.py --a <replay.exe> --write-reference ref_d3d11 --captures ...
+    python3 scripts/replay_ab.py --reference ref_d3d11 --b build-mac/src/replay/d3d8_replay \
+        --captures ... --tolerance 50
+
 This is the acceptance test the Vulkan work runs on
 (docs/technical/vulkan-backend.md, section 5): a capture is deterministic, so
 the same frame drawn by two builds, or by two backends of one build, can be
@@ -28,11 +33,22 @@ its own options. --present compares the frame as it reaches the swap chain as
 well as the scene, which is the only way the display resolve is covered. An
 older replay build that does not know an argument fails every capture, so pass
 it to both sides only when both builds have it.
+
+--write-reference <dir> replays side A only and keeps its images as
+<dir>/<capture name>NNN.bmp; --reference <dir> then stands in for side A,
+which is how a frame replayed by D3D11 on Windows is compared with the same
+frame replayed by Vulkan on a Mac or Linux machine, where there is no D3D11.
+Copy the reference directory along with the captures.
+
+--clean-config runs every replay with an empty settings directory
+(RECOMP_USER_DIR, and APPDATA on Windows, XDG_CONFIG_HOME and HOME elsewhere), so the player's own settings file -- a
+resolution scale, widescreen -- cannot make two machines' images differ.
 """
 import argparse
 import glob
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -40,7 +56,21 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MIN_READ, MAX_READ = 5, 6          # D3D8CAP_VERSION_MIN_READ .. D3D8CAP_VERSION
+
+
+def readable_versions():
+    """D3D8CAP_VERSION_MIN_READ .. D3D8CAP_VERSION, from the header itself, so
+    a version bump cannot leave this script skipping every new capture."""
+    try:
+        h = (ROOT / "src" / "hle" / "d3d8_capture.h").read_text(errors="replace")
+        lo = int(re.search(r"#define\s+D3D8CAP_VERSION_MIN_READ\s+(\d+)", h).group(1))
+        hi = int(re.search(r"#define\s+D3D8CAP_VERSION\s+(\d+)", h).group(1))
+        return lo, hi
+    except (OSError, AttributeError):
+        return 5, 7
+
+
+MIN_READ, MAX_READ = readable_versions()
 
 
 def capture_version(path):
@@ -109,6 +139,21 @@ def write_diff(pa, pb, out):
     Path(out).write_bytes(hdr + info + bytes(body))
 
 
+def images_of(ref_dir, stem):
+    """The images d3d8_replay wrote for --out <ref_dir>/<stem>: stem, three
+    digits, maybe _present. Matched exactly, so c_0200 does not take
+    c_02000's images."""
+    pat = re.compile(re.escape(stem) + r"\d{3}(_present)?\.bmp")
+    return sorted(str(p) for p in Path(ref_dir).glob("*.bmp") if pat.fullmatch(p.name))
+
+
+def reference(ref_dir, capture):
+    """Side A from a --write-reference directory: (0, images, [])."""
+    stem = Path(capture).stem
+    out = images_of(ref_dir, stem)
+    return (0 if out else 1), out, ([] if out else [f"no reference image for {stem} in {ref_dir}"])
+
+
 def replay(exe, env_over, extra, capture, prefix):
     env = dict(os.environ)
     env.update(env_over)
@@ -142,15 +187,39 @@ def main():
     ap.add_argument("--tolerance", type=float, default=None,
                     help="pass when PSNR is at least this many dB (default: exact only)")
     ap.add_argument("--keep", help="keep both sides' images in this directory")
+    ap.add_argument("--write-reference", metavar="DIR",
+                    help="replay side A only and keep its images in DIR, named by capture")
+    ap.add_argument("--reference", metavar="DIR",
+                    help="side A is the images a --write-reference run left in DIR")
+    ap.add_argument("--clean-config", action="store_true",
+                    help="replay with an empty settings directory, ignoring the player's own")
     args = ap.parse_args()
 
-    exe_a = args.a or args.b
-    exe_b = args.b or args.a
-    exe_a = exe_a and os.path.abspath(exe_a)
-    exe_b = exe_b and os.path.abspath(exe_b)
-    if not exe_a:
-        ap.error("give --a and/or --b")
+    if args.reference and args.write_reference:
+        ap.error("--reference and --write-reference are two different runs")
+    if args.reference:
+        exe_a = None
+        exe_b = args.b and os.path.abspath(args.b)
+        if not exe_b:
+            ap.error("--reference needs --b")
+    else:
+        exe_a = args.a or args.b
+        exe_b = args.b or args.a
+        exe_a = exe_a and os.path.abspath(exe_a)
+        exe_b = exe_b and os.path.abspath(exe_b)
+        if not exe_a:
+            ap.error("give --a and/or --b")
     env_a, env_b = parse_env(args.a_env), parse_env(args.b_env)
+    if args.clean_config:
+        empty = tempfile.mkdtemp(prefix="replay_ab_config_")
+        for env in (env_a, env_b):
+            env.setdefault("RECOMP_USER_DIR", empty)     # the runtime's own override
+            if os.name == "nt":
+                env.setdefault("APPDATA", empty)
+            else:
+                # macOS keeps settings under $HOME/Library/Application Support.
+                env.setdefault("XDG_CONFIG_HOME", empty)
+                env.setdefault("HOME", empty)
 
     caps = args.captures or sorted(glob.glob(str(ROOT / "games" / "_pipeline" / "**" / "*.d3dcap"),
                                              recursive=True))
@@ -158,6 +227,21 @@ def main():
     if not caps:
         print("no readable captures found")
         return 2
+
+    if args.write_reference:
+        ref = Path(args.write_reference)
+        ref.mkdir(parents=True, exist_ok=True)
+        failed = 0
+        for cap in caps:
+            stem = Path(cap).stem
+            for old in images_of(ref, stem):
+                os.remove(old)
+            rc, imgs, tail = replay(exe_a, env_a, args.arg + args.a_arg, cap, str(ref / stem))
+            if rc or not imgs:
+                failed += 1
+                print(f"{os.path.relpath(cap, ROOT)}: FAILED rc {rc} {tail}")
+        print(f"\n{len(caps) - failed} of {len(caps)} captures written to {ref}")
+        return 0 if not failed else 1
 
     work = Path(args.keep) if args.keep else Path(tempfile.mkdtemp(prefix="replay_ab_"))
     work.mkdir(parents=True, exist_ok=True)
@@ -168,8 +252,11 @@ def main():
     rows = []
     for i, cap in enumerate(caps):
         tag = f"{i:03d}_" + Path(cap).stem
-        rc_a, imgs_a, tail_a = replay(exe_a, env_a, args.arg + args.a_arg, cap,
-                                      str(work / ("a_" + tag)))
+        if args.reference:
+            rc_a, imgs_a, tail_a = reference(args.reference, cap)
+        else:
+            rc_a, imgs_a, tail_a = replay(exe_a, env_a, args.arg + args.a_arg, cap,
+                                          str(work / ("a_" + tag)))
         rc_b, imgs_b, tail_b = replay(exe_b, env_b, args.arg + args.b_arg, cap,
                                       str(work / ("b_" + tag)))
         rel = os.path.relpath(cap, ROOT)

@@ -41,7 +41,7 @@ Verify against the repo rather than trusting the README. Known discrepancies as 
 |---|---|
 | NV2A push-buffer interception is a core feature | Push-buffer parsing is a **stub**, marked "N/A — D3D8 API intercept instead". The project already does D3D8 HLE. |
 | "115 of 366 ordinals resolved, 55 bridged" | Do not trust any number written down; the useful question is per-title, not global. Run `py -3 -m tools.kernel_audit.coverage <analysis.json> --list`, which splits what is missing into "needs a bridge wrapper", "is a data export", and "does not exist yet". Note an ordinal with an `xbox_*` implementation but no bridge silently returns 0. |
-| Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. **"Win32-only in practice" is out of date (Sep 2026):** `src/platform/win32_compat.c` implements those on POSIX, with `MAP_FIXED_NOREPLACE` and a returned-address check, because `xbox_memory_layout.c` depends on a failed placement failing. What is untested is whether the 28 mirror views and the apertures actually place on Linux — no title has ever linked there. The lifted output is portable too: `templates/runtime/recomp_types.h` guards every x86 intrinsic and keeps the MMX/SSE helpers as lane-wise C. See `docs/technical/vulkan-backend.md` §6.5 for the rest of the Linux/Android gap. |
+| Portable C output targeting ARM, RISC-V, WASM | Memory model uses `CreateFileMapping` + fixed-address `MapViewOfFileEx` at guest VAs. **"Win32-only in practice" is out of date (Sep 2026):** `src/platform/win32_compat.c` implements those on POSIX, with `MAP_FIXED_NOREPLACE` and a returned-address check, because `xbox_memory_layout.c` depends on a failed placement failing. **Titles run on macOS arm64 since Oct 2026** (see "macOS port" below), where guest memory is a 4 GB arena at a base offset rather than at fixed VAs; on Linux the runtime builds and its tests pass in CI, but no title has been run there yet. The lifted output is portable too: `templates/runtime/recomp_types.h` guards every x86 intrinsic and keeps the MMX/SSE helpers as lane-wise C. See `docs/technical/vulkan-backend.md` §6.5 for the rest of the Linux/Android gap. |
 | Burnout 3 is the proven target | True, and it is a **D3D8LTCG** build on XDK 5849 — so LTCG is not disqualifying. |
 
 **Corrected Sep 2026:** that "17 of 66 formats, mipmap level 0 only, no P8 palette, no
@@ -140,7 +140,8 @@ held. See `docs/technical/frame-interpolation.md`.
 
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
-`%APPDATA%\xboxrecomp\input_bindings.json`, else one beside the executable — and falls
+`input_bindings.json` in the per-user folder (`%APPDATA%\xboxrecomp` on Windows; the other
+OSes in `src/config/recomp_config.h`), else one beside the executable — and falls
 back to exactly the old behaviour when there is none. `py -3 -m tools.input_ui` is the UI
 that writes it. See `docs/technical/input-binding.md`. `RECOMP_FAKE_INPUT` and
 `RECOMP_INPUT_SEQ` still apply to controller 1 and ignore the bindings.
@@ -213,14 +214,71 @@ carries one hand-annotated winding fix, so do not stack a second).
 
 **The plan behind that paragraph is `docs/technical/vulkan-backend.md`** (Sep 2026): only
 7% of `src/d3d` touches D3D11 at all (814 lines of 11.3k, 58 distinct entry points), so the
-seam goes *inside* `src/d3d` as an RHI, not at the COM vtable — `d3d8_gl.c` is the in-tree
-proof of what the vtable seam costs, and it should be deleted once Vulkan can replay a
-frame. Read §4.4 before touching the winding, and §4.10 before choosing a present mode.
+seam goes *inside* `src/d3d` as an RHI, not at the COM vtable. Read §4.4 before touching
+the winding, and §4.10 before choosing a present mode.
+
+**State, Oct 2026:** the Vulkan RHI (`src/d3d/rhi_vulkan.c`) is the renderer everywhere but
+Windows, where D3D11 stays the default (`RECOMP_D3D8_BACKEND=vulkan` picks Vulkan there).
+On macOS it runs on MoltenVK. `d3d8_gl.c` is **deleted**. For Vulkan, DXC is loaded at
+run time (`libdxcompiler.dylib`/`.so`; on Windows from `third_party\dxc`, without which the
+Vulkan backend is not built) and compiles the generated HLSL with
+`-HV 2018`: the generators rely on HLSL 2018's implicit conversions, so do not move them
+to 2021 without fixing those first. MoltenVK gaps the RHI works around: no D24S8 (D32S8
+instead), B4G4R4A4 is not a blendable target, no sampler LOD bias, strips always restart
+at 0xFFFF. Capture format 9 records screen copies and the scene as each frame begins, and
+a replayed TS2 frame (menus and in-level) is byte-identical to the live one; a capture
+named N holds the frame drawn after swap N, so it pairs with frame dump N+1, and a capture
+with `RECOMP_FRAME_INTERP` on records twice, so capture with it off. Two renderer fixes from
+this work change what Windows shows too: the display resolve sampled half a pixel off (every
+presented frame was slightly blurred, D3D11 included), and a `Clear` with rectangles cleared
+the whole target (`src/d3d/d3d8_clear.c` now clears only the rectangles). The Vulkan path
+asks DXC for `-HV 2018`; a `third_party\dxc` too old to know the flag fails every shader.
 
 The A/B problem is solved: **frame capture and replay** (`src/hle/d3d8_capture.h`,
 `src/replay`) records one frame's host calls and plays them back with no game running, so
 one frame can be drawn by two backends and compared. That is the bring-up loop for a Vulkan
 backend, and it needs no D3D11On12-style bridge.
+
+**macOS port (Oct 2026, branch `exp/macOs-support`): TimeSplitters 2 and BLiNX run on an
+Apple Silicon Mac** at 60 fps with sound, TS2 playable in-level. What to know before
+touching it:
+
+- **Memory.** arm64 macOS reserves the low 4 GB (`__PAGEZERO`) and uses 16 KB pages, so
+  guest memory is a 4 GB `PROT_NONE` arena at a base offset (`XBOX_PTR(a) = a +
+  g_xbox_mem_offset`, 0 on Windows), mirrors are extra mappings of one shared object and
+  stop below 0x80000000, a 4 KB guest-protection side table sits over the 16 KB host pages,
+  and the main TIB moved from 0x1000 to 0x4000. `docs/technical/memory-layout.md`.
+- **Faults.** No SEH: SIGBUS/SIGSEGV handlers run an AArch64 load/store emulator
+  (`src/platform/mmio_decode_a64.h`) and route device ranges through `xbox_fault_route`;
+  watchpoints work by emulating the store. Same doc.
+- **Threads.** The guest lock (`RECOMP_GUEST_LOCK`, on by default on arm64 only) keeps one
+  guest thread in lifted code at a time, and the translator puts `RECOMP_BACKEDGE()` at every
+  loop header so a spinning thread hands it over (planned change #4). Measured cost: at most
+  2% of TS2's main-thread CPU. A title's own priority-based lock (BLiNX's CRI middleware raises
+  itself to 16 and resumes a priority-2 spinner) assumes a strict-priority uniprocessor, so
+  the lock is scheduled as the console schedules: the highest-priority runnable thread owns
+  it, and preemption happens only at a back edge or a blocking call, **never at the return of
+  a non-blocking kernel call** (`bridge_may_block` lists the ones that block). The rules, the
+  seven ways BLiNX's lock broke before them, and the switches are in
+  `docs/technical/memory-layout.md` ("Guest threads"). `KeQueryBasePriorityThread` answered 0
+  for every thread on every host until Oct 2026. Windows runs guest threads truly in parallel.
+- **Lifter semantics that differ on arm64,** now emitted explicitly on every host: locked
+  read-modify-write and `xchg` are real atomics (they used to do nothing anywhere),
+  `cvtss2si`/`cvtsd2si` round and give 0x80000000 on overflow, division by zero raises the
+  same fault x86 would.
+- **Window, sound, input** come from `src/host` (SDL3, main-thread event loop) and
+  `src/hle/audio_output_sdl.c`. The audio device opens on a host thread of its own, so a
+  stuck `coreaudiod` costs nothing but the sound.
+- **Per-user folders** come from `src/config/recomp_config.h`, one place per OS (macOS
+  `~/Library/Application Support/xboxrecomp`; Linux XDG). `RECOMP_USER_DIR=<dir>` replaces
+  all of them for tests.
+- **A `.app`** (`scripts/make_macos_app.py`, or `-DXBOXRECOMP_MACOS_APP=ON`) is for the
+  machine that built it only. It holds the title's code, so it never goes to CI artifacts
+  or releases.
+- **No build step, CMake target or ctest may ever start a title.** One draft did, and the game
+  ran unmuted, in front, on the player's saves.
+- **Changes that alter Windows behaviour** (lifter output, shared HLE, shared HLSL) need a
+  Windows regression of TS2 and BLiNX before `main`.
 
 ---
 
@@ -233,6 +291,8 @@ any bulk codegen.**
 Move from fixed-VA mapping to base+offset. Reserve 4 GB. Keep guest pointers **32-bit** — they
 live inside guest structs, so widening them breaks every layout. Implement mirror regions as
 multiple mappings of one shared object. This is what makes the project portable off Win32.
+**Done on POSIX (Oct 2026):** `XBOX_PTR` adds `g_xbox_mem_offset` (0 on Windows, where the
+fixed-VA layout stays).
 
 ### 2. Register model
 Replace global `g_eax`-style registers plus the simulated stack in a guest memory array with a
@@ -249,6 +309,8 @@ before the lifter emits its first FP instruction.
 The Xbox is uniprocessor. Guest code raises IRQL as mutual exclusion and spins without
 barriers. Keep the cooperative single-thread model, but inject **yield checks at loop
 back-edges** so a spinning guest thread cannot deadlock.
+**Done (Oct 2026):** `RECOMP_BACKEDGE()` at every loop header, live wherever the guest lock
+is on (the default on arm64); see "macOS port" above.
 
 ### 5. Separate engine from per-title data — **upstream owns this now**
 Overrides stay in `recomp_manual.c`. Upstream's `tools/recomp/manual_scan.py` treats that
@@ -332,8 +394,11 @@ now; TimeSplitters 2 was re-lifted plain on 19 Sep 2026 with no change in behavi
 Projects live in `titles/<name>/` (committed: CMakeLists, `main.c`, `recomp_manual.c`),
 game data in `games/<title>/` and stage output in `games/_pipeline/<name>/out` (both
 ignored). Regenerate a title's `main.c` from the template with
-`scripts/regen_title_main.py` rather than editing the copy. On this machine CMake is the
-one bundled with VS 2019 Build Tools; there is no VS 2022 and none is needed.
+`scripts/regen_title_main.py` rather than editing the copy. On the Windows machine CMake is
+the one bundled with VS 2019 Build Tools; there is no VS 2022 and none is needed. On macOS,
+Homebrew's CMake and Ninja plus the LunarG Vulkan SDK (MoltenVK, the loader, DXC); see
+`docs/GETTING_STARTED.md`. Titles there build into `titles/<name>/build/Release/`, the
+same depth as Visual Studio's, so relative game paths work unchanged.
 
 ---
 
@@ -344,7 +409,13 @@ lives here.
 
 **Give every scripted or test run its own saves: `RECOMP_SAVE_DIR=<fresh folder>`.** Saves
 live in FATX partition images (`Partition0-5.img`), by default in
-`%LOCALAPPDATA%\xboxrecomp` -- shared by every title and by the player's own games. A run
+`%LOCALAPPDATA%\xboxrecomp` (macOS `~/Library/Application Support/xboxrecomp`) -- shared by
+every title and by the player's own games. **And `\Device\Harddisk0\Partition1\` maps to the
+game folder**, so a title that keeps its saves on E: (TimeSplitters 2, under `UDATA`) writes
+them into `games/<title>/` whatever `RECOMP_SAVE_DIR` says: run tests from a copy of the
+game folder without `UDATA` (`scripts/regress.py` does; on macOS `cp -c` makes the copy
+free). Scripted runs also take `RECOMP_MUTE=1 RECOMP_WINDOW_BACKGROUND=1`, so a run never
+takes the focus or plays sound while someone is at the machine. A run
 without the switch reads and writes the player's real saves, and inherits whatever the run
 before it saved, which makes runs depend on each other (on 30 Sep 2026 that looked like an
 input regression). Every run's log says which it got: `[PATH] saves in <dir> (RECOMP_SAVE_DIR)`.

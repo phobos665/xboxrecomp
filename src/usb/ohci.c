@@ -6,6 +6,11 @@
  * plus a trace of every register access, because what the driver does after
  * that decides how the rest gets built.
  */
+/* glibc names the x86-64 ucontext registers (REG_RIP, ...) that
+ * mmio_decode.h reads only with _GNU_SOURCE, before the first header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
@@ -525,7 +530,14 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    fn();
+    {
+        /* Guest code on a host thread: under the guest lock, bounded as an
+         * interrupt is (xbox_GuestLockEnterTimed). */
+        int held = xbox_GuestLockEnterTimed(100);
+        fn();
+        if (held)
+            xbox_GuestLockLeave();
+    }
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);

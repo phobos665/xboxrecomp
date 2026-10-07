@@ -1,5 +1,12 @@
 # A Vulkan backend for `src/d3d`
 
+**Status, October 2026:** the backend exists (`src/d3d/rhi_vulkan.c`), matches
+D3D11 on TimeSplitters 2 captures on Windows (54 dB, §4.4), and is the only
+backend off Windows: it runs on macOS through MoltenVK and builds on Linux
+(not yet run against a Linux driver). `d3d8_gl.c` is deleted (§6). What
+macOS needed is §10. The rest of this document is the September analysis it
+was built from.
+
 **Status: analysis, September 2026. No code written.** CLAUDE.md records the
 decision ("Backend decision (Sep 2026): Vulkan, for portability — Linux, Steam
 Deck, Android") and two of its costs (the Y-flip, the winding inversion). This
@@ -771,3 +778,58 @@ sed -n '205,225p' src/d3d/d3d8_states.c
   — both already note that the Vulkan backend inherits their design points
   rather than their code.
 - `src/d3d/README.md` — the format table and the D3D8→D3D11 feature matrix.
+
+## 10. macOS: MoltenVK (October 2026)
+
+The same backend, with what Apple's stack needs and nothing else. Measured on
+an M4, MoltenVK 1.4.2, Vulkan SDK 1.4.357.1.
+
+- **Instance and device.** MoltenVK is a portability driver: the instance asks
+  for `VK_KHR_portability_enumeration` (Apple only), and the device enables
+  `VK_KHR_portability_subset` when it lists it. Of the subset's gaps one
+  reaches this renderer: no sampler LOD bias, so `D3DTSS_MIPMAPLODBIAS` is left
+  at zero and said once.
+- **Two drivers.** The SDK installs MoltenVK and Mesa's KosmicKrisp side by
+  side, both for the same GPU. The device is chosen by rank (discrete, then
+  integrated, then on Apple MoltenVK), not by loader order;
+  `RECOMP_VK_DEVICE=<index|name>` overrides. KosmicKrisp has
+  `VK_EXT_provoking_vertex` but no headless presentation.
+- **Window.** `RhiDeviceDesc.window` is a `CAMetalLayer` made by `src/host` on
+  the main thread (`host_window_metal_layer`); the backend creates the
+  surface itself (`VK_EXT_metal_surface`) through volk, so `src/d3d` needs no
+  SDL and no second Vulkan loader. The owner reports the drawable size with
+  `xbox_D3D8SetWindowSize`, since there is no HWND to ask.
+- **No window.** `window == NULL` presents to `VK_EXT_headless_surface`: the
+  whole present path runs and nothing is shown. The replay tool and the tests
+  run this way (`tests/d3d8_replay`); `d3d8_replay --window` uses a real
+  background window instead.
+- **Present.** No FIFO wait at interval 0: MoltenVK offers IMMEDIATE and
+  FIFO, and §4.10's order takes IMMEDIATE. A background window still hands
+  out drawables at the display's rate: ~8.9 ms a present against 1.7 ms
+  headless for the same frame. That wait is bracketed by
+  `rhi_set_wait_hooks`, which the HLE points at the guest lock's drop and
+  restore, so it stops no other guest thread.
+- **Formats.** `audit_formats()` says at device creation what the device
+  cannot do with the table. On the M4: everything samples; `B4G4R4A4` cannot
+  be a blended render target; `D24S8` is absent, so `D32S8` stands in
+  (§4.9).
+- **DXC.** `libdxcompiler.dylib`, found beside the executable, in an app
+  bundle's `Frameworks`, system-wide or under `$VULKAN_SDK`. The shaders are
+  compiled as **HLSL 2018** (`-HV 2018`): the generators write D3DCompile's
+  language, where `?:` on vectors selects per component, and DXC 1.7+
+  defaults to HLSL 2021, which refuses it -- every combiner shader that reads
+  a title's own texture modes failed. `tests/nv2a_combiners_hlsl` (400
+  combiner configurations) and `tests/nv2a_vsh_hlsl` compile the generators'
+  output with the backend's own DXC call.
+- **Loader.** volk's search finds a system-wide SDK; a shipped build puts
+  `libvulkan.1.dylib` in the bundle's `Frameworks` (looked for first) and
+  MoltenVK's ICD manifest under `Contents/Resources/vulkan/icd.d`.
+- **Not done.** Flat shading exists on no backend (`D3DRS_SHADEMODE` is
+  forwarded and never applied), so Metal's last-vertex rule for flat
+  primitives -- MoltenVK has no `VK_EXT_provoking_vertex`; D3D takes the
+  first vertex -- cannot show yet. `d3d8_replay` counts a capture's
+  flat-shaded draws; when titles turn out to have them, flat shading goes
+  into the generators for both backends, and on MoltenVK each flat triangle's
+  indices are rotated so its first vertex is last (rotation keeps the
+  winding). Metal also always restarts a strip at index 0xFFFF, which D3D8
+  does not.

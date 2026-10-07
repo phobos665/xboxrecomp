@@ -29,18 +29,18 @@ add_library(xbox_hle STATIC
     hle_xmv.c
     hle_xmv_play.c
     input_model.c
+    # The host pads behind the replaced XAPI input, through src/input's
+    # bindings (SDL3 or XInput), plus RECOMP_FAKE_INPUT / RECOMP_INPUT_SEQ.
+    input_host.c
 )
 
-# Host backends. XAudio2 and XInput exist only on Windows. A POSIX host needs
-# its own recomp_audio_output_* (audio_output.h) and recomp_input_host_sample
-# (input_host.h) -- SDL2 is the obvious candidate, since xbox_apu and
-# xbox_input already use it. Until those exist the library compiles on POSIX,
-# but a title that links it there will be missing those symbols.
+# Host audio: XAudio2 on Windows, SDL3 elsewhere, with the same switches
+# (RECOMP_MUTE, RECOMP_AUDIO_GAIN) and the same play-position clock.
 if(WIN32)
-    target_sources(xbox_hle PRIVATE
-        audio_output_xaudio2.cpp
-        input_host.c
-    )
+    target_sources(xbox_hle PRIVATE audio_output_xaudio2.cpp)
+else()
+    target_sources(xbox_hle PRIVATE audio_output_sdl.c)
+    target_link_libraries(xbox_hle PRIVATE SDL3::SDL3)
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_config)
@@ -48,9 +48,14 @@ target_link_libraries(xbox_hle PUBLIC xbox_kernel)
 # Host device choice and per-control bindings (src/input/input_bindings.c),
 # shared with the USB gamepad so one config file covers both input paths.
 target_link_libraries(xbox_hle PUBLIC xbox_input)
+# The D3D8 replacements drive the host renderer in src/d3d, on every
+# platform, and open a window of their own for it: Win32 on Windows, the host
+# shell (src/host) elsewhere.
+target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video)
 if(WIN32)
-    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0)
-    # The D3D8 replacements drive the host renderer in src/d3d, and open a
-    # window of their own for it.
-    target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)
+    target_link_libraries(xbox_hle PRIVATE xaudio2 ole32 xinput9_1_0 user32)
+else()
+    # The host shell: the main-thread loop a title's main.c runs, and the
+    # game window. PUBLIC so a title gets it through this library.
+    target_link_libraries(xbox_hle PUBLIC xbox_host)
 endif()
