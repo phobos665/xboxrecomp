@@ -244,7 +244,10 @@ rule that bit twice. The rest:
   `xbox_GuestSleep`) or suspends itself.
 - A waiter of higher priority takes over at the holder's next back edge
   (`RECOMP_BACKEDGE()`, at every loop header; the only preemption point lifted
-  code has) or when the holder blocks.
+  code has) or when the holder blocks. A non-blocking kernel call is an
+  exception only when the call itself readied that waiter (a resume, the
+  event it waited on). It then preempts at the call's return, as NT does. A
+  waiter that was already waiting before the call does not.
 - Equal priorities take turns at a back edge or a blocking call once the
   holder's quantum (`RECOMP_GUEST_QUANTUM_US`, 2000) is up.
 - A lower priority runs only when everything above it blocks. That starves
@@ -287,7 +290,7 @@ host tid, with the previous value. `RECOMP_GUEST_RESERVE_US=0` and
 CRI's ADX/Sofdec middleware (BLiNX; MvC2 has it too) locks like this,
 `sub_000FA230`/`sub_000FA270` in BLiNX:
 
-```
+```c
 lock:   if (count == 0) {                       /* [0x414AC4] */
             saved = GetThreadPriority(self);    /* one slot, [0xAAC358] */
             SetThreadPriority(self, 16);
