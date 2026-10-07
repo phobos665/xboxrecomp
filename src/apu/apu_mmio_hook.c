@@ -18,6 +18,20 @@ MCPXAPUState *g_apu_state = NULL;
 /* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
  * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
  * now the whole body is Windows-only so apu_emu links on Debian. */
+/* The AC'97 bus-master control registers and their self-clearing reset bit;
+ * see the comment above mcpx_ac97_handle_write below for the model. Outside
+ * the Windows guard because both fault paths apply it. */
+#define MCPX_AC97_BM0_CR     0x0040011Bu   /* 0xFEC0011B, engine 0 */
+#define MCPX_AC97_BM1_CR     0x0040017Bu   /* 0xFEC0017B, engine 1 */
+#define MCPX_AC97_CR_RR      0x02u         /* Reset Registers, self-clearing */
+
+uint64_t mcpx_ac97_apply_mask(uint32_t mcpx_offset, uint64_t value)
+{
+    if (mcpx_offset == MCPX_AC97_BM0_CR || mcpx_offset == MCPX_AC97_BM1_CR)
+        return value & ~(uint64_t)MCPX_AC97_CR_RR;
+    return value;
+}
+
 #if defined(_WIN32)
 #include <windows.h>
 /* getenv: without <stdlib.h> its pointer is truncated to int. */
@@ -296,16 +310,9 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * Dropping the bit is the whole model. There is no DSP to run the command,
  * and the title reads this byte only to find out whether it may proceed.
  */
-#define MCPX_AC97_BM0_CR     0x0040011Bu   /* 0xFEC0011B, engine 0 */
-#define MCPX_AC97_BM1_CR     0x0040017Bu   /* 0xFEC0017B, engine 1 */
-#define MCPX_AC97_CR_RR      0x02u         /* Reset Registers, self-clearing */
-
-static uint64_t ac97_apply_mask(uint32_t mcpx_offset, uint64_t value)
-{
-    if (mcpx_offset == MCPX_AC97_BM0_CR || mcpx_offset == MCPX_AC97_BM1_CR)
-        return value & ~(uint64_t)MCPX_AC97_CR_RR;
-    return value;
-}
+/* The mask itself is mcpx_ac97_apply_mask, above the Windows guard: the
+ * POSIX fault path (apu_fault.c) applies the same model. */
+#define ac97_apply_mask mcpx_ac97_apply_mask
 
 /* Put the value in the page, which is read-only to everyone including us.
  *

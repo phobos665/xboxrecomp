@@ -13,7 +13,7 @@ add_library(xbox_input STATIC
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
+target_link_libraries(xbox_input PUBLIC platform xbox_config SDL3::SDL3)
 if(WIN32)
     target_link_libraries(xbox_input PUBLIC xinput)
 endif()

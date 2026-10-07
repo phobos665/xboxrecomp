@@ -30,6 +30,11 @@ directory and entry point. A title with no built executable is reported as
 such rather than skipped, because "it stopped building" is a regression too.
 
 These are windowed programs: a run opens a window per title, in sequence.
+Off Windows every run is muted and in the background (RECOMP_MUTE=1,
+RECOMP_WINDOW_BACKGROUND=1, RECOMP_FULLSCREEN=0), so its window never takes
+the focus, and titles build with Ninja into titles/<title>/build/Release/ --
+the same depth as Visual Studio's output, so a title's relative game path
+works unchanged.
 """
 
 import argparse
@@ -37,8 +42,10 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -58,6 +65,105 @@ def find_cmake():
     return "cmake"
 
 
+WINDOWS = os.name == "nt"
+
+
+def build_dir(project):
+    """Where a title's build lives. Visual Studio is multi-configuration and
+    puts Release under build/; a single-configuration Ninja build is given
+    build/Release itself, so the executable sits at the same depth."""
+    return project / "build" if WINDOWS else project / "build" / "Release"
+
+
+def title_exe(project, name):
+    return project / "build" / "Release" / (f"{name}_recomp.exe" if WINDOWS
+                                             else f"{name}_recomp")
+
+
+def configure_cmd(project):
+    """The first configure of a title's build, or None on Windows, whose
+    builds are configured by hand (the Visual Studio generator)."""
+    if WINDOWS:
+        return None
+    return [find_cmake(), "-S", str(project), "-B", str(build_dir(project)),
+            "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"]
+
+
+def build_cmd(project, name):
+    extra = ["--", "-m", "-v:m"] if WINDOWS else ["--parallel"]
+    return [find_cmake(), "--build", str(build_dir(project)), "--config", "Release",
+            "--target", f"{name}_recomp", *extra]
+
+
+# ── off Windows: a run never sees the real game folder ──────────────────────
+#
+# Device\Harddisk0\Partition1 (E:, where titles keep their UDATA saves) maps
+# to the game directory itself, not to RECOMP_SAVE_DIR. So a run against
+# games/<title>/ reads -- and may write -- the player's real saves. Off Windows
+# every run here goes against a copy-on-write clone of the folder instead
+# (APFS clonefile on macOS, a reflink where Linux has one), with the player's
+# saves left out, and a fresh save directory of its own.
+
+PLAYER_DATA = ("UDATA", "_save")      # never copied, never touched
+
+
+def is_player_data(name):
+    return any(name.upper().startswith(p.upper()) for p in PLAYER_DATA)
+
+
+def clone_path(src, dst):
+    """Copy-on-write where the filesystem has it: free until written."""
+    if sys.platform == "darwin":
+        subprocess.run(["cp", "-cR", str(src), str(dst)], check=True)
+    elif os.name != "nt":
+        subprocess.run(["cp", "-a", "--reflink=auto", str(src), str(dst)], check=True)
+    elif Path(src).is_dir():
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def _remove_from_mirror(path, mirror_root):
+    """Delete inside a mirror, and nowhere else."""
+    path = Path(path).resolve()
+    if mirror_root.resolve() not in path.parents:
+        raise SystemExit(f"refusing to delete {path}: not inside {mirror_root}")
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def clone_mirror(game_dir, mirror_root):
+    """games/<title> as a clone under mirror_root, minus the player's saves.
+    Made once; on later calls what a run may have written (UDATA, TDATA,
+    CACHE) is dropped and TDATA/CACHE come back from the real folder, so
+    every run starts from the disc's state."""
+    game_dir = Path(game_dir)
+    dst = Path(mirror_root) / game_dir.name
+    if dst.resolve() == game_dir.resolve():
+        raise SystemExit(f"mirror {dst} is the game folder itself")
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in ("UDATA", "TDATA", "CACHE"):
+        if (dst / name).exists():
+            _remove_from_mirror(dst / name, Path(mirror_root))
+    for e in sorted(game_dir.iterdir()):
+        if is_player_data(e.name) or (dst / e.name).exists():
+            continue
+        clone_path(e, dst / e.name)
+    return dst
+
+
+def background_env(env):
+    """Off Windows a run is always silent and never in front: the same
+    switches as the agents' run-title.sh. Forced, not defaulted, so nothing
+    inherited from the caller's environment can unmute a scripted run."""
+    if not WINDOWS:
+        env.update({"RECOMP_MUTE": "1", "RECOMP_WINDOW_BACKGROUND": "1",
+                    "RECOMP_FULLSCREEN": "0"})
+    return env
+
+
 def discover(only=None):
     """Every title project, with the game directory its main.c points at."""
     out = []
@@ -74,7 +180,7 @@ def discover(only=None):
             "name": name,
             "project": main_c.parent.parent,
             "game": game,
-            "exe": main_c.parent.parent / "build" / "Release" / f"{name}_recomp.exe",
+            "exe": title_exe(main_c.parent.parent, name),
             "pipeline": ROOT / "games" / "_pipeline" / name / "out",
             "game_dir": (ROOT / "games" / game) if game else None,
         })
@@ -120,15 +226,19 @@ def refresh_thunks(t, verbose=False):
 
 
 def build(t):
-    bdir = t["project"] / "build"
+    bdir = build_dir(t["project"])
     if not (bdir / "CMakeCache.txt").is_file():
-        return "not configured"
-    r = subprocess.run([find_cmake(), "--build", str(bdir), "--config", "Release",
-                        "--target", f"{t['name']}_recomp", "--", "-m", "-v:m"],
+        cfg = configure_cmd(t["project"])
+        if not cfg:
+            return "not configured"
+        r = subprocess.run(cfg, cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            return "BUILD FAILED: configure (see cmake output)"
+    r = subprocess.run(build_cmd(t["project"], t["name"]),
                        cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
         errs = [l for l in (r.stdout + r.stderr).splitlines()
-                if " error " in l.lower()]
+                if " error " in l.lower() or " error:" in l.lower()]
         return "BUILD FAILED: " + (errs[0][:90] if errs else "see log")
     return "built"
 
@@ -185,8 +295,11 @@ def summarise(err_text, exit_code, seconds):
     # An NT exception code is an exit status only in the sense that the process
     # had one. TimeSplitters 2 returned 0xC0000005 and this table called it the
     # best-performing title in the library, because it rendered 98.5% of a
-    # frame before faulting and nothing looked at the code.
-    s["crashed"] = isinstance(exit_code, int) and exit_code >= 0x80000000
+    # frame before faulting and nothing looked at the code. Off Windows a
+    # fault ends the process by its signal, which Python reports as minus the
+    # signal number.
+    s["crashed"] = isinstance(exit_code, int) and (exit_code >= 0x80000000
+                                                   or exit_code < 0)
     s["seconds"] = seconds
     # Verdict, coarsest first: the point is to spot a title falling off a
     # rung, not to grade it.
@@ -210,7 +323,8 @@ def summarise(err_text, exit_code, seconds):
         # Said first and said loudly. How far it got before faulting is in the
         # other columns; a fault is a regression however much of a frame
         # arrived first, and it outranks every other thing this can report.
-        s["verdict"] = "CRASHED 0x%08X" % s["exit"]
+        s["verdict"] = ("CRASHED 0x%08X" % s["exit"] if s["exit"] >= 0
+                        else "CRASHED signal %d" % -s["exit"])
     elif s["swaps"] > 0:
         s["verdict"] = "renders"
     elif s["swapped"]:
@@ -400,6 +514,31 @@ def fresh_save_data(game_dir, enabled=True):
                       f" Nothing has been deleted.", file=sys.stderr)
 
 
+@contextlib.contextmanager
+def run_lock(path):
+    """Hold a lock directory for one run, so only one game runs at a time on
+    this machine whoever starts it (--run-lock; the agents' scripts use the
+    same mkdir convention). Taken before the title starts, so waiting for it
+    does not eat into the run's own time."""
+    if not path:
+        yield
+        return
+    lock = Path(path)
+    while True:
+        try:
+            lock.mkdir(parents=False)
+            break
+        except FileExistsError:
+            time.sleep(2)
+    try:
+        yield
+    finally:
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
+
+
 def default_input_seq(seconds):
     """Press start a few times, then A, spread across the measured window.
 
@@ -458,9 +597,16 @@ def run_title(t, seconds, out_dir, extra_env=None):
     # frames show where the run ended up as well as how it began.
     env.setdefault("RECOMP_HLE_D3D8_DUMP_KEEP_LAST", "12")
     env.update(extra_env or {})
+    background_env(env)
+    if not WINDOWS and t.get("game_dir") and "RECOMP_GAME_DIR" not in (extra_env or {}):
+        env["RECOMP_GAME_DIR"] = str(clone_mirror(t["game_dir"], out_dir / "mirror"))
+    if not WINDOWS and "RECOMP_SAVE_DIR" not in (extra_env or {}):
+        (out_dir / "saves").mkdir(parents=True, exist_ok=True)
+        env["RECOMP_SAVE_DIR"] = tempfile.mkdtemp(
+            prefix=f"{t['name']}-{time.strftime('%Y%m%d-%H%M%S')}-", dir=out_dir / "saves")
     err_path = out_dir / f"{t['name']}.err"
-    with open(err_path, "wb") as errf, fresh_save_data(t.get("game_dir"),
-                                                       t.get("fresh_saves")):
+    with run_lock(t.get("run_lock")), open(err_path, "wb") as errf, \
+            fresh_save_data(t.get("game_dir"), t.get("fresh_saves")):
         p = subprocess.Popen([str(t["exe"])], cwd=str(t["project"]),
                              stdout=subprocess.DEVNULL, stderr=errf, env=env)
         try:
@@ -595,6 +741,8 @@ def cell(col, value):
     """
     if col == "exit" and isinstance(value, int) and value >= 0x80000000:
         return "0x%08X" % value
+    if col == "exit" and isinstance(value, int) and value < 0:
+        return "sig%d" % -value
     return str(value)
 
 
@@ -729,6 +877,9 @@ def main():
     ap.add_argument("--out-dir", default="games/_pipeline/_matrix",
                     help="where per-title logs and the JSON go")
     ap.add_argument("--baseline", help="a previous run's JSON to compare against")
+    ap.add_argument("--run-lock", metavar="DIR",
+                    help="a lock directory each run holds (mkdir), so only one "
+                         "game runs at a time on this machine")
     args = ap.parse_args()
     if args.mute:
         os.environ["RECOMP_MUTE"] = "1"      # inherited by every title run
@@ -777,6 +928,7 @@ def main():
             t["input_seq"] = TITLE_INPUT.get(t["name"],
                                              default_input_seq(args.seconds))
         t["fresh_saves"] = args.fresh_saves
+        t["run_lock"] = args.run_lock
         rows[t["name"]] = run_repeated(t, args.seconds, out_dir, args.repeat)
         print(f"{prefix} {rows[t['name']]['verdict']} "
               f"({time.time() - t0:.0f}s)", flush=True)

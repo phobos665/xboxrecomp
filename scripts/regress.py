@@ -33,6 +33,13 @@ and game folders are never touched. Launcher settings a player tuned
 environment, which wins over the file.
 
 Nothing runs while a title is already running: that is someone playing.
+
+Off Windows (macOS, Linux) the same pass works with three differences: the
+builds are Ninja into titles/<title>/build/Release/, every run is muted and
+in the background (compat_matrix.background_env, the switches the agents'
+run-title.sh uses), and the runs go one title at a time unless --jobs says
+otherwise. --build-prefix wraps each build command (e.g. a build-slot script
+and `nice`), so a pass shares the machine politely.
 """
 
 import argparse
@@ -40,6 +47,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -106,7 +114,11 @@ def git(*args, cwd=ROOT, check=True):
 
 def title_running():
     if os.name != "nt":
-        return False
+        # A title is started by path, so its command line has a "/" right
+        # before "<name>_recomp"; a build's "--target <name>_recomp" does not.
+        r = subprocess.run(["pgrep", "-f", r"/[A-Za-z0-9]+_recomp( |$)"],
+                           capture_output=True, text=True)
+        return r.returncode == 0 and bool(r.stdout.strip())
     out = subprocess.run(["tasklist"], capture_output=True, text=True).stdout
     return "_recomp.exe" in out
 
@@ -212,25 +224,27 @@ def lift(wt, sha, t, stage):
     return rc, time.time() - t0
 
 
-def build(wt, name):
+def build(wt, name, prefix=()):
     """Incremental build; configures only the first time (the projects glob
     their generated sources with CONFIGURE_DEPENDS)."""
     project = wt / "titles" / name
-    bdir = project / "build"
+    bdir = cm.build_dir(project)
     logs = work_dir(wt, name)
     logs.mkdir(parents=True, exist_ok=True)
     cmake = cm.find_cmake()
     t0 = time.time()
     with open(logs / "build.log", "w", encoding="utf-8", errors="replace") as f:
         if not (bdir / "CMakeCache.txt").is_file():
-            gen = ["-G", "Visual Studio 16 2019", "-A", "x64"] if os.name == "nt" else []
-            rc = subprocess.run([cmake, "-S", str(project), "-B", str(bdir), *gen],
+            if os.name == "nt":
+                cfg = [cmake, "-S", str(project), "-B", str(bdir),
+                       "-G", "Visual Studio 16 2019", "-A", "x64"]
+            else:
+                cfg = cm.configure_cmd(project)
+            rc = subprocess.run([*prefix, *cfg],
                                 stdout=f, stderr=subprocess.STDOUT).returncode
             if rc:
                 return rc, time.time() - t0
-        extra = ["--", "-m", "-v:m"] if os.name == "nt" else ["--parallel"]
-        rc = subprocess.run([cmake, "--build", str(bdir), "--config", "Release",
-                             "--target", f"{name}_recomp", *extra],
+        rc = subprocess.run([*prefix, *cm.build_cmd(project, name)],
                             stdout=f, stderr=subprocess.STDOUT).returncode
     return rc, time.time() - t0
 
@@ -243,6 +257,13 @@ def ensure_mirror(game_dir):
     for e in sorted(game_dir.iterdir()):
         target = dst / e.name
         if target.exists() or _is_link(target):
+            continue
+        if os.name != "nt":
+            # A clone, not a link: Partition1 maps to the game folder, so a
+            # link would let a run write into the real one. Copy-on-write
+            # (cm.clone_path) makes the whole folder free to copy.
+            if not cm.is_player_data(e.name):
+                cm.clone_path(e, target)
             continue
         if e.is_dir():
             if e.name.upper().startswith("UDATA"):
@@ -271,10 +292,13 @@ def reset_mirror(game_dir, debris):
     for name in ("TDATA", "CACHE"):
         src = game_dir / name
         if src.is_dir():
-            shutil.copytree(src, m / name)
+            if os.name != "nt":
+                cm.clone_path(src, m / name)
+            else:
+                shutil.copytree(src, m / name)
 
 
-def run_once(side, wt, t, mode, seconds, out_root):
+def run_once(side, wt, t, mode, seconds, out_root, run_lock=None):
     name = t["name"]
     tag = f"{side}-{mode}-{name}-{time.strftime('%H%M%S')}"
     out_dir = out_root / side / mode / name
@@ -285,8 +309,9 @@ def run_once(side, wt, t, mode, seconds, out_root):
     env = dict(PIN_ENV, RECOMP_GAME_DIR=str(MIRROR / t["game_dir"].name),
                RECOMP_SAVE_DIR=str(save), **TITLE_ENV.get(name, {}))
     spec = {"name": name, "project": wt / "titles" / name,
-            "exe": wt / "titles" / name / "build" / "Release" / f"{name}_recomp.exe",
+            "exe": cm.title_exe(wt / "titles" / name, name),
             "game_dir": MIRROR / t["game_dir"].name, "fresh_saves": False,
+            "run_lock": run_lock,
             "input_seq": cm.default_input_seq(seconds) if mode == "driven" else None}
     s = cm.run_title(spec, seconds, out_dir, env)
     text = (out_dir / f"{name}.err").read_text(encoding="utf-8", errors="replace") \
@@ -300,12 +325,13 @@ def run_once(side, wt, t, mode, seconds, out_root):
     return s
 
 
-def run_title_chain(t, sides, seconds, out_root):
+def run_title_chain(t, sides, seconds, out_root, run_lock=None):
     """One driven and one idle run per side, alternating sides."""
     res = {}
     for mode, secs in (("driven", seconds), ("idle", seconds + 5)):
         for side in SIDES:
-            res[(side, mode)] = run_once(side, sides[side], t, mode, secs, out_root)
+            res[(side, mode)] = run_once(side, sides[side], t, mode, secs, out_root,
+                                         run_lock)
     for side in SIDES:
         reset_mirror(t["game_dir"], out_root / "debris" / f"{side}-end-{t['name']}")
     return t["name"], res
@@ -338,7 +364,18 @@ def main():
     ap.add_argument("--force-lift", action="store_true",
                     help="full lift on both sides, ignoring the stamps")
     ap.add_argument("--no-run", action="store_true", help="lift and build only")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="titles run at once (default: all of them on Windows, "
+                         "one at a time elsewhere)")
+    ap.add_argument("--build-prefix", default="",
+                    help="a command each configure and build runs under, e.g. "
+                         "'nice' or a build-slot script; split like a shell")
+    ap.add_argument("--run-lock", metavar="DIR",
+                    help="a lock directory each run holds (mkdir), so only one "
+                         "game runs at a time on this machine")
     args = ap.parse_args()
+    prefix = shlex.split(args.build_prefix)
+    jobs = args.jobs or None
 
     if title_running():
         sys.exit("A title is running -- someone is playing. Not starting.")
@@ -372,7 +409,7 @@ def main():
                     log(f"{side} {t['name']}: lift from {stage} FAILED "
                         f"(see {work_dir(wt, t['name']) / 'lift.log'})")
                     continue
-            rc, bt = build(wt, t["name"])
+            rc, bt = build(wt, t["name"], prefix)
             timings[(side, t["name"])] = (stage, lt, bt, rc)
             log(f"{side} {t['name']}: lift {'from ' + stage if stage else 'none'}"
                 f" {lt:.0f}s, build {bt:.0f}s{' FAILED' if rc else ''}")
@@ -388,8 +425,11 @@ def main():
     log(f"running {len(titles)} titles x 4 runs into {out_root}")
     t0 = time.time()
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(titles)) as ex:
-        for name, res in ex.map(lambda t: run_title_chain(t, sides, args.seconds, out_root),
+    if jobs is None:
+        jobs = len(titles) if os.name == "nt" else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
+        for name, res in ex.map(lambda t: run_title_chain(t, sides, args.seconds, out_root,
+                                                          args.run_lock),
                                 titles):
             results[name] = res
     log(f"runs took {time.time() - t0:.0f}s")

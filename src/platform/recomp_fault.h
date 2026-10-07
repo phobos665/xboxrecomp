@@ -76,9 +76,11 @@ void recomp_fault_thread_init(void);
 
 /* A fault the host does not trap, raised by the runtime itself: an integer
  * divide on AArch64, which returns 0 rather than faulting. Builds a fault
- * (native and ctx NULL, sp this frame's), routes it, reports it, and exits
- * as an unhandled exception would, with `code` as the status. Returns only
- * when route handled it. */
+ * (native and ctx NULL, sp this frame's), routes it, reports it, and ends
+ * the process as an unhandled exception would: on Windows with `code` as the
+ * status, on POSIX by the matching signal (SIGFPE for a divide), so a parent
+ * sees a fault rather than an exit status. Returns only when route handled
+ * it. */
 void recomp_fault_raise(int kind, uint32_t code, uintptr_t pc);
 
 /* The callbacks recomp_fault_install was given, for the host halves. */
