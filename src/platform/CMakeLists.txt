@@ -28,6 +28,7 @@ if(WIN32)
     add_library(platform STATIC
         host_timer.c
         fault_common.c
+        fault_emulate.c
         fault_win32.c
         host_main_win32.c
     )
@@ -46,6 +47,7 @@ else()
         posix_memory.c
         host_timer.c
         fault_common.c
+        fault_emulate.c
         fault_posix.c
         host_main_posix.c
     )

@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "recomp_config.h"
 #include "xbox_watchpoint.h"
+#include "platform/fault_emulate.h" /* recomp_fault_set_guest_base */
 #include "platform/host_timer.h"   /* the flip gate's and the ack thread's waits */
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
@@ -2594,6 +2595,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Set the global offset for recompiled code MEM macros */
     g_xbox_mem_offset = g_memory_offset;
+    recomp_fault_set_guest_base((uintptr_t)g_memory_offset);  /* fault_emulate.h */
 
     /*
      * Initialize the Xbox stack for recompiled code.
@@ -3257,7 +3259,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
                     " (aliases the contiguous window)\n",
-                    (unsigned)(g_memory_size / (1024 * 1024)),
+                    (unsigned)(tiled_size / (1024 * 1024)),   /* what was mapped, capped at the window */
                     XBOX_TILED_BASE);
         } else {
             fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"

@@ -17,12 +17,14 @@
 #endif
 
 #include "recomp_fault.h"
+#include "mmio_decode_a64.h"   /* the Linux arm64 ESR record */
 
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #ifdef __APPLE__
 #include <sys/ucontext.h>   /* <ucontext.h> wants _XOPEN_SOURCE for routines this does not use */
 #else
@@ -78,17 +80,34 @@ static void read_context(recomp_fault *f, ucontext_t *uc)
 #elif defined(__linux__) && defined(__aarch64__)
     f->pc = (uintptr_t)uc->uc_mcontext.pc;
     f->sp = (uintptr_t)uc->uc_mcontext.sp;
-    /* The ESR is in an esr_context record in __reserved; not read yet. */
+    /* The ESR is an esr_context record in __reserved. */
+    if (f->kind == RECOMP_FAULT_ACCESS)
+        f->is_write = mmio_a64_esr_is_write(mmio_a64_esr(uc));
 #else
     (void)uc;
 #endif
 }
+
+/* Set while this thread is inside the handler. A fault in the route or the
+ * report itself -- a different signal, since the one being handled is
+ * blocked -- must not go round again: it would re-enter the code that just
+ * faulted, on the same alternate stack. */
+static __thread volatile sig_atomic_t t_in_handler;
 
 static void on_signal(int sig, siginfo_t *si, void *ucv)
 {
     recomp_fault_route_fn route = recomp_fault_route_cb();
     recomp_crash_fn crash = recomp_fault_crash_cb();
     recomp_fault f;
+
+    if (t_in_handler) {
+        static const char msg[] = "[CRASH] fault inside the fault handler\n";
+        ssize_t w = write(2, msg, sizeof msg - 1);
+        (void)w;
+        signal(sig, SIG_DFL);
+        return;                         /* re-faults with the default action */
+    }
+    t_in_handler = 1;
 
     memset(&f, 0, sizeof f);
     f.kind      = kind_of(sig, si);
@@ -99,8 +118,10 @@ static void on_signal(int sig, siginfo_t *si, void *ucv)
     f.ctx       = ucv;
     read_context(&f, (ucontext_t *)ucv);
 
-    if (route && route(&f))
+    if (route && route(&f)) {
+        t_in_handler = 0;
         return;                         /* resume where ctx now says */
+    }
 
     if (f.kind != RECOMP_FAULT_BREAKPOINT && crash)
         crash(&f);
@@ -111,6 +132,7 @@ static void on_signal(int sig, siginfo_t *si, void *ucv)
      * as this handler returns (the signal is blocked while it runs). */
     signal(sig, SIG_DFL);
     raise(sig);
+    t_in_handler = 0;
 }
 
 /* The alternate stack goes when its thread does. */
