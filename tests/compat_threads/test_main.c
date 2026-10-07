@@ -177,9 +177,18 @@ static void test_suspend(void)
     h = CreateThread(NULL, 0, self_suspender, NULL, 0, NULL);
     while (g_self_phase == 0)
         Sleep(1);
-    Sleep(30);
     CHECK(g_self_phase == 1);
-    CHECK(ResumeThread(h) == 1);
+    /* The thread sets the phase and only then suspends itself, so it may not
+     * be suspended yet: a resume of a running thread is a no-op returning 0,
+     * so retry until one finds it suspended, rather than guessing how long
+     * a loaded machine takes to get there. */
+    {
+        DWORD r = 0;
+        int i;
+        for (i = 0; i < 2000 && (r = ResumeThread(h)) == 0; i++)
+            Sleep(1);
+        CHECK(r == 1);
+    }
     CHECK(WaitForSingleObject(h, 2000) == WAIT_OBJECT_0);
     CHECK(g_self_phase == 2);
     CloseHandle(h);
