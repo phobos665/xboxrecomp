@@ -473,7 +473,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     return 0;
 }
 
-static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
+static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1, int suspended,
                                   uint32_t ctx2, uint32_t stack_top)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
@@ -482,7 +482,7 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    th = CreateThread(NULL, 0, bridge_thread_main, s, suspended ? CREATE_SUSPENDED : 0, NULL);
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -512,6 +512,11 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
     uint32_t start_routine   = STACK_ARG(9);
+    /* Created suspended, it waits for NtResumeThread: Forza tears down a Bink
+     * worker it never resumed by setting its quit event, resuming it and
+     * waiting for it to exit. Started at once, the worker had already parked
+     * on an event the teardown does not set, and the race never began. */
+    int create_suspended     = (STACK_ARG(7) & 0xFFu) != 0;
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
@@ -592,7 +597,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
+                    HANDLE th = bridge_spawn_thread(fn, start_context1, create_suspended,
                                                     start_context2, stack_top);
                     /* A thread handle is signalled when the thread exits, and
                      * a zero-timeout wait on one is a read rather than a
@@ -1783,6 +1788,79 @@ static void bridge_KeSetEvent(void)
         g_eax = 0;
 }
 
+/* ── I/O completion routines, delivered at alertable waits ──
+ *
+ * A file request's APC (ReadFileEx/WriteFileEx's completion routine) runs on
+ * the console only when the issuing thread next waits alertably -- never
+ * inside the call that issued the request. It used to run inline, inside
+ * NtReadFile/NtWriteFile (see bridge_complete_file_io), which is the same
+ * data delivered earlier, and a title that does its bookkeeping after issuing
+ * the request notices. Forza's cache copier counts a write as pending after
+ * WriteFileEx returns; run inline, the routine found nothing pending, took
+ * the request for the last one, and every on-demand copy to N: stopped after
+ * its first 64 KB -- the race load then read past the end of its own wave
+ * bank and collision file and waited forever.
+ *
+ * So routines queue per thread (a request completes on the thread that
+ * issued it, which is also the one that waits) and every alertable wait
+ * delivers what is queued first and returns STATUS_USER_APC, as NT does.
+ * RECOMP_APC_INLINE=1 restores inline delivery. */
+#define BRIDGE_APC_MAX 64
+typedef struct { uint32_t routine, context, iostatus; } bridge_apc;
+static RECOMP_TLS bridge_apc t_apcs[BRIDGE_APC_MAX];
+static RECOMP_TLS int t_apc_head, t_apc_count;
+
+static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
+                            uint32_t iostatus);
+
+static int bridge_apc_inline(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = xbox_EnvSwitch("RECOMP_APC_INLINE", 0);
+    return v;
+}
+
+static int bridge_queue_apc(uint32_t routine, uint32_t context, uint32_t iostatus)
+{
+    bridge_apc *a;
+
+    if (t_apc_count == BRIDGE_APC_MAX)
+        return 0;
+    a = &t_apcs[(t_apc_head + t_apc_count++) % BRIDGE_APC_MAX];
+    a->routine = routine;
+    a->context = context;
+    a->iostatus = iostatus;
+    return 1;
+}
+
+/* Deliver every queued routine; how many ran. A routine may queue more (it
+ * issues the next request), which this delivers too, as NT would before the
+ * wait returns. */
+static int bridge_drain_apcs(void)
+{
+    int n = 0;
+
+    while (t_apc_count) {
+        bridge_apc a = t_apcs[t_apc_head];
+        t_apc_head = (t_apc_head + 1) % BRIDGE_APC_MAX;
+        t_apc_count--;
+        deliver_one_apc(a.routine, a.context, a.iostatus);
+        n++;
+    }
+    return n;
+}
+
+#define BRIDGE_STATUS_USER_APC 0x000000C0u
+/* At the top of an alertable wait: run what is queued and leave. */
+#define BRIDGE_ALERTABLE_APCS(alertable)                                       \
+    do {                                                                       \
+        if ((alertable) && bridge_drain_apcs()) {                              \
+            g_eax = BRIDGE_STATUS_USER_APC;                                    \
+            return;                                                            \
+        }                                                                      \
+    } while (0)
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
@@ -1790,6 +1868,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
     uint32_t alertable = STACK_ARG(3);
+    BRIDGE_ALERTABLE_APCS(alertable);
     uint32_t timeout_ptr = STACK_ARG(4);
     int sync = 0;
     volatile LONG *state = bridge_guest_event(object, &sync);
@@ -1912,6 +1991,7 @@ static void bridge_NtWaitForSingleObject(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
+    BRIDGE_ALERTABLE_APCS(alertable);
     uint32_t timeout_ptr = STACK_ARG(2);
 
     if (bridge_wait_on_self(STACK_ARG(0), alertable, timeout_ptr))
@@ -1969,6 +2049,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
+    BRIDGE_ALERTABLE_APCS(alertable);
     uint32_t timeout_ptr = STACK_ARG(3);
 
     static int      logged = 0;
@@ -2059,6 +2140,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     uint32_t wait_type   = STACK_ARG(2);
     uint32_t wait_mode   = STACK_ARG(3);   /* KernelMode / UserMode */
     uint32_t alertable   = STACK_ARG(4);
+    BRIDGE_ALERTABLE_APCS(alertable);
     uint32_t timeout_ptr = STACK_ARG(5);
 
     (void)wait_mode;
@@ -2156,6 +2238,7 @@ static void bridge_KeDelayExecutionThread(void)
 {
     uint32_t wait_mode    = STACK_ARG(0);
     uint32_t alertable    = STACK_ARG(1);
+    BRIDGE_ALERTABLE_APCS(alertable);
     uint32_t interval_ptr = STACK_ARG(2);
 
 
@@ -3838,8 +3921,15 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
+        /* NTAPI: the routine's own `ret 12` takes the return address and all
+         * three arguments, and kernel_thunk_dispatch -- the routine when it is
+         * a kernel export like NtUserIoApcDispatcher -- pops the same 16. So
+         * esp is already back where it was. This used to add 12 more, which
+         * left every caller of a file request with a completion routine 12
+         * bytes high ([KESP] ordinal 219/236 moved esp by +12): survivable
+         * once per call, corrupting the frame when several queued routines
+         * run back to back at one alertable wait. */
         fn();
-        g_esp += 12;
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
@@ -3872,7 +3962,10 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         }
     }
     if (apc_routine) {
-        deliver_one_apc(apc_routine, apc_context, iostatus);
+        /* At the next alertable wait (see bridge_drain_apcs); inline only on
+         * request, or if the queue is full. */
+        if (bridge_apc_inline() || !bridge_queue_apc(apc_routine, apc_context, iostatus))
+            deliver_one_apc(apc_routine, apc_context, iostatus);
     }
 }
 
@@ -4084,6 +4177,17 @@ static void bridge_NtReadFile(void)
                     length, got, (uint32_t)ios.Status, buffer_va,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+        /* A failed read says which file: an end-of-file is only wrong if the
+         * file is longer than the offset, and nothing above says which. */
+        if (ios.Status) {
+            WCHAR where[MAX_PATH];
+            DWORD wn = GetFinalPathNameByHandleW(handle, where, MAX_PATH, FILE_NAME_NORMALIZED);
+            LARGE_INTEGER sz;
+            sz.QuadPart = -1;
+            GetFileSizeEx(handle, &sz);
+            fprintf(stderr, "  [READ]   that file: %ls (%lld bytes, async %d)\n",
+                    wn && wn < MAX_PATH ? where : L"?", (long long)sz.QuadPart, async_file);
+        }
         fflush(stderr);
     }
     /* A request that fails before it pends completes nothing.
@@ -4369,6 +4473,16 @@ static void bridge_NtWriteFile(void)
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
+
+    /* A write on an asynchronous handle pends, as a read does (see
+     * bridge_NtReadFile): the disk driver queues it, and the result arrives
+     * through the status block and the event, both already written above.
+     * Not with a completion routine, which is queued for the next alertable
+     * wait whatever is returned here; RECOMP_FILE_SYNC keeps the immediate
+     * answer, as it does for reads. */
+    if (g_eax == 0 && bridge_handle_is_async(STACK_ARG(0)) && !STACK_ARG(2) &&
+        !xbox_EnvSwitch("RECOMP_FILE_SYNC", 0))
+        g_eax = 0x00000103u;           /* STATUS_PENDING */
 }
 
 /* ── NtQueryInformationFile (ordinal 211, 5 args = 20 bytes) */
@@ -5469,6 +5583,7 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t objects_va = STACK_ARG(1);
     uint32_t wait_type  = STACK_ARG(2);
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
+    BRIDGE_ALERTABLE_APCS(alertable);
     uint32_t timeout_va = STACK_ARG(6);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
     volatile LONG *states[BRIDGE_MAXIMUM_WAIT_OBJECTS];
@@ -8778,7 +8893,7 @@ static void bridge_PsCreateSystemThread(void)
                 if (!stack_top) {
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
+                    HANDLE th = bridge_spawn_thread(fn, start_context1, 0,
                                                     start_context2, stack_top);
                     /* A thread handle is signalled when the thread exits, and
                      * a zero-timeout wait on one is a read rather than a
