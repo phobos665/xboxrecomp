@@ -406,11 +406,39 @@ static int sample_thread(SampleThread *t, uintptr_t *frames, int max_frames)
     {
         arm_thread_state64_t st;
         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        uintptr_t lr, rec[2];
+        uint32_t insn = 0;
+        mach_vm_size_t got = 0;
+
         if (thread_get_state(t->handle, ARM_THREAD_STATE64, (thread_state_t)&st,
                              &cnt) != KERN_SUCCESS)
             goto out;
         pc = (uintptr_t)arm_thread_state64_get_pc(st);
         fp = (uintptr_t)arm_thread_state64_get_fp(st);
+        lr = (uintptr_t)arm_thread_state64_get_lr(st) & 0x0000FFFFFFFFFFFFull;
+
+        /* A leaf function keeps no frame record (Apple's arm64 default), so
+         * its caller is only in lr and the fp walk would skip it. Take lr as
+         * the first caller when it is a return address (the instruction
+         * before it is a BL or BLR) that the first frame record does not
+         * already hold. Inside a non-leaf, after one of its own calls, lr
+         * points back into itself and the function is counted twice in the
+         * inclusive view; that is the price of seeing a leaf's caller. */
+        frames[n++] = pc;
+        if (lr > 4 && mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(lr - 4),
+                                             sizeof insn, (mach_vm_address_t)&insn, &got)
+                == KERN_SUCCESS && got == sizeof insn
+            && ((insn & 0xFC000000u) == 0x94000000u            /* bl  */
+                || (insn & 0xFFFFFC1Fu) == 0xD63F0000u)) {      /* blr */
+            got = 0;
+            if (!(fp && !(fp & 7) &&
+                  mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fp,
+                                         sizeof rec, (mach_vm_address_t)rec, &got)
+                      == KERN_SUCCESS && got == sizeof rec &&
+                  (rec[1] & 0x0000FFFFFFFFFFFFull) == lr) && n < max_frames)
+                frames[n++] = lr;
+        }
+        goto walk;
     }
 #else
     {
@@ -422,8 +450,10 @@ static int sample_thread(SampleThread *t, uintptr_t *frames, int max_frames)
         pc = (uintptr_t)st.__rip;
         fp = (uintptr_t)st.__rbp;
     }
-#endif
     frames[n++] = pc;
+    goto walk;
+#endif
+walk:
     while (n < max_frames && fp && !(fp & 7)) {
         uintptr_t rec[2];            /* [0] caller's fp, [1] return address */
         mach_vm_size_t got = 0;
@@ -568,15 +598,16 @@ static int categorise(const ResolvedAddr *r)
     const char *m = r->module, *n = r->name;
 
 #ifndef _WIN32
-    /* Darwin: every blocking call ends in a libsystem_kernel trap. */
-    if (strcmp(m, "libsystem_kernel.dylib") == 0) {
-        if (strstr(n, "wait") || strstr(n, "psynch") || strstr(n, "ulock")
+    /* Darwin: every blocking call ends in a libsystem trap (and a sample can
+     * land in the libc or pthread wrapper around it). */
+    if (starts(m, "libsystem_")
+        && (strstr(n, "wait") || strstr(n, "psynch") || strstr(n, "ulock")
             || strstr(n, "mach_msg") || strstr(n, "sleep") || strstr(n, "kevent")
             || strstr(n, "select") || strstr(n, "poll") || strstr(n, "workq")
-            || strstr(n, "semwait") || strstr(n, "os_sync"))
-            return CAT_WAIT;
+            || strstr(n, "semwait") || strstr(n, "os_sync")))
+        return CAT_WAIT;
+    if (strcmp(m, "libsystem_kernel.dylib") == 0)
         return CAT_OS;
-    }
     if (starts(m, "libsystem_c") || starts(m, "libsystem_malloc")
         || starts(m, "libsystem_platform") || starts(m, "libc++"))
         return CAT_CRT;
@@ -1104,8 +1135,6 @@ void xbox_NameCurrentThread(const wchar_t *name)
 }
 
 #else  /* neither Windows nor macOS */
-
-#include <wchar.h>
 
 #include <wchar.h>
 
