@@ -153,6 +153,8 @@ BOOL   ReleaseMutex(HANDLE h);
 /* ---- Waiting ---------------------------------------------------------- */
 DWORD WaitForSingleObject(HANDLE h, DWORD ms);
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable);
+/* Not Win32: WaitForSingleObject with a microsecond timeout (host_timer.c). */
+DWORD w32_wait_single_us(HANDLE h, long long us);
 DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, DWORD ms);
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable);

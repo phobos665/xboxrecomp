@@ -430,11 +430,23 @@ static int drain_apcs(void)
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
  */
+static DWORD wait_single_until(w32_object *o, const struct timespec *deadline);
+
 static DWORD wait_single(w32_object *o, DWORD ms)
 {
     struct timespec ts;
-    int timed = (ms != INFINITE);
-    if (timed) deadline_from_ms(ms, &ts);
+    if (ms == INFINITE)
+        return wait_single_until(o, NULL);
+    deadline_from_ms(ms, &ts);
+    return wait_single_until(o, &ts);
+}
+
+/* The same, to a CLOCK_REALTIME deadline (NULL for none). */
+static DWORD wait_single_until(w32_object *o, const struct timespec *deadline)
+{
+    struct timespec ts;
+    int timed = (deadline != NULL);
+    if (timed) ts = *deadline;
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
@@ -474,6 +486,23 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
     return wait_single((w32_object *)h, ms);
+}
+
+/* WaitForSingleObject to the microsecond, for host_timer's event-or-time
+ * wait (src/platform/host_timer.c). The millisecond API cannot express the
+ * flip gate's sub-millisecond slots, and WaitForMultipleObjects polls. */
+DWORD w32_wait_single_us(HANDLE h, long long us)
+{
+    struct timespec ts;
+    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return WAIT_OBJECT_0;
+    if (us < 0)
+        us = 0;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += (time_t)(us / 1000000);
+    ts.tv_nsec += (long)(us % 1000000) * 1000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    return wait_single_until((w32_object *)h, &ts);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)

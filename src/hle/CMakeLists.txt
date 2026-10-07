@@ -54,3 +54,8 @@ if(WIN32)
     # window of their own for it.
     target_link_libraries(xbox_hle PRIVATE xbox_d3d8 xbox_video user32)
 endif()
+if(NOT WIN32)
+    # The host shell (src/host): the main-thread loop a title's main.c runs,
+    # and the game window. PUBLIC so a title gets it through this library.
+    target_link_libraries(xbox_hle PUBLIC xbox_host)
+endif()

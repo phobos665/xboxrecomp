@@ -4,10 +4,11 @@ project(platform C)
 # Platform layer
 #   xbox_winnt.h   - Win32 / NT type vocabulary (header only)
 #   win32_compat.* - POSIX implementation of generic Win32 host primitives
+#   host_timer.*   - a sub-millisecond timer on every host
 #
-# On Windows the real <windows.h> is used, so this is an INTERFACE library
-# that only contributes the src/ include path. On Linux it is a real static
-# library carrying the POSIX primitive implementations.
+# On Windows the real <windows.h> is used for the Win32 vocabulary, so the
+# library carries only the host_* pieces that have a Windows half. On POSIX it
+# also carries the Win32 primitive implementations.
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -21,10 +22,16 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 if(WIN32)
-    add_library(platform INTERFACE)
-    target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
+    add_library(platform STATIC host_timer.c)
+    target_include_directories(platform PUBLIC ${XBOXRECOMP_SRC_DIR})
+    # winmm: timeBeginPeriod, the vblank clock's fallback (host_timer.c).
+    target_link_libraries(platform PUBLIC winmm)
+    if(MSVC)
+        target_compile_options(platform PRIVATE /W4 /Zi)
+        target_compile_definitions(platform PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
 else()
-    add_library(platform STATIC win32_compat.c)
+    add_library(platform STATIC win32_compat.c host_timer.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

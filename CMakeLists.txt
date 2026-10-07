@@ -108,6 +108,11 @@ add_subdirectory(src/input)
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 
+# The host shell off Windows: the main-thread loop and the game window (SDL3).
+if(NOT WIN32)
+    add_subdirectory(src/host)
+endif()
+
 # XDK functions replaced by name (tools/recomp/hle.py)
 add_subdirectory(src/hle)
 
@@ -126,7 +131,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     enable_testing()
     add_subdirectory(tests/nv2a_vsh)
     add_subdirectory(tests/d3d8_capture)        # portable: the capture container
+    add_subdirectory(tests/host_timer)          # portable: the sub-millisecond timer
     if(NOT WIN32)
+        add_subdirectory(tests/host_window)     # needs a display; run by hand
         add_subdirectory(tests/compat_threads)  # POSIX thread and fiber shims
     endif()
     if(WIN32)
