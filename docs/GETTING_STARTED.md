@@ -289,6 +289,43 @@ toolkit's `CMakeLists.txt` instead of your project's.
 
 **It will crash.** That's expected and normal. The stderr log tells you what happened.
 
+### Running it: never from a build step
+
+No CMake target, custom command, post-build step or ctest may start a title.
+A title run is a game run: it opens a window, plays sound, and writes saves
+(into the game folder's `UDATA`, which is the console's E: drive, and into the
+per-user partition images). Run titles only from a shell, or in automation
+through the harness that mutes them, keeps them in the background and gives
+them a throwaway copy of the game folder and their own saves (on this
+project's agents' Macs, `run-title.sh`). This rule exists because a bundling
+target once had an empty variable for its interpreter, so its command became
+the title itself, and building it ran the game, unmuted and in front, on a
+player's real saves. `scripts/make_macos_app.py` now refuses to start any
+program but `otool`, `install_name_tool`, `codesign` and `cp`, and has a
+`--dry-run`.
+
+### macOS: an application bundle (for your own machine)
+
+```bash
+cmake -S . -B build-mac -G Ninja -DXBOXRECOMP_MACOS_APP=ON -DXBOXRECOMP_APP_NAME="My Game"
+cmake --build build-mac              # also builds build-mac/My Game.app
+# or, for an executable you already have:
+python3 <toolkit>/scripts/make_macos_app.py build-mac/my_game --name "My Game" [--dry-run]
+```
+
+`-DXBOXRECOMP_MACOS_APP_DRY_RUN=ON` makes the target print what it would do.
+The `.app` carries the Vulkan loader, MoltenVK and its driver manifest, DXC,
+and every non-system library the title links (Homebrew's `libcrypto`), signed
+ad hoc. Put the game folder (the one with `default.xbe`) beside it, named
+`game`; `Contents/Resources/game` also works, but the title writes its saves
+into its game folder, and writing inside the bundle breaks its signature. A
+run started from the Finder logs to `~/Library/Logs/xboxrecomp/<exe>.log`.
+FFmpeg is not bundled (Homebrew's is a GPL build); XMV movies play when one is
+installed and are skipped otherwise.
+
+**The `.app` contains the title's recompiled code. It is for your machine
+only: never put one in CI artifacts or a release, never share it.**
+
 ## Step 8: Debug Iteratively
 
 This is where the real work begins. The general pattern:
