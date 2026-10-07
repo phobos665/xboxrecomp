@@ -62,5 +62,5 @@ third_party/ffmpeg/
 # DXC release build, HLSL -> SPIR-V for the Vulkan backend (fetched, not committed; see docs/technical/vulkan-backend.md)
 third_party/dxc/
 
-# Cartridge dumps of other games (GoldenEye 007 for the gun mod): never committed.
+references/
 n64/
