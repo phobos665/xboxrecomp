@@ -1656,7 +1656,7 @@ static int replay_main(int argc, char **argv)
     hr = d3d ? d3d->lpVtbl->CreateDevice(d3d, 0, 1 /* HAL */, hwnd, 0, &pp, &r.dev)
              : E_FAIL;
     if (FAILED(hr) || !r.dev) {
-        fprintf(stderr, "[replay] CreateDevice failed (0x%08lX)\n", (unsigned long)hr);
+        fprintf(stderr, "[replay] CreateDevice failed (0x%08lX)\n", (unsigned long)(uint32_t)hr);
         d3d8cap_close_read(cap);
         return 1;
     }
