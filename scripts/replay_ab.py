@@ -40,8 +40,8 @@ which is how a frame replayed by D3D11 on Windows is compared with the same
 frame replayed by Vulkan on a Mac or Linux machine, where there is no D3D11.
 Copy the reference directory along with the captures.
 
---clean-config runs every replay with an empty settings directory (APPDATA on
-Windows, XDG_CONFIG_HOME elsewhere), so the player's own settings file -- a
+--clean-config runs every replay with an empty settings directory
+(RECOMP_USER_DIR, and APPDATA on Windows, XDG_CONFIG_HOME and HOME elsewhere), so the player's own settings file -- a
 resolution scale, widescreen -- cannot make two machines' images differ.
 """
 import argparse
@@ -213,7 +213,13 @@ def main():
     if args.clean_config:
         empty = tempfile.mkdtemp(prefix="replay_ab_config_")
         for env in (env_a, env_b):
-            env.setdefault("APPDATA" if os.name == "nt" else "XDG_CONFIG_HOME", empty)
+            env.setdefault("RECOMP_USER_DIR", empty)     # the runtime's own override
+            if os.name == "nt":
+                env.setdefault("APPDATA", empty)
+            else:
+                # macOS keeps settings under $HOME/Library/Application Support.
+                env.setdefault("XDG_CONFIG_HOME", empty)
+                env.setdefault("HOME", empty)
 
     caps = args.captures or sorted(glob.glob(str(ROOT / "games" / "_pipeline" / "**" / "*.d3dcap"),
                                              recursive=True))

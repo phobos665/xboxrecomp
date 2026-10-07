@@ -19,6 +19,12 @@ endif()
 
 # An empty settings directory and no shader cache: nothing from the machine's
 # own runs may change the picture.
+# On macOS the settings live under $HOME/Library/Application Support, so
+# HOME moves too; RECOMP_USER_DIR is the runtime's own override for all of
+# them, where it exists.
+file(MAKE_DIRECTORY ${WORK}/home)
+set(ENV{HOME} ${WORK}/home)
+set(ENV{RECOMP_USER_DIR} ${WORK}/config)
 set(ENV{XDG_CONFIG_HOME} ${WORK}/config)
 set(ENV{APPDATA} ${WORK}/config)
 set(ENV{RECOMP_SHADER_CACHE} 0)

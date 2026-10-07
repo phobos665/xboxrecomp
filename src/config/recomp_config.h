@@ -42,6 +42,8 @@ uint32_t recomp_config_title_id(void);
  * and writes the path (no trailing separator), or 0 if the host has no home
  * to put it in. None creates anything (recomp_make_dirs does), and none needs
  * SDL or any other initialisation: they read the environment only.
+ * RECOMP_USER_DIR=<dir> overrides all three (user and data are <dir>, cache
+ * is <dir>/cache), for tests and scripted runs.
  *
  *   user  settings and input bindings
  *         Windows %APPDATA%\xboxrecomp; macOS ~/Library/Application Support/

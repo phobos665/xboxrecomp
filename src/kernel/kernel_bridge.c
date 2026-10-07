@@ -466,6 +466,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     xbox_GuestLockEnter();
     xbox_GuestLiftedEnter();
     xbox_NameCurrentThread(L"guest worker");
+    if (xbox_EnvSwitch("RECOMP_GUESTLOCK_TRACE", 0))
+        fprintf(stderr, "  [THREAD] guest worker tid %lu (ctx 0x%08X)\n",
+                (unsigned long)GetCurrentThreadId(), ctx1);
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -1488,6 +1491,17 @@ static void bridge_NtCreateEvent(void)
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+
+/* RECOMP_THREAD_TRACE=1: who suspends, resumes and re-prioritises whom, by
+ * host thread id, and which thread each file read comes from -- for a title
+ * whose threads hand work to each other by suspending and resuming. */
+static int bridge_thread_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_THREAD_TRACE", 0);
+    return on;
+}
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 /* Guest dispatcher objects.
@@ -3410,6 +3424,8 @@ static unsigned char s_handle_kind[BRIDGE_HANDLE_MAX];
 
 /* The guest-side dispatcher object synthesised for each token, or 0. */
 static uint32_t s_handle_dispatcher[BRIDGE_HANDLE_MAX];
+/* The object ObReferenceObjectByHandle hands out for NtCurrentThread. */
+static uint32_t *s_pseudo_thread_obj;
 
 
 static uint32_t bridge_handle_token(HANDLE h)
@@ -4074,6 +4090,8 @@ static void bridge_NtReadFile(void)
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
+        if (bridge_thread_trace())
+            fprintf(stderr, "  [READ] tid %lu:\n", (unsigned long)GetCurrentThreadId());
         if (poff)
             fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X -> 0x%08X  %02X %02X %02X %02X\n",
                     (long long)off.QuadPart, length, got,
@@ -4824,6 +4842,8 @@ static void bridge_ObReferenceObjectByHandle(void)
             if (i < PSEUDO_MAX && pseudo_handle[i] == handle) {
                 slot_disp = &pseudo_disp[i];
                 disp = *slot_disp;
+                if (handle == 0xFFFFFFFEu)      /* NtCurrentThread */
+                    s_pseudo_thread_obj = &pseudo_disp[i];
             }
         }
     }
@@ -5090,8 +5110,36 @@ static void bridge_KeQueryBasePriorityThread(void)
         XBOX_TO_NATIVE(STACK_ARG(0)));
 }
 
+/* The host thread a guest thread object stands for, for the guest lock's
+ * priorities: the caller, when the object is its own (its TIB's, or the one
+ * object every NtCurrentThread reference shares); else the thread whose
+ * handle owns the object. 0 if none. */
+uint32_t xbox_CurrentThreadObject(void);
+
+static DWORD bridge_thread_object_tid(uint32_t obj)
+{
+    uint32_t i;
+    if (!obj)
+        return 0;
+    if (obj == xbox_CurrentThreadObject() ||
+        (s_pseudo_thread_obj && obj == *s_pseudo_thread_obj))
+        return GetCurrentThreadId();
+    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+        if (s_handle_dispatcher[i] == obj && s_handle_kind[i] == BRIDGE_OBJ_THREAD)
+            return GetThreadId(bridge_resolve_handle(BRIDGE_HANDLE_TAG | i));
+    return 0;
+}
+
 static void bridge_KeSetBasePriorityThread(void)
 {
+    /* Also for the guest lock, which hands over by priority. */
+    xbox_GuestLockNotePriority(bridge_thread_object_tid(STACK_ARG(0)),
+                               (int32_t)STACK_ARG(1));
+    if (bridge_thread_trace())
+        fprintf(stderr, "  [THREADS] tid %lu sets tid %lu priority %d\n",
+                (unsigned long)GetCurrentThreadId(),
+                (unsigned long)bridge_thread_object_tid(STACK_ARG(0)),
+                (int)(int32_t)STACK_ARG(1));
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
         XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
 }
@@ -5181,18 +5229,30 @@ static void bridge_NtReleaseMutant(void)
 static void bridge_NtSuspendThread(void)
 {
     uint32_t count_va = STACK_ARG(1);
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
 
     g_eax = (uint32_t)xbox_NtSuspendThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+        h, count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    if (bridge_thread_trace())
+        fprintf(stderr, "  [THREADS] tid %lu suspends tid %lu -> 0x%08X prev %u\n",
+                (unsigned long)GetCurrentThreadId(), (unsigned long)GetThreadId(h),
+                g_eax, count_va ? BRIDGE_MEM32(count_va) : 0u);
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
 static void bridge_NtResumeThread(void)
 {
+    uint32_t count_va = STACK_ARG(1);
+    HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+
+    /* The count pointer is optional: NULL must stay NULL, not become guest
+     * address 0's host address and have the count written there. */
     g_eax = (uint32_t)xbox_NtResumeThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+        h, count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    if (bridge_thread_trace())
+        fprintf(stderr, "  [THREADS] tid %lu resumes tid %lu -> 0x%08X prev %u\n",
+                (unsigned long)GetCurrentThreadId(), (unsigned long)GetThreadId(h),
+                g_eax, count_va ? BRIDGE_MEM32(count_va) : 0u);
 }
 
 /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
@@ -8005,8 +8065,11 @@ static void bridge_KeResumeThread(void)
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
-    if (hThread)
-        g_eax = (uint32_t)ResumeThread(hThread);
+    if (hThread) {
+        DWORD prev;
+        g_eax = xbox_GuestThreadResume(hThread, &prev)
+                    ? (uint32_t)prev : (uint32_t)ResumeThread(hThread);
+    }
     else
         g_eax = 0;
 }
@@ -8018,8 +8081,11 @@ static void bridge_KeSuspendThread(void)
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
 
-    if (hThread)
-        g_eax = (uint32_t)SuspendThread(hThread);
+    if (hThread) {
+        DWORD prev;
+        g_eax = xbox_GuestThreadSuspend(hThread, &prev)
+                    ? (uint32_t)prev : (uint32_t)SuspendThread(hThread);
+    }
     else
         g_eax = 0;
 }
@@ -8241,8 +8307,10 @@ static void bridge_KeSetPriorityProcess(void)
 /* --- KeSetPriorityThread (ordinal 148, 2 args = 8 bytes) --- */
 static void bridge_KeSetPriorityThread(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
+    /* An absolute priority (8 is normal); the guest lock weighs it as an
+     * increment from normal. */
+    xbox_GuestLockNotePriority(bridge_thread_object_tid(STACK_ARG(0)),
+                               (int32_t)STACK_ARG(1) - 8);
     g_eax = 0;
 }
 

@@ -113,6 +113,31 @@ ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
 
+#if defined(_MSC_VER)
+#define CONF_ALIGN16 __declspec(align(16))
+#else
+#define CONF_ALIGN16 __attribute__((aligned(16)))
+#endif
+#define CONF_STACK_BYTES (64 * 1024)
+
+#ifdef CONF_GOLDEN
+/* Golden mode: no native side in this process -- its results were recorded
+   on an x86 machine (--record) and are loaded instead. The state the native
+   side would have defined lives here. */
+unsigned int g_in_a, g_in_b;
+unsigned int g_out_eax;
+unsigned short g_out_sw;
+double g_out_st[8];
+unsigned char g_out_xmm[128];
+unsigned char *g_scratch_ptr;
+/* One block, reached through g_xbox_mem_offset so that the guest address of
+   the scratch buffer is the one the recording saw: a 64-bit host cannot put
+   it below 4 GB, and a case whose eax ends up holding the pointer must still
+   compare equal. */
+static CONF_ALIGN16 unsigned char g_arena[0x1000 + CONF_STACK_BYTES];
+#define g_scratch     g_arena
+#define g_guest_stack (g_arena + 0x1000)
+#else
 extern unsigned int g_in_a, g_in_b;
 extern unsigned int g_out_eax;
 extern unsigned short g_out_sw;
@@ -123,8 +148,22 @@ extern unsigned char *g_scratch_ptr;
 /* Guest addresses are host addresses here (g_xbox_mem_offset stays 0), so a
    memory operand reads the same bytes on both sides. 16-byte aligned for the
    aligned SSE moves. */
-static __declspec(align(16)) unsigned char g_scratch[64];
-static unsigned char g_guest_stack[64 * 1024];
+static CONF_ALIGN16 unsigned char g_scratch[64];
+static unsigned char g_guest_stack[CONF_STACK_BYTES];
+#endif
+/* A host pointer as the guest sees it: itself, unless golden mode moved it. */
+#define GUEST_VA(p) ((uint32_t)((uintptr_t)(p) - (uintptr_t)g_xbox_mem_offset))
+
+/* A lifted division by zero on a host whose own division does not trap
+   (recomp_types.h): the native side would have faulted, so say so and stop. */
+#if !(defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__))
+#include <stdlib.h>
+void recomp_int_divide_fault(uint32_t code)
+{
+    printf("lifted division raised 0x%08X@NL@", code);
+    exit(3);
+}
+#endif
 
 /* What the lifted run produced, in the same shape as the native capture. */
 static unsigned int  l_eax;
@@ -138,12 +177,12 @@ _LIFTED_PROLOGUE = {
     "fpu": """    g_fp_top = 0; g_fp_control_word = 0x027Fu; g_fp_cmp = 0; g_fp_cc = 0x4000;
 @FPMACROS@
     memset(g_fp_stack, 0, sizeof(g_fp_stack));
-    g_eax = (uint32_t)(uintptr_t)g_scratch; g_ecx = 0; g_edx = 0;""",
+    g_eax = GUEST_VA(g_scratch); g_ecx = 0; g_edx = 0;""",
     "sse": """    memset(&g_xmm0, 0, sizeof(g_xmm0)); memset(&g_xmm1, 0, sizeof(g_xmm1));
     memset(&g_xmm2, 0, sizeof(g_xmm2)); memset(&g_xmm3, 0, sizeof(g_xmm3));
     memset(&g_xmm4, 0, sizeof(g_xmm4)); memset(&g_xmm5, 0, sizeof(g_xmm5));
     memset(&g_xmm6, 0, sizeof(g_xmm6)); memset(&g_xmm7, 0, sizeof(g_xmm7));
-    g_eax = (uint32_t)(uintptr_t)g_scratch; g_ecx = 0; g_edx = 0;""",
+    g_eax = GUEST_VA(g_scratch); g_ecx = 0; g_edx = 0;""",
 }
 
 # The model's TOP moves the same way the hardware's does: fp_push decrements it
@@ -254,8 +293,54 @@ static void cmp_sse(const char *name, const char *why, int *shown, int vec) {
 """
 
 
-def harness_source(prepared, why_of, tol_of):
-    """prepared: list of (name, kind, lifted_lines, inputs)."""
+# Golden values: the native side's results, recorded on an x86 machine with
+# MSVC (`--record`) so the lifted side can be checked anywhere (`--golden`),
+# including hosts that cannot run x86 at all. A record is
+#   [eax, status word, x87 stack as 64 bytes of hex, xmm0-7 as 128 bytes of hex]
+# per input vector, and the recording also notes the scratch buffer's address,
+# which golden mode reproduces as a guest address.
+_GOLD_TYPES = """
+typedef struct {
+    unsigned int   eax;
+    unsigned short sw;
+    unsigned char  st[64];
+    unsigned char  xmm[128];
+} conf_gold;
+
+static void gold_load(const conf_gold *g)
+{
+    g_out_eax = g->eax;
+    g_out_sw = g->sw;
+    memcpy(g_out_st, g->st, sizeof g->st);
+    memcpy(g_out_xmm, g->xmm, sizeof g->xmm);
+}
+"""
+
+_GOLD_DUMP = """
+static void gold_dump(const char *name, int vec)
+{
+    const unsigned char *st = (const unsigned char *)g_out_st;
+    int i;
+    printf("@GOLD %s %d %08X %04X ", name, vec, g_out_eax, (unsigned)g_out_sw);
+    for (i = 0; i < 64; i++) printf("%02X", st[i]);
+    printf(" ");
+    for (i = 0; i < 128; i++) printf("%02X", g_out_xmm[i]);
+    printf("@NL@");
+}
+"""
+
+
+def _c_bytes(hexstr):
+    return "{" + ",".join(f"0x{hexstr[i:i + 2]}" for i in range(0, len(hexstr), 2)) + "}"
+
+
+def harness_source(prepared, why_of, tol_of, record=False, golden=None):
+    """prepared: list of (name, kind, lifted_lines, inputs).
+
+    record: also print every native result as an @GOLD line (--record).
+    golden: {"scratch_va": int, "cases": {name: {"vectors": [...]}}} -- build
+    with -DCONF_GOLDEN and no native object: the recorded results stand in
+    for the native side (--golden)."""
     from tools.recomp.translator import FP_STACK_MACROS, FP_STACK_UNDEFS
     global _LIFTED_PROLOGUE, _LIFTED_EPILOGUE
     _LIFTED_PROLOGUE = dict(_LIFTED_PROLOGUE)
@@ -264,9 +349,20 @@ def harness_source(prepared, why_of, tol_of):
         "@FPMACROS@", chr(10).join(FP_STACK_MACROS))
     _LIFTED_EPILOGUE["fpu"] = _LIFTED_EPILOGUE["fpu"].replace(
         "@FPUNDEFS@", chr(10).join(FP_STACK_UNDEFS))
-    out = [_PREAMBLE]
-    for name, _, _, _ in prepared:
-        out.append(f"void nat_{name}(void);")
+    out = [("#define CONF_GOLDEN 1\n" if golden else "") + _PREAMBLE]
+    if golden:
+        out.append(_GOLD_TYPES)
+        for name, _, _, inputs in prepared:
+            vecs = golden["cases"][name]["vectors"]
+            rows = ",\n    ".join(
+                f"{{0x{v[0]:08X}u, 0x{v[1]:04X}u, {_c_bytes(v[2])}, {_c_bytes(v[3])}}}"
+                for v in vecs)
+            out.append(f"static const conf_gold gold_{name}[{len(vecs)}] = {{\n    {rows}\n}};")
+    else:
+        for name, _, _, _ in prepared:
+            out.append(f"void nat_{name}(void);")
+        if record:
+            out.append(_GOLD_DUMP)
     out.append("")
     for name, kind, lines, _ in prepared:
         body = "\n".join(f"    {l}" for l in lines) or "    /* nothing */"
@@ -276,17 +372,28 @@ def harness_source(prepared, why_of, tol_of):
     (void)ebp; (void)_cf; (void)_flags;
     (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
 {_LIFTED_PROLOGUE[kind]}
-    g_esp = (uint32_t)(uintptr_t)(g_guest_stack + sizeof(g_guest_stack) / 2);
+    g_esp = GUEST_VA(g_guest_stack + CONF_STACK_BYTES / 2);
 {body}
 {_LIFTED_EPILOGUE[kind]}
 }}""")
     out.append(_COMPARE)
-    out.append("int main(void) {\n    g_scratch_ptr = g_scratch;\n    int shown;")
+    out.append("int main(void) {\n    int shown;")
+    if golden:
+        out.append(f"    g_xbox_mem_offset = (ptrdiff_t)((uintptr_t)g_arena"
+                   f" - (uintptr_t)0x{golden['scratch_va']:08X}u);")
+    out.append("    g_scratch_ptr = g_scratch;")
+    if record:
+        out.append('    printf("@GOLDBASE %08X@NL@", (unsigned)(uintptr_t)g_scratch);')
     for name, kind, _, inputs in prepared:
         out.append(f"    shown = 0;   /* {name} */")
         for vec, inp in enumerate(inputs):
             out.append(f"    {{ {_load_inputs(kind, inp)}")
-            out.append(f"      nat_{name}();"
+            if golden:
+                native = f"gold_load(&gold_{name}[{vec}]);"
+            else:
+                native = f"nat_{name}();" + (f' gold_dump("{name}", {vec});'
+                                             if record else "")
+            out.append(f"      {native}"
                        + ("\n      n_depth = (8 - ((g_out_sw >> 11) & 7)) & 7;"
                           "\n      memcpy(n_st, g_out_st, sizeof n_st);"
                           if kind == "fpu" else ""))
@@ -299,6 +406,23 @@ def harness_source(prepared, why_of, tol_of):
     out.append('    printf("@NL@%d vectors, %d mismatches@NL@", g_total, g_fail);'
                "\n    return g_fail != 0;\n}")
     return "\n".join(out).replace("@NL@", chr(92) + "n")
+
+
+def parse_gold_lines(stdout):
+    """The @GOLD lines a --record run printed: (scratch_va, {name: [vectors]})."""
+    base, cases = None, {}
+    for line in stdout.splitlines():
+        parts = line.split()
+        if parts[:1] == ["@GOLDBASE"]:
+            base = int(parts[1], 16)
+        elif parts[:1] == ["@GOLD"] and len(parts) == 7:
+            name, vec = parts[1], int(parts[2])
+            row = [int(parts[3], 16), int(parts[4], 16), parts[5], parts[6]]
+            vecs = cases.setdefault(name, [])
+            if vec != len(vecs):
+                raise RuntimeError(f"@GOLD {name}: vector {vec} out of order")
+            vecs.append(row)
+    return base, cases
 
 
 def _load_inputs(kind, inp):

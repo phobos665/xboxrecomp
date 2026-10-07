@@ -174,6 +174,60 @@ space starts (the contiguous window, then the tiled aperture and the
 devices), and none of it is a wrap of low RAM. 28 mirrors of a 64 MB map end
 at 0x74000000, so a retail map is unaffected. A 128 MB map (BLiNX) gets 15.
 
+### Faults off Windows
+
+On Windows a trapped page is serviced by the vectored exception handler. On
+POSIX it is a `SIGSEGV`/`SIGBUS` handler (`src/platform/fault_posix.c`) on a
+per-thread alternate stack. Every thread gets one through
+`recomp_fault_thread_init`, which also pre-touches the handler's
+thread-locals, because on Darwin the first use of a `__thread` variable
+allocates. Both handlers build a `recomp_fault` (`recomp_fault.h`) and hand
+it to the same route, `xbox_fault_route` (`src/kernel/xbox_fault_route.c`),
+which tries these in order:
+
+1. A single-step: Windows watchpoints only.
+2. A watched page (`RECOMP_WATCH_WRITE`).
+3. A registered device range. `apu_fault_register` adds the PCRTC interrupt
+   page, the APU registers and the AC'97 page.
+4. POSIX only: the 16 KB pass-through above.
+
+Anything the route declines reaches the title's crash report.
+
+"Completing" an access means decoding the host instruction, doing what it
+would have done against a device model or the backdoor, writing the result
+registers back into the signal context and stepping past it. The decoder is
+chosen by the host CPU, not the OS. `mmio_decode.h` handles x86-64 (Windows
+and Linux x86-64). `mmio_decode_a64.h` handles arm64, and is complete, not
+device-shaped: on a 16 KB host the collateral 12 KB is ordinary guest memory
+reached by whatever clang emitted. That covers every LDR/STR addressing mode,
+sign-extending loads, FP/SIMD up to Q, all four LDP/STP modes, LSE atomics,
+CAS, LDXR/STXR and DC ZVA. Guest-memory atomics are done as real atomics on
+the backdoor, and an emulated LDXR/STXR pair becomes a compare-and-swap, so
+they stay atomic against other threads. A dry run checks every element of an
+access against the 4 KB side table before anything is done, so a pair that
+straddles into a trapped page is refused whole rather than half-done.
+`tests/mmio_decode_a64` compares the emulator against the hardware on about
+100 assembled forms and on clang-compiled MEM-style code, memcpy, memmove and
+memset.
+
+### Measured (Gate A, 7 Oct 2026)
+
+On an Apple M4 (macOS 27, 16 KB pages) at exp `47b78dd`, `RECOMP_HLE_D3D8=off`,
+60 s:
+
+- **TimeSplitters 2** reaches its first `Swap` straight after
+  `Direct3D_CreateDevice` and runs 3569 Swaps in 60 s, about 59.5 fps. The
+  Windows baseline is 58-59. There were no faults and no unresolved indirect
+  calls, and 26,835 kernel calls. The PCRTC acknowledge, the APU start and
+  the DSP doorbell all go through the device ranges.
+- **BLiNX** maps 128 MB with 15/15 mirrors and takes no faults. It reaches its
+  first `Swap` only with `RECOMP_GUEST_LOCK=0` (2072 Swaps in 40 s). With the
+  guest lock on, the default on arm64, it starves before the first frame.
+  That is a lock-fairness problem, not a memory one.
+
+`RECOMP_FPS` prints nothing on POSIX yet (`recomp_fps.c` is Windows-only).
+These counts are `[TRACE swap]` lines from `RECOMP_HLE_D3D8_TRACE_SWAPS=0-1`.
+
 ## Section Initialization
 
 After mapping the 64 MB region, the XBE file's sections are copied to their original addresses:

@@ -227,7 +227,11 @@ static inline int mmio_emulate(mmio_x86_ctx *ctx, uint32_t off, void *dev,
 
 /* ---- POSIX x86-64: the register file from a signal's ucontext ---------- */
 #if !defined(_WIN32)
-#if defined(__linux__)
+/* Linux names the registers (REG_RAX...) only under _GNU_SOURCE, which has
+ * to be defined before the first system header -- something only the
+ * including file can do. So the glue exists where that file asked for it
+ * (fault_emulate.c does); any other includer just gets the decoder. */
+#if defined(__linux__) && defined(_GNU_SOURCE)
 #include <ucontext.h>
 static inline void mmio_x86_from_ucontext(mmio_x86_ctx *c, const ucontext_t *uc)
 {

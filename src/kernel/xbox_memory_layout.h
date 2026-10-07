@@ -250,6 +250,16 @@ int  xbox_GuestLockEnterTimed(DWORD ms);
  * whatever thread: a guest thread (one that took xbox_GuestLockEnter) waits
  * unbounded, as after a kernel call; a host thread waits at most host_ms. */
 int  xbox_GuestLockEnterForCall(DWORD host_ms);
+/* A guest thread's priority, for the guest lock's handoffs: its host thread
+ * id and the KeSetBasePriorityThread increment (-16..16, 0 normal). */
+void xbox_GuestLockNotePriority(DWORD tid, int32_t prio);
+/* Guest NtSuspendThread/NtResumeThread with the guest lock on: the target
+ * parks itself at its next safe point instead of being stopped holding the
+ * lock. 1 if handled (prev = the previous suspend count), 0 to fall back to
+ * SuspendThread/ResumeThread (lock off, not a running guest thread, or the
+ * caller itself). */
+int  xbox_GuestThreadSuspend(HANDLE thread, DWORD *prev);
+int  xbox_GuestThreadResume(HANDLE thread, DWORD *prev);
 int  xbox_GuestLockOn(void);
 int  xbox_GuestConcurrencyOn(void);
 void xbox_GuestLiftedEnter(void);

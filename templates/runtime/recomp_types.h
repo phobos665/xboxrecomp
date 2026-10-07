@@ -234,6 +234,156 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
 #endif
 
+/* The rest of the locked family, and xchg with memory (locked whether or not
+ * it says so): lock add/sub/and/or/xor/inc/dec/not/neg on a byte, word or
+ * dword. They used to reach RECOMP_UNIMPL and do nothing at all -- a
+ * `lock inc [refcount]` never counted -- on every host.
+ *
+ * The lifter emits a compare-and-swap loop over the operation, then derives
+ * the flags from the old and new values exactly as the unlocked form does.
+ * RECOMP_ATOMIC_CASV<n>(p, &expected, desired): 1 if *p held expected and now
+ * holds desired, else 0 with expected updated to what *p held.
+ * RECOMP_ATOMIC_XCHG<n>(p, v): store v, return what was there.
+ *
+ * AArch64 note: these are LSE atomics, which need natural alignment, or with
+ * FEAT_LSE2 (every Apple M-series) at least to stay inside a 16-byte granule.
+ * A guest locked op that straddles one faults as SIGBUS at the lifted
+ * instruction. x86 has no such limit (a split lock). None has been seen. */
+#if defined(_MSC_VER)
+static __forceinline int RECOMP_ATOMIC_CASV32(volatile uint32_t *p, uint32_t *e, uint32_t d)
+{
+    uint32_t o = (uint32_t)_InterlockedCompareExchange((volatile long *)p, (long)d, (long)*e);
+    if (o == *e) return 1;
+    *e = o;
+    return 0;
+}
+static __forceinline int RECOMP_ATOMIC_CASV16(volatile uint16_t *p, uint16_t *e, uint16_t d)
+{
+    uint16_t o = (uint16_t)_InterlockedCompareExchange16((volatile short *)p, (short)d, (short)*e);
+    if (o == *e) return 1;
+    *e = o;
+    return 0;
+}
+static __forceinline int RECOMP_ATOMIC_CASV8(volatile uint8_t *p, uint8_t *e, uint8_t d)
+{
+    uint8_t o = (uint8_t)_InterlockedCompareExchange8((volatile char *)p, (char)d, (char)*e);
+    if (o == *e) return 1;
+    *e = o;
+    return 0;
+}
+#define RECOMP_ATOMIC_XCHG32(p, v) ((uint32_t)_InterlockedExchange((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_XCHG16(p, v) ((uint16_t)_InterlockedExchange16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_XCHG8(p, v)  ((uint8_t)_InterlockedExchange8((volatile char *)(p), (char)(v)))
+#else
+#define RECOMP_ATOMIC_CASV32(p, e, d) \
+    __atomic_compare_exchange_n((volatile uint32_t *)(p), (e), (uint32_t)(d), 0, \
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_CASV16(p, e, d) \
+    __atomic_compare_exchange_n((volatile uint16_t *)(p), (e), (uint16_t)(d), 0, \
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_CASV8(p, e, d) \
+    __atomic_compare_exchange_n((volatile uint8_t *)(p), (e), (uint8_t)(d), 0, \
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_XCHG32(p, v) \
+    __atomic_exchange_n((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_XCHG16(p, v) \
+    __atomic_exchange_n((volatile uint16_t *)(p), (uint16_t)(v), __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_XCHG8(p, v) \
+    __atomic_exchange_n((volatile uint8_t *)(p), (uint8_t)(v), __ATOMIC_SEQ_CST)
+#endif
+
+/* Integer division, as x86 does it.
+ *
+ * x86 raises #DE for a zero divisor, and for a quotient that does not fit;
+ * AArch64's sdiv/udiv return 0 for the first and C leaves INT64_MIN / -1
+ * undefined. The lifted division is 64-by-32 in C, so on an x86 host the
+ * hardware still traps exactly where Windows has always trapped -- a zero
+ * divisor (EXCEPTION_INT_DIVIDE_BY_ZERO), and edx:eax = 0x8000000000000000
+ * over -1 (EXCEPTION_INT_OVERFLOW) -- and these checks compile to nothing
+ * there. Elsewhere they raise the same two faults through the runtime
+ * (recomp_int_divide_fault -> recomp_fault_raise), so a title that divides by
+ * zero dies the same observable way on every host.
+ *
+ * A 32-bit quotient that overflows is NOT trapped, on any host: Windows has
+ * never trapped it (the division is done in 64 bits and truncated), though
+ * the console would. That is a decision, not an oversight. */
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_UNLIKELY(c) __builtin_expect(!!(c), 0)
+#else
+#define RECOMP_UNLIKELY(c) (c)
+#endif
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#define RECOMP_DIV_CHECK(d)        ((void)0)
+#define RECOMP_IDIV_CHECK(n, d)    ((void)0)
+#else
+void recomp_int_divide_fault(uint32_t code);
+#define RECOMP_DIV_CHECK(d) do {                                         \
+        if (RECOMP_UNLIKELY((d) == 0))                                    \
+            recomp_int_divide_fault(0xC0000094u);                        \
+    } while (0)
+#define RECOMP_IDIV_CHECK(n, d) do {                                     \
+        if (RECOMP_UNLIKELY((d) == 0))                                    \
+            recomp_int_divide_fault(0xC0000094u);                        \
+        else if (RECOMP_UNLIKELY((d) == -1 && (n) == INT64_MIN))           \
+            recomp_int_divide_fault(0xC0000095u);                        \
+    } while (0)
+#endif
+
+/* A loop's back edge: the place a guest thread lets another one run.
+ *
+ * With the guest lock on (the default on ARM hosts) only one guest thread is
+ * in lifted code at a time, and a thread lets go only at a kernel call -- so
+ * one that spins in lifted code waiting for another guest thread would wait
+ * forever, where the console's scheduler would end its quantum. The
+ * translator puts this at every loop header. It reads one plain global, the
+ * number of threads waiting for the lock: zero (always, with the lock off) is
+ * a load and a predicted branch; non-zero calls the runtime, which hands the
+ * lock over if this thread has held it for its quantum (xbox_memory_layout.c,
+ * RECOMP_GUEST_QUANTUM_US). Volatile, so the compiler re-reads it on every
+ * iteration even of a loop that touches no other memory. */
+extern volatile int32_t g_guest_lock_waiters;
+void recomp_guest_backedge_yield(void);
+#ifdef RECOMP_NO_BACKEDGE
+/* For measuring what the check costs; a build without it can deadlock a
+ * title with the guest lock on. */
+#define RECOMP_BACKEDGE() ((void)0)
+#else
+#define RECOMP_BACKEDGE() do {                                           \
+        if (RECOMP_UNLIKELY(g_guest_lock_waiters))                       \
+            recomp_guest_backedge_yield();                               \
+    } while (0)
+#endif
+
+/* SSE float-to-int conversions, as x86 does them.
+ *
+ * cvttss2si/cvttsd2si truncate; cvtss2si/cvtsd2si round under MXCSR.RC,
+ * which the guest never changes here (ldmxcsr is not lifted), so to nearest.
+ * A NaN or out-of-range input gives 0x80000000, the "integer indefinite".
+ * These were plain (int32_t) casts: right for the truncating forms on an x86
+ * host, where the cast compiles to cvttss2si; wrong for the rounding forms on
+ * every host (they truncated); and on AArch64 a cast saturates instead of
+ * giving 0x80000000. x86 hosts use the instructions themselves. */
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#include <emmintrin.h>
+static __forceinline int32_t recomp_cvtss2si(float v)   { return _mm_cvtss_si32(_mm_set_ss(v)); }
+static __forceinline int32_t recomp_cvttss2si(float v)  { return _mm_cvttss_si32(_mm_set_ss(v)); }
+static __forceinline int32_t recomp_cvtsd2si(double v)  { return _mm_cvtsd_si32(_mm_set_sd(v)); }
+static __forceinline int32_t recomp_cvttsd2si(double v) { return _mm_cvttsd_si32(_mm_set_sd(v)); }
+#else
+static inline int32_t recomp_f2i32_indef(double rounded)
+{
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return INT32_MIN;                  /* integer indefinite, NaN included */
+    return (int32_t)rounded;
+}
+/* nearbyint rounds in the host's mode, which nothing here changes: nearest,
+ * as MXCSR's default. */
+static inline int32_t recomp_cvtss2si(float v)   { return recomp_f2i32_indef(nearbyint((double)v)); }
+static inline int32_t recomp_cvttss2si(float v)  { return recomp_f2i32_indef(trunc((double)v)); }
+static inline int32_t recomp_cvtsd2si(double v)  { return recomp_f2i32_indef(nearbyint(v)); }
+static inline int32_t recomp_cvttsd2si(double v) { return recomp_f2i32_indef(trunc(v)); }
+#endif
+
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
