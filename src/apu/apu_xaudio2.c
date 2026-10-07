@@ -298,18 +298,26 @@ int xa2_is_active(void)
 
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
-    int copy_samples;
-    SDL_AudioStream *stream = __atomic_load_n(&g_sdl_stream, __ATOMIC_ACQUIRE);
+    int copy_samples, ok = 0;
+    SDL_AudioStream *stream;
 
-    if (!g_xa2_initialized || !stream) return 0;     /* not open (yet) */
-    /* What the device has not yet pulled counts as buffers in flight. */
-    if (SDL_GetAudioStreamQueued(stream) >= XA2_NUM_BUFS * XA2_BUF_BYTES) return 0;
-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
-    if (!SDL_PutAudioStreamData(stream, samples,
-                                copy_samples * XA2_CHANNELS * (int)sizeof(int16_t)))
-        return 0;
-    g_xa2_frames_written++;
-    return 1;
+    /* Under the lock, so xa2_shutdown cannot destroy the stream while it is
+     * being written (one uncontended lock per 1024-sample buffer). */
+    pthread_mutex_lock(&g_xa2_lock);
+    stream = g_sdl_stream;
+    /* Not open (yet), or what the device has not yet pulled is three
+     * buffers in flight already. */
+    if (g_xa2_initialized && stream &&
+        SDL_GetAudioStreamQueued(stream) < XA2_NUM_BUFS * XA2_BUF_BYTES) {
+        copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
+        if (SDL_PutAudioStreamData(stream, samples,
+                                   copy_samples * XA2_CHANNELS * (int)sizeof(int16_t))) {
+            g_xa2_frames_written++;
+            ok = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_xa2_lock);
+    return ok;
 }
 
 int xa2_get_buffer_size(void)

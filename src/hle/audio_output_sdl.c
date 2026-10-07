@@ -156,6 +156,14 @@ static void *open_device_thread(void *arg)
                 "device=%d Hz %d ch, %d-frame buffer\n", SDL_GetCurrentAudioDriver(),
                 (double)gain, spec.freq, spec.channels, frames);
     }
+    {
+        /* RECOMP_AUDIO_OPEN_DELAY_MS: publish the device that much later, so
+         * a test can watch streams cross from their own clock to the
+         * device's, as they do when a slow CoreAudio opens mid-run. */
+        const char *delay = getenv("RECOMP_AUDIO_OPEN_DELAY_MS");
+        if (delay && *delay && atoi(delay) > 0)
+            SDL_Delay((Uint32)atoi(delay));
+    }
     pthread_mutex_lock(&g_lock);
     if (g_summary_printed) {                 /* shut down while this was opening */
         pthread_mutex_unlock(&g_lock);
