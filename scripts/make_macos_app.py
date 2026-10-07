@@ -58,9 +58,15 @@ import subprocess
 import sys
 
 SYSTEM_PREFIXES = ("/usr/lib/", "/System/")
-# The only programs this script starts. Anything else -- the title above
-# all -- is refused, so no mistake in how it is called can run a game.
-ALLOWED_TOOLS = {"otool", "install_name_tool", "codesign", "cp"}
+# The only programs this script starts, by absolute path so nothing on PATH
+# can stand in for one. Anything else -- the title above all -- is refused,
+# so no mistake in how it is called can run a game.
+ALLOWED_TOOLS = {
+    "otool": "/usr/bin/otool",
+    "install_name_tool": "/usr/bin/install_name_tool",
+    "codesign": "/usr/bin/codesign",
+    "cp": "/bin/cp",
+}
 DRY = False
 
 
@@ -75,6 +81,7 @@ def run(*cmd, capture=False, writes=True):
         die(f"refusing a command with an empty part: {cmd!r}")
     if cmd[0] not in ALLOWED_TOOLS:
         die(f"refusing to run {cmd[0]!r}: this script only runs {sorted(ALLOWED_TOOLS)}")
+    cmd = (ALLOWED_TOOLS[cmd[0]],) + tuple(cmd[1:])
     if DRY and writes:
         print("  would run: " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
         return ""
