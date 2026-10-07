@@ -21,7 +21,6 @@ against both spellings is testing nothing.
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -43,10 +42,14 @@ HEADERS = """#include <string.h>
 # failure mode is a preprocessor expansion rather than a redeclaration.
 SHARP = ("isnan", "isinf", "isfinite", "isnormal", "signbit", "fpclassify",
          "round", "trunc", "onexit", "div", "exit", "abs")
-# onexit is an MSVC/glibc extension: macOS's headers do not declare it, so
-# there it is reserved for Windows' sake and compiles clean unmangled.
-if sys.platform == "darwin":
-    SHARP = tuple(n for n in SHARP if n != "onexit")
+
+# Reserved because one host's headers declare them, not every host's: MSVC's
+# stdlib.h declares onexit, glibc's does not, and Apple's does. Generated code
+# has to build on all of them, so the reserved set keeps these; but the
+# negative control can only require a clash where the compiler running it
+# sees the declaration. Asked of the headers themselves rather than of
+# sys.platform, which got macOS wrong once already.
+HOST_DECLARED = ("onexit",)
 
 
 def _find_cc():
@@ -66,6 +69,13 @@ def _compile(body):
         r = subprocess.run([cc, "-c", src, "-o", os.path.join(tmp, "t.o")],
                            capture_output=True, text=True)
         return r.returncode, r.stderr
+
+
+def _declared_here(name):
+    """Do this host's headers declare `name`? Taking its address compiles
+    only if they do."""
+    rc, _ = _compile(f"void *probe_{name}(void) {{ return (void *){name}; }}")
+    return rc == 0
 
 
 class ReservedIdentTest(unittest.TestCase):
@@ -96,6 +106,8 @@ class ReservedIdentTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, _FUNC_RESERVED_IDENT,
                               f"{name} is missing from the reserved set")
+                if name in HOST_DECLARED and not _declared_here(name):
+                    continue      # reserved for another host's headers
                 rc, _ = _compile(f"void {name}(void);\nvoid {name}(void) {{ }}")
                 self.assertNotEqual(
                     rc, 0,
