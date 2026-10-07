@@ -402,7 +402,7 @@ static void on_window_close(void *user)
 
 static HWND replay_window(UINT width, UINT height)
 {
-    static const host_window_callbacks cb = { on_window_close, NULL, NULL };
+    static const host_window_callbacks cb = { .on_close = on_window_close };
     void *layer;
     int pw = 0, ph = 0;
 
