@@ -65,6 +65,18 @@ int host_timer_wait_until(host_timer *t, int64_t deadline_ns, uint32_t cap_ms);
  * cancelled), _ELAPSED, _NOT_ARMED or _FAILED. */
 int host_timer_wait_us_or_event(host_timer *t, int64_t us, void *event, uint32_t cap_ms);
 
+/* Make the calling thread a real-time one, for a host thread that wakes on
+ * a cadence and does little each time (the vblank clock): on macOS
+ * THREAD_TIME_CONSTRAINT_POLICY with these figures (0 period: aperiodic),
+ * which removes the leeway described in host_timer.c, so this thread's
+ * waits are one plain sleep instead of stepped ones and a spin. If the
+ * scheduler demotes the thread later (a real-time thread that computes too
+ * much is), its wakes come late again; the waits notice and go back to
+ * stepping. 1 if the policy took, 0 where there is none (Windows, Linux
+ * without privileges: nothing changes there). */
+int host_thread_realtime(uint32_t period_us, uint32_t computation_us,
+                         uint32_t constraint_us);
+
 /* Make Sleep() good to about a millisecond where it is not already: on
  * Windows timeBeginPeriod(1), at the cost of a system-wide 1 kHz tick (the
  * vblank clock's fallback when there is no high-resolution timer). Nothing
