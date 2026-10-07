@@ -1201,8 +1201,13 @@ static int pick_physical_device(void)
         VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
         int rank;
 
-        p2.pNext = &drv;
-        vkGetPhysicalDeviceProperties2(pds[i], &p2);
+        /* The driver's name and ID are Vulkan 1.2; an older device (which
+         * is refused below anyway) is asked only for what 1.0 has. */
+        vkGetPhysicalDeviceProperties(pds[i], &p2.properties);
+        if (p2.properties.apiVersion >= VK_API_VERSION_1_2) {
+            p2.pNext = &drv;
+            vkGetPhysicalDeviceProperties2(pds[i], &p2);
+        }
         rank = device_rank(&p2.properties, &drv);
         if (rank > best) {
             best = rank;
@@ -1632,8 +1637,27 @@ static int load_vulkan(void)
             return 0;
         }
     }
-#endif
+    if (volkInitialize() == VK_SUCCESS)
+        return 0;
+    /* Last, an SDK that was unpacked rather than installed: its loader is
+     * in $VULKAN_SDK/lib. Its drivers then come from VK_DRIVER_FILES (the
+     * SDK's setup-env.sh sets it), since that loader's own search paths do
+     * not include the SDK. */
+    if (getenv("VULKAN_SDK")) {
+        snprintf(path, sizeof path, "%s/lib/%s", getenv("VULKAN_SDK"), beside[0]);
+        if ((m = dlopen(path, RTLD_NOW | RTLD_LOCAL)) != NULL) {
+            PFN_vkGetInstanceProcAddr gipa =
+                (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
+            if (gipa) {
+                volkInitializeCustom(gipa);
+                return 0;
+            }
+        }
+    }
+    return -1;
+#else
     return volkInitialize() == VK_SUCCESS ? 0 : -1;
+#endif
 }
 
 static int v_device_create(const RhiDeviceDesc *dd)

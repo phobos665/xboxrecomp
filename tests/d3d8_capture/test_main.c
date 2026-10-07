@@ -760,10 +760,15 @@ int main(int argc, char **argv)
      *   d3d8_capture_test --write synthetic.d3dcap
      *   d3d8_replay synthetic.d3dcap --out synthetic --loops 3 --dump-every
      *
-     * The image should show, on a dark blue clear, a red/green checker on the
-     * left (fixed function, texture) and an orange square on the right
-     * (vertex program, declaration, NORMPACKED3 normal, screen-space undo,
-     * combiners), and every loop's image should be byte-identical. */
+     * The image should show, on a dark blue clear, a red square on the left
+     * (fixed function, texture) and an orange square on the right (vertex
+     * program, declaration, NORMPACKED3 normal, screen-space undo,
+     * combiners), and every loop's image should be byte-identical. The left
+     * one is solid red, not the red/green checker the texture holds: the
+     * texture is LIN_A8R8G8B8, linear textures are addressed in texels on
+     * the NV2A (docs/technical/shadow-mode.md, Future Perfect item 5), so
+     * the quad's 0..1 coordinates reach only the first texel, which is red.
+     * tests/d3d8_replay checks exactly this picture. */
     if (argc == 3 && strcmp(argv[1], "--write") == 0) {
         if (write_capture(argv[2]) != 0) {
             printf("could not write %s\n", argv[2]);
