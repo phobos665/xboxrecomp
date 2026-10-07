@@ -1651,8 +1651,15 @@ static int load_vulkan(void)
          * KosmicKrisp), and a second MoltenVK in the process duplicates its
          * Objective-C classes ("implemented in both ... mysterious
          * crashes"). So the bundle's manifest only, unless the person
-         * running it chose drivers themselves. */
-        if (m && i == 1 && !getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES")) {
+         * running it chose drivers themselves.
+         *
+         * An environment variable, not VK_LUNARG_direct_driver_loading: that
+         * extension only governs vkCreateInstance, and the loader already
+         * opens every manifest's driver earlier, to answer
+         * vkEnumerateInstanceExtensionProperties -- which is where the
+         * second MoltenVK would get in. Set once, before any Vulkan call. */
+        if (m && strstr(beside[i], "Frameworks") && !getenv("VK_DRIVER_FILES") &&
+            !getenv("VK_ICD_FILENAMES")) {
             char icd[1200];
             snprintf(icd, sizeof icd, "%s../Resources/vulkan/icd.d/MoltenVK_icd.json", dir);
             if (access(icd, R_OK) == 0)
