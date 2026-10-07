@@ -1637,7 +1637,11 @@ static void shadow_set_texture(uint32_t stage, uint32_t texture)
  * hle_d3d8.c uses it for RECOMP_HLE_D3D8_SKIP_FULLSCREEN. */
 int hle_d3d8_stage0_is_framebuffer(void)
 {
+#ifdef _WIN32
     return g_stage0_framebuffer;
+#else
+    return 0;           /* no host renderer, so nothing samples the frame */
+#endif
 }
 
 HLE_ORIGINAL(D3DDevice_SetPalette);

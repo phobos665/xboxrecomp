@@ -104,6 +104,11 @@ HLE_EXPORT(D3DDevice_SetSoftDisplayFilter)
 
 /* ------------------------------------------------------------------ shadow */
 
+/* Swaps the shadow renderer has presented. Outside the _WIN32 block because
+ * the visibility-test polling below reads it on every host; without a host
+ * renderer it stays 0. */
+static unsigned long g_shadow_swaps;
+
 #ifdef _WIN32
 
 #define SHADOW_WM_DESTROY (WM_APP + 1)
@@ -132,7 +137,6 @@ static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
 static int                g_shadow_thread_notes;
 static unsigned long      g_shadow_clears;
-static unsigned long      g_shadow_swaps;
 /* The video overlay's state, from EnableOverlay and UpdateOverlay. */
 static int                g_overlay_enabled, g_overlay_updated;
 /* Where the playing movie's surface keeps its texels (hle_xmv_play.c), and
@@ -1973,6 +1977,7 @@ static void swap_timing_report(void)
     g_swap_timed = 0;
 }
 
+#ifdef _WIN32   /* the overlay draws through the host renderer and reads keys through Win32 */
 /* ------------------------------------------------------------------ overlay
  *
  * A frame-rate counter the player can turn on, and a frame cap they can
@@ -2076,6 +2081,7 @@ static void overlay_frame(void)
     if (enabled)
         d3d8_overlay_draw(line);
 }
+#endif /* _WIN32: the overlay */
 
 /* HRESULT D3DDevice_Swap(DWORD Flags)                                       */
 #ifdef _WIN32
@@ -2874,8 +2880,8 @@ static void shadow_track_vertex_shader(uint32_t guest, int has_function,
         if (slot >= 0 && slot == g_shadow_vs_slot)
             g_shadow_vs_kind = kind;
     }
-#endif
 }
+#endif
 
 /* void D3DDevice_LoadVertexShaderProgram(const DWORD *pFunction, DWORD Address)
  * Xbox-only: copy a compiled program (the same X_VSH_SHADER_HEADER form
