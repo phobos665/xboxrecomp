@@ -36,11 +36,30 @@ int main(void)
     for (i = 0; i < CHUNK / 2; i++)                  /* a quiet square wave */
         ((int16_t *)pcm)[i] = (int16_t)(((i / 2) / 50) & 1 ? 800 : -800);
 
+    /* The device opens on a host thread of its own, so the first submissions
+     * are refused until it is up (and the caller, a guest thread in a title,
+     * never waits for CoreAudio). */
+    t0 = SDL_GetTicksNS();
     recomp_audio_output_initialize();
-    if (!recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0)) {
-        printf("SKIP: no audio device (%s)\n", SDL_GetError());
-        return 0;
+    {
+        /* 0: neither the initialize nor a submission waits for the device
+         * (a guest thread holding the guest lock makes them). */
+        int took = recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0);
+        double ms = (double)(SDL_GetTicksNS() - t0) / 1e6;
+
+        printf("initialize + first submission: %.1f ms (%s)\n", ms, took ? "taken" : "refused, device opening");
+        CHECK(ms < 100.0, "initialize/submit blocked %.0f ms waiting for the device", ms);
+        if (took)
+            recomp_audio_output_reset_voice(256);
     }
+    while (!recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0)) {
+        if (SDL_GetTicksNS() - t0 > 30000000000ull) {
+            printf("%s: no audio device within 30 s (%s)\n", g_fail ? "FAIL" : "SKIP", SDL_GetError());
+            return g_fail ? 1 : 0;
+        }
+        SDL_Delay(20);
+    }
+    printf("device up after %.0f ms\n", (double)(SDL_GetTicksNS() - t0) / 1e6);
     taken = 1;
     /* 2: fill the queue, then one more is refused. */
     while (taken < 12 && recomp_audio_output_submit(256, pcm, CHUNK, RATE, 2, 16, 0))
