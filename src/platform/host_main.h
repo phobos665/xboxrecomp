@@ -50,8 +50,9 @@ void host_error_box(const char *title, const char *message);
  * (Mach-O exports them by default; Linux titles link with -rdynamic). */
 int host_symbol_name(uintptr_t addr, char *name, size_t bytes, uintptr_t *offset);
 
-/* The address range of the executable's own image, to tell its return
- * addresses from other words on a stack. 0 when unknown. */
+/* The address range of the executable's own image (on POSIX its code
+ * alone), to tell its return addresses from other words on a stack. 0 when
+ * unknown. */
 int host_module_range(uintptr_t *lo, uintptr_t *hi);
 
 /* ---- POSIX: which thread the title runs on --------------------------- */

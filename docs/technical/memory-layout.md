@@ -144,6 +144,36 @@ static const uintptr_t try_bases[] = {
 };
 ```
 
+## On macOS and Linux: one 4 GB arena
+
+The base list above is useless off Windows: every address in it is below
+4 GB, and an arm64 macOS process has a 4 GB `__PAGEZERO` there that cannot be
+shrunk. So on POSIX `xbox_MemoryLayoutInit` first reserves the whole guest
+span: 4 GB plus a 64 KB guard, aligned to 4 GB, as one inaccessible range
+(`w32_reserve_arena`, `src/platform/posix_memory.c`). Guest 0 is its base,
+which is `g_xbox_mem_offset`. RAM, the mirrors, the contiguous window, the
+tiled aperture and the device apertures are then placed inside it with the
+same `MapViewOfFileEx` and `VirtualAlloc` calls Windows uses. The arena keeps
+Windows' rule that a fixed placement lands exactly there or fails, because the
+code here depends on a failed placement failing. The shared objects are
+`memfd` on Linux and `shm_open` with an immediate `shm_unlink` on Darwin.
+
+Apple Silicon's pages are 16 KB and the Xbox's are 4 KB. The arena keeps
+every 4 KB page's requested protection in a side table and gives each host
+page the most restrictive protection among its four guest pages. An access the
+guest page allows but the host page refuses (the 12 KB beside a 4 KB trap
+such as the PCRTC page, the AC'97 page or `RECOMP_TRAP_NULL`'s page zero) is
+completed by the fault route through an always-writable second view of the
+same memory (`w32_backdoor`, `recomp_fault_passthrough`). The main TIB
+moved from 0x1000 to 0x4000 for this reason: on a 16 KB host, page zero's trap
+covers 0..0x3FFF. `tests/guest_memory`, `tests/memory_layout` (the real layout
+at 64 and 128 MB) and `tests/guest_faults` cover all of it.
+
+Mirrors stop at 0x80000000 on every host. That is where the console's kernel
+space starts (the contiguous window, then the tiled aperture and the
+devices), and none of it is a wrap of low RAM. 28 mirrors of a 64 MB map end
+at 0x74000000, so a retail map is unaffected. A 128 MB map (BLiNX) gets 15.
+
 ## Section Initialization
 
 After mapping the 64 MB region, the XBE file's sections are copied to their original addresses:
