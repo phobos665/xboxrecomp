@@ -2141,6 +2141,36 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Windows 11 where low addresses are often reserved), try page-aligned
      * addresses upward until we find a free region.
      */
+#if !defined(_WIN32)
+    /* POSIX: reserve the whole guest span first and build inside it.
+     *
+     * Windows places each piece at its own fixed host address, trying a
+     * list of bases for RAM. That list is useless here: every one of those
+     * addresses is below 4 GB, and an arm64 macOS process has a 4 GB
+     * __PAGEZERO there (a binary linked with a smaller one is killed at
+     * launch). So the guest's 4 GB is reserved as one inaccessible range,
+     * aligned to 4 GB so a host address's low 32 bits are its guest address,
+     * and RAM, mirrors, the contiguous window, the tiled aperture and the
+     * device apertures are all placed in it at base + guest VA. Placement
+     * inside the arena keeps Windows' rule -- exactly there or a failure --
+     * so everything below behaves as it does on Windows (posix_memory.c).
+     *
+     * The 64 KB past 4 GB are a guard: XBOX_PTR wraps at 32 bits, but an
+     * access that starts at 0xFFFFFFFD still runs a few bytes beyond. */
+    {
+        void *arena = w32_reserve_arena(0x100000000ull + 0x10000u,
+                                        0x100000000ull);
+        if (arena)
+            g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                            0, 0, g_memory_size, arena);
+        if (!g_memory_base)
+            fprintf(stderr, "xbox_MemoryLayoutInit: could not reserve the 4 GB "
+                    "guest arena (%s)\n", arena ? "RAM view failed" : "no address space");
+        else
+            fprintf(stderr, "  Guest arena: 4 GB reserved at %p (host page %zu KB)\n",
+                    arena, w32_host_page_size() / 1024);
+    }
+#else
     {
         static const uintptr_t try_bases[] = {
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
@@ -2171,6 +2201,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
         }
     }
+#endif /* _WIN32 */
 
     if (!g_memory_base) {
         fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",
@@ -2968,12 +2999,34 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * (m + 1) * g_memory_size. */
         uint64_t tiled_lo = XBOX_TILED_BASE;
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
+        int mirrors_wanted = 0;
 
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
             uint64_t guest_hi = guest_lo + g_memory_size;
+
+            /* The wrap is a user-space thing: mirrors stop where kernel
+             * space starts.
+             *
+             * On the console everything from 0x80000000 up is the kernel's
+             * -- the contiguous window there (physical RAM again, the way
+             * MmAllocateContiguousMemory hands it out), the tiled aperture
+             * at 0xF0000000, the device registers above that -- and none of
+             * it is a wrap of low memory. 28 mirrors of 64 MB end at
+             * 0x74000000, so for a retail-sized map this never fired. A
+             * bigger map strides further: BLiNX maps 128 MB for its
+             * demand-loaded sections, and its mirror 16 landed exactly on
+             * the contiguous window -- refused with a warning on Windows
+             * (the window was mapped first), and the rest of 17..28 put RAM
+             * where the console has kernel space. A RAM mirror up there
+             * would also hide a title's bad kernel-space pointer behind
+             * plausible data. So the last mirror is the one that ends at or
+             * below XBOX_CONTIG_BASE, on every host. */
+            if (guest_hi > XBOX_CONTIG_BASE)
+                break;
+            mirrors_wanted++;
 
             if (guest_lo < tiled_hi && tiled_lo < guest_hi) {
                 fprintf(stderr, "  Mirror %d: skipped, overlaps the tiled"
@@ -2996,7 +3049,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
-                mirrors_ok, XBOX_NUM_MIRRORS,
+                mirrors_ok, mirrors_wanted,
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
     }
 

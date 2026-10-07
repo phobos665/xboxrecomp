@@ -31,7 +31,7 @@ if(WIN32)
         target_compile_definitions(platform PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
 else()
-    add_library(platform STATIC win32_compat.c host_timer.c)
+    add_library(platform STATIC win32_compat.c host_timer.c posix_memory.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

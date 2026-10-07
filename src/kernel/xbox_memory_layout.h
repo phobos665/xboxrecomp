@@ -456,8 +456,15 @@ extern uint32_t g_xbox_low_shift;
  *
  * XBOX_TIB_MAIN is where the first thread's TIB is built; every spawned
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
- * it. */
-#define XBOX_TIB_MAIN       0x00001000
+ * it.
+ *
+ * 0x4000 rather than the 0x1000 it was: RECOMP_TRAP_NULL protects guest
+ * page zero, and on a host with 16 KB pages (Apple Silicon) that protection
+ * covers the whole host page 0..0x3FFF. The TIB there would trap on every
+ * fs: access. Nothing addresses the TIB but through g_fs_base -- the lifted
+ * code reads fs:[N] as MEM32(XBOX_FS_BASE + N) -- so the move changes no
+ * title, on any host. */
+#define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
