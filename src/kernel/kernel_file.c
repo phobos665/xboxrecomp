@@ -837,7 +837,7 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
-static uint32_t g_xbox_last_file_error;
+static __thread uint32_t g_xbox_last_file_error;   /* per thread, like errno */
 
 static NTSTATUS errno_to_status(int e)
 {
