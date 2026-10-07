@@ -3099,7 +3099,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 if (wait_us > 10000)
                     wait_us = 10000;
                 if (hires) {
-                    host_timer_wait_us(hires, wait_us, INFINITE);
+                    /* A timer that will not arm must not become a spin. */
+                    if (host_timer_wait_us(hires, wait_us, INFINITE) == HOST_WAIT_NOT_ARMED)
+                        Sleep(1);
                 } else {
                     Sleep((DWORD)((wait_us + 999) / 1000));
                 }
