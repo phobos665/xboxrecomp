@@ -257,6 +257,11 @@ int  xbox_GuestLockEnterForCall(DWORD host_ms);
 /* A guest thread's priority, for the guest lock's handoffs: its host thread
  * id and the KeSetBasePriorityThread increment (-16..16, 0 normal). */
 void xbox_GuestLockNotePriority(DWORD tid, int32_t prio);
+/* The increment last noted for that thread: 1 and *prio if there is one,
+ * 0 if none was ever set (the thread runs at 0). Also what
+ * KeQueryBasePriorityThread answers, so it is kept whether or not the lock
+ * is on. */
+int  xbox_GuestLockQueryPriority(DWORD tid, int32_t *prio);
 /* Guest NtSuspendThread/NtResumeThread with the guest lock on: the target
  * parks itself at its next safe point instead of being stopped holding the
  * lock. 1 if handled (prev = the previous suspend count), 0 to fall back to
