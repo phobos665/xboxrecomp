@@ -220,8 +220,11 @@ static DWORD WINAPI stack_probe(LPVOID p)
 
 static ULONG_PTR stack_of(SIZE_T size, DWORD flags)
 {
-    HANDLE h = CreateThread(NULL, size, stack_probe, NULL, flags, NULL);
+    HANDLE h;
+    /* Before the thread exists: reset after CreateThread, a probe that had
+     * already run would have its answer wiped (a flaky failure). */
     g_stack_bytes = 0;
+    h = CreateThread(NULL, size, stack_probe, NULL, flags, NULL);
     CHECK(h != NULL);
     CHECK(WaitForSingleObject(h, 2000) == WAIT_OBJECT_0);
     CloseHandle(h);
