@@ -142,8 +142,94 @@ extern RECOMP_MANUAL_TLS uint32_t g_icall_dispatch_form;
  *       g_eax = result;
  *   }
  */
+/* ── Forza's small-object pool: pages that own their 64 KB window ──
+ *
+ * operator delete (sub_00059560) tells a pool slot from a CRT heap block by
+ * one bit per 64 KB region: the bitmap at 0x589340, indexed ptr >> 16. That is
+ * exact on the console, where every VirtualAlloc region starts on a 64 KB
+ * boundary, and the pool takes each page with its own one-page VirtualAlloc
+ * (sub_0027D020). Here regions are 4 KB apart, so fifteen pool pages and the
+ * tail of the process heap shared a window: releasing one page cleared the
+ * bit for all of them, deletes of live slots went to RtlFreeHeap 8 bytes off
+ * a block, and the heap was corrupt by the race load. Giving every region a
+ * 64 KB window instead (RECOMP_VA_64K) cures it and runs the 64 MB guest out
+ * of memory, because a window here is real memory, not address space.
+ *
+ * So the pool gets windows of its own. These replace the two functions that
+ * take and give back a pool page and set or clear its bit: pages come from
+ * 64 KB-aligned chunks that hold nothing but pool pages, sixteen to a window,
+ * and the window's bit is cleared only when its last page goes back. The bit
+ * then means exactly what delete takes it to mean, at no cost in memory.
+ * Pages are reused rather than released; the pool asks MEM_NOZERO anyway. */
+extern RECOMP_MANUAL_TLS uint32_t g_ecx;
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+
+#define FZ_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
+#define FZ_POOL_CHUNKS 1024
+
+static uint32_t fz_chunk[FZ_POOL_CHUNKS];
+static uint16_t fz_used[FZ_POOL_CHUNKS];   /* one bit per 4 KB page */
+static int      fz_nchunks;
+
+static void fz_window_bit(uint32_t bitmap, uint32_t page, int on)
+{
+    uint32_t w = page >> 16, a = bitmap + (w >> 5) * 4u, m = 1u << (w & 31u);
+    if (on) FZ_MEM32(a) |= m; else FZ_MEM32(a) &= ~m;
+}
+
+/* this (ecx): the pool; returns a page in eax. `ret`. */
+void sub_00059250(void)
+{
+    uint32_t bitmap = FZ_MEM32(g_ecx + 0x28), page = 0;
+    int i, p;
+
+    for (i = 0; i < fz_nchunks && !page; i++) {
+        if (fz_used[i] == 0xFFFFu)
+            continue;
+        for (p = 0; p < 16; p++)
+            if (!(fz_used[i] & (1u << p))) {
+                fz_used[i] |= (uint16_t)(1u << p);
+                page = fz_chunk[i] + (uint32_t)p * 0x1000u;
+                break;
+            }
+    }
+    if (!page && fz_nchunks < FZ_POOL_CHUNKS) {
+        uint32_t c = xbox_HeapAlloc(0x10000u, 0x10000u);
+        if (c) {
+            fz_chunk[fz_nchunks] = c;
+            fz_used[fz_nchunks++] = 1;
+            page = c;
+        }
+    }
+    if (page)
+        fz_window_bit(bitmap, page, 1);
+    g_eax = page;
+    g_esp += 4;
+}
+
+/* this (ecx): the pool; [esp+4]: the page. `ret 4`. */
+void sub_00059210(void)
+{
+    uint32_t bitmap = FZ_MEM32(g_ecx + 0x28);
+    uint32_t page = FZ_MEM32(g_esp + 4) & ~0xFFFu;
+    int i;
+
+    for (i = 0; i < fz_nchunks; i++)
+        if (page - fz_chunk[i] < 0x10000u) {
+            fz_used[i] &= (uint16_t)~(1u << ((page - fz_chunk[i]) >> 12));
+            if (!fz_used[i])
+                fz_window_bit(bitmap, page, 0);
+            break;
+        }
+    if (i == fz_nchunks)
+        fprintf(stderr, "[FZPOOL] page 0x%08X was not the pool's; left alone\n", page);
+    g_esp += 8;
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    if (xbox_va == 0x00059250u) return sub_00059250;
+    if (xbox_va == 0x00059210u) return sub_00059210;
     /*
      * TODO: Add your overrides here. Examples:
      *
