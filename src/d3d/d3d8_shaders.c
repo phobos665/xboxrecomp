@@ -150,6 +150,12 @@ static const char g_vs_source[] =
     "    return mul(uv, TexMat[stage]);\n"
     "}\n"
     "\n"
+    "float4 mat_source(uint src, float4 material, VS_IN input) {\n"
+    "    if (src == 1u && (Flags & FLAG_HAS_DIFFUSE))  return input.diffuse.bgra;\n"
+    "    if (src == 2u && (Flags & FLAG_HAS_SPECULAR)) return input.specular.bgra;\n"
+    "    return material;\n"
+    "}\n"
+    "\n"
     "VS_OUT main(VS_IN input) {\n"
     "    VS_OUT o;\n"
     "    o.fog = 1.0;\n"
@@ -203,7 +209,16 @@ static const char g_vs_source[] =
     "        float3 worldPos = mul(float4(input.pos.xyz, 1.0), World).xyz;\n"
     "        float3 viewDir = normalize(EyePos.xyz - worldPos);\n"
     "\n"
-    "        float4 litDiffuse = MatEmissive + MatAmbient * GlobalAmbient;\n"
+    /* Each material colour from where D3DRS_*MATERIALSOURCE says: the
+     * material, the vertex's diffuse (1) or its specular (2), packed two bits
+     * each into Flags 8-15 by the host (diffuse, ambient, specular, emissive)
+     * and zero when COLORVERTEX is off. A vertex without that colour falls
+     * back to the material, as D3D does. */
+    "        float4 mDiffuse  = mat_source((Flags >> 8)  & 3u, MatDiffuse,  input);\n"
+    "        float4 mAmbient  = mat_source((Flags >> 10) & 3u, MatAmbient,  input);\n"
+    "        float4 mSpecular = mat_source((Flags >> 12) & 3u, MatSpecular, input);\n"
+    "        float4 mEmissive = mat_source((Flags >> 14) & 3u, MatEmissive, input);\n"
+    "        float4 litDiffuse = mEmissive + mAmbient * GlobalAmbient;\n"
     "        float4 litSpecular = float4(0,0,0,0);\n"
     "\n"
     "        for (uint i = 0; i < NumLights && i < 8u; i++) {\n"
@@ -231,17 +246,17 @@ static const char g_vs_source[] =
     "            }\n"
     "\n"
     "            float NdotL = max(dot(worldNormal, lightDir), 0.0);\n"
-    "            litDiffuse += atten * spotFactor * (Lights[i].Ambient * MatAmbient + NdotL * Lights[i].Diffuse * MatDiffuse);\n"
+    "            litDiffuse += atten * spotFactor * (Lights[i].Ambient * mAmbient + NdotL * Lights[i].Diffuse * mDiffuse);\n"
     "\n"
     "            if (NdotL > 0.0 && MatPower > 0.0) {\n"
     "                float3 halfVec = normalize(lightDir + viewDir);\n"
     "                float NdotH = max(dot(worldNormal, halfVec), 0.0);\n"
-    "                litSpecular += atten * spotFactor * pow(NdotH, MatPower) * Lights[i].Specular * MatSpecular;\n"
+    "                litSpecular += atten * spotFactor * pow(NdotH, MatPower) * Lights[i].Specular * mSpecular;\n"
     "            }\n"
     "        }\n"
     "\n"
     "        o.diffuse = saturate(litDiffuse);\n"
-    "        o.diffuse.a = MatDiffuse.a;\n"
+    "        o.diffuse.a = mDiffuse.a;\n"
     "        o.specular = saturate(litSpecular);\n"
     "    } else {\n"
     "        o.diffuse = vertDiffuse;\n"
@@ -995,6 +1010,15 @@ static void ff_vs_prepare_draw(DWORD fvf)
         if (fvf & D3DFVF_SPECULAR) cb->flags |= 0x04;
         if (fvf & D3DFVF_NORMAL) cb->flags |= 0x08;
         if (rs && rs[D3DRS_LIGHTING]) cb->flags |= 0x10;
+        /* Material sources, two bits each from bit 8 (the shader's
+         * mat_source), only while COLORVERTEX is on: off, every colour is
+         * the material's. */
+        if (rs && rs[D3DRS_COLORVERTEX]) {
+            cb->flags |= (rs[D3DRS_DIFFUSEMATERIALSOURCE]  & 3u) << 8;
+            cb->flags |= (rs[D3DRS_AMBIENTMATERIALSOURCE]  & 3u) << 10;
+            cb->flags |= (rs[D3DRS_SPECULARMATERIALSOURCE] & 3u) << 12;
+            cb->flags |= (rs[D3DRS_EMISSIVEMATERIALSOURCE] & 3u) << 14;
+        }
 
         /* Fog parameters */
         if (rs && rs[D3DRS_FOGENABLE]) {

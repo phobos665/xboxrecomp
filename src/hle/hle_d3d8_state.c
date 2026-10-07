@@ -42,10 +42,10 @@
  * object D3DDevice_SetPixelShader selects, not from the render states.
  *
  * Forwarded but not yet used by the host: SHADEMODE, DITHERENABLE,
- * COLORVERTEX, NORMALIZENORMALS, RESULTARG, BUMPENVMAT*, MIPMAPLODBIAS,
+ * NORMALIZENORMALS, RESULTARG, BUMPENVMAT*, MIPMAPLODBIAS,
  * MAXMIPLEVEL, BORDERCOLOR. Not forwarded: WRAP0-3, VERTEXBLEND, LOCALVIEWER, ZBIAS,
  * EDGEANTIALIAS, BLENDCOLOR, the back-face material and two-sided lighting
- * states, point sprite, material source and multisample states, and the
+ * states, point sprite and multisample states, and the
  * texture stage states ADDRESSW, TEXTURETRANSFORMFLAGS, BUMPENVLSCALE/LOFFSET,
  * COLORKEYOP, COLORSIGN, ALPHAKILL, COLORKEYCOLOR, COLORARG0 (its host number
  * is ALPHAKILL's) and ALPHAARG0.
@@ -397,6 +397,15 @@ static const struct {
     { 102, D3DRS_LIGHTING,         AS_IS },
     { 103, D3DRS_SPECULARENABLE,   AS_IS },
     { 105, D3DRS_COLORVERTEX,      AS_IS },
+    /* Where a lit vertex takes each material colour from: the material, or
+     * its own diffuse (1) or specular (2) colour. Same values on both. Max
+     * Payne's graphic novel fades its panel covers by vertex alpha under
+     * lighting; with these unforwarded the host lit from the material, whose
+     * alpha is 1, and every panel stayed covered in black. */
+    { 110, D3DRS_SPECULARMATERIALSOURCE, AS_IS },
+    { 111, D3DRS_DIFFUSEMATERIALSOURCE,  AS_IS },
+    { 112, D3DRS_AMBIENTMATERIALSOURCE,  AS_IS },
+    { 113, D3DRS_EMISSIVEMATERIALSOURCE, AS_IS },
     { 115, D3DRS_AMBIENT,          AS_IS },
     { 138, D3DRS_FOGCOLOR,         AS_IS },
     { 139, D3DRS_FILLMODE,         FILL },
