@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>   /* ptrdiff_t: not in stdlib.h off MSVC */
 #include <stdlib.h>   /* getenv, exit: the spin verdict below */
 #include <string.h>   /* strcmp: RECOMP_ICALL_FATAL */
 
@@ -130,6 +131,17 @@ static void __cdecl wweraw2_defaults(void)
 #pragma section(".CRT$XCU", read)
 __declspec(allocate(".CRT$XCU")) void (__cdecl *wweraw2_defaults_init)(void) = wweraw2_defaults;
 #pragma comment(linker, "/include:wweraw2_defaults_init")
+#elif defined(__GNUC__) || defined(__clang__)
+/* The same, for clang and GCC, which skip the MSVC section above. */
+__attribute__((constructor)) static void wweraw2_defaults(void)
+{
+#ifdef _WIN32
+    if (!getenv("RECOMP_XMV_LAYER"))
+        _putenv("RECOMP_XMV_LAYER=0");
+#else
+    setenv("RECOMP_XMV_LAYER", "0", 0);    /* 0: an existing value wins */
+#endif
+}
 #endif
 
 /* ── Manual function overrides ─────────────────────────────── */

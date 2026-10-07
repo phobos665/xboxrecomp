@@ -1155,17 +1155,11 @@ struct IDirect3D8 {
  * ================================================================ */
 
 /**
- * Create the D3D8-compatible interface backed by D3D11.
+ * Create the D3D8-compatible interface, drawn through rhi.h (Direct3D 11 by
+ * default on Windows, Vulkan elsewhere).
  * This replaces the Xbox Direct3DCreate8() call.
  */
 IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion);
-
-/**
- * Set the window title used by the D3D8 GL backend (POSIX builds) when it
- * creates its own SDL window. The Win32 backend renders into a host-provided
- * HWND and does not use this. Passing NULL restores the generic default.
- */
-void xbox_D3D8SetWindowTitle(const char *title);
 
 /**
  * Get the current D3D device (Xbox uses a global device pointer).
@@ -1217,6 +1211,14 @@ void xbox_D3D8SetWideFrames(BOOL wide);
  * (rhi_swapchain_set_vrr). Called by whoever owns the window, from any
  * thread; the swap chain follows at the next present. */
 void xbox_D3D8SetFullscreen(BOOL on);
+
+/* The window's drawable size in pixels, from whoever owns the window, on a
+ * host where the device cannot ask the window itself: off Windows the
+ * device window (D3DPRESENT_PARAMETERS.hDeviceWindow) is a CAMetalLayer on
+ * Apple, or NULL for no window at all. Call it when the window is made and
+ * on every resize, from any thread; the swap chain follows at the next
+ * present. Windows reads the HWND's client rectangle and ignores this. */
+void xbox_D3D8SetWindowSize(UINT width, UINT height);
 
 /* Where the title's next screen-space draws belong in widescreen, for a title
  * that knows what it is drawing. A 4:3-only title's 2D is squeezed back to
