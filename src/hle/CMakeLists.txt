@@ -29,18 +29,18 @@ add_library(xbox_hle STATIC
     hle_xmv.c
     hle_xmv_play.c
     input_model.c
+    # The host pads behind the replaced XAPI input, through src/input's
+    # bindings (SDL3 or XInput), plus RECOMP_FAKE_INPUT / RECOMP_INPUT_SEQ.
+    input_host.c
 )
 
-# Host backends. XAudio2 and XInput exist only on Windows. A POSIX host needs
-# its own recomp_audio_output_* (audio_output.h) and recomp_input_host_sample
-# (input_host.h) -- SDL2 is the obvious candidate, since xbox_apu and
-# xbox_input already use it. Until those exist the library compiles on POSIX,
-# but a title that links it there will be missing those symbols.
+# Host audio. XAudio2 exists only on Windows. Elsewhere audio_output_none.c
+# behaves as the XAudio2 path does when it opens no device
+# (RECOMP_AUDIO_GAIN=0) until an SDL3 output replaces it.
 if(WIN32)
-    target_sources(xbox_hle PRIVATE
-        audio_output_xaudio2.cpp
-        input_host.c
-    )
+    target_sources(xbox_hle PRIVATE audio_output_xaudio2.cpp)
+else()
+    target_sources(xbox_hle PRIVATE audio_output_none.c)
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_config)
