@@ -23,8 +23,8 @@
 #include "input_host.h"
 #include "input_bindings.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+/* <windows.h> on Windows, the POSIX shim (GetTickCount64) elsewhere. */
+#include "platform/xbox_winnt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
