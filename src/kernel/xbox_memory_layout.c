@@ -1102,46 +1102,48 @@ static void guest_lock_report(int64_t now)
  * when the holder blocks -- or, against starvation, after 20 quanta. A host
  * thread waiting (an interrupt) outranks every guest thread.
  *
- * Guest priorities come from KeSetBasePriorityThread, keyed by the guest
- * thread object the title names (xbox_GuestLockNotePriority); 0 until set. */
+ * Guest priorities come from KeSetBasePriorityThread / KeSetPriorityThread,
+ * resolved by the bridge to the thread they name (xbox_GuestLockNotePriority,
+ * by host thread id: the object a title passes is often the one shared
+ * pseudo-handle object for "the current thread", so it names nobody); 0
+ * until set. A title commonly sets a thread's priority before it first runs,
+ * so the table is keyed by id, not by the thread's own record. */
 #define GL_PRIO_MIN   (-16)
 #define GL_PRIO_MAX   16
 #define GL_PRIO_HOST  (GL_PRIO_MAX + 1)
 #define GL_PRIO_SLOTS 64
-static struct { volatile uint32_t obj; volatile int32_t prio; } s_gl_prio[GL_PRIO_SLOTS];
+static struct { volatile DWORD tid; volatile int32_t prio; } s_gl_prio[GL_PRIO_SLOTS];
 static volatile LONG s_gl_waiting_at[GL_PRIO_HOST - GL_PRIO_MIN + 1];
 
-void xbox_GuestLockNotePriority(uint32_t thread_obj, int32_t prio)
+void xbox_GuestLockNotePriority(DWORD tid, int32_t prio)
 {
     int i;
-    if (!thread_obj)
+    if (!tid)
         return;
     if (prio < GL_PRIO_MIN) prio = GL_PRIO_MIN;
     if (prio > GL_PRIO_MAX) prio = GL_PRIO_MAX;
     {
         static volatile LONG said;
         if (InterlockedIncrement(&said) <= 16) {
-            fprintf(stderr, "  [GUESTLOCK] guest thread 0x%08X priority %d\n",
-                    thread_obj, (int)prio);
+            fprintf(stderr, "  [GUESTLOCK] thread %lu priority %d\n",
+                    (unsigned long)tid, (int)prio);
             fflush(stderr);
         }
     }
     for (i = 0; i < GL_PRIO_SLOTS; i++) {
-        uint32_t have = s_gl_prio[i].obj;
-        if (have == thread_obj ||
-            (have == 0 && InterlockedCompareExchange((volatile LONG *)&s_gl_prio[i].obj,
-                                                     (LONG)thread_obj, 0) == 0)) {
+        DWORD have = s_gl_prio[i].tid;
+        if (have == tid ||
+            (have == 0 && InterlockedCompareExchange((volatile LONG *)&s_gl_prio[i].tid,
+                                                     (LONG)tid, 0) == 0)) {
             s_gl_prio[i].prio = prio;
             return;
         }
     }
 }
 
-uint32_t xbox_CurrentThreadObject(void);   /* below */
-
 static int32_t guest_my_priority(void)
 {
-    uint32_t obj;
+    DWORD me;
     int i;
     if (!g_guest_thread)
         return GL_PRIO_HOST;
@@ -1153,9 +1155,9 @@ static int32_t guest_my_priority(void)
         if (!use)
             return 0;
     }
-    obj = xbox_CurrentThreadObject();
-    for (i = 0; obj && i < GL_PRIO_SLOTS && s_gl_prio[i].obj; i++)
-        if (s_gl_prio[i].obj == obj)
+    me = GetCurrentThreadId();
+    for (i = 0; i < GL_PRIO_SLOTS && s_gl_prio[i].tid; i++)
+        if (s_gl_prio[i].tid == me)
             return s_gl_prio[i].prio;
     return 0;
 }

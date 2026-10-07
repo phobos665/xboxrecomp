@@ -3413,6 +3413,8 @@ static unsigned char s_handle_kind[BRIDGE_HANDLE_MAX];
 
 /* The guest-side dispatcher object synthesised for each token, or 0. */
 static uint32_t s_handle_dispatcher[BRIDGE_HANDLE_MAX];
+/* The object ObReferenceObjectByHandle hands out for NtCurrentThread. */
+static uint32_t *s_pseudo_thread_obj;
 
 
 static uint32_t bridge_handle_token(HANDLE h)
@@ -4827,6 +4829,8 @@ static void bridge_ObReferenceObjectByHandle(void)
             if (i < PSEUDO_MAX && pseudo_handle[i] == handle) {
                 slot_disp = &pseudo_disp[i];
                 disp = *slot_disp;
+                if (handle == 0xFFFFFFFEu)      /* NtCurrentThread */
+                    s_pseudo_thread_obj = &pseudo_disp[i];
             }
         }
     }
@@ -5093,10 +5097,31 @@ static void bridge_KeQueryBasePriorityThread(void)
         XBOX_TO_NATIVE(STACK_ARG(0)));
 }
 
+/* The host thread a guest thread object stands for, for the guest lock's
+ * priorities: the caller, when the object is its own (its TIB's, or the one
+ * object every NtCurrentThread reference shares); else the thread whose
+ * handle owns the object. 0 if none. */
+uint32_t xbox_CurrentThreadObject(void);
+
+static DWORD bridge_thread_object_tid(uint32_t obj)
+{
+    uint32_t i;
+    if (!obj)
+        return 0;
+    if (obj == xbox_CurrentThreadObject() ||
+        (s_pseudo_thread_obj && obj == *s_pseudo_thread_obj))
+        return GetCurrentThreadId();
+    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+        if (s_handle_dispatcher[i] == obj && s_handle_kind[i] == BRIDGE_OBJ_THREAD)
+            return GetThreadId(bridge_resolve_handle(BRIDGE_HANDLE_TAG | i));
+    return 0;
+}
+
 static void bridge_KeSetBasePriorityThread(void)
 {
     /* Also for the guest lock, which hands over by priority. */
-    xbox_GuestLockNotePriority(STACK_ARG(0), (int32_t)STACK_ARG(1));
+    xbox_GuestLockNotePriority(bridge_thread_object_tid(STACK_ARG(0)),
+                               (int32_t)STACK_ARG(1));
     g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
         XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
 }
@@ -8254,7 +8279,8 @@ static void bridge_KeSetPriorityThread(void)
 {
     /* An absolute priority (8 is normal); the guest lock weighs it as an
      * increment from normal. */
-    xbox_GuestLockNotePriority(STACK_ARG(0), (int32_t)STACK_ARG(1) - 8);
+    xbox_GuestLockNotePriority(bridge_thread_object_tid(STACK_ARG(0)),
+                               (int32_t)STACK_ARG(1) - 8);
     g_eax = 0;
 }
 
