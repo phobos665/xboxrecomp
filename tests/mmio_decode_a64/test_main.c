@@ -398,6 +398,17 @@ static void run_device(void)
     /* ldr w1, [x2] = B9400041: zero-extended, high half cleared */
     CHECK("device ldr w", mmio_a64_emulate(&c, 0xB9400041u, 0x1000000, NULL, d_rd, d_wr)
                           && c.x[1] == 0x80000001ull);
+    /* str wzr, [x10] = B900015F: the exact store TimeSplitters 2's
+     * Direct3D_CreateDevice makes to PCRTC (0xFD600140). Rt = 31 is the zero
+     * register for the data, so the device sees a 4-byte 0; Rn = 10 is the
+     * base. (Rn = 31 would be SP; Rt = 31 never is.) */
+    c.x[10] = 0x1600140;
+    c.sp = 0xDEADBEEF;
+    memset(&dev, 0, sizeof(dev));
+    dev.val = 0x55;
+    CHECK("str wzr, [x10] handled", mmio_a64_emulate(&c, 0xB900015Fu, 0x1000000, NULL, d_rd, d_wr));
+    CHECK("str wzr stores zero, not SP", dev.writes == 1 && dev.val == 0 && dev.size == 4
+                                         && dev.off == 0x600140);
     /* Not a load/store: add x1, x1, #1 = 91000421 */
     c.pc = 0x5000;
     CHECK("non-memory instruction refused",
