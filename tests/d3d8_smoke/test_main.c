@@ -15,7 +15,30 @@
 
 #define COBJMACROS
 #include "d3d8_internal.h"
+#if defined(_WIN32)
 #include <d3d11.h>   /* this test drives D3D11 itself */
+#else
+/* No DXGI header here. rhi.h's formats carry DXGI's numbers (rhi.h), so the
+ * expectations below can keep their DXGI names. */
+#define DXGI_FORMAT_BC1_UNORM RHI_FORMAT_BC1_UNORM
+#define DXGI_FORMAT_BC2_UNORM RHI_FORMAT_BC2_UNORM
+#define DXGI_FORMAT_BC3_UNORM RHI_FORMAT_BC3_UNORM
+#define DXGI_FORMAT_BC5_UNORM RHI_FORMAT_BC5_UNORM
+#define DXGI_FORMAT_D24_UNORM_S8_UINT RHI_FORMAT_D24_UNORM_S8_UINT
+#define DXGI_FORMAT_D32_FLOAT RHI_FORMAT_D32_FLOAT
+#define DXGI_FORMAT_R10G10B10A2_UNORM RHI_FORMAT_R10G10B10A2_UNORM
+#define DXGI_FORMAT_R11G11B10_FLOAT RHI_FORMAT_R11G11B10_FLOAT
+#define DXGI_FORMAT_R16_FLOAT RHI_FORMAT_R16_FLOAT
+#define DXGI_FORMAT_R16G16_FLOAT RHI_FORMAT_R16G16_FLOAT
+#define DXGI_FORMAT_R16G16_UNORM RHI_FORMAT_R16G16_UNORM
+#define DXGI_FORMAT_R16G16B16A16_FLOAT RHI_FORMAT_R16G16B16A16_FLOAT
+#define DXGI_FORMAT_R16G16B16A16_SNORM RHI_FORMAT_R16G16B16A16_SNORM
+#define DXGI_FORMAT_R16G16B16A16_UNORM RHI_FORMAT_R16G16B16A16_UNORM
+#define DXGI_FORMAT_R32_FLOAT RHI_FORMAT_R32_FLOAT
+#define DXGI_FORMAT_R32G32_FLOAT RHI_FORMAT_R32G32_FLOAT
+#define DXGI_FORMAT_R32G32B32A32_FLOAT RHI_FORMAT_R32G32B32A32_FLOAT
+#define DXGI_FORMAT_R32G32B32A32_SINT RHI_FORMAT_R32G32B32A32_SINT
+#endif
 #include "d3d8_swizzle.h"
 #include "d3d8_fvf.h"
 
@@ -25,9 +48,11 @@
 
 /* ---- Stub accessors referenced by d3d8_resources.c (not used by the
  *      pure functions under test, but must link). ---- */
+#if defined(_WIN32)
 ID3D11Device        *d3d8_GetD3D11Device(void)   { return NULL; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void)  { return NULL; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return NULL; }
+#endif
 IDirect3DDevice8      *xbox_GetD3DDevice(void)  { return NULL; }
 
 static DWORD g_palette[256];
@@ -201,7 +226,7 @@ static void test_swizzle_offset(void)
     printf("test_swizzle_offset\n");
     for (c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); c++) {
         UINT w = cases[c].w, h = cases[c].h, bpp = 4, n = w * h * bpp;
-        UINT32 *lin = (UINT32 *)malloc(n), *swz = (UINT32 *)malloc(n);
+        uint32_t *lin = (uint32_t *)malloc(n), *swz = (uint32_t *)malloc(n);
         UINT bad = 0, x, y;
 
         /* One distinct value per texel, so a wrong address cannot alias. */
@@ -236,7 +261,7 @@ static void put16(BYTE *p, UINT v) { p[0] = (BYTE)(v & 0xFF); p[1] = (BYTE)(v >>
 static void test_dxt_decode(void)
 {
     BYTE blk[16];
-    UINT32 argb;
+    uint32_t argb;
     const UINT RED = 0xF800, BLUE = 0x001F;   /* RGB565 */
 
     printf("test_dxt_decode\n");
@@ -313,8 +338,8 @@ static void test_convert_linear(void)
     /* A16B16G16R16 -> R16G16B16A16 (channel swap, 64 bpp, 1 px).
      * src[0..7] = A(LE) B G R. Use A=1, B=2, G=3, R=4. */
     {
-        UINT16 s[4] = { 1, 2, 3, 4 };  /* A=1, B=2, G=3, R=4 */
-        UINT16 d[4] = { 0, 0, 0, 0 };
+        uint16_t s[4] = { 1, 2, 3, 4 };  /* A=1, B=2, G=3, R=4 */
+        uint16_t d[4] = { 0, 0, 0, 0 };
         d3d8_convert_linear_pixels(D3DFMT_A16B16G16R16, 1, 1, (const BYTE *)s, (BYTE *)d, 0);
         CHECK_INT("A16B16G16R16 R", d[0], 4);
         CHECK_INT("A16B16G16R16 G", d[1], 3);
@@ -325,8 +350,8 @@ static void test_convert_linear(void)
 
     /* A32B32G32R32 -> R32G32B32A32 (channel swap, 128 bpp, 1 px). */
     {
-        UINT32 s[4] = { 1, 2, 3, 4 };  /* A=1, B=2, G=3, R=4 */
-        UINT32 d[4] = { 0, 0, 0, 0 };
+        uint32_t s[4] = { 1, 2, 3, 4 };  /* A=1, B=2, G=3, R=4 */
+        uint32_t d[4] = { 0, 0, 0, 0 };
         d3d8_convert_linear_pixels(D3DFMT_A32B32G32R32, 1, 1, (const BYTE *)s, (BYTE *)d, 0);
         CHECK_INT("A32B32G32R32 R", d[0], 4);
         CHECK_INT("A32B32G32R32 G", d[1], 3);
@@ -339,7 +364,7 @@ static void test_convert_linear(void)
      * Xbox: A=0x3, R=0x3FF (bits 20-29), G=0x155, B=0x0AA.
      * word = (0x3<<30)|(0x3FF<<20)|(0x155<<10)|0x0AA */
     {
-        UINT32 s, d;
+        uint32_t s, d;
         s = (0x3u << 30) | (0x3FFu << 20) | (0x155u << 10) | (0x0AAu);
         d3d8_convert_linear_pixels(D3DFMT_A2R10G10B10, 1, 1, (const BYTE *)&s, (BYTE *)&d, 0);
         CHECK_INT("A2R10G10B10->R10G10B10A2", d, (0x3u << 30) | (0x3FFu) | (0x155u << 10) | (0x0AAu << 20));
@@ -349,11 +374,11 @@ static void test_convert_linear(void)
     /* L6V5U5 sign extension: V=0x10 (=-16), U=0x10, L=0x20.
      * word = (U<<11)|(L<<5)|V = (0x10<<11)|(0x20<<5)|0x10 */
     {
-        UINT16 w = (UINT16)((0x10u << 11) | (0x20u << 5) | 0x10u);
+        uint16_t w = (uint16_t)((0x10u << 11) | (0x20u << 5) | 0x10u);
         BYTE d[2] = { 0, 0 };
         d3d8_convert_linear_pixels(D3DFMT_L6V5U5, 1, 1, (const BYTE *)&w, d, 0);
-        CHECK_INT("L6V5U5 V->R sign", (INT8)d[0], -16 * 8);   /* -16 << 3 */
-        CHECK_INT("L6V5U5 U->G sign", (INT8)d[1], -16 * 8);
+        CHECK_INT("L6V5U5 V->R sign", (int8_t)d[0], -16 * 8);   /* -16 << 3 */
+        CHECK_INT("L6V5U5 U->G sign", (int8_t)d[1], -16 * 8);
         CHECK("has_conversion L6V5U5", d3d8_format_has_conversion(D3DFMT_L6V5U5));
     }
 
