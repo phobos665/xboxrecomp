@@ -2639,25 +2639,25 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     /* Initialize shader and state subsystems */
     hr = d3d8_shaders_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: Shader init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: Shader init failed: 0x%08lX\n", (unsigned long)hr);
         return hr;
     }
 
     hr = d3d8_states_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: State init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: State init failed: 0x%08lX\n", (unsigned long)hr);
         return hr;
     }
 
     hr = d3d8_combiners_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: Combiner init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: Combiner init failed: 0x%08lX\n", (unsigned long)hr);
         /* Non-fatal: fall back to fixed-function pixel shaders */
     }
 
     hr = d3d8_vsh_init();
     if (FAILED(hr)) {
-        fprintf(stderr, "D3D8: VSH init failed: 0x%08lX\n", hr);
+        fprintf(stderr, "D3D8: VSH init failed: 0x%08lX\n", (unsigned long)hr);
         /* Non-fatal: fall back to FVF vertex shaders */
     }
 
