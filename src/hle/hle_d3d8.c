@@ -2047,6 +2047,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
 HLE_EXPORT(D3DDevice_Clear)
 {
     static int seen;
+    uint32_t count = HLE_ARG(0), rects = HLE_ARG(1);
     uint32_t flags = HLE_ARG(2), color = HLE_ARG(3);
     uint32_t z_bits = HLE_ARG(4), stencil = HLE_ARG(5);
 
@@ -2061,7 +2062,23 @@ HLE_EXPORT(D3DDevice_Clear)
         if (g_shadow_clears < 4)
             fprintf(stderr, "[HLE-D3D8] shadow Clear: flags 0x%08X color 0x%08X "
                     "z %g stencil %u\n", flags, color, z, stencil);
-        host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
+        /* The rectangles go on as given -- the title's target pixels; the
+         * host scales them with its target and clears only those
+         * (d3d8_device.c, dev_Clear). A split-screen title clears each
+         * player's part of the screen this way, and passing none cleared
+         * the whole screen every time. Count with no array is the whole
+         * target, as on the console. At most 64, as the host takes. */
+        {
+            D3DRECT rect[64];
+            UINT n = count > 64 ? 64 : count;
+
+            if (n && rects)
+                memcpy(rect, HLE_PTR(rects), n * sizeof rect[0]);
+            else
+                n = 0;
+            host_Clear(g_shadow, n, n ? rect : NULL, xbox_clear_flags_to_host(flags), color, z,
+                       stencil);
+        }
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())

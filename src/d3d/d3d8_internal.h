@@ -40,6 +40,15 @@ RhiView  *d3d8_GetDefaultTargetView(void);
  * horizontal treatment. */
 void d3d8_SetTwoDSqueeze(BOOL on);
 
+/* Clear with rectangles (d3d8_clear.c): each rectangle, in the target's
+ * host pixels, clipped to width x height, cleared through a draw -- colour,
+ * depth and stencil as asked, the scissor and viewport ignored. 0 done (or
+ * nothing to do), -1 if the pass could not be made. */
+int  d3d8_clear_rects(RhiView *rtv, RhiView *dsv, UINT width, UINT height,
+                      const RhiRect *rects, UINT count, int color, int depth, int stencil,
+                      const float rgba[4], float z, uint8_t stencil_value);
+void d3d8_clear_shutdown(void);
+
 /* Runtime shader compiles, timed (d3d8_compile.c). kind: 0 combiner pixel
  * shader, 1 fixed-function pixel shader, 2 vertex program. Reported every
  * few seconds with the count and the milliseconds they took, because a

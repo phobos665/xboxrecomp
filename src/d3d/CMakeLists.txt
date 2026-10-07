@@ -18,6 +18,7 @@ set(XBR_D3D8_SOURCES
     d3d8_overlay.c
     d3d8_movie.c
     d3d8_screencopy.c
+    d3d8_clear.c
     d3d8_display.c
     d3d8_compile.c
     rhi.c
