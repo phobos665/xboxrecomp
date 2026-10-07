@@ -19,6 +19,7 @@
  */
 #include "input_bindings.h"
 #include "recomp_pad.h"
+#include "recomp_config.h"   /* recomp_config_user_dir */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -585,21 +586,16 @@ static int readable(const char *path)
 static int find_config(char *out, size_t n)
 {
     const char *env = getenv("RECOMP_INPUT_CONFIG");
+    char dir[600];
 #if defined(_WIN32)
-    const char *home = getenv("APPDATA");
-    const char *tail = "\\xboxrecomp\\input_bindings.json";
+    const char *tail = "\\input_bindings.json";
 #else
-    const char *home = getenv("XDG_CONFIG_HOME");
-    const char *tail = "/xboxrecomp/input_bindings.json";
-    if (!home || !*home) {
-        static char buf[400];
-        const char *h = getenv("HOME");
-        if (h) {
-            snprintf(buf, sizeof buf, "%s/.config", h);
-            home = buf;
-        }
-    }
+    const char *tail = "/input_bindings.json";
 #endif
+    /* The per-user settings directory (recomp_config.h): %APPDATA%\xboxrecomp,
+     * ~/Library/Application Support/xboxrecomp, ~/.config/xboxrecomp. */
+    const char *home = recomp_config_user_dir(dir, sizeof dir) ? dir : NULL;
+
     if (env && *env) {
         snprintf(out, n, "%s", env);
         if (readable(out))
