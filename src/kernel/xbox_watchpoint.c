@@ -77,6 +77,7 @@ typedef struct {
     uint32_t va;
     uint32_t len;
     uint32_t last;      /* value at the last report, for the -> arrow */
+    DWORD    orig_prot; /* the page's own protection before the watch (POSIX) */
 } Watch;
 
 static Watch   g_watch[MAX_WATCH];
@@ -314,6 +315,12 @@ void xbox_watch_init(void)
             g_watch[g_n_watch].va = va;
             g_watch[g_n_watch].len = len;
             g_watch[g_n_watch].last = guest_read32(va);
+#ifndef _WIN32
+            /* What the guest itself asked for on that page, so a watch never
+             * lets through an access the page would have refused anyway. */
+            g_watch[g_n_watch].orig_prot =
+                w32_page_protection(guest_base() + va) & 0xFF;
+#endif
             fprintf(stderr, "[WATCH] watching 0x%08X (%u bytes), currently 0x%08X\n",
                     va, len, g_watch[g_n_watch].last);
             g_n_watch++;
@@ -498,16 +505,28 @@ int xbox_watch_handle_trap(recomp_fault *f)
 
 #else /* POSIX */
 
-/* An element of a watched access may go ahead if its page is one the watch
- * protected, or one the guest itself left accessible. */
+/* An element of a watched access may go ahead if the page allows it -- for a
+ * watched page, by the protection it had before the watch made it
+ * read-only, so a watch never opens a page the guest had closed. */
 static int watch_allows(uintptr_t host, int size, int is_write, void *arg)
 {
     uintptr_t p, end = host + (uintptr_t)(size > 0 ? size : 1);
     (void)arg;
     for (p = host & ~(uintptr_t)0xFFF; p < end; p += 0x1000) {
         DWORD prot = w32_page_protection((const void *)p) & 0xFF;
-        if (on_watched_page((uint32_t)(p - (uintptr_t)guest_base())))
-            continue;
+        uint32_t pva = (uint32_t)(p - (uintptr_t)guest_base());
+        if (on_watched_page(pva)) {
+            /* The watch made it read-only; judge it by what it was before. */
+            int i;
+            for (i = 0; i < g_n_watch; i++) {
+                uint32_t first = g_watch[i].va & ~0xFFFu;
+                uint32_t last = (g_watch[i].va + g_watch[i].len - 1) & ~0xFFFu;
+                if (pva >= first && pva <= last) {
+                    prot = g_watch[i].orig_prot;
+                    break;
+                }
+            }
+        }
         if (prot == 0 || prot == PAGE_NOACCESS || prot == PAGE_EXECUTE)
             return 0;
         if (is_write && (prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ))

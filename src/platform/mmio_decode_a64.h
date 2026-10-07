@@ -41,6 +41,22 @@ typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 #endif
 
+/* Atomics, for a caller whose target is real shared memory (the guest
+ * arena's backdoor) and so can do them for real. Without one, an atomic is
+ * completed as a read and a write, which is right for a device model and
+ * not atomic against another thread. op is one of MMIO_AT_*; the result is
+ * the old value (for MMIO_AT_LDX the value loaded). MMIO_AT_CAS stores
+ * operand if the old value equals expected. MMIO_AT_STX stores operand if
+ * nothing has changed the location since this thread's MMIO_AT_LDX, and
+ * sets *status to 0 on success, 1 on failure -- STXR's own result. */
+enum {
+    MMIO_AT_ADD, MMIO_AT_CLR, MMIO_AT_EOR, MMIO_AT_SET,
+    MMIO_AT_SMAX, MMIO_AT_SMIN, MMIO_AT_UMAX, MMIO_AT_UMIN,   /* = LSE opc */
+    MMIO_AT_SWP, MMIO_AT_CAS, MMIO_AT_LDX, MMIO_AT_STX
+};
+typedef uint64_t (*mmio_atomic_fn)(void *dev, uint32_t off, int size, int op,
+                                   uint64_t operand, uint64_t expected, int *status);
+
 typedef struct mmio_a64_ctx {
     uint64_t x[31];        /* x0..x30 (x29 fp, x30 lr) */
     uint64_t sp;
@@ -206,8 +222,9 @@ static inline unsigned mmio_a64_fp_scale(unsigned size_f, unsigned opc)
  * effective address minus dev_base. Returns 1 with registers updated and
  * c->pc advanced, or 0 for an instruction this does not handle.
  */
-static inline int mmio_a64_emulate(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev_base,
-                                   void *dev, mmio_read_fn rd, mmio_write_fn wr)
+static inline int mmio_a64_emulate_ex(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev_base,
+                                      void *dev, mmio_read_fn rd, mmio_write_fn wr,
+                                      mmio_atomic_fn at)
 {
     unsigned rt = insn & 31, rn = (insn >> 5) & 31;
     unsigned size_f = insn >> 30;
@@ -329,8 +346,8 @@ static inline int mmio_a64_emulate(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev
     }
 
     /* LSE atomics (LDADD, LDCLR, LDEOR, LDSET, LD{S,U}{MAX,MIN}, SWP) and
-     * LDAPR: size 111 0 00 A R 1 Rs o3 opc 00 Rn Rt. The fault handler runs
-     * the read-modify-write as two accesses; it is atomic against the guest
+     * LDAPR: size 111 0 00 A R 1 Rs o3 opc 00 Rn Rt. Through `at` when the
+     * caller has one; otherwise a read and a write, atomic against the guest
      * only as far as one trapped access at a time is. */
     if ((insn & 0x3F200C00u) == 0x38200000u) {
         unsigned rs = (insn >> 16) & 31, o3 = (insn >> 15) & 1, opc = (insn >> 12) & 7;
@@ -347,6 +364,13 @@ static inline int mmio_a64_emulate(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev
         }
         if (o3 && opc != 0)
             return 0;
+        if (at) {
+            old[0] = at(dev, (uint32_t)(ea - dev_base), size,
+                        o3 ? MMIO_AT_SWP : (int)opc, s, 0, NULL) & mask;
+            mmio_a64_set_loaded(c, rt, old[0], size, 0, size == 8);
+            c->pc += 4;
+            return 1;
+        }
         mmio_a64_read(ea, dev_base, dev, rd, size, old);
         if (o3) {
             nw[0] = s;                              /* SWP */
@@ -382,9 +406,17 @@ static inline int mmio_a64_emulate(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev
             /* LDXR/LDAXR/LDAR/LDLAR, STXR/STLXR/STLR/STLLR. An emulated
              * exclusive store always succeeds: its load was emulated too,
              * or ran against memory nothing else is writing. */
+            uint32_t off = (uint32_t)(ea - dev_base);
             if (load) {
-                mmio_a64_read(ea, dev_base, dev, rd, size, d);
+                if (at && !o2)
+                    d[0] = at(dev, off, size, MMIO_AT_LDX, 0, 0, NULL);
+                else
+                    mmio_a64_read(ea, dev_base, dev, rd, size, d);
                 mmio_a64_set_loaded(c, rt, d[0], size, 0, size == 8);
+            } else if (at && !o2) {
+                int status = 0;
+                at(dev, off, size, MMIO_AT_STX, mmio_a64_xr(c, rt), 0, &status);
+                mmio_a64_xw(c, rs, (uint64_t)status);
             } else {
                 d[0] = mmio_a64_xr(c, rt);
                 mmio_a64_write(ea, dev_base, dev, wr, size, d);
@@ -397,6 +429,13 @@ static inline int mmio_a64_emulate(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev
         if (o2 && ((insn >> 10) & 31) == 31) {     /* CAS, CASA, CASL, CASAL */
             uint64_t mask = size == 8 ? ~0ULL : ((1ULL << (size * 8)) - 1);
             uint64_t want = mmio_a64_xr(c, rs) & mask;
+            if (at) {
+                d[0] = at(dev, (uint32_t)(ea - dev_base), size, MMIO_AT_CAS,
+                          mmio_a64_xr(c, rt) & mask, want, NULL) & mask;
+                mmio_a64_set_loaded(c, rs, d[0], size, 0, size == 8);
+                c->pc += 4;
+                return 1;
+            }
             mmio_a64_read(ea, dev_base, dev, rd, size, d);
             if ((d[0] & mask) == want) {
                 uint64_t n[2] = { mmio_a64_xr(c, rt), 0 };
@@ -427,6 +466,12 @@ static inline int mmio_a64_emulate(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev
     }
 
     return 0;
+}
+
+static inline int mmio_a64_emulate(mmio_a64_ctx *c, uint32_t insn, uintptr_t dev_base,
+                                   void *dev, mmio_read_fn rd, mmio_write_fn wr)
+{
+    return mmio_a64_emulate_ex(c, insn, dev_base, dev, rd, wr, NULL);
 }
 
 /* ---- ucontext glue ------------------------------------------------------ */
