@@ -10,22 +10,22 @@ only about building and running the *game*:
 
 | | Pipeline | Game build | Graphics backend |
 |---|---|---|---|
-| **Windows 10/11** | yes | MSVC | D3D11, the complete path |
-| **Linux** | yes | GCC/Clang | OpenGL 3.3 (`d3d8_gl.c`), less complete |
-| **macOS** | yes | Clang | OpenGL 3.3, least exercised |
+| **Windows 10/11** | yes | MSVC | D3D11 (default) or Vulkan, the complete path |
+| **Linux** | yes | GCC/Clang | Vulkan, the same renderer; least exercised |
+| **macOS** | yes | Clang | Vulkan on MoltenVK, the same renderer; being brought up |
 
-Start on Windows if you have the choice — the D3D11 backend is six files of
-translation against one for OpenGL, so a title that renders there may not
-render elsewhere yet. If you are on Linux or macOS you can still do the whole
-analysis half, and reports of what breaks on the OpenGL path are welcome.
+Every platform runs the same renderer (`src/d3d`, through `rhi.h`); only the
+graphics API under it differs (`docs/technical/vulkan-backend.md`). Windows is
+still where titles are proven first.
 
 - **Python 3.10+** with `capstone` installed (`pip install capstone`)
 - **CMake 3.20+**
 - A C compiler: **Visual Studio 2022** (MSVC, C/C++ desktop workload) on
   Windows; GCC or Clang elsewhere
-- **Linux**: `bash tools/linux/install_deps.sh` installs SDL2, libepoxy,
-  OpenSSL and ffmpeg for the OpenGL backend (apt/pacman/dnf, needs sudo)
-- **macOS**: `brew install sdl2 libepoxy`
+- **Linux**: `bash tools/linux/install_deps.sh` installs the system libraries
+  (apt/pacman/dnf, needs sudo), plus a Vulkan SDK for the renderer
+- **macOS**: the [Vulkan SDK](https://vulkan.lunarg.com/) (MoltenVK, the loader,
+  DXC). Installed system-wide it is found on its own; otherwise set `VULKAN_SDK`
 - An original Xbox game disc image (ISO/XISO) — you must own the game
 
 > **On the `py -3` in every command below.** That is the Windows Python

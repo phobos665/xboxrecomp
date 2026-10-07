@@ -167,8 +167,9 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 
 ### Prerequisites
 
-- **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
-- **macOS**: install the native libraries required by the OpenGL backend with `brew install sdl2 libepoxy`
+- **Windows 11/10** (D3D11 backend, Vulkan optional) — or **Linux** / **macOS** (Vulkan backend;
+  MoltenVK on macOS). The Vulkan backend needs the vendored submodules and, to build, DXC's headers:
+  a [Vulkan SDK](https://vulkan.lunarg.com/) provides those, the loader and `libdxcompiler`
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022**, or the **2019 Build Tools** (either MSVC works; the
   2019 Build Tools ship a CMake of their own, so you may not need to install one)

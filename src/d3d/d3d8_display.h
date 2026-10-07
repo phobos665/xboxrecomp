@@ -18,8 +18,6 @@
 
 #include "d3d8_internal.h"
 
-#if defined(_WIN32)
-
 /* Read once, from the environment, before the first device is created.
  *
  * RECOMP_RES_SCALE=<1..8> is the supersample factor. 1 renders at the
@@ -87,6 +85,5 @@ HRESULT d3d8_display_resolve(RhiView *scene, UINT scene_w, UINT scene_h,
 
 void d3d8_display_shutdown(void);
 
-#endif /* _WIN32 */
 
 #endif /* XBOXRECOMP_D3D8_DISPLAY_H */
