@@ -49,6 +49,7 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "xbox_watchpoint.h"
+#include "xbox_fault_route.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -202,8 +203,10 @@ extern void xbe_entry_point(void);
 
 /*
  * The runtime catches every host fault (src/platform/recomp_fault.h) and
- * hands it to the two functions below: title_route, which services the
- * faults that are meant to happen, and title_crash, the report for the rest.
+ * hands it first to xbox_fault_route (src/kernel/xbox_fault_route.c), which
+ * services the faults that are meant to happen -- a watchpoint, a trapped
+ * device register, the rest of a 16 KB host page a 4 KB trap covered -- and
+ * then to title_crash below, the report for everything else.
  *
  * When the recompiled game hits an access violation, the report prints
  * the faulting address, all Xbox register values, and a native stack trace.
@@ -266,79 +269,6 @@ static void print_guest_context(uintptr_t pc)
             fprintf(stderr, "    [esp+%-3d] %08X %08X %08X %08X\n",
                     i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
     }
-}
-
-/* Register pages the runtime deliberately makes fault, so a guest access to
- * them can be given hardware semantics instead of landing in plain memory.
- * Each has a handler in the runtime that decodes the faulting instruction,
- * performs the access and moves the pc past it; this function's job is only
- * to route the fault to the right one. The pages are trapped only when the
- * matching switch is set (RECOMP_VBLANK, RECOMP_AC97_READY), so without it
- * these ranges never fault and this code is never reached. */
-#define GUEST_NV2A_BASE        0xFD000000u
-#define GUEST_NV2A_PCRTC_PAGE  0xFD600000u   /* interrupt status: write-trapped */
-#define GUEST_APU_REGS_BASE    0xFE800000u   /* APU registers: PAGE_NOACCESS   */
-#define GUEST_APU_REGS_SIZE    0x00030000u   /* the DSP memory above stays RAM */
-#define GUEST_AC97_PAGE        0xFEC00000u   /* codec / DSP command: write-trapped */
-
-static int route_device_fault(recomp_fault *f, uintptr_t fault_addr, int is_write)
-{
-#ifdef _WIN32
-    struct _CONTEXT *ctx = (struct _CONTEXT *)f->ctx;
-    uint32_t va = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
-
-    if (is_write && va >= GUEST_NV2A_PCRTC_PAGE && va < GUEST_NV2A_PCRTC_PAGE + 0x1000u) {
-        if (nv2a_intr_handle_write(ctx, fault_addr,
-                                   va - GUEST_NV2A_BASE,
-                                   (uintptr_t)g_xbox_mem_offset + GUEST_NV2A_BASE))
-            return 1;
-    }
-    if (va >= GUEST_APU_REGS_BASE && va < GUEST_APU_REGS_BASE + GUEST_APU_REGS_SIZE) {
-        if (apu_hook_handle_mmio(ctx, fault_addr, va, is_write))
-            return 1;
-    }
-    if (is_write && va >= GUEST_AC97_PAGE && va < GUEST_AC97_PAGE + 0x1000u) {
-        if (mcpx_ac97_handle_write(ctx, fault_addr,
-                                   va - GUEST_APU_REGS_BASE))
-            return 1;
-    }
-    return 0;
-#else
-    /* The device decoders read x86-64 instructions out of a Windows
-     * CONTEXT (src/apu/apu_mmio_hook.c). Off Windows they come with the
-     * runtime's own fault route; until then a trapped register reports
-     * as a crash, which names it. */
-    (void)f;
-    (void)fault_addr;
-    (void)is_write;
-    return 0;
-#endif
-}
-
-/* Faults that are meant to happen: serviced and resumed, never reported.
- * 1 when handled. */
-static int title_route(recomp_fault *f)
-{
-    /* A watchpoint stepping over the instruction it just trapped. This
-     * has to come first: it is a single-step exception this process
-     * asked for, not a fault, and reporting it would bury the watch
-     * output in noise. */
-    if (f->kind == RECOMP_FAULT_SINGLE_STEP)
-        return xbox_watch_handle_step((PEXCEPTION_POINTERS)f->native) ? 1 : 0;
-    if (f->kind != RECOMP_FAULT_ACCESS)
-        return 0;
-
-    /* An armed watchpoint, which protected the page on purpose.
-     * Checked before the device ranges because a watch is a
-     * deliberate trap and the device hooks would not know it. */
-    if (xbox_watch_handle_av((PEXCEPTION_POINTERS)f->native, f->host_addr,
-                             f->is_write == 1))
-        return 1;
-
-    /* A trapped device register: serviced and resumed, not a crash. */
-    if (g_xbox_mem_offset && route_device_fault(f, f->host_addr, f->is_write == 1))
-        return 1;
-    return 0;
 }
 
 /* Every fault the route declined, except breakpoints. Say something about
@@ -487,7 +417,7 @@ static int title_main(int argc, char **argv)
     /* The fault handler, first in line: a VEH on Windows, signals on POSIX.
      * It loads the symbols the report names functions with up front, since
      * at fault time the process is already in a bad way. */
-    recomp_fault_install(title_route, title_crash);
+    recomp_fault_install(xbox_fault_route, title_crash);
     /* And the other way a run ends: an exit nobody logged. Prints [EXIT]
      * with the code and both stacks before the process goes (exit_trace.c). */
     recomp_exit_trace_init();
@@ -534,6 +464,11 @@ static int title_main(int argc, char **argv)
 
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
+
+    /* The device registers the layout traps (the vblank interrupt page, the
+     * APU, AC'97), registered with the fault route that services them. Only
+     * a table: a range whose page is never trapped never faults. */
+    apu_fault_register();
 
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
