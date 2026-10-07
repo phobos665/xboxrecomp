@@ -312,7 +312,13 @@ def config_path():
     env = os.environ.get("RECOMP_INPUT_CONFIG")
     if env:
         return env
-    return os.path.join(user_dir(), "input_bindings.json")
+    directory = user_dir()
+    if directory is None:
+        # src/config has no per-user directory either and falls back to a
+        # file beside the executable, which this tool cannot know.
+        raise RuntimeError("no per-user directory (APPDATA is not set); "
+                           "pass a path or set RECOMP_INPUT_CONFIG")
+    return os.path.join(directory, "input_bindings.json")
 
 
 def user_dir(platform=None, environ=None, home=None):
@@ -324,14 +330,17 @@ def user_dir(platform=None, environ=None, home=None):
       Linux    $XDG_CONFIG_HOME/xboxrecomp, else ~/.config/xboxrecomp
 
     The arguments are for the test that holds the two to the same answer on
-    every platform; by default they are this machine's."""
+    every platform; by default they are this machine's. None where the C
+    has no directory either: Windows with APPDATA unset."""
     platform = platform or ("win32" if os.name == "nt" else sys.platform)
     environ = os.environ if environ is None else environ
     home = home or os.path.expanduser("~")
     if environ.get("RECOMP_USER_DIR"):          # tests and scripted runs
         return environ["RECOMP_USER_DIR"]
     if platform == "win32":
-        base = environ.get("APPDATA") or home
+        base = environ.get("APPDATA")
+        if not base:
+            return None
     elif platform == "darwin":
         base = os.path.join(home, "Library", "Application Support")
     else:
