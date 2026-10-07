@@ -305,7 +305,9 @@ typedef struct {
 
 /* The scene -- what the device calls the back buffer, at the size the host
  * renders it -- as the frame begins: `height` rows of `pitch` bytes, each
- * `width` R8G8B8A8 pixels, read through the back buffer surface. In the
+ * `width` 32-bit pixels exactly as the back buffer surface's LockRect hands
+ * them out, which is R8G8B8A8 under every backend (d3d8_device.c makes the
+ * scene image in that format) and is written back the same way. In the
  * snapshot, before anything else. A title whose screen copy or blend reads
  * the frame before it -- TimeSplitters 2 copies its screen before it
  * clears, for its blur -- replays from what the run had there, and every
