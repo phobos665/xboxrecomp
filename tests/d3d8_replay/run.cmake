@@ -73,5 +73,11 @@ foreach(img syn000.bmp syn000_present.bmp)
     # Right: the vertex program's quad, orange from the NORMPACKED3 normal
     # through the combiners.
     expect_pixel(${WORK}/${img} 480 160 255 127 0 "the vertex program quad")
+    # Below the left quad: the screen as it was after that quad, copied into
+    # a 64x64 texture (a v8 SCREEN_COPY chunk) and drawn at 40..280 x
+    # 300..460. The red square lands at about x 55-145, y 313-393 of it;
+    # around it is the clear. Black here means the copy never happened.
+    expect_pixel(${WORK}/${img} 100 350 255 0 0 "the screen copy's red square")
+    expect_pixel(${WORK}/${img} 250 350 0x20 0x30 0x60 "the screen copy's clear")
 endforeach()
 message("d3d8_replay: the synthetic frame replays, identically each loop, with its colours")

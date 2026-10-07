@@ -742,6 +742,15 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float  oPts : PSIZE;\n"
         "    float4 oB0  : TEXCOORD6;\n"
         "    float4 oB1  : TEXCOORD7;\n"
+        /* Vulkan: a vertex stage feeding a point list must write the point
+         * size; D3D11 has none (oPts above goes nowhere, every point is one
+         * pixel). __spirv__ is DXC's macro for a SPIR-V compile, so
+         * D3DCompile never sees this, and a builtin takes no varying
+         * location. One pixel, as under D3D11, not oPts: a program that
+         * never writes oPts would make its points vanish. */
+        "#ifdef __spirv__\n"
+        "    [[vk::builtin(\"PointSize\")]] float vk_point_size : VK_POINT_SIZE;\n"
+        "#endif\n"
         "};\n\n");
 
     /* Main function */
@@ -864,6 +873,9 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    o.oPts = oPts.x;\n"
         "    o.oB0  = saturate(oB0);\n"
         "    o.oB1  = saturate(oB1);\n"
+        "#ifdef __spirv__\n"
+        "    o.vk_point_size = 1.0;\n"
+        "#endif\n"
         "    return o;\n"
         "}\n");
 
