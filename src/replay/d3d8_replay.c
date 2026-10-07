@@ -19,9 +19,15 @@
  *                    its snapshot.
  *   --dump-every     write a BMP after every loop, not just the last, so a
  *                    frame that is not idempotent shows itself.
- *   --hold           leave the window up until it is closed (Windows only:
- *                    elsewhere there is no window -- the frame is drawn to
- *                    a headless swap chain and only the BMPs show it).
+ *   --hold           leave the window up until it is closed (on Windows,
+ *                    or with --window).
+ *   --window         (macOS) present into a real window rather than the
+ *                    headless swap chain, through src/host as a title does:
+ *                    always in background mode (RECOMP_WINDOW_BACKGROUND),
+ *                    below the other windows and never taking the focus.
+ *                    Without it nothing is shown anywhere off Windows -- the
+ *                    frame is drawn to a headless swap chain and only the
+ *                    BMPs show it.
  *   --quiet          only errors.
  *   --no-combiners   draw with the fixed-function pixel path whatever the
  *                    capture's combiner token says.
@@ -89,6 +95,11 @@
 #include "d3d8_vsh.h"
 #include "d3d8_combiners.h"
 #include "d3d8_capture.h"
+#if defined(REPLAY_HAVE_HOST)
+#include "host.h"
+#include <pthread.h>
+#include <time.h>
+#endif
 
 #define REPLAY_MAX_PROGRAMS 256
 #define REPLAY_STAGES       4
@@ -361,11 +372,46 @@ static void pump(void)
     }
 }
 #else
-/* No window anywhere else: the device is given none, and the Vulkan
- * backend presents to a headless surface (rhi.h, RhiDeviceDesc.window).
- * That is what a tool run by the dozen from a script wants -- nothing on
- * screen, nothing to take the focus -- and the images are the BMPs. */
+/* No window by default anywhere else: the device is given none, and the
+ * Vulkan backend presents to a headless surface (rhi.h,
+ * RhiDeviceDesc.window). That is what a tool run by the dozen from a script
+ * wants -- nothing on screen, nothing to take the focus -- and the images
+ * are the BMPs. --window (macOS) asks src/host for a background window and
+ * hands the device its CAMetalLayer, which is the present path a title
+ * takes; main() then runs the host loop and the replay runs beside it. */
+static int g_window;
+#if defined(REPLAY_HAVE_HOST)
+static host_window *g_host_window;
+static volatile int g_window_closed;
+
+static void on_window_close(void *user)
+{
+    (void)user;
+    g_window_closed = 1;
+}
+
+static HWND replay_window(UINT width, UINT height)
+{
+    static const host_window_callbacks cb = { on_window_close, NULL, NULL };
+    void *layer;
+    int pw = 0, ph = 0;
+
+    if (!g_window)
+        return NULL;
+    g_host_window = host_window_open((int)width, (int)height, "xboxrecomp - D3D8 frame replay", &cb);
+    if (!g_host_window || !(layer = host_window_metal_layer(g_host_window))) {
+        fprintf(stderr, "[replay] --window: no window%s\n",
+                g_host_window ? " layer (Metal layers are macOS only)" : "");
+        return NULL;
+    }
+    host_window_drawable_size(g_host_window, &pw, &ph);
+    if (pw > 0 && ph > 0)
+        xbox_D3D8SetWindowSize((UINT)pw, (UINT)ph);
+    return (HWND)layer;
+}
+#else
 static HWND replay_window(UINT width, UINT height) { (void)width; (void)height; return NULL; }
+#endif
 static void replay_show(HWND hwnd, int hold)       { (void)hwnd; (void)hold; }
 static void pump(void)                             { }
 #endif
@@ -1441,7 +1487,7 @@ static void usage(void)
         D3D8CAP_EXTENSION);
 }
 
-int main(int argc, char **argv)
+static int replay_main(int argc, char **argv)
 {
     const char *path = NULL, *prefix = "replay";
     int loops = 1, dump_every = 0, hold = 0, present = 0, each_tag = 0, i, loop;
@@ -1464,6 +1510,16 @@ int main(int argc, char **argv)
             dump_every = 1;
         else if (!strcmp(argv[i], "--hold"))
             hold = 1;
+#if !defined(_WIN32)
+        else if (!strcmp(argv[i], "--window")) {
+#if defined(REPLAY_HAVE_HOST) && defined(__APPLE__)
+            g_window = 1;
+#else
+            fprintf(stderr, "[replay] --window: this build has no window to give (macOS only)\n");
+            return 2;
+#endif
+        }
+#endif
         else if (!strcmp(argv[i], "--quiet"))
             g_quiet = 1;
         else if (!strcmp(argv[i], "--no-combiners"))
@@ -1556,8 +1612,12 @@ int main(int argc, char **argv)
         return 1;
     }
 #else
-    if (hold) {
-        note("[replay] --hold: there is no window off Windows; ignored\n");
+    if (g_window && !hwnd) {
+        d3d8cap_close_read(cap);
+        return 1;
+    }
+    if (hold && !g_window) {
+        note("[replay] --hold: there is no window without --window; ignored\n");
         hold = 0;
     }
 #endif
@@ -1637,9 +1697,59 @@ int main(int argc, char **argv)
             DispatchMessageA(&msg);
         }
     }
+#elif defined(REPLAY_HAVE_HOST)
+    if (hold) {
+        const struct timespec tick = { 0, 50 * 1000000L };
+        note("[replay] holding the window open; close it to exit\n");
+        while (!g_window_closed)
+            nanosleep(&tick, NULL);
+    }
 #endif
 
     free(r.textures);
     d3d8cap_close_read(cap);
     return 0;
+}
+
+#if defined(REPLAY_HAVE_HOST)
+typedef struct { int argc; char **argv; int code; } ReplayArgs;
+
+static void *replay_thread(void *p)
+{
+    ReplayArgs *a = (ReplayArgs *)p;
+    a->code = replay_main(a->argc, a->argv);
+    recomp_host_loop_quit(a->code);
+    return NULL;
+}
+#endif
+
+/* With --window the replay runs on a thread of its own and the main thread
+ * runs the host loop, because on macOS every window belongs to the thread
+ * that ran main() (src/host/host.h). Otherwise the replay is main(). */
+int main(int argc, char **argv)
+{
+#if defined(REPLAY_HAVE_HOST) && defined(__APPLE__)
+    int i;
+
+    for (i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--window")) {
+            ReplayArgs a = { argc, argv, 1 };
+            pthread_t th;
+            pthread_attr_t attr;
+
+            /* There is deliberately no foreground switch: a replay is run
+             * from scripts while someone works at the same desk. */
+            setenv("RECOMP_WINDOW_BACKGROUND", "1", 1);
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 8u << 20);
+            if (pthread_create(&th, &attr, replay_thread, &a) != 0) {
+                fprintf(stderr, "[replay] pthread_create failed\n");
+                return 1;
+            }
+            recomp_host_loop_run();
+            pthread_join(th, NULL);
+            return a.code;
+        }
+#endif
+    return replay_main(argc, argv);
 }
