@@ -356,7 +356,11 @@ NTSTATUS __stdcall xbox_NtSuspendThread(
      * the two are not interchangeable: -1 must become an error status rather
      * than a suspend count of 0xFFFFFFFF.
      */
-    prev = SuspendThread(ThreadHandle);
+    /* With the guest lock on, the target parks itself rather than being
+     * stopped where it stands, possibly holding the lock
+     * (xbox_GuestThreadSuspend). */
+    if (!xbox_GuestThreadSuspend(ThreadHandle, &prev))
+        prev = SuspendThread(ThreadHandle);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
@@ -379,7 +383,8 @@ NTSTATUS __stdcall xbox_NtResumeThread(
     DWORD prev;
 
     /* Mirror of NtSuspendThread: (DWORD)-1 is failure, not a count. */
-    prev = ResumeThread(ThreadHandle);
+    if (!xbox_GuestThreadResume(ThreadHandle, &prev))
+        prev = ResumeThread(ThreadHandle);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtResumeThread: ResumeThread failed (error %u)", GetLastError());

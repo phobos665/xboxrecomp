@@ -49,11 +49,11 @@
  * named function in two runs, provided the failure is deterministic.
  */
 
-/* glibc declares dladdr (the [WATCH] writer's name) only with _GNU_SOURCE,
- * and it has to come before the first system header. */
+/* dladdr and Dl_info are GNU extensions in glibc. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

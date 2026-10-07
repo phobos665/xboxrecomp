@@ -321,6 +321,18 @@ DWORD GetCurrentThreadId(void)
     return t_tid;
 }
 
+/* The id GetCurrentThreadId returns on that thread; 0 for a handle that is
+ * not a thread this layer created. */
+DWORD GetThreadId(HANDLE h)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    if (h == PSEUDO_CURRENT_THREAD && !o)
+        return GetCurrentThreadId();
+    if (!o || o->kind != K_THREAD)
+        return 0;
+    return o->tid;
+}
+
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
