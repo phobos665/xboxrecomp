@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 
 #include "win32_compat.h"
+#include "posix_memory.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -294,6 +295,7 @@ typedef struct w32_object {
     /* file mapping / fd-backed file handle */
     int             fd;
     SIZE_T          map_size;
+    struct pm_object *pm;
     char           *file_path;
 } w32_object;
 
@@ -336,7 +338,7 @@ static void obj_release(w32_object *o)
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
-        if (o->fd >= 0) close(o->fd);
+        pm_object_release(o->pm);   /* live views keep their memory */
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
@@ -998,76 +1000,9 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 }
 
 /* ===================================================================== */
-/* Virtual memory                                                        */
+/* Virtual memory: VirtualAlloc, VirtualFree, VirtualProtect and          */
+/* VirtualQuery live in posix_memory.c, with the guest arena.             */
 /* ===================================================================== */
-
-static int prot_from_page(DWORD protect)
-{
-    switch (protect & 0xFF) {
-    case PAGE_NOACCESS:          return PROT_NONE;
-    case PAGE_READONLY:          return PROT_READ;
-    case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
-    case PAGE_EXECUTE:           return PROT_EXEC;
-    case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
-    default:                     return PROT_READ | PROT_WRITE;
-    }
-}
-
-LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
-{
-    int prot  = prot_from_page(protect);
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-
-    /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
-     * just adjust protection. */
-    if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
-        if (mprotect(address, size, prot) == 0)
-            return address;
-        /* fall through to a fresh mapping */
-    }
-
-#if defined(MAP_FIXED_NOREPLACE)
-    if (address) flags |= MAP_FIXED_NOREPLACE;
-#elif defined(__APPLE__)
-    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
-     * or a mach_vm_region probe before an MAP_FIXED call. */
-#endif
-    void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
-                   flags, -1, 0);
-    if (p == MAP_FAILED) { SetLastError(8); return NULL; }
-    /* Getting a different address means the range was taken, which Windows
-     * reports as a failure rather than quietly relocating the allocation. An
-     * older kernel without MAP_FIXED_NOREPLACE ignores the flag and places it
-     * elsewhere, so this check is what makes the two behave alike -- and it
-     * never destroys an existing mapping to get there, which is why the flag
-     * is a hint here and never bare MAP_FIXED. */
-    if (address && p != address) {
-        munmap(p, size);
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return NULL;
-    }
-    return p;
-}
-
-BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
-{
-    if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0; we can't know the length, so this
-         * path is only safe when callers pass the real size. */
-        if (size == 0) return TRUE;
-        return munmap(address, size) == 0;
-    }
-    if (freeType & MEM_DECOMMIT)
-        return mprotect(address, size, PROT_NONE) == 0;
-    return TRUE;
-}
-
-BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
-{
-    if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot_from_page(newProtect)) == 0;
-}
 
 /* ===================================================================== */
 /* Time                                                                  */
@@ -1422,62 +1357,23 @@ int WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 }
 
 /* ===================================================================== */
-/* File mapping (memfd-backed) -- true aliased mirror views              */
+/* File mapping -- true aliased views of one shared-memory object.        */
+/* The object and the views are posix_memory.c's; a handle wraps one.     */
 /* ===================================================================== */
-
-/* Registry of active views: UnmapViewOfFile takes no length, so we must
- * recover the mapping length here for munmap. */
-typedef struct { void *addr; size_t len; } w32_view;
-static w32_view        s_views[512];
-static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void view_register(void *addr, size_t len)
-{
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (!s_views[i].addr) { s_views[i].addr = addr; s_views[i].len = len; break; }
-    pthread_mutex_unlock(&s_views_lock);
-}
-
-static size_t view_take(const void *addr)
-{
-    size_t len = 0;
-    pthread_mutex_lock(&s_views_lock);
-    for (int i = 0; i < 512; i++)
-        if (s_views[i].addr == addr) { len = s_views[i].len; s_views[i].addr = NULL; break; }
-    pthread_mutex_unlock(&s_views_lock);
-    return len;
-}
-
-/* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
- * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
-static int anon_map_fd(const char *name)
-{
-#if defined(__APPLE__)
-    // TODO: use shm_open on macOS 10.12+ or mkstemp + unlink for older versions
-    return 0;
-#else
-    return memfd_create(name ? name : "xbox_map", 0);
-#endif
-}
 
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
 {
-    (void)file; (void)sa; (void)protect;
+    (void)file; (void)sa; (void)protect; (void)name;
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
-    int fd = anon_map_fd(name);
-    if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    if (ftruncate(fd, (off_t)size) != 0) {
-        close(fd);
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return NULL;
-    }
+    pm_object *pm = pm_object_create(size);
+    if (!pm) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
 
     w32_object *o = obj_alloc(K_FILEMAP);
-    o->fd       = fd;
+    o->fd       = -1;
+    o->pm       = pm;
     o->map_size = size;
     return (HANDLE)o;
 }
@@ -1489,50 +1385,17 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     return CreateFileMappingA(file, sa, protect, maxSizeHigh, maxSizeLow, NULL);
 }
 
+/* A requested address is honoured exactly or refused, never by replacing
+ * what is already there: xbox_memory_layout.c depends on a failed placement
+ * failing (see posix_memory.c). */
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
     w32_object *o = (w32_object *)mapping;
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
-    off_t  off = ((off_t)offHigh << 32) | offLow;
-    SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
-    int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED;
-
-    /* A requested address must either be honoured exactly or refused.
-     *
-     * This used to pass bare MAP_FIXED, which does the opposite of what the
-     * caller wants: it silently unmaps whatever already lives there and
-     * reports success. Windows fails instead, and the runtime depends on that
-     * failing -- xbox_memory_layout.c tries a list of preferred bases for the
-     * 64 MB view and checks which one it got, and maps up to 28 mirror views
-     * plus the contiguous, tiled, NV2A, MCPX and flash apertures at fixed
-     * offsets, printing "Mirror N: FAILED" when one cannot be placed. With
-     * MAP_FIXED those never fail; they quietly destroy a live mapping and
-     * carry on, and the damage surfaces later as memory that changed by
-     * itself.
-     *
-     * MAP_FIXED_NOREPLACE (Linux 4.17+) asks for exactly this. Without it,
-     * pass the address as a hint only and check what came back, which never
-     * destroys anything -- the cost is that a hint may be ignored, and the
-     * check below turns that into the same clean failure. */
-#if defined(MAP_FIXED_NOREPLACE)
-    if (baseAddr) flags |= MAP_FIXED_NOREPLACE;
-#endif
-
-    void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
-    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-    if (baseAddr && p != baseAddr) {
-        /* The range was taken. An older kernel ignores MAP_FIXED_NOREPLACE
-         * and places it elsewhere, so this check is what makes the behaviour
-         * the same on both. */
-        munmap(p, len);
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return NULL;
-    }
-    view_register(p, len);
-    return p;
+    size_t off = ((size_t)offHigh << 32) | offLow;
+    return pm_map_view(o->pm, off, count, access != FILE_MAP_READ, baseAddr);
 }
 
 LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, SIZE_T count)
@@ -1542,26 +1405,7 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
-    size_t len = view_take(baseAddr);
-    if (len == 0) return FALSE;
-    return munmap((void *)baseAddr, len) == 0;
-}
-
-/* ===================================================================== */
-/* VirtualQuery                                                           */
-/* ===================================================================== */
-
-SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length)
-{
-    if (!buffer || length < sizeof(*buffer)) return 0;
-    memset(buffer, 0, sizeof(*buffer));
-    buffer->BaseAddress    = (PVOID)address;
-    buffer->AllocationBase = NULL;       /* != address -> freed via _aligned_free */
-    buffer->RegionSize     = 0x1000;
-    buffer->State          = MEM_COMMIT;
-    buffer->Protect        = PAGE_READWRITE;
-    buffer->Type           = 0x20000;    /* MEM_PRIVATE */
-    return sizeof(*buffer);
+    return pm_unmap_view(baseAddr) ? TRUE : FALSE;
 }
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)

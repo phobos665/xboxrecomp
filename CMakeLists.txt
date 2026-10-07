@@ -133,6 +133,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(NOT WIN32)
         add_subdirectory(tests/host_window)     # needs a display; run by hand
         add_subdirectory(tests/d3d8_replay)     # the renderer, headless (needs a Vulkan device)
+        add_subdirectory(tests/guest_memory)    # POSIX memory backend semantics
     endif()
     if(WIN32)
         add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
