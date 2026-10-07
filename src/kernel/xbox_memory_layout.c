@@ -1055,6 +1055,34 @@ static volatile LONG     s_gl_host_waits, s_gl_host_timeouts;
 static volatile int64_t  s_gl_host_wait_ns, s_gl_host_wait_max_ns;
 static volatile int64_t  s_gl_last_report_ns;
 
+/* 64-bit counters for the stats, on InterlockedCompareExchange64 so MSVC
+ * builds them too (it has no __atomic builtins). */
+static int gl_cas64(volatile int64_t *p, int64_t *expected, int64_t desired)
+{
+    int64_t seen = (int64_t)InterlockedCompareExchange64((volatile LONGLONG *)p,
+                                                         (LONGLONG)desired,
+                                                         (LONGLONG)*expected);
+    if (seen == *expected)
+        return 1;
+    *expected = seen;
+    return 0;
+}
+
+static int64_t gl_xchg64(volatile int64_t *p, int64_t v)
+{
+    int64_t cur = *p;
+    while (!gl_cas64(p, &cur, v))
+        ;
+    return cur;
+}
+
+static void gl_add64(volatile int64_t *p, int64_t v)
+{
+    int64_t cur = *p;
+    while (!gl_cas64(p, &cur, cur + v))
+        ;
+}
+
 static int64_t guest_quantum_ns(void)
 {
     if (g_guest_quantum_ns < 0) {
@@ -1072,15 +1100,14 @@ static void guest_lock_report(int64_t now)
     int64_t wait_ns, max_ns;
 
     if (now - last < 5000000000ll ||
-        !__atomic_compare_exchange_n(&s_gl_last_report_ns, &last, now, 0,
-                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+        !gl_cas64(&s_gl_last_report_ns, &last, now))
         return;
     bk = InterlockedExchange(&s_gl_handoff_backedge, 0);
     kn = InterlockedExchange(&s_gl_handoff_kernel, 0);
     hw = InterlockedExchange(&s_gl_host_waits, 0);
     ht = InterlockedExchange(&s_gl_host_timeouts, 0);
-    wait_ns = __atomic_exchange_n(&s_gl_host_wait_ns, 0, __ATOMIC_SEQ_CST);
-    max_ns = __atomic_exchange_n(&s_gl_host_wait_max_ns, 0, __ATOMIC_SEQ_CST);
+    wait_ns = gl_xchg64(&s_gl_host_wait_ns, 0);
+    max_ns = gl_xchg64(&s_gl_host_wait_max_ns, 0);
     if (!last)
         return;                       /* the first call only starts the clock */
     fprintf(stderr, "  [GUESTLOCK] last 5 s: handoffs at back edges %ld, after "
@@ -1433,10 +1460,9 @@ int xbox_GuestLockEnterTimed(DWORD ms)
             if (g_guest_depth++ == 0)
                 guest_took();
             InterlockedIncrement(&s_gl_host_waits);
-            __atomic_add_fetch(&s_gl_host_wait_ns, w, __ATOMIC_RELAXED);
+            gl_add64(&s_gl_host_wait_ns, w);
             max = s_gl_host_wait_max_ns;
-            while (w > max && !__atomic_compare_exchange_n(&s_gl_host_wait_max_ns,
-                       &max, w, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            while (w > max && !gl_cas64(&s_gl_host_wait_max_ns, &max, w))
                 ;
             guest_lock_report(now);
             return 1;
