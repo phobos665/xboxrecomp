@@ -1901,6 +1901,31 @@ static int recomp_on_current_stack(uintptr_t a)
     return a >= lo && a < hi;
 }
 
+/* A lifted integer division that x86 would have trapped (recomp_types.h,
+ * RECOMP_DIV_CHECK): a zero divisor, or INT64_MIN / -1. Only hosts whose own
+ * division does not trap call this. It raises the same fault Windows reports
+ * -- EXCEPTION_INT_DIVIDE_BY_ZERO or EXCEPTION_INT_OVERFLOW -- through the
+ * fault route and the title's crash report, and the process ends with it.
+ * The pc is the lifted function's, which names the guest function. */
+#if !(defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__))
+#include "platform/recomp_fault.h"
+
+void recomp_int_divide_fault(uint32_t code)
+{
+    recomp_fault_raise(code == 0xC0000095u ? RECOMP_FAULT_INT_OVERFLOW
+                                           : RECOMP_FAULT_INT_DIVIDE,
+                       code,
+#if defined(_MSC_VER)
+                       (uintptr_t)_ReturnAddress()
+#else
+                       (uintptr_t)__builtin_return_address(0)
+#endif
+                       );
+    /* Only if a route handled it -- nothing does. Never resume the division. */
+    abort();
+}
+#endif
+
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va)
 {
     int i;
