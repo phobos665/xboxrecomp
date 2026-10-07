@@ -32,6 +32,7 @@ before SDL3 say, and means the same slot.
 
 import json
 import os
+import sys
 
 VERSION = 1
 PORTS = 4
@@ -311,12 +312,31 @@ def config_path():
     env = os.environ.get("RECOMP_INPUT_CONFIG")
     if env:
         return env
-    if os.name == "nt":
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(user_dir(), "input_bindings.json")
+
+
+def user_dir(platform=None, environ=None, home=None):
+    """The per-user settings directory, as src/config's recomp_config_user_dir
+    decides it (the runtime reads the bindings from there too):
+
+      Windows  %APPDATA%\\xboxrecomp
+      macOS    ~/Library/Application Support/xboxrecomp
+      Linux    $XDG_CONFIG_HOME/xboxrecomp, else ~/.config/xboxrecomp
+
+    The arguments are for the test that holds the two to the same answer on
+    every platform; by default they are this machine's."""
+    platform = platform or ("win32" if os.name == "nt" else sys.platform)
+    environ = os.environ if environ is None else environ
+    home = home or os.path.expanduser("~")
+    if environ.get("RECOMP_USER_DIR"):          # tests and scripted runs
+        return environ["RECOMP_USER_DIR"]
+    if platform == "win32":
+        base = environ.get("APPDATA") or home
+    elif platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
     else:
-        base = (os.environ.get("XDG_CONFIG_HOME")
-                or os.path.join(os.path.expanduser("~"), ".config"))
-    return os.path.join(base, "xboxrecomp", "input_bindings.json")
+        base = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return os.path.join(base, "xboxrecomp")
 
 
 def load(path=None):
