@@ -1934,17 +1934,23 @@ HLE_EXPORT(D3DDevice_Clear)
          * (d3d8_device.c, dev_Clear). A split-screen title clears each
          * player's part of the screen this way, and passing none cleared
          * the whole screen every time. Count with no array is the whole
-         * target, as on the console. At most 64, as the host takes. */
-        {
+         * target, as on the console. The host takes at most 64 at a time,
+         * so more go in batches of 64 -- clearing is order-independent. */
+        if (!count || !rects) {
+            host_Clear(g_shadow, 0, NULL, xbox_clear_flags_to_host(flags), color, z, stencil);
+        } else {
             D3DRECT rect[64];
-            UINT n = count > 64 ? 64 : count;
+            uint32_t done = 0;
 
-            if (n && rects)
-                memcpy(rect, HLE_PTR(rects), n * sizeof rect[0]);
-            else
-                n = 0;
-            host_Clear(g_shadow, n, n ? rect : NULL, xbox_clear_flags_to_host(flags), color, z,
-                       stencil);
+            while (done < count) {
+                UINT n = count - done > 64 ? 64 : (UINT)(count - done);
+
+                memcpy(rect, HLE_PTR(rects + done * (uint32_t)sizeof rect[0]),
+                       n * sizeof rect[0]);
+                host_Clear(g_shadow, n, rect, xbox_clear_flags_to_host(flags), color, z,
+                           stencil);
+                done += n;
+            }
         }
         g_shadow_clears++;
         g_shadow_last_color = color;
