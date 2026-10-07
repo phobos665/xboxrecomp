@@ -71,13 +71,55 @@ class Vocabulary(unittest.TestCase):
         self.assertIn('getenv("RECOMP_INPUT_CONFIG")', self.text)
 
     def test_the_runtime_looks_in_the_same_per_user_place(self):
-        # bindings.config_path() builds %APPDATA%\xboxrecomp\input_bindings.json
-        # and find_config() in the C builds the same path from the same pieces.
-        self.assertIn('getenv("APPDATA")', self.text)
-        self.assertIn('"\\\\xboxrecomp\\\\input_bindings.json"', self.text)
+        # find_config() in the C takes the directory from src/config's
+        # recomp_config_user_dir() and adds input_bindings.json; the UI's
+        # config_path() does the same with bindings.user_dir().
+        self.assertIn("recomp_config_user_dir(", self.text)
+        self.assertIn('input_bindings.json"', self.text)
         self.assertTrue(bindings.config_path().endswith(
             os.path.join("xboxrecomp", "input_bindings.json"))
             or os.environ.get("RECOMP_INPUT_CONFIG"))
+
+    def test_the_per_user_directory_is_src_configs_on_every_platform(self):
+        # recomp_config.c's user_dir() is one dir_from() call per platform:
+        #   dir_from(out, n, <environment variable or NULL>, <home-relative or NULL>)
+        # Read those back and check bindings.user_dir() agrees on each.
+        with open(os.path.join(ROOT, "src", "config", "recomp_config.c"),
+                  encoding="utf-8") as handle:
+            c = handle.read()
+        body = c[c.index("static int user_dir(char *out, size_t n)"):]
+        body = body[:body.index("\n}\n")]
+        calls = re.findall(r'dir_from\(out, n, (NULL|"[^"]*"), (NULL|"[^"]*")\)', body)
+        branches = dict(zip(("win32", "darwin", "linux"), calls))
+        self.assertEqual(len(calls), 3, body)
+
+        home = os.path.join(os.sep, "home", "player")
+        env = {"APPDATA": os.path.join(os.sep, "appdata"),
+               "XDG_CONFIG_HOME": os.path.join(os.sep, "xdg")}
+        for platform, (var, rel) in branches.items():
+            with self.subTest(platform=platform):
+                var, rel = var.strip('"'), rel.strip('"')
+                base = env[var] if var != "NULL" else os.path.join(home, *rel.split("/"))
+                self.assertEqual(bindings.user_dir(platform, env, home),
+                                 os.path.join(base, "xboxrecomp"))
+        # The fallback when the variable is unset, where there is one.
+        self.assertEqual(bindings.user_dir("linux", {}, home),
+                         os.path.join(home, ".config", "xboxrecomp"))
+
+    def test_both_sides_honour_recomp_user_dir(self):
+        with open(os.path.join(ROOT, "src", "config", "recomp_config.c"),
+                  encoding="utf-8") as handle:
+            c = handle.read()
+        body = c[c.index("static int user_dir(char *out, size_t n)"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn('getenv("RECOMP_USER_DIR")', c)
+        self.assertIn('override_dir(out, n, "")', body)
+        for platform in ("win32", "darwin", "linux"):
+            with self.subTest(platform=platform):
+                self.assertEqual(bindings.user_dir(
+                    platform, {"RECOMP_USER_DIR": "/scratch/u",
+                               "APPDATA": "/appdata"}, "/home/p"),
+                    "/scratch/u")
 
 
 if __name__ == "__main__":
