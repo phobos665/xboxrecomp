@@ -183,64 +183,112 @@ int xa2_get_buffer_size(void)
 #define XA2_NUM_BUFS      3
 #define XA2_BUF_BYTES     (XA2_BUF_SAMPLES * XA2_CHANNELS * (int)sizeof(int16_t))
 
+#include <pthread.h>
+
+/* The device opens on a host thread of its own (open_thread): CoreAudio can
+ * take seconds to open one (15 s, then failure, has been seen), and the
+ * caller is the title's start-up. xa2_init answers at once, the monitor mix
+ * runs as usual, and its submissions are refused until the stream is
+ * published -- or for ever, if the open fails, which is said once. */
+static pthread_mutex_t   g_xa2_lock = PTHREAD_MUTEX_INITIALIZER;
 static SDL_AudioDeviceID g_sdl_device;
-static SDL_AudioStream  *g_sdl_stream;
+static SDL_AudioStream  *g_sdl_stream;     /* published with release order */
 static int               g_xa2_initialized;
+static int               g_xa2_closed;
 static int               g_xa2_frames_written;
 
-int xa2_init(void)
+static void *open_thread(void *arg)
 {
     SDL_AudioSpec spec;
-    const char *mute;
+    SDL_AudioDeviceID dev;
+    SDL_AudioStream *stream;
+    const char *mute = getenv("RECOMP_MUTE");
 
-    if (g_xa2_initialized) return 1;
+    (void)arg;
     /* SDL's audio brings up its event subsystem; keep SIGINT/SIGTERM fatal. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-        fprintf(stderr, "[XA2] SDL audio failed to start: %s\n", SDL_GetError());
-        return 0;
+        fprintf(stderr, "[XA2] SDL audio failed to start: %s; no audio output\n", SDL_GetError());
+        return NULL;
     }
     spec.format = SDL_AUDIO_S16LE;
     spec.channels = XA2_CHANNELS;
     spec.freq = XA2_SAMPLE_RATE;
-    g_sdl_device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
-    if (!g_sdl_device) {
-        fprintf(stderr, "[XA2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        return 0;
+    dev = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
+    if (!dev) {
+        fprintf(stderr, "[XA2] SDL_OpenAudioDevice failed: %s; no audio output\n", SDL_GetError());
+        return NULL;
     }
     /* Muted before anything is bound, and no output at all if muting fails:
      * a run that asked for silence must never be heard. */
-    mute = getenv("RECOMP_MUTE");
-    if (mute && *mute && strcmp(mute, "0") != 0 &&
-        !SDL_SetAudioDeviceGain(g_sdl_device, 0.0f)) {
+    if (mute && *mute && strcmp(mute, "0") != 0 && !SDL_SetAudioDeviceGain(dev, 0.0f)) {
         fprintf(stderr, "[XA2] RECOMP_MUTE: could not mute the device (%s); no audio output\n",
                 SDL_GetError());
-        xa2_shutdown();
-        return 0;
+        SDL_CloseAudioDevice(dev);
+        return NULL;
     }
-    g_sdl_stream = SDL_CreateAudioStream(&spec, NULL);
-    if (!g_sdl_stream || !SDL_BindAudioStream(g_sdl_device, g_sdl_stream)) {
-        fprintf(stderr, "[XA2] SDL audio stream failed: %s\n", SDL_GetError());
-        g_xa2_initialized = 0;
-        xa2_shutdown();
-        return 0;
+    stream = SDL_CreateAudioStream(&spec, NULL);
+    if (!stream || !SDL_BindAudioStream(dev, stream)) {
+        fprintf(stderr, "[XA2] SDL audio stream failed: %s; no audio output\n", SDL_GetError());
+        if (stream) SDL_DestroyAudioStream(stream);
+        SDL_CloseAudioDevice(dev);
+        return NULL;
     }
-    g_xa2_initialized = 1;
-    g_xa2_frames_written = 0;
+    pthread_mutex_lock(&g_xa2_lock);
+    if (g_xa2_closed) {                        /* shut down while this was opening */
+        pthread_mutex_unlock(&g_xa2_lock);
+        SDL_DestroyAudioStream(stream);
+        SDL_CloseAudioDevice(dev);
+        return NULL;
+    }
+    g_sdl_device = dev;
+    __atomic_store_n(&g_sdl_stream, stream, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_xa2_lock);
     fprintf(stderr, "[XA2] SDL3 %s audio initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
             SDL_GetCurrentAudioDriver(), XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
-    return 1;
+    return NULL;
+}
+
+int xa2_init(void)
+{
+    pthread_t thread;
+    pthread_attr_t attr;
+    int ok;
+
+    pthread_mutex_lock(&g_xa2_lock);
+    if (g_xa2_initialized) {
+        pthread_mutex_unlock(&g_xa2_lock);
+        return 1;
+    }
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    ok = pthread_create(&thread, &attr, open_thread, NULL) == 0;
+    pthread_attr_destroy(&attr);
+    if (ok) {
+        g_xa2_initialized = 1;
+        g_xa2_closed = 0;
+        g_xa2_frames_written = 0;
+    } else {
+        fprintf(stderr, "[XA2] could not start the audio thread; no audio output\n");
+    }
+    pthread_mutex_unlock(&g_xa2_lock);
+    return ok;
 }
 
 void xa2_shutdown(void)
 {
-    if (g_sdl_stream) SDL_DestroyAudioStream(g_sdl_stream);
-    g_sdl_stream = NULL;
+    SDL_AudioStream *stream;
+
+    pthread_mutex_lock(&g_xa2_lock);
+    stream = __atomic_exchange_n(&g_sdl_stream, NULL, __ATOMIC_ACQ_REL);
+    if (stream) SDL_DestroyAudioStream(stream);
     if (g_sdl_device) SDL_CloseAudioDevice(g_sdl_device);
     g_sdl_device = 0;
     if (g_xa2_initialized)
         fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
     g_xa2_initialized = 0;
+    g_xa2_closed = 1;
+    pthread_mutex_unlock(&g_xa2_lock);
 }
 
 int xa2_is_active(void)
@@ -250,17 +298,26 @@ int xa2_is_active(void)
 
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
-    int copy_samples;
+    int copy_samples, ok = 0;
+    SDL_AudioStream *stream;
 
-    if (!g_xa2_initialized || !g_sdl_stream) return 0;
-    /* What the device has not yet pulled counts as buffers in flight. */
-    if (SDL_GetAudioStreamQueued(g_sdl_stream) >= XA2_NUM_BUFS * XA2_BUF_BYTES) return 0;
-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
-    if (!SDL_PutAudioStreamData(g_sdl_stream, samples,
-                                copy_samples * XA2_CHANNELS * (int)sizeof(int16_t)))
-        return 0;
-    g_xa2_frames_written++;
-    return 1;
+    /* Under the lock, so xa2_shutdown cannot destroy the stream while it is
+     * being written (one uncontended lock per 1024-sample buffer). */
+    pthread_mutex_lock(&g_xa2_lock);
+    stream = g_sdl_stream;
+    /* Not open (yet), or what the device has not yet pulled is three
+     * buffers in flight already. */
+    if (g_xa2_initialized && stream &&
+        SDL_GetAudioStreamQueued(stream) < XA2_NUM_BUFS * XA2_BUF_BYTES) {
+        copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
+        if (SDL_PutAudioStreamData(stream, samples,
+                                   copy_samples * XA2_CHANNELS * (int)sizeof(int16_t))) {
+            g_xa2_frames_written++;
+            ok = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_xa2_lock);
+    return ok;
 }
 
 int xa2_get_buffer_size(void)

@@ -98,10 +98,89 @@ static void retire_played(voice *v)
     }
 }
 
+/* Opens the device, on a host thread of its own (open_device_thread).
+ *
+ * Not on the caller's: the first submission comes from a guest thread inside
+ * an HLE call, which holds the guest lock, and CoreAudio can take seconds to
+ * open a device (15 s, then failure, has been seen) -- every other guest
+ * thread and the vblank ISR would wait that long. Until the device is up,
+ * submissions are refused (a stream offers them again; audio_output.h) and
+ * there is no play position, so the streams run on their own clock, exactly
+ * as before the first voice exists. */
+static float g_open_gain;
+
+static void *open_device_thread(void *arg)
+{
+    SDL_AudioDeviceID dev;
+    float gain = g_open_gain;
+    const char *mute = getenv("RECOMP_MUTE");
+    int muted = mute && *mute && strcmp(mute, "0") != 0;
+
+    (void)arg;
+    /* SDL's audio brings up its event subsystem, which would otherwise turn
+     * SIGINT/SIGTERM into a quit event nobody reads (src/host/host_sdl.c). */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr, "[audio-output] disabled operation=SDL_InitSubSystem error=%s\n",
+                SDL_GetError());
+        return NULL;
+    }
+    dev = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
+    if (!dev) {
+        fprintf(stderr, "[audio-output] disabled operation=SDL_OpenAudioDevice error=%s\n",
+                SDL_GetError());
+        return NULL;
+    }
+    /* RECOMP_MUTE: silent, but everything else as usual -- the device runs
+     * and pulls the voices at its own rate, so their play positions are the
+     * ones an audible run would see (see the XAudio2 file). The gain is set
+     * before the device is published, so nothing is ever bound to it unmuted,
+     * and a device that cannot be muted is not used at all. */
+    if (muted) {
+        gain = 0.0f;
+        fprintf(stderr, "[audio-output] RECOMP_MUTE: playing silently\n");
+    }
+    if (!SDL_SetAudioDeviceGain(dev, gain)) {
+        fprintf(stderr, "[audio-output] disabled operation=SetAudioDeviceGain error=%s\n",
+                SDL_GetError());
+        SDL_CloseAudioDevice(dev);
+        return NULL;
+    }
+    {
+        SDL_AudioSpec spec;
+        int frames = 0;
+
+        SDL_zero(spec);
+        SDL_GetAudioDeviceFormat(dev, &spec, &frames);
+        fprintf(stderr, "[audio-output] initialized backend=sdl3_%s master_gain=%.6f "
+                "device=%d Hz %d ch, %d-frame buffer\n", SDL_GetCurrentAudioDriver(),
+                (double)gain, spec.freq, spec.channels, frames);
+    }
+    {
+        /* RECOMP_AUDIO_OPEN_DELAY_MS: publish the device that much later, so
+         * a test can watch streams cross from their own clock to the
+         * device's, as they do when a slow CoreAudio opens mid-run. */
+        const char *delay = getenv("RECOMP_AUDIO_OPEN_DELAY_MS");
+        if (delay && *delay && atoi(delay) > 0)
+            SDL_Delay((Uint32)atoi(delay));
+    }
+    pthread_mutex_lock(&g_lock);
+    if (g_summary_printed) {                 /* shut down while this was opening */
+        pthread_mutex_unlock(&g_lock);
+        SDL_CloseAudioDevice(dev);
+        return NULL;
+    }
+    __atomic_store_n(&g_device, dev, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
 void recomp_audio_output_initialize(void)
 {
     double gain = 1.0;
-    const char *setting, *mute;
+    const char *setting;
+    pthread_t thread;
+    pthread_attr_t attr;
 
     pthread_mutex_lock(&g_lock);
     if (g_attempted) {
@@ -125,48 +204,12 @@ void recomp_audio_output_initialize(void)
         pthread_mutex_unlock(&g_lock);
         return;
     }
-    /* SDL's audio brings up its event subsystem, which would otherwise turn
-     * SIGINT/SIGTERM into a quit event nobody reads (src/host/host_sdl.c). */
-    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-        fprintf(stderr, "[audio-output] disabled operation=SDL_InitSubSystem error=%s\n",
-                SDL_GetError());
-        pthread_mutex_unlock(&g_lock);
-        return;
-    }
-    g_device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
-    if (!g_device) {
-        fprintf(stderr, "[audio-output] disabled operation=SDL_OpenAudioDevice error=%s\n",
-                SDL_GetError());
-        pthread_mutex_unlock(&g_lock);
-        return;
-    }
-    /* RECOMP_MUTE: silent, but everything else as usual -- the device runs
-     * and pulls the voices at its own rate, so their play positions are the
-     * ones an audible run would see (see the XAudio2 file). */
-    mute = getenv("RECOMP_MUTE");
-    if (mute && *mute && strcmp(mute, "0") != 0) {
-        gain = 0.0;
-        fprintf(stderr, "[audio-output] RECOMP_MUTE: playing silently\n");
-    }
-    if (!SDL_SetAudioDeviceGain(g_device, (float)gain)) {
-        fprintf(stderr, "[audio-output] disabled operation=SetAudioDeviceGain error=%s\n",
-                SDL_GetError());
-        SDL_CloseAudioDevice(g_device);
-        g_device = 0;
-        pthread_mutex_unlock(&g_lock);
-        return;
-    }
-    {
-        SDL_AudioSpec spec;
-        int frames = 0;
-
-        SDL_zero(spec);
-        SDL_GetAudioDeviceFormat(g_device, &spec, &frames);
-        fprintf(stderr, "[audio-output] initialized backend=sdl3_%s master_gain=%.6f "
-                "device=%d Hz %d ch, %d-frame buffer\n", SDL_GetCurrentAudioDriver(),
-                gain, spec.freq, spec.channels, frames);
-    }
+    g_open_gain = (float)gain;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, open_device_thread, NULL) != 0)
+        fprintf(stderr, "[audio-output] disabled operation=pthread_create\n");
+    pthread_attr_destroy(&attr);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -234,9 +277,9 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     const uint8_t silence = bits_per_sample == 8 ? 0x80 : 0;
 
     recomp_audio_output_initialize();
-    /* Read outside the lock: g_device is written once, under it, inside
-     * the initialize just above, before any submission can see it. */
-    if (!g_device || bytes == 0)
+    /* Read outside the lock: g_device is published once, by the opening
+     * thread, with release order; 0 until then (refused, offered again). */
+    if (!__atomic_load_n(&g_device, __ATOMIC_ACQUIRE) || bytes == 0)
         return 0;
     pthread_mutex_lock(&g_lock);
     if (slot >= VOICE_COUNT || !pcm || bytes > MAX_BUFFER ||
