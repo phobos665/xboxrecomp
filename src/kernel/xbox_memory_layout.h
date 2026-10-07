@@ -241,9 +241,18 @@ void xbox_GuestLockEnter(void);
 void xbox_GuestLockLeave(void);
 int  xbox_GuestLockDrop(void);
 void xbox_GuestLockRestore(int held);
+/* The same around a kernel bridge call, which knows whether the call can
+ * block. One that cannot (NtResumeThread, KeSetBasePriorityThread, ...) is
+ * not a place another guest thread gets in: on the console a call like that
+ * runs to completion without a reschedule, and titles build locks on it. Host
+ * threads (interrupts) and the caller's own callbacks still take the lock
+ * during the call. */
+int  xbox_GuestLockDropForKernel(int may_block, uint32_t ordinal);
+void xbox_GuestLockRestoreForKernel(int held);
 /* Sleep ms from guest context (a title override's wait loop) without holding
- * the guest lock: Drop, leave lifted code, Sleep, Restore, enter -- the same
- * blocking point a kernel bridge is. Plain Sleep(ms) where the lock is off. */
+ * the guest lock: Drop, leave lifted code, Sleep, Restore, enter -- a
+ * blocking point, as a blocking kernel call is, so the highest-priority
+ * waiter takes over. Plain Sleep(ms) where the lock is off. */
 void xbox_GuestSleep(DWORD ms);
 /* For a host thread about to run guest code (an ISR, a DPC, a device
  * callback): the lock, waiting at most ms. 1 if taken (then

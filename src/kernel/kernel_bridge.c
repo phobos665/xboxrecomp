@@ -10380,6 +10380,56 @@ static void kcaller_report(void)
                 g_kcaller_ordinal, (unsigned long long)g_kcaller_other);
 }
 
+/* The kernel calls that can block a guest thread: waits, delays, a contended
+ * critical section, disc and file I/O, a thread suspending or ending itself.
+ * Around these the guest lock goes to whoever is waiting, as the console's
+ * scheduler would run another thread. Every other call runs to completion
+ * without a reschedule there, so it is not a handoff point here either
+ * (xbox_GuestLockDropForKernel). A call missing from this list costs at most
+ * RECOMP_GUEST_RESERVE_US (50 ms) of other guest threads' time when it does
+ * block, and the log names it. */
+static int bridge_may_block(uint32_t ordinal)
+{
+    switch (ordinal) {
+    case 12:  /* ExAcquireReadWriteLockExclusive */
+    case 13:  /* ExAcquireReadWriteLockShared */
+    case 49:  /* HalReturnToFirmware */
+    case 66:  /* IoCreateFile */
+    case 84:  /* IoSynchronousDeviceIoControlRequest */
+    case 95:  /* KeBugCheck */
+    case 99:  /* KeDelayExecutionThread */
+    case 158: /* KeWaitForMultipleObjects */
+    case 159: /* KeWaitForSingleObject */
+    case 190: /* NtCreateFile */
+    case 196: /* NtDeviceIoControlFile */
+    case 198: /* NtFlushBuffersFile */
+    case 200: /* NtFsControlFile */
+    case 202: /* NtOpenFile */
+    case 219: /* NtReadFile */
+    case 220: /* NtReadFileScatter */
+    case 223: /* NtRemoveIoCompletion */
+    case 230: /* NtSignalAndWaitForSingleObjectEx */
+    /* Not 152/231 (Ke/NtSuspendThread): suspending another thread does not
+     * block, and BLiNX's ADX unlock suspends its spinner and then restores
+     * its own priority from a shared slot -- a handoff between the two let
+     * the main thread overwrite the slot. A thread suspending itself gives
+     * the reservation up there (xbox_GuestThreadSuspend). */
+    case 233: /* NtWaitForSingleObject */
+    case 234: /* NtWaitForSingleObjectEx */
+    case 235: /* NtWaitForMultipleObjectsEx */
+    case 236: /* NtWriteFile */
+    case 237: /* NtWriteFileGather */
+    case 238: /* NtYieldExecution */
+    case 258: /* PsTerminateSystemThread */
+    case 277: /* RtlEnterCriticalSection */
+    case 278: /* RtlEnterCriticalSectionAndRegion */
+    case 327: /* XeLoadSection */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
@@ -10520,7 +10570,7 @@ static void kernel_thunk_dispatch(void)
          * to enumerate which ordinals block. It also costs one uncontended
          * acquire per kernel call, which is the price of not having to be
          * right about that list. */
-        int _guest_held = xbox_GuestLockDrop();
+        int _guest_held = xbox_GuestLockDropForKernel(bridge_may_block(ordinal), ordinal);
         xbox_GuestLiftedLeave();
         if (xbox_FpsWaitProfileOn()) {
             /* RECOMP_WAIT_PROFILE: how long this call held the thread. */
@@ -10538,7 +10588,7 @@ static void kernel_thunk_dispatch(void)
          * the lock on -- which is meant to make overlap impossible -- took
          * the reported overlaps from 1,625 to 8,265,550. The meter has to
          * read zero under the lock or it is not measuring what it claims. */
-        xbox_GuestLockRestore(_guest_held);
+        xbox_GuestLockRestoreForKernel(_guest_held);
         xbox_GuestLiftedEnter();
         if (g_esp != _esp_before) {
             static uint8_t said[XBOX_KERNEL_THUNK_TABLE_SIZE];

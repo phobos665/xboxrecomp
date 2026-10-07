@@ -256,7 +256,12 @@ touching it:
   loop header so a spinning thread hands it over (planned change #4). Measured cost: at most
   2% of TS2's main-thread CPU. A title's own priority-based lock (BLiNX's CRI middleware raises
   itself to 16 and resumes a priority-2 spinner) assumes a strict-priority uniprocessor, so
-  the hand-over has to respect priority. Windows runs guest threads truly in parallel.
+  the lock is scheduled as the console schedules: the highest-priority runnable thread owns
+  it, and preemption happens only at a back edge or a blocking call, **never at the return of
+  a non-blocking kernel call** (`bridge_may_block` lists the ones that block). The rules, the
+  seven ways BLiNX's lock broke before them, and the switches are in
+  `docs/technical/memory-layout.md` ("Guest threads"). `KeQueryBasePriorityThread` answered 0
+  for every thread on every host until Oct 2026. Windows runs guest threads truly in parallel.
 - **Lifter semantics that differ on arm64,** now emitted explicitly on every host: locked
   read-modify-write and `xchg` are real atomics (they used to do nothing anywhere),
   `cvtss2si`/`cvtsd2si` round and give 0x80000000 on overflow, division by zero raises the
