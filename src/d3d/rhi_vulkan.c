@@ -511,7 +511,11 @@ static void wait_serial(uint64_t s)
     wi.semaphoreCount = 1;
     wi.pSemaphores = &V.timeline;
     wi.pValues = &s;
-    vkWaitSemaphores(V.dev, &wi, UINT64_MAX);
+    {
+        int h = rhi_wait_begin();
+        vkWaitSemaphores(V.dev, &wi, UINT64_MAX);
+        rhi_wait_end(h);
+    }
     update_completed();
 }
 
@@ -861,7 +865,11 @@ static int recreate_swapchain(void)
         flush_wait();
         SC.acquired = 0;
     }
-    vkDeviceWaitIdle(V.dev);
+    {
+        int h = rhi_wait_begin();
+        vkDeviceWaitIdle(V.dev);
+        rhi_wait_end(h);
+    }
     update_completed();
     return create_swapchain(SC.extent.width, SC.extent.height);
 }
@@ -881,8 +889,14 @@ static int acquire(void)
         /* The frame's acquire semaphore is free: its last wait was in a
          * submission begin_recording has already waited for. */
         cmd();
-        r = vkAcquireNextImageKHR(V.dev, SC.sc, UINT64_MAX, V.frames[V.fi].acquire,
-                                  VK_NULL_HANDLE, &SC.index);
+        {
+            /* Can sleep until the window system hands an image back: on
+             * macOS, at the display's rate even in IMMEDIATE mode. */
+            int h = rhi_wait_begin();
+            r = vkAcquireNextImageKHR(V.dev, SC.sc, UINT64_MAX, V.frames[V.fi].acquire,
+                                      VK_NULL_HANDLE, &SC.index);
+            rhi_wait_end(h);
+        }
         if (r == VK_ERROR_OUT_OF_DATE_KHR) {
             SC.stale = 1;
             continue;
@@ -1863,7 +1877,11 @@ static int32_t v_present(uint32_t interval)
     pi.swapchainCount = 1;
     pi.pSwapchains = &SC.sc;
     pi.pImageIndices = &idx;
-    r = vkQueuePresentKHR(V.queue, &pi);
+    {
+        int h = rhi_wait_begin();
+        r = vkQueuePresentKHR(V.queue, &pi);
+        rhi_wait_end(h);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         SC.stale = 1;
     SC.acquired = 0;

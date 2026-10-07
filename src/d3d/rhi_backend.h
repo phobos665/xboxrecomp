@@ -89,4 +89,8 @@ extern const RhiBackend rhi_vulkan_backend;     /* rhi_vulkan.c, RHI_HAVE_VULKAN
 /* The backend in use (rhi.c). */
 extern const RhiBackend *g_rhi;
 
+/* rhi_set_wait_hooks, for a backend to put around each wait (rhi.c). */
+int  rhi_wait_begin(void);
+void rhi_wait_end(int h);
+
 #endif /* XBOXRECOMP_RHI_BACKEND_H */

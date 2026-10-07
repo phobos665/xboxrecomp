@@ -525,7 +525,14 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    fn();
+    {
+        /* Guest code on a host thread: under the guest lock, bounded as an
+         * interrupt is (xbox_GuestLockEnterTimed). */
+        int held = xbox_GuestLockEnterTimed(100);
+        fn();
+        if (held)
+            xbox_GuestLockLeave();
+    }
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);

@@ -13,7 +13,9 @@
  * Pure parsing; no device is created.
  */
 #include "d3d8_internal.h"
+#if defined(_WIN32)
 #include <d3d11.h>   /* this test drives D3D11 itself */
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -21,9 +23,11 @@
  * never touches; parsing needs no device. Same stubs as test_a8.c. */
 static DWORD states[512], stages[4][64];
 static const D3DMATRIX identity = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+#if defined(_WIN32)
 ID3D11Device *d3d8_GetD3D11Device(void) { return NULL; }
 ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return NULL; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return NULL; }
+#endif
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
 const DWORD *d3d8_GetPalette(DWORD stage) { (void)stage; return states; }
 const DWORD *d3d8_GetRenderStates(void) { return states; }

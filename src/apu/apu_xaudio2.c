@@ -12,8 +12,7 @@
 #include <stdlib.h>   /* getenv: RECOMP_MUTE */
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
- * stubbed to report inactive; real audio output via SDL2 comes later. */
+/* XAudio2 on Windows; SDL3 audio with the same limits everywhere else. */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -169,12 +168,104 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32 -- SDL3 output, the same contract */
 
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
+/* The monitor mix goes to an SDL3 audio stream on the default device: 48 kHz
+ * stereo 16-bit, at most XA2_NUM_BUFS submissions of XA2_BUF_SAMPLES waiting,
+ * the XAudio2 voice's limits above, so the device paces the APU frame the
+ * same way. RECOMP_MUTE=1 plays at device gain 0 with the device still
+ * pulling at its own rate. */
+#include <SDL3/SDL.h>
+
+#define XA2_SAMPLE_RATE   48000
+#define XA2_CHANNELS      2
+#define XA2_BUF_SAMPLES   1024
+#define XA2_NUM_BUFS      3
+#define XA2_BUF_BYTES     (XA2_BUF_SAMPLES * XA2_CHANNELS * (int)sizeof(int16_t))
+
+static SDL_AudioDeviceID g_sdl_device;
+static SDL_AudioStream  *g_sdl_stream;
+static int               g_xa2_initialized;
+static int               g_xa2_frames_written;
+
+int xa2_init(void)
+{
+    SDL_AudioSpec spec;
+    const char *mute;
+
+    if (g_xa2_initialized) return 1;
+    /* SDL's audio brings up its event subsystem; keep SIGINT/SIGTERM fatal. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr, "[XA2] SDL audio failed to start: %s\n", SDL_GetError());
+        return 0;
+    }
+    spec.format = SDL_AUDIO_S16LE;
+    spec.channels = XA2_CHANNELS;
+    spec.freq = XA2_SAMPLE_RATE;
+    g_sdl_device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
+    if (!g_sdl_device) {
+        fprintf(stderr, "[XA2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    /* Muted before anything is bound, and no output at all if muting fails:
+     * a run that asked for silence must never be heard. */
+    mute = getenv("RECOMP_MUTE");
+    if (mute && *mute && strcmp(mute, "0") != 0 &&
+        !SDL_SetAudioDeviceGain(g_sdl_device, 0.0f)) {
+        fprintf(stderr, "[XA2] RECOMP_MUTE: could not mute the device (%s); no audio output\n",
+                SDL_GetError());
+        xa2_shutdown();
+        return 0;
+    }
+    g_sdl_stream = SDL_CreateAudioStream(&spec, NULL);
+    if (!g_sdl_stream || !SDL_BindAudioStream(g_sdl_device, g_sdl_stream)) {
+        fprintf(stderr, "[XA2] SDL audio stream failed: %s\n", SDL_GetError());
+        g_xa2_initialized = 0;
+        xa2_shutdown();
+        return 0;
+    }
+    g_xa2_initialized = 1;
+    g_xa2_frames_written = 0;
+    fprintf(stderr, "[XA2] SDL3 %s audio initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
+            SDL_GetCurrentAudioDriver(), XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+    return 1;
+}
+
+void xa2_shutdown(void)
+{
+    if (g_sdl_stream) SDL_DestroyAudioStream(g_sdl_stream);
+    g_sdl_stream = NULL;
+    if (g_sdl_device) SDL_CloseAudioDevice(g_sdl_device);
+    g_sdl_device = 0;
+    if (g_xa2_initialized)
+        fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
+    g_xa2_initialized = 0;
+}
+
+int xa2_is_active(void)
+{
+    return g_xa2_initialized;
+}
+
+int xa2_submit_samples(const int16_t *samples, int num_samples)
+{
+    int copy_samples;
+
+    if (!g_xa2_initialized || !g_sdl_stream) return 0;
+    /* What the device has not yet pulled counts as buffers in flight. */
+    if (SDL_GetAudioStreamQueued(g_sdl_stream) >= XA2_NUM_BUFS * XA2_BUF_BYTES) return 0;
+    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
+    if (!SDL_PutAudioStreamData(g_sdl_stream, samples,
+                                copy_samples * XA2_CHANNELS * (int)sizeof(int16_t)))
+        return 0;
+    g_xa2_frames_written++;
+    return 1;
+}
+
+int xa2_get_buffer_size(void)
+{
+    return XA2_BUF_SAMPLES;
+}
 
 #endif /* _WIN32 */

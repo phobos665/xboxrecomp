@@ -230,14 +230,26 @@ int xbox_EnvSwitch(const char *name, int default_on);
  * released and Restore takes it back, because a bridge that runs guest code
  * can re-enter.
  *
- * RECOMP_GUEST_LOCK=1 turns it on. Off by default: this is an experiment,
- * and a title that works today must not change because of one.
+ * RECOMP_GUEST_LOCK=1 turns it on. Off by default on x86 hosts: there it is
+ * an experiment, and a title that works today must not change because of
+ * one. On by default on ARM hosts (RECOMP_GUEST_LOCK=0 turns it off), whose
+ * weak memory ordering breaks the barrier-free guest code that x86 lets
+ * through.
  */
 void xbox_GuestLockInit(void);
 void xbox_GuestLockEnter(void);
 void xbox_GuestLockLeave(void);
 int  xbox_GuestLockDrop(void);
 void xbox_GuestLockRestore(int held);
+/* For a host thread about to run guest code (an ISR, a DPC, a device
+ * callback): the lock, waiting at most ms. 1 if taken (then
+ * xbox_GuestLockLeave), 0 if the lock is off or the wait ran out -- the guest
+ * code runs either way, as an interrupt would. */
+int  xbox_GuestLockEnterTimed(DWORD ms);
+/* The same for a call into guest code made from inside the runtime, on
+ * whatever thread: a guest thread (one that took xbox_GuestLockEnter) waits
+ * unbounded, as after a kernel call; a host thread waits at most host_ms. */
+int  xbox_GuestLockEnterForCall(DWORD host_ms);
 int  xbox_GuestLockOn(void);
 int  xbox_GuestConcurrencyOn(void);
 void xbox_GuestLiftedEnter(void);

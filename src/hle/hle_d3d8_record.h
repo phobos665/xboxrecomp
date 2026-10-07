@@ -40,7 +40,6 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
 
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
@@ -228,6 +227,5 @@ void    host_vsh_set_screenspace(const float scale[4], const float offset[4]);
 void    host_vsh_set_vertex_data(int reg, const float value[4]);
 void    host_combiners_set_pixel_shader(DWORD token);
 
-#endif /* _WIN32 */
 
 #endif /* XBOXRECOMP_HLE_D3D8_RECORD_H */

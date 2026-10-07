@@ -55,8 +55,16 @@ static lib_t lib_open(const char *dir, const char *name)
 static void *lib_sym(lib_t l, const char *s) { return dlsym(l, s); }
 #define STR2(x) #x
 #define STR(x) STR2(x)
+#if defined(__APPLE__)
+/* Homebrew's, or a bundle's, libavcodec.62.dylib: the major version is the
+ * ABI, so it has to be the one the headers were. */
+#define AVCODEC_NAME    "libavcodec." STR(LIBAVCODEC_VERSION_MAJOR) ".dylib"
+#define AVUTIL_NAME     "libavutil." STR(LIBAVUTIL_VERSION_MAJOR) ".dylib"
+#else
 #define AVCODEC_NAME    "libavcodec.so." STR(LIBAVCODEC_VERSION_MAJOR)
 #define AVUTIL_NAME     "libavutil.so." STR(LIBAVUTIL_VERSION_MAJOR)
+#endif
+/* A dylib/so records its own dependencies, so swresample needs no help. */
 #define SWRESAMPLE_NAME NULL
 #endif
 
@@ -78,7 +86,7 @@ static struct {
 /* Load once; 1 if FFmpeg is usable. */
 static int ff_load(void)
 {
-    const char *dirs[3];
+    const char *dirs[4];
     lib_t codec = NULL, util = NULL;
     int i;
 
@@ -92,7 +100,13 @@ static int ff_load(void)
 #else
     dirs[2] = NULL;
 #endif
-    for (i = 0; i < 3 && !codec; i++) {
+#if defined(__APPLE__)
+    /* dlopen does not look beside the executable by itself on macOS. */
+    dirs[3] = "@executable_path";
+#else
+    dirs[3] = NULL;
+#endif
+    for (i = 0; i < 4 && !codec; i++) {
         if (i > 0 && !dirs[i])
             continue;
         util = lib_open(dirs[i], AVUTIL_NAME);
