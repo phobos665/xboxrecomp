@@ -65,6 +65,31 @@ int host_file_exists(const char *path)
     return stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
 }
 
+int host_app_bundle_dir(char *buf, size_t bytes)
+{
+#ifdef __APPLE__
+    char exe[PATH_MAX];
+    size_t n;
+    static const char tail[] = ".app/Contents/MacOS";
+
+    if (!host_exe_path(exe, sizeof exe))
+        return 0;
+    host_path_dirname(exe);                  /* <...>/X.app/Contents/MacOS */
+    n = strlen(exe);
+    if (n < sizeof tail || strcmp(exe + n - (sizeof tail - 1), tail) != 0)
+        return 0;
+    exe[n - (sizeof tail - 1) + 4] = '\0';   /* keep "<...>/X.app" */
+    if (strlen(exe) >= bytes)
+        return 0;
+    strcpy(buf, exe);
+    return 1;
+#else
+    (void)buf;
+    (void)bytes;
+    return 0;
+#endif
+}
+
 /* A descriptor something will read: a terminal, a file, a pipe. Not one
  * that is closed or is /dev/null, which is what a Finder launch gets. */
 static int fd_is_read(int fd)
@@ -88,6 +113,21 @@ void host_setup_output(char *log_path, size_t bytes)
     if (!host_exe_path(exe, sizeof exe))
         return;
     snprintf(log_path, bytes, "%s.log", exe);
+    {
+        /* Inside a .app: never into the bundle (it is signed, and may be
+         * read-only), but where macOS keeps an application's logs. */
+        char app[PATH_MAX], dir[PATH_MAX];
+        const char *home = getenv("HOME");
+        const char *name = strrchr(exe, '/');
+
+        if (host_app_bundle_dir(app, sizeof app) && home && *home && name) {
+            snprintf(dir, sizeof dir, "%s/Library/Logs", home);
+            mkdir(dir, 0755);
+            snprintf(dir, sizeof dir, "%s/Library/Logs/xboxrecomp", home);
+            mkdir(dir, 0755);
+            snprintf(log_path, bytes, "%s%s.log", dir, name);
+        }
+    }
     if (!freopen(log_path, "w", stderr)) {   /* read-only folder */
         log_path[0] = '\0';
         return;

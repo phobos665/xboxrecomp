@@ -835,6 +835,46 @@ static void do_depth_surface(Replay *r, const D3D8CapChunk *c)
     }
 }
 
+/* A screen copy (version 8): the same call the run made, into this
+ * process's texture for the id. */
+static void do_screen_copy(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapScreenCopy *p = c->data;
+    ReplayTexture *slot;
+    IDirect3DTexture8 *tex;
+    HRESULT hr;
+
+    if (c->bytes < sizeof *p || !p->texture_id) {
+        r->malformed++;
+        return;
+    }
+    slot = texture_slot(r, p->texture_id, 0);
+    if (!slot || !slot->tex || slot->is_cube) {
+        r->unmapped++;
+        return;
+    }
+    tex = (IDirect3DTexture8 *)slot->tex;
+    if (p->has_rect) {
+        RECT src;
+        POINT at;
+
+        src.left = p->src_left;
+        src.top = p->src_top;
+        src.right = p->src_right;
+        src.bottom = p->src_bottom;
+        at.x = p->at_x;
+        at.y = p->at_y;
+        hr = xbox_D3D8CopyBackBufferRectToTexture(tex, &src, &at);
+    } else {
+        hr = xbox_D3D8CopyBackBufferToTexture(tex);
+    }
+    if (g_list_draws)
+        fprintf(stderr, "[screen copy after %ld draws] into texture %u%s\n", g_draw_index,
+                p->texture_id, p->has_rect ? " (a rectangle)" : "");
+    if (FAILED(hr))
+        r->failed++;
+}
+
 static void do_set_render_target(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapSetRenderTarget *t = c->data;
@@ -1384,6 +1424,9 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         break;
     case D3D8CAP_PALETTE:
         do_palette(r, c);
+        break;
+    case D3D8CAP_SCREEN_COPY:
+        do_screen_copy(r, c);
         break;
     case D3D8CAP_DEPTH_SURFACE:
         do_depth_surface(r, c);
