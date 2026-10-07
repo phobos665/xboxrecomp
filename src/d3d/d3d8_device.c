@@ -351,11 +351,41 @@ static BOOL two_d_squeeze(float *k_out, float *cx_out)
 /* Put the scene on the back buffer, immediately before presenting it.
  * Nothing to do while unscaled: the scene target is the back buffer, and
  * this is the one call that has to stay free in that case. */
+/* xbox_D3D8SetWindowSize: the drawable's size in pixels, from the window's
+ * owner, where there is no HWND to ask (a CAMetalLayer on Apple). */
+static volatile LONG g_window_w, g_window_h;
+
+void xbox_D3D8SetWindowSize(UINT width, UINT height)
+{
+    InterlockedExchange(&g_window_w, (LONG)width);
+    InterlockedExchange(&g_window_h, (LONG)height);
+}
+
+/* The size the swap chain should be: the window's client area. FALSE when
+ * nothing says (no window, or an owner that has not reported one yet). */
+static BOOL window_size(const D3D8DeviceState *s, UINT *w, UINT *h)
+{
+#if defined(_WIN32)
+    RECT rc;
+
+    if (!s->hwnd || !GetClientRect(s->hwnd, &rc))
+        return FALSE;
+    *w = (UINT)(rc.right - rc.left);
+    *h = (UINT)(rc.bottom - rc.top);
+    return TRUE;
+#else
+    (void)s;
+    *w = (UINT)InterlockedCompareExchange(&g_window_w, 0, 0);
+    *h = (UINT)InterlockedCompareExchange(&g_window_h, 0, 0);
+    return *w && *h;
+#endif
+}
+
 static void present_scene(void)
 {
     D3D8DeviceState *s = &g_device_state;
     D3D8DisplayFit fit;
-    RECT rc;
+    UINT w, h;
 
     if (!rhi_swapchain_view() || !s->rhi_scene_srv)
         return;
@@ -365,9 +395,7 @@ static void present_scene(void)
      * right all the way through still reaches the screen distorted. Keep
      * the buffer the size of the window and the stretch is the identity;
      * the fit below then puts bars around the picture instead. */
-    if (s->hwnd && GetClientRect(s->hwnd, &rc)) {
-        UINT w = (UINT)(rc.right - rc.left), h = (UINT)(rc.bottom - rc.top);
-
+    if (window_size(s, &w, &h)) {
         if (w && h && (w != s->swap_width || h != s->swap_height)) {
             if (rhi_swapchain_resize(w, h) == 0) {
                 s->swap_width = w;

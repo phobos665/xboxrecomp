@@ -300,7 +300,12 @@ enum { RHI_CLEAR_DEPTH = 1, RHI_CLEAR_STENCIL = 2 };
 
 /* The device and its swap chain */
 typedef struct {
-    void    *window;            /* the native window: an HWND on Windows */
+    /* What the swap chain presents to: an HWND on Windows, a CAMetalLayer on
+     * Apple (made by the window's owner on the main thread), or NULL for no
+     * window: Vulkan then presents to a headless surface (frames are drawn
+     * and read back, and shown nowhere), which is what the replay tool and
+     * the tests use. The D3D11 backend needs an HWND. */
+    void    *window;
     uint32_t width, height;     /* the swap chain's size */
     uint32_t buffer_count;
     uint32_t windowed;

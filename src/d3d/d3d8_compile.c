@@ -26,6 +26,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#define HLSL_DIR_SEP "\\"
+#define make_dir(d)         CreateDirectoryA((d), NULL)
+#define add64(p, v)         InterlockedAdd64((p), (v))
+#else
+#include <sys/stat.h>
+#define HLSL_DIR_SEP "/"
+#define make_dir(d)         mkdir((d), 0777)
+#define add64(p, v)         __atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
+#endif
+
 /* FNV-1a over the source, the macros, the entry point and the target: the
  * same text under a different target is a different shader. */
 static uint32_t hlsl_hash(const char *src, size_t len, const RhiMacro *macros,
@@ -79,7 +90,7 @@ static const char *hlsl_dump_dir(void)
         const char *v = getenv("RECOMP_D3D8_HLSL_DIR");
         dir = (v && *v) ? v : NULL;
         if (dir) {
-            CreateDirectoryA(dir, NULL);
+            make_dir(dir);
             fprintf(stderr, "[D3D8] writing every compiled HLSL source to %s\n", dir);
         }
         checked = 1;
@@ -100,7 +111,7 @@ void d3d8_hlsl_note(const char *src, size_t len, const char *name,
     hash = hlsl_hash(src, len, macros, entry, target);
     if (!hlsl_first_sighting(hash))
         return;
-    snprintf(path, sizeof path, "%s\\%s-%s-%s-%08X.hlsl",
+    snprintf(path, sizeof path, "%s" HLSL_DIR_SEP "%s-%s-%s-%08X.hlsl",
              dir, name ? name : "shader", entry, target, hash);
     f = fopen(path, "wb");
     if (!f)
@@ -138,7 +149,7 @@ void d3d8_compile_note(int kind, long long started)
         g_compile_last_report = now.QuadPart;
     }
     InterlockedIncrement(&g_compiles[kind]);
-    InterlockedAdd64(&g_compile_ticks[kind], now.QuadPart - started);
+    add64(&g_compile_ticks[kind], now.QuadPart - started);
     if (now.QuadPart - g_compile_last_report >= 5 * g_compile_qpf) {
         g_compile_last_report = now.QuadPart;
         fprintf(stderr, "[D3D8] runtime shader compiles so far: combiner %ld (%.0f ms), "
