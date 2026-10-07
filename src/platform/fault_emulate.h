@@ -88,6 +88,10 @@ int recomp_fault_passthrough(recomp_fault *f);
 uint64_t recomp_guest_read(void *dev, uint32_t va, int size);
 void     recomp_guest_write(void *dev, uint32_t va, uint64_t val, int size);
 
+/* Per-thread set-up of the thread-locals this uses inside a fault handler
+ * (recomp_fault_thread_init calls it). Nothing on Windows. */
+void recomp_fault_emulate_thread_init(void);
+
 /* The host instruction at the fault, as text, for a report: x86 bytes, or
  * the arm64 word. */
 void recomp_fault_insn_text(const recomp_fault *f, char *buf, size_t n);

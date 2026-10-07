@@ -18,6 +18,7 @@
 
 #include "recomp_fault.h"
 #include "mmio_decode_a64.h"   /* the Linux arm64 ESR record */
+#include "fault_emulate.h"      /* recomp_fault_emulate_thread_init */
 
 #include <pthread.h>
 #include <signal.h>
@@ -157,6 +158,12 @@ static void altstack_key_init(void)
 void recomp_fault_thread_init(void)
 {
     stack_t ss;
+
+    /* First use of the handler's thread-locals happens here, not inside the
+     * handler: on Darwin that first use allocates, and a fault can arrive
+     * while this thread holds the malloc lock. */
+    t_in_handler = 0;
+    recomp_fault_emulate_thread_init();
 
     pthread_once(&g_altstack_once, altstack_key_init);
     if (pthread_getspecific(g_altstack_key))
