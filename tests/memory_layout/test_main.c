@@ -95,7 +95,9 @@ int main(int argc, char **argv)
 {
     int map_mb = argc > 1 ? atoi(argv[1]) : 64;
     uint32_t map = (uint32_t)map_mb * MB;
-    int expect_mirrors = (int)(0x80000000u / map) - 1;
+    /* XBOX_NUM_MIRRORS of them, but none reaching past 0x80000000. */
+    int expect_mirrors = (int)(0x80000000u / map) - 1 < XBOX_NUM_MIRRORS
+                       ? (int)(0x80000000u / map) - 1 : XBOX_NUM_MIRRORS;
     size_t xbe_size;
     uint8_t *xbe;
     int m;
@@ -146,7 +148,7 @@ int main(int argc, char **argv)
     CHECK("contiguous is not a RAM mirror", *G32(0x80070000u) != 0x5EED0001u);
     *G32(0xF0001000u) = 0xA5C30F17u;
     CHECK("tiled aliases contiguous", *G32(0x80001000u) == 0xA5C30F17u);
-    CHECK("tiled is not RAM", *G32(0x00001000u) != 0xA5C30F17u);
+    CHECK("tiled is not RAM", *G32(0x00071000u) != 0xA5C30F17u);  /* not 0x1000: the null trap shares its host page */
     CHECK("fake kernel PE header", *G32(0x8001003Cu) == 0x80u);
 
     /* The device apertures, and the 4 KB trap pages in them. */

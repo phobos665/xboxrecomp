@@ -5,7 +5,7 @@
 # process, so two tests. POSIX (setenv/_exit); no game files.
 
 add_executable(memory_layout_test test_main.c)
-target_link_libraries(memory_layout_test PRIVATE xbox_kernel)
+target_link_libraries(memory_layout_test PRIVATE xboxrecomp)
 
 add_test(NAME memory_layout_64  COMMAND memory_layout_test 64)
 add_test(NAME memory_layout_128 COMMAND memory_layout_test 128)
