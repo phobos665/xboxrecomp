@@ -328,6 +328,8 @@ void xbox_FpsCountVblank(void)
 
 #else  /* !_WIN32 */
 
+#include <stdint.h>
+
 void xbox_FpsCountSwap(void)   {}
 int  xbox_FpsWaitProfileOn(void) { return 0; }
 void xbox_FpsNoteKernel(unsigned ordinal, long long ticks, uint32_t object)

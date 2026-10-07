@@ -67,13 +67,30 @@ if(WIN32)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
 else()
-    add_library(xbox_d3d8 STATIC
-        d3d8_gl.c
-    )
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(EPOXY REQUIRED epoxy)
-    target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
-    target_link_libraries(xbox_d3d8 PUBLIC platform SDL3::SDL3 ${EPOXY_LIBRARIES})
+    # The OpenGL path needs libepoxy, which macOS does not have; a macOS
+    # build leaves it out and xbox_d3d8 is headers only until the Vulkan
+    # RHI builds there (docs/technical/vulkan-backend.md).
+    if(APPLE)
+        set(XBR_D3D8_GL_DEFAULT OFF)
+    else()
+        set(XBR_D3D8_GL_DEFAULT ON)
+    endif()
+    option(XBOXRECOMP_D3D8_GL "Build the OpenGL D3D8 backend (d3d8_gl.c, libepoxy)"
+           ${XBR_D3D8_GL_DEFAULT})
+    if(XBOXRECOMP_D3D8_GL)
+        add_library(xbox_d3d8 STATIC
+            d3d8_gl.c
+        )
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(EPOXY REQUIRED epoxy)
+        target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
+        target_link_libraries(xbox_d3d8 PUBLIC platform SDL3::SDL3 ${EPOXY_LIBRARIES})
+    else()
+        add_library(xbox_d3d8 INTERFACE)
+        target_include_directories(xbox_d3d8 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(xbox_d3d8 INTERFACE platform xbox_config)
+        return()
+    endif()
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

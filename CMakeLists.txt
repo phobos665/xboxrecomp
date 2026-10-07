@@ -131,6 +131,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     enable_testing()
     add_subdirectory(tests/nv2a_vsh)
     add_subdirectory(tests/d3d8_capture)        # portable: the capture container
+    add_subdirectory(tests/host_timer)          # portable: the sub-millisecond timer
     if(NOT WIN32)
         add_subdirectory(tests/host_window)     # needs a display; run by hand
     endif()
