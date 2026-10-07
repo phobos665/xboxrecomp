@@ -34,13 +34,13 @@ add_library(xbox_hle STATIC
     input_host.c
 )
 
-# Host audio. XAudio2 exists only on Windows. Elsewhere audio_output_none.c
-# behaves as the XAudio2 path does when it opens no device
-# (RECOMP_AUDIO_GAIN=0) until an SDL3 output replaces it.
+# Host audio: XAudio2 on Windows, SDL3 elsewhere, with the same switches
+# (RECOMP_MUTE, RECOMP_AUDIO_GAIN) and the same play-position clock.
 if(WIN32)
     target_sources(xbox_hle PRIVATE audio_output_xaudio2.cpp)
 else()
-    target_sources(xbox_hle PRIVATE audio_output_none.c)
+    target_sources(xbox_hle PRIVATE audio_output_sdl.c)
+    target_link_libraries(xbox_hle PRIVATE SDL3::SDL3)
 endif()
 target_include_directories(xbox_hle PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_hle PUBLIC xbox_config)
