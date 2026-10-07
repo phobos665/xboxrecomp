@@ -835,6 +835,46 @@ static void do_depth_surface(Replay *r, const D3D8CapChunk *c)
     }
 }
 
+/* The scene as the frame began (version 9), written back through the back
+ * buffer surface. A scene of another size -- the capture was taken at a
+ * different RECOMP_RES_SCALE -- is left alone, and said once. */
+static void do_scene(Replay *r, const D3D8CapChunk *c)
+{
+    const D3D8CapScene *p = c->data;
+    const uint8_t *rows;
+    IDirect3DSurface8 *surf = NULL;
+    D3DSURFACE_DESC sd;
+    D3DLOCKED_RECT lr;
+    uint32_t y;
+
+    if (c->bytes < sizeof *p || !p->width || !p->height || p->pitch < p->width * 4u ||
+        !(rows = d3d8cap_tail(c, sizeof *p, (size_t)p->pitch * p->height))) {
+        r->malformed++;
+        return;
+    }
+    if (FAILED(r->dev->lpVtbl->GetBackBuffer(r->dev, 0, 0, &surf)) || !surf) {
+        r->failed++;
+        return;
+    }
+    if (FAILED(surf->lpVtbl->GetDesc(surf, &sd)) || sd.Width != p->width ||
+        sd.Height != p->height) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[replay] the capture's scene is %ux%u and this one %ux%u "
+                    "(another RECOMP_RES_SCALE?); the frame starts from this one's\n",
+                    p->width, p->height, sd.Width, sd.Height);
+    } else if (SUCCEEDED(surf->lpVtbl->LockRect(surf, &lr, NULL, 0))) {
+        for (y = 0; y < p->height; y++)
+            memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch,
+                   rows + (size_t)y * p->pitch, (size_t)p->width * 4u);
+        if (FAILED(surf->lpVtbl->UnlockRect(surf)))
+            r->failed++;
+    } else {
+        r->failed++;
+    }
+    surf->lpVtbl->Release(surf);
+}
+
 /* A screen copy (version 8): the same call the run made, into this
  * process's texture for the id. */
 static void do_screen_copy(Replay *r, const D3D8CapChunk *c)
@@ -1427,6 +1467,9 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         break;
     case D3D8CAP_SCREEN_COPY:
         do_screen_copy(r, c);
+        break;
+    case D3D8CAP_SCENE:
+        do_scene(r, c);
         break;
     case D3D8CAP_DEPTH_SURFACE:
         do_depth_surface(r, c);

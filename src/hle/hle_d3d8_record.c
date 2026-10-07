@@ -484,6 +484,33 @@ static void rec_set_render_target(IDirect3DBaseTexture8 *texture, UINT level,
 /* Everything the frame draws with that was set before it began, read from the
  * host. The order is the one d3d8_capture.h documents: SetTexture rewrites
  * COLOROP, so the stage states come after the textures. */
+/* The scene's pixels as the frame begins (D3D8CAP_SCENE), read the way the
+ * frame dumps read them -- the one read of the host's state src/hle makes --
+ * so it changes nothing. */
+static void rec_scene(IDirect3DDevice8 *dev)
+{
+    IDirect3DSurface8 *surf = NULL;
+    D3DSURFACE_DESC sd;
+    D3DLOCKED_RECT lr;
+    D3D8CapScene c;
+
+    if (FAILED(dev->lpVtbl->GetBackBuffer(dev, 0, 0, &surf)) || !surf)
+        return;
+    if (SUCCEEDED(surf->lpVtbl->GetDesc(surf, &sd)) && sd.Width && sd.Height &&
+        (uint64_t)sd.Width * 4u * sd.Height <= D3D8CAP_SCENE_MAX_BYTES &&
+        SUCCEEDED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        if (lr.pBits && lr.Pitch >= (INT)(sd.Width * 4u)) {
+            c.width = sd.Width;
+            c.height = sd.Height;
+            c.pitch = (uint32_t)lr.Pitch;
+            chunk(D3D8CAP_SCENE, &c, sizeof c, lr.pBits, (size_t)c.pitch * c.height,
+                  NULL, 0);
+        }
+        surf->lpVtbl->UnlockRect(surf);
+    }
+    surf->lpVtbl->Release(surf);
+}
+
 static void capture_snapshot(IDirect3DDevice8 *dev)
 {
     static const DWORD transforms[] = {
@@ -498,6 +525,7 @@ static void capture_snapshot(IDirect3DDevice8 *dev)
     DWORD vs = 0, s, t;
     D3DVIEWPORT8 vp;
 
+    rec_scene(dev);
     for (slot = 0; slot < NV2A_VS_MAX_SLOTS; slot++) {
         const DWORD *microcode;
         const D3D8VshInput *decl;
