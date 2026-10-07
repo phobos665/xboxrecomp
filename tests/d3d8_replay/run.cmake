@@ -85,5 +85,10 @@ foreach(img syn000.bmp syn000_present.bmp)
     # around it is the clear. Black here means the copy never happened.
     expect_pixel(${WORK}/${img} 100 350 255 0 0 "the screen copy's red square")
     expect_pixel(${WORK}/${img} 250 350 0x20 0x30 0x60 "the screen copy's clear")
+    # Bottom right: a copy of the screen taken before the frame's clear, so
+    # of the scene the capture began with (a v9 SCENE chunk, all green
+    # 0xC0), drawn at 360..600 x 300..460. Black here means the snapshot was
+    # not restored, blue that the copy came after the clear.
+    expect_pixel(${WORK}/${img} 480 380 0 0xC0 0 "the scene the frame began with")
 endforeach()
 message("d3d8_replay: the synthetic frame replays, identically each loop, with its colours")
