@@ -20,6 +20,8 @@ import struct
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
+from .runtime_headers import (NO_SIMD_DEFINE, refresh_runtime_headers,
+                              simd_opt_out)
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
@@ -2221,26 +2223,11 @@ class BatchTranslator:
         # So it tracks the template, like the .c files do. A project that
         # genuinely needs its own can put one earlier on the include path --
         # gen/ is only found because recomp_funcs.h sits beside it.
-        types_dst = os.path.join(output_dir, "recomp_types.h")
-        types_src = os.path.join(os.path.dirname(__file__), "..", "..",
-                                 "templates", "runtime", "recomp_types.h")
-        try:
-            with open(types_src, "r", encoding="utf-8") as src:
-                want = src.read()
-            have = None
-            if os.path.exists(types_dst):
-                with open(types_dst, "r", encoding="utf-8") as dst:
-                    have = dst.read()
-            if have != want:
-                with open(types_dst, "w", encoding="utf-8") as dst:
-                    dst.write(want)
-                print("  %s recomp_types.h (runtime register model)"
-                      % ("refreshed" if have is not None else "wrote"),
-                      file=sys.stderr)
-        except OSError as e:
-            print(f"  WARNING: could not write recomp_types.h ({e}); copy "
-                  f"it from templates/runtime/ by hand or the build will "
-                  f"not find it", file=sys.stderr)
+        #
+        # recomp_types_simd.h goes too: recomp_types.h includes it (see
+        # runtime_headers.py). Each is written only when it changed, so a
+        # chunk that skips the SIMD header is not rebuilt by a change to it.
+        refresh_runtime_headers(output_dir)
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
@@ -2264,6 +2251,7 @@ class BatchTranslator:
 
         for ci, chunk in enumerate(chunks):
             c_path = os.path.join(output_dir, f"{prefix}_{ci:04d}.c")
+            body = [code for _addr, _name, code in chunk]
             c_lines = [
                 "/**",
                 f" * {_config.banner_name(getattr(self, 'title', None))}"
@@ -2273,12 +2261,14 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+                # A chunk with no SSE/MMX skips recomp_types_simd.h, so a
+                # change there rebuilds only the chunks that use it.
+                *simd_opt_out("\n".join(body)),
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",
             ]
-            for addr, name, code in chunk:
-                c_lines.append(code)
+            c_lines.extend(body)
 
             write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)
@@ -2299,6 +2289,7 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+                NO_SIMD_DEFINE,     # stubs move esp and nothing else
                 f'#include "{header_name}"',
                 "",
             ]
@@ -2384,6 +2375,7 @@ class BatchTranslator:
             " */",
             "",
             "#define RECOMP_DISPATCH_H",
+            NO_SIMD_DEFINE,         # a table of function pointers
             f'#include "{header_name}"',
             '#include <stddef.h>',
             '#include <stdlib.h>',
