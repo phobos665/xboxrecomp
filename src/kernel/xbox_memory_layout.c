@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "recomp_config.h"
 #include "xbox_watchpoint.h"
+#include "platform/fault_emulate.h" /* recomp_fault_set_guest_base */
 #include "platform/host_timer.h"   /* the flip gate's and the ack thread's waits */
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
@@ -2485,6 +2486,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Set the global offset for recompiled code MEM macros */
     g_xbox_mem_offset = g_memory_offset;
+    recomp_fault_set_guest_base((uintptr_t)g_memory_offset);  /* fault_emulate.h */
 
     /*
      * Initialize the Xbox stack for recompiled code.

@@ -22,7 +22,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 if(WIN32)
-    add_library(platform STATIC host_timer.c)
+    add_library(platform STATIC host_timer.c fault_emulate.c)
     target_include_directories(platform PUBLIC ${XBOXRECOMP_SRC_DIR})
     # winmm: timeBeginPeriod, the vblank clock's fallback (host_timer.c).
     target_link_libraries(platform PUBLIC winmm)
@@ -31,7 +31,7 @@ if(WIN32)
         target_compile_definitions(platform PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
 else()
-    add_library(platform STATIC win32_compat.c host_timer.c posix_memory.c)
+    add_library(platform STATIC win32_compat.c host_timer.c posix_memory.c fault_emulate.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

@@ -135,6 +135,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(NOT WIN32)
         add_subdirectory(tests/host_window)     # needs a display; run by hand
         add_subdirectory(tests/guest_memory)    # POSIX memory backend semantics
+        add_subdirectory(tests/mmio_decode_a64) # arm64 fault emulation vs hardware
+        add_subdirectory(tests/guest_faults)    # trapped pages via the signal path
     endif()
     if(WIN32)
         add_subdirectory(tests/nv2a_vsh_hlsl)   # needs D3DCompile
