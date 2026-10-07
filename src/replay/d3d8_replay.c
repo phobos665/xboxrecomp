@@ -1064,8 +1064,9 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
         /* A clear after the --draws limit would wipe the draws kept before
          * it, so it counts as drawing. */
         if (g_list_draws)
-            fprintf(stderr, "[clear after %ld draws] flags 0x%X color 0x%08X z %g%s\n",
-                    g_draw_index, p->flags, p->color, p->z,
+            fprintf(stderr, "[clear after %ld draws] flags 0x%X color 0x%08X z %g stencil %u, "
+                    "%u rect(s)%s\n",
+                    g_draw_index, p->flags, p->color, p->z, p->stencil, p->rect_count,
                     (g_max_draws >= 0 && g_draw_index >= g_max_draws) ? "  (skipped)" : "");
         if (g_max_draws >= 0 && g_draw_index >= g_max_draws)
             break;

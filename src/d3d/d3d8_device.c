@@ -683,6 +683,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
         /* Cleanup subsystems first */
         up_ring_shutdown();
         d3d8_overlay_shutdown();
+        d3d8_clear_shutdown();
         d3d8_movie_shutdown();
         xbox_D3D8ScreenCopyShutdown();
         d3d8_display_shutdown();
@@ -827,9 +828,52 @@ static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *self)
     return S_OK;
 }
 
+/* Clear's rectangles in the target's host pixels, clipped to it. TRUE when
+ * the clear is the whole target after all: no rectangles, or one that covers
+ * it -- which is the native clear's fast path. */
+#define CLEAR_MAX_RECTS 64
+static BOOL clear_rects_to_host(DWORD count, const D3DRECT *rects, UINT w, UINT h,
+                                RhiRect *out, UINT *n_out)
+{
+    float sx = rt_scale_x(), sy = rt_scale_y();
+    DWORD i;
+    UINT n = 0;
+
+    *n_out = 0;
+    if (!count || !rects)
+        return TRUE;
+    for (i = 0; i < count && n < CLEAR_MAX_RECTS; i++) {
+        RhiRect r;
+
+        r.left   = (int32_t)((float)rects[i].x1 * sx);
+        r.top    = (int32_t)((float)rects[i].y1 * sy);
+        r.right  = (int32_t)((float)rects[i].x2 * sx);
+        r.bottom = (int32_t)((float)rects[i].y2 * sy);
+        if (r.left < 0) r.left = 0;
+        if (r.top < 0) r.top = 0;
+        if (r.right > (int32_t)w) r.right = (int32_t)w;
+        if (r.bottom > (int32_t)h) r.bottom = (int32_t)h;
+        if (r.right <= r.left || r.bottom <= r.top)
+            continue;                   /* nothing of it is on the target */
+        if (r.left == 0 && r.top == 0 && r.right == (int32_t)w && r.bottom == (int32_t)h)
+            return TRUE;                /* one of them is the whole target */
+        out[n++] = r;
+    }
+    *n_out = n;
+    return FALSE;
+}
+
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil)
 {
-    (void)self; (void)Count; (void)pRects; (void)Stencil;
+    RhiRect host_rects[CLEAR_MAX_RECTS];
+    UINT n_rects = 0, target_w, target_h;
+    float clear_color[4] = {
+        ((Color >> 16) & 0xFF) / 255.0f,  /* R */
+        ((Color >>  8) & 0xFF) / 255.0f,  /* G */
+        ((Color >>  0) & 0xFF) / 255.0f,  /* B */
+        ((Color >> 24) & 0xFF) / 255.0f,  /* A */
+    };
+    (void)self;
     g_d3d_clear_count++;
 
     /* Clear the currently bound targets. With no depth surface bound there
@@ -837,15 +881,28 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
     RhiView *rtv = g_cur_rt ? g_cur_rt->rtv : g_device_state.rhi_default_rtv;
     RhiView *dsv = g_cur_ds ? g_cur_ds->dsv : NULL;
 
-    if ((Flags & D3DCLEAR_TARGET) && rtv) {
-        float clear_color[4] = {
-            ((Color >> 16) & 0xFF) / 255.0f,  /* R */
-            ((Color >>  8) & 0xFF) / 255.0f,  /* G */
-            ((Color >>  0) & 0xFF) / 255.0f,  /* B */
-            ((Color >> 24) & 0xFF) / 255.0f,  /* A */
-        };
-        rhi_clear_color(rtv, clear_color);
+    /* With rectangles, only those parts of the target, in its own pixels
+     * and whatever the viewport and the scissor say (d3d8_clear.c). A
+     * rectangle that is the whole target, or none at all, is the native
+     * clear below. */
+    target_w = g_cur_rt ? g_cur_rt->width : g_device_state.width;
+    target_h = g_cur_rt ? g_cur_rt->height : g_device_state.height;
+    if (!clear_rects_to_host(Count, pRects, target_w, target_h, host_rects, &n_rects)) {
+        if (n_rects &&
+            d3d8_clear_rects(rtv, dsv, target_w, target_h, host_rects, n_rects,
+                             (Flags & D3DCLEAR_TARGET) != 0, (Flags & D3DCLEAR_ZBUFFER) != 0,
+                             (Flags & D3DCLEAR_STENCIL) != 0, clear_color, Z,
+                             (uint8_t)Stencil) != 0) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "D3D8: a Clear with rectangles could not be drawn; "
+                        "it is not applied\n");
+        }
+        return S_OK;
     }
+
+    if ((Flags & D3DCLEAR_TARGET) && rtv)
+        rhi_clear_color(rtv, clear_color);
 
     if ((Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) && dsv) {
         uint32_t clear_flags = 0;
