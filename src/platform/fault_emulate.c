@@ -41,13 +41,37 @@ typedef struct {
     const char     *name;
 } fault_range;
 
-static fault_range  s_ranges[MAX_RANGES];
-static volatile int s_nranges;
+static fault_range   s_ranges[MAX_RANGES];
+static volatile long s_nranges;
+
+/* Publishing a filled-in slot, and reading the count that publishes it: a
+ * release store and an acquire load. MSVC has no __atomic builtins (and C11
+ * atomics only behind /experimental:c11atomics), so it gets the Interlocked
+ * exchange (a full barrier) to publish, and a volatile read followed by a
+ * compiler barrier to read: an acquire on x86-64, where loads are not
+ * reordered with later loads, plus a load barrier on ARM64, where MSVC's
+ * default /volatile:iso gives a volatile read no ordering. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static void ranges_publish(long n) { _InterlockedExchange(&s_nranges, n); }
+static long ranges_count(void)
+{
+    long n = s_nranges;
+    _ReadWriteBarrier();
+#if defined(_M_ARM64)
+    __dmb(_ARM64_BARRIER_ISHLD);
+#endif
+    return n;
+}
+#else
+static void ranges_publish(long n) { __atomic_store_n(&s_nranges, n, __ATOMIC_RELEASE); }
+static long ranges_count(void) { return __atomic_load_n(&s_nranges, __ATOMIC_ACQUIRE); }
+#endif
 
 int recomp_fault_add_range(uint32_t lo_va, uint32_t hi_va, int write_only,
                            recomp_range_fn fn, const char *name)
 {
-    int n = s_nranges;
+    int n = (int)s_nranges;
 
     if (!fn || hi_va <= lo_va || n >= MAX_RANGES)
         return -1;
@@ -59,13 +83,13 @@ int recomp_fault_add_range(uint32_t lo_va, uint32_t hi_va, int write_only,
     s_ranges[n].write_only = write_only;
     s_ranges[n].fn = fn;
     s_ranges[n].name = name;
-    __atomic_store_n(&s_nranges, n + 1, __ATOMIC_RELEASE);
+    ranges_publish(n + 1);
     return 0;
 }
 
 int recomp_fault_dispatch_ranges(recomp_fault *f, uint32_t va)
 {
-    int n = __atomic_load_n(&s_nranges, __ATOMIC_ACQUIRE);
+    int n = (int)ranges_count();
 
     for (int i = 0; i < n; i++) {
         const fault_range *r = &s_ranges[i];
