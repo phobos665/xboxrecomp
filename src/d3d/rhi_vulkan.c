@@ -391,6 +391,63 @@ static int format_ok(VkFormat f, VkFormatFeatureFlags need)
     return (p.optimalTilingFeatures & need) == need;
 }
 
+/* Section 4.9's other half: the format table is the same on every device,
+ * what a device can do with each entry is not. Said once at device creation,
+ * and only what is missing: a format a title's texture maps to that cannot
+ * be sampled draws nothing and fails no call, which is the hardest kind of
+ * picture bug to trace back. Vertex-only formats are checked as vertex
+ * input, and depth formats as depth attachments. RECOMP_VK_FORMATS=1 lists
+ * every entry. */
+static int env_on(const char *name);
+
+static void audit_formats(void)
+{
+    static const RhiFormat vertex_only[] = { RHI_FORMAT_R32G32B32_FLOAT, RHI_FORMAT_R32G32B32A32_SINT };
+    char missing[512] = "", no_target[512] = "";
+    int all = env_on("RECOMP_VK_FORMATS");
+    int f;
+
+    for (f = 1; f < 128; f++) {
+        VkFormat vf = vk_format((RhiFormat)f);
+        VkFormatProperties p;
+        VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        int vertex = 0;
+        size_t k;
+        char item[16];
+
+        if (vf == VK_FORMAT_UNDEFINED)
+            continue;
+        for (k = 0; k < sizeof vertex_only / sizeof vertex_only[0]; k++)
+            vertex |= vertex_only[k] == (RhiFormat)f;
+        if (vertex)
+            need = VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+        else if (is_depth_format(vf))
+            need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        vkGetPhysicalDeviceFormatProperties(V.pd, vf, &p);
+        if (all)
+            fprintf(stderr, "[RHI] vulkan: format %d -> VkFormat %d: optimal 0x%X buffer 0x%X\n",
+                    f, (int)vf, (unsigned)p.optimalTilingFeatures, (unsigned)p.bufferFeatures);
+        snprintf(item, sizeof item, " %d", f);
+        if (((vertex ? p.bufferFeatures : p.optimalTilingFeatures) & need) != need) {
+            if (strlen(missing) + strlen(item) < sizeof missing)
+                strcat(missing, item);
+        } else if (!vertex && !is_depth_format(vf) && vf != VK_FORMAT_BC1_RGBA_UNORM_BLOCK &&
+                   vf != VK_FORMAT_BC2_UNORM_BLOCK && vf != VK_FORMAT_BC3_UNORM_BLOCK &&
+                   vf != VK_FORMAT_BC5_UNORM_BLOCK &&
+                   vf != VK_FORMAT_R32_UINT && vf != VK_FORMAT_R16_UINT &&     /* never blended */
+                   !(p.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) {
+            if (strlen(no_target) + strlen(item) < sizeof no_target)
+                strcat(no_target, item);
+        }
+    }
+    if (*missing)
+        fprintf(stderr, "[RHI] vulkan: %s cannot use these formats (DXGI numbers) at all:%s\n",
+                V.props.deviceName, missing);
+    if (*no_target)
+        fprintf(stderr, "[RHI] vulkan: %s cannot render and blend into (DXGI numbers):%s\n",
+                V.props.deviceName, no_target);
+}
+
 /* ---- deferred destruction ---------------------------------------------------------- */
 
 /* A handle the GPU may still be reading goes here with the serial of the
@@ -1276,6 +1333,7 @@ static int create_device(void)
     /* Section 4.9: AMD has no D24S8, so the depth format is the device's. */
     V.depth24 = format_ok(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
                 ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    audit_formats();
     return 0;
 }
 
