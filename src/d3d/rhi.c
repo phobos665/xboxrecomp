@@ -34,6 +34,18 @@ static const RhiBackend *const g_backends[] = {
     NULL
 };
 
+static int  (*g_rhi_wait_begin)(void);
+static void (*g_rhi_wait_end)(int);
+
+void rhi_set_wait_hooks(int (*begin)(void), void (*end)(int))
+{
+    g_rhi_wait_begin = begin;
+    g_rhi_wait_end = end;
+}
+
+int  rhi_wait_begin(void)  { return g_rhi_wait_begin ? g_rhi_wait_begin() : 0; }
+void rhi_wait_end(int h)   { if (g_rhi_wait_end) g_rhi_wait_end(h); }
+
 int rhi_select_backend(const char *name)
 {
     int i;

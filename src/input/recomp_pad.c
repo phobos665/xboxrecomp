@@ -77,6 +77,13 @@ static int sdl_start(void)
     /* The window the player looks at may not be SDL's, so SDL cannot know
      * it has focus: read the pads regardless, as XInput always did. */
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifndef _WIN32
+    /* The gamepad subsystem brings up SDL's events, which would otherwise
+     * turn SIGINT/SIGTERM into a quit event nobody reads: a timeout or
+     * Ctrl-C must still end the process (src/host/host_sdl.c does the same).
+     * Windows keeps its behaviour as it was. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#endif
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[INPUT] SDL3 could not start its gamepad support (%s)\n",
                 SDL_GetError());

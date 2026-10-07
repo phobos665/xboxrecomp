@@ -24,4 +24,9 @@ target_include_directories(d3d8_replay PRIVATE
 target_link_libraries(d3d8_replay PRIVATE xbox_d3d8)
 if(WIN32)
     target_link_libraries(d3d8_replay PRIVATE user32)
+elseif(TARGET xbox_host)
+    # --window (macOS): a real window from src/host, in background mode.
+    target_link_libraries(d3d8_replay PRIVATE xbox_host)
+    target_include_directories(d3d8_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../host)
+    target_compile_definitions(d3d8_replay PRIVATE REPLAY_HAVE_HOST)
 endif()

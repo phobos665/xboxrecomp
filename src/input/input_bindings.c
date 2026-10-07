@@ -32,6 +32,7 @@
 #  include <windows.h>
 #else
 #  include <time.h>
+#  include <SDL3/SDL.h>      /* the keyboard (sdl_key_down) */
 #endif
 
 #define MAX_SOURCES 4
@@ -737,6 +738,75 @@ typedef struct { unsigned char state[256]; } KeyCache;
 static unsigned char g_key_state[256];
 static unsigned long long g_key_state_at;
 
+#if !defined(_WIN32)
+/* Off Windows the keyboard is SDL's: the state its events leave behind, kept
+ * by the host shell's loop on the main thread (src/host). Keys reach it only
+ * while the game's window has the focus -- unlike GetAsyncKeyState, which
+ * reads the keyboard whatever is in front -- so a background run's window,
+ * which never takes the focus, never hears a key. The config's names are
+ * Windows virtual-key codes, so they are translated here. */
+static SDL_Scancode vk_scancode(int vk, SDL_Scancode *second)
+{
+    static const struct { unsigned char vk; SDL_Scancode sc; } MAP[] = {
+        { 0x26, SDL_SCANCODE_UP }, { 0x28, SDL_SCANCODE_DOWN },
+        { 0x25, SDL_SCANCODE_LEFT }, { 0x27, SDL_SCANCODE_RIGHT },
+        { 0x0D, SDL_SCANCODE_RETURN }, { 0x08, SDL_SCANCODE_BACKSPACE },
+        { 0x20, SDL_SCANCODE_SPACE }, { 0x09, SDL_SCANCODE_TAB },
+        { 0x1B, SDL_SCANCODE_ESCAPE }, { 0xA0, SDL_SCANCODE_LSHIFT },
+        { 0xA1, SDL_SCANCODE_RSHIFT }, { 0xA2, SDL_SCANCODE_LCTRL },
+        { 0xA3, SDL_SCANCODE_RCTRL }, { 0xA4, SDL_SCANCODE_LALT },
+        { 0xA5, SDL_SCANCODE_RALT }, { 0x14, SDL_SCANCODE_CAPSLOCK },
+        { 0x2D, SDL_SCANCODE_INSERT }, { 0x2E, SDL_SCANCODE_DELETE },
+        { 0x24, SDL_SCANCODE_HOME }, { 0x23, SDL_SCANCODE_END },
+        { 0x21, SDL_SCANCODE_PAGEUP }, { 0x22, SDL_SCANCODE_PAGEDOWN },
+        { 0x60, SDL_SCANCODE_KP_0 }, { 0x61, SDL_SCANCODE_KP_1 },
+        { 0x62, SDL_SCANCODE_KP_2 }, { 0x63, SDL_SCANCODE_KP_3 },
+        { 0x64, SDL_SCANCODE_KP_4 }, { 0x65, SDL_SCANCODE_KP_5 },
+        { 0x66, SDL_SCANCODE_KP_6 }, { 0x67, SDL_SCANCODE_KP_7 },
+        { 0x68, SDL_SCANCODE_KP_8 }, { 0x69, SDL_SCANCODE_KP_9 },
+        { 0x6A, SDL_SCANCODE_KP_MULTIPLY }, { 0x6B, SDL_SCANCODE_KP_PLUS },
+        { 0x6D, SDL_SCANCODE_KP_MINUS }, { 0x6E, SDL_SCANCODE_KP_PERIOD },
+        { 0x6F, SDL_SCANCODE_KP_DIVIDE }, { 0xBA, SDL_SCANCODE_SEMICOLON },
+        { 0xBB, SDL_SCANCODE_EQUALS }, { 0xBC, SDL_SCANCODE_COMMA },
+        { 0xBD, SDL_SCANCODE_MINUS }, { 0xBE, SDL_SCANCODE_PERIOD },
+        { 0xBF, SDL_SCANCODE_SLASH }, { 0xC0, SDL_SCANCODE_GRAVE },
+        { 0xDB, SDL_SCANCODE_LEFTBRACKET }, { 0xDC, SDL_SCANCODE_BACKSLASH },
+        { 0xDD, SDL_SCANCODE_RIGHTBRACKET }, { 0xDE, SDL_SCANCODE_APOSTROPHE },
+    };
+    size_t i;
+
+    *second = SDL_SCANCODE_UNKNOWN;
+    if (vk >= 'A' && vk <= 'Z')
+        return (SDL_Scancode)(SDL_SCANCODE_A + (vk - 'A'));
+    if (vk >= '1' && vk <= '9')
+        return (SDL_Scancode)(SDL_SCANCODE_1 + (vk - '1'));
+    if (vk == '0')
+        return SDL_SCANCODE_0;
+    if (vk >= 0x70 && vk <= 0x7B)                       /* F1..F12 */
+        return (SDL_Scancode)(SDL_SCANCODE_F1 + (vk - 0x70));
+    /* Either side, as GetAsyncKeyState answers for the generic codes. */
+    if (vk == 0x10) { *second = SDL_SCANCODE_RSHIFT; return SDL_SCANCODE_LSHIFT; }
+    if (vk == 0x11) { *second = SDL_SCANCODE_RCTRL;  return SDL_SCANCODE_LCTRL; }
+    if (vk == 0x12) { *second = SDL_SCANCODE_RALT;   return SDL_SCANCODE_LALT; }
+    for (i = 0; i < sizeof MAP / sizeof MAP[0]; i++)
+        if (MAP[i].vk == vk)
+            return MAP[i].sc;
+    return SDL_SCANCODE_UNKNOWN;
+}
+
+static int sdl_key_down(int vk)
+{
+    int count = 0;
+    const bool *keys = SDL_GetKeyboardState(&count);
+    SDL_Scancode second, first = vk_scancode(vk, &second);
+
+    if (!keys)
+        return 0;
+    return (first != SDL_SCANCODE_UNKNOWN && (int)first < count && keys[first]) ||
+           (second != SDL_SCANCODE_UNKNOWN && (int)second < count && keys[second]);
+}
+#endif
+
 static int key_down(KeyCache *kc, int vk)
 {
     (void)kc;
@@ -747,7 +817,7 @@ static int key_down(KeyCache *kc, int vk)
         g_key_state[vk] = (GetAsyncKeyState(vk) & 0x8000) ? 2 : 1;
     return g_key_state[vk] == 2;
 #else
-    return 0;           /* no keyboard source off Windows yet */
+    return sdl_key_down(vk);
 #endif
 }
 

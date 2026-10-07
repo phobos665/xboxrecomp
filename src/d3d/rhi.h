@@ -312,9 +312,21 @@ typedef struct {
     uint32_t debug;             /* ask for the debug / validation layer */
 } RhiDeviceDesc;
 
+/* Called around every wait the backend makes on the GPU or the window
+ * system -- acquiring and presenting a swap chain image, waiting for a frame
+ * in flight or a readback, waiting for the device to go idle -- and around
+ * nothing else. begin returns a value end is given back. The HLE sets the
+ * guest lock's drop and restore here (xbox_GuestLockDrop/Restore), so a
+ * present that sleeps on the display does not stop every other guest
+ * thread. Nothing in src/d3d touches guest state, so dropping it there is
+ * safe. Unset (NULL, NULL): no-ops, as in the replay tool. Set it before the
+ * device is created, from one thread. */
+void        rhi_set_wait_hooks(int (*begin)(void), void (*end)(int));
+
 /* Chooses the backend before the device is created. NULL or "" means
- * RECOMP_D3D8_BACKEND, and that unset means d3d11. Returns 0 when the
- * named backend exists; otherwise it says so and keeps d3d11. */
+ * RECOMP_D3D8_BACKEND, and that unset means the platform's default (d3d11
+ * on Windows, vulkan elsewhere). Returns 0 when the named backend exists;
+ * otherwise it says so and keeps the default. */
 int         rhi_select_backend(const char *name);
 const char *rhi_backend_name(void);
 int         rhi_device_create(const RhiDeviceDesc *desc);   /* 0 on success */

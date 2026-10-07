@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ loop */
 
@@ -28,6 +29,7 @@ static pthread_cond_t  g_cond = PTHREAD_COND_INITIALIZER;
 static host_call *g_head, *g_tail;
 static int        g_running;          /* recomp_host_loop_run is serving calls */
 static int        g_quit, g_quit_code;
+static int        g_no_loop;          /* Apple: waited for a loop that never came */
 static pthread_t  g_main_thread;
 static int        g_video;            /* SDL video started (main thread only writes) */
 static Uint32     g_wake_event;       /* user event that wakes SDL_WaitEvent */
@@ -76,6 +78,7 @@ int recomp_host_loop_run(void)
     pthread_mutex_lock(&g_lock);
     g_main_thread = pthread_self();
     g_running = 1;
+    pthread_cond_broadcast(&g_cond);      /* calls waiting for the loop to start */
     for (;;) {
         while (!g_quit && !g_head && !g_video)
             pthread_cond_wait(&g_cond, &g_lock);
@@ -141,7 +144,21 @@ void recomp_host_call_main(void (*fn)(void *), void *arg)
      * loop has quit: run on this thread it would throw inside AppKit and
      * turn a clean exit into an abort. A dropped call leaves its result
      * as the caller initialised it (no window, size 0). */
-    if (g_quit) {
+    if (!g_running && !g_quit && !g_no_loop) {
+        struct timespec until;
+
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += 10;
+        while (!g_running && !g_quit &&
+               pthread_cond_timedwait(&g_cond, &g_lock, &until) == 0)
+            ;
+        if (!g_running && !g_quit) {
+            g_no_loop = 1;
+            fprintf(stderr, "[HOST] no main-thread loop is running (main.c does not "
+                    "call recomp_host_loop_run): no window on this platform\n");
+        }
+    }
+    if (g_quit || g_no_loop) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
@@ -184,7 +201,7 @@ struct host_window {
 };
 
 static host_window g_window;
-static int         g_window_open;     /* guarded by g_lock */
+static int         g_window_open;     /* main thread only */
 
 int host_window_background(void)
 {
@@ -232,6 +249,14 @@ typedef struct {
     host_window *result;
 } open_request;
 
+static void report_size(host_window *w)
+{
+    int pw = 0, ph = 0;
+
+    if (w->cb.on_resize && SDL_GetWindowSizeInPixels(w->sdl, &pw, &ph) && pw > 0 && ph > 0)
+        w->cb.on_resize(w->cb.user, pw, ph);
+}
+
 static void open_on_main(void *arg)
 {
     open_request *req = arg;
@@ -259,6 +284,7 @@ static void open_on_main(void *arg)
     }
     w->id = SDL_GetWindowID(w->sdl);
     w->background = background;
+    memset(&w->cb, 0, sizeof w->cb);
     if (req->cb)
         w->cb = *req->cb;
     SDL_SetAtomicInt(&w->focus, 0);
@@ -273,6 +299,7 @@ static void open_on_main(void *arg)
     }
     g_window_open = 1;
     req->result = w;
+    report_size(w);
 }
 
 host_window *host_window_open(int width, int height, const char *title,
@@ -368,6 +395,8 @@ static void fullscreen_on_main(void *arg)
     }
     SDL_SetAtomicInt(&w->fullscreen, on);
     fprintf(stderr, on ? "[HOST] fullscreen (Option+Enter for a window)\n" : "[HOST] windowed\n");
+    if (w->cb.on_fullscreen)
+        w->cb.on_fullscreen(w->cb.user, on);
 }
 
 void host_window_set_fullscreen(host_window *w, int on)
@@ -410,6 +439,29 @@ void host_window_set_title(host_window *w, const char *utf8)
     op.w = w;
     op.text = utf8;
     recomp_host_call_main(title_on_main, &op);
+}
+
+static void close_on_main(void *arg)
+{
+    host_window *w = arg;
+
+#ifdef __APPLE__
+    if (w->view)
+        SDL_Metal_DestroyView(w->view);
+    w->view = NULL;
+#endif
+    w->layer = NULL;
+    if (w->sdl)
+        SDL_DestroyWindow(w->sdl);
+    w->sdl = NULL;
+    w->id = 0;
+    g_window_open = 0;
+}
+
+void host_window_close(host_window *w)
+{
+    if (w && w->sdl)
+        recomp_host_call_main(close_on_main, w);
 }
 
 static void active_on_main(void *arg)
@@ -461,10 +513,23 @@ static void dispatch_event(const SDL_Event *e)
             SDL_SetAtomicInt(&w->focus, 0);
         break;
     case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
-        SDL_SetAtomicInt(&w->fullscreen, 1);
-        break;
     case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
-        SDL_SetAtomicInt(&w->fullscreen, 0);
+        /* Also what the green button and the system's own fullscreen
+         * gesture send, so the renderer hears of those too. */
+        if (e->window.windowID == w->id) {
+            int on = e->type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN;
+
+            if (SDL_GetAtomicInt(&w->fullscreen) != on) {
+                SDL_SetAtomicInt(&w->fullscreen, on);
+                if (w->cb.on_fullscreen)
+                    w->cb.on_fullscreen(w->cb.user, on);
+            }
+        }
+        break;
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        if (e->window.windowID == w->id && w->cb.on_resize && e->window.data1 > 0 &&
+            e->window.data2 > 0)
+            w->cb.on_resize(w->cb.user, e->window.data1, e->window.data2);
         break;
     case SDL_EVENT_KEY_DOWN:
         if (e->key.repeat || e->key.windowID != w->id)
