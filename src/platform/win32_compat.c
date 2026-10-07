@@ -1335,8 +1335,8 @@ int MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type)
     return 1;   /* IDOK */
 }
 
-/* Message-loop stubs: no Win32 messages on POSIX (SDL events drive the
- * d3d8_gl backend; this layer is just for the game's Win32 message pump). */
+/* Message-loop stubs: no Win32 messages on POSIX (the window's events are
+ * src/host's, on the main thread; this is only for a Win32 message pump). */
 BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 { (void)m; (void)w; (void)a; (void)b; (void)f; return FALSE; }
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
