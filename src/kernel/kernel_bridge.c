@@ -418,6 +418,24 @@ static void bridge_set_handle_kind(HANDLE h, int kind);
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 
+/* Call guest code from inside the runtime, holding the guest lock.
+ *
+ * The dispatcher drops the guest lock around every kernel call, so a bridge
+ * that calls back into lifted code -- the title's main thread started inline
+ * by PsCreateSystemThreadEx, an APC, a DPC run inline, an exception handler --
+ * would otherwise run it with no lock at all, and so would a host thread
+ * delivering an ISR or a DPC. With the lock on (the default on ARM hosts) that
+ * is guest code running beside other guest code, the very thing the lock is
+ * there to stop: the main thread of every title ran that way. Bounded, so an
+ * interrupt never waits on a guest thread that spins without yielding; a no-op
+ * when the lock is off. */
+#define BRIDGE_CALL_GUEST(fn) do {                         \
+        int _bcg_held = xbox_GuestLockEnterTimed(100);     \
+        (fn)();                                            \
+        if (_bcg_held)                                     \
+            xbox_GuestLockLeave();                         \
+    } while (0)
+
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                      uint32_t ctx2)
 {
@@ -425,7 +443,7 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     g_seh_ebp = g_esp;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     g_esp += 12;
 }
 
@@ -545,7 +563,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                BRIDGE_CALL_GUEST(fn);
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
@@ -2158,7 +2176,7 @@ static void bridge_NtUserIoApcDispatcher(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = information;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = (status == 0) ? 0 : status;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
 
     g_eax = 0;
 }
@@ -2437,7 +2455,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     return 1;
 }
 
@@ -2477,7 +2495,7 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2625,7 +2643,7 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    BRIDGE_CALL_GUEST(fn);
     return (int)(g_eax & 1u);
 }
 
@@ -3815,7 +3833,7 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-        fn();
+        BRIDGE_CALL_GUEST(fn);
         g_esp += 12;
     } else {
         uint32_t ord = 0;
@@ -3972,7 +3990,7 @@ static void bridge_RtlUnwind(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
-                fn();
+                BRIDGE_CALL_GUEST(fn);
                 /* 16, not 20: the handler's own `ret` has already taken the
                  * return address off, leaving just the four arguments for the
                  * caller to drop. Cleaning 20 leaves esp four bytes high, and
@@ -8675,7 +8693,7 @@ static void bridge_PsCreateSystemThread(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                BRIDGE_CALL_GUEST(fn);
                 g_esp += 12;
             } else {
                 const char *inline_workers = getenv("RECOMP_WORKERS");

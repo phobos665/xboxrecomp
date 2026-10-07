@@ -1040,10 +1040,67 @@ int xbox_GuestLockDrop(void)
     return held;
 }
 
+/* A host thread about to run guest code -- the timer thread's ISRs and DPCs,
+ * a device model's interrupt -- takes the lock like a guest thread, but with
+ * a bound: on the console an interrupt preempts whatever is running, so a
+ * guest thread spinning in lifted code on a flag the ISR sets (no kernel call
+ * in the loop, so it never drops the lock) would wait forever for an ISR that
+ * waits for it. Past the bound the routine runs anyway, as it always did, and
+ * the first time says so.
+ *
+ * While a host thread is waiting, a guest thread coming back from a kernel
+ * call yields before re-taking the lock (xbox_GuestLockRestore): a TryEnter
+ * loop is not queued on the mutex, and a guest thread that makes a kernel
+ * call every few microseconds would otherwise win it every time.
+ *
+ * Returns 1 if the lock was taken (pair with xbox_GuestLockLeave), 0 if the
+ * lock is off or the bound passed. Recursive: a thread that already holds it
+ * gets it at once. */
+static volatile LONG g_guest_host_waiting;
+
+int xbox_GuestLockEnterTimed(DWORD ms)
+{
+    ULONGLONG deadline;
+
+    if (!xbox_GuestLockOn() || !g_guest_cs_ready)
+        return 0;
+    if (TryEnterCriticalSection(&g_guest_cs)) {
+        g_guest_depth++;
+        return 1;
+    }
+    InterlockedIncrement(&g_guest_host_waiting);
+    deadline = GetTickCount64() + ms;
+    do {
+        Sleep(0);
+        if (TryEnterCriticalSection(&g_guest_cs)) {
+            InterlockedDecrement(&g_guest_host_waiting);
+            g_guest_depth++;
+            return 1;
+        }
+    } while (GetTickCount64() < deadline);
+    InterlockedDecrement(&g_guest_host_waiting);
+    {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) == 1) {
+            fprintf(stderr, "  [THREAD] a host thread waited %lu ms for the guest "
+                            "lock and ran guest code without it (a guest thread is "
+                            "spinning in lifted code?)\n", (unsigned long)ms);
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
 void xbox_GuestLockRestore(int held)
 {
     if (!xbox_GuestLockOn() || !g_guest_cs_ready)
         return;
+    if (held > 0 && g_guest_host_waiting) {
+        /* Let the waiting host thread in first; bounded, it may be gone. */
+        int spins;
+        for (spins = 0; spins < 200 && g_guest_host_waiting; spins++)
+            SwitchToThread();
+    }
     while (held-- > 0) {
         EnterCriticalSection(&g_guest_cs);
         g_guest_depth++;
@@ -1190,14 +1247,22 @@ void xbox_Nv2aFlipGateArm(void)
         return;
     if (g_flip_gate_strict)
         ResetEvent(g_flip_gate_event);                  /* the next vblank, not a past one */
-    /* Only while one Swap a vblank is the cadence: the release is then
-     * always the next vblank, which is what the hook is told. */
-    if (g_flip_gate_idle && flip_gate_divisor() == 1 && flip_gate_lend())
-        return;
-    if (WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
-        fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "
-                        "the title is not being paced\n");
-        fflush(stderr);
+    {
+        /* Swap is an HLE call, not a kernel call, so the guest lock is still
+         * held here; a frame's worth of waiting with it held would stop every
+         * other guest thread (audio, streaming) for that long. Dropped for
+         * the wait, as a kernel wait drops it. */
+        int guest_held = xbox_GuestLockDrop();
+
+        /* Only while one Swap a vblank is the cadence: the release is then
+         * always the next vblank, which is what the hook is told. */
+        if (!(g_flip_gate_idle && flip_gate_divisor() == 1 && flip_gate_lend()) &&
+            WaitForSingleObject(g_flip_gate_event, 250) == WAIT_TIMEOUT && !said++) {
+            fprintf(stderr, "  [NV2A] flip gate timed out: no vblank for 250 ms, "
+                            "the title is not being paced\n");
+            fflush(stderr);
+        }
+        xbox_GuestLockRestore(guest_held);
     }
 }
 

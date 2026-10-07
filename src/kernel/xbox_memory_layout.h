@@ -241,6 +241,11 @@ void xbox_GuestLockEnter(void);
 void xbox_GuestLockLeave(void);
 int  xbox_GuestLockDrop(void);
 void xbox_GuestLockRestore(int held);
+/* For a host thread about to run guest code (an ISR, a DPC, a device
+ * callback): the lock, waiting at most ms. 1 if taken (then
+ * xbox_GuestLockLeave), 0 if the lock is off or the wait ran out -- the guest
+ * code runs either way, as an interrupt would. */
+int  xbox_GuestLockEnterTimed(DWORD ms);
 int  xbox_GuestLockOn(void);
 int  xbox_GuestConcurrencyOn(void);
 void xbox_GuestLiftedEnter(void);
