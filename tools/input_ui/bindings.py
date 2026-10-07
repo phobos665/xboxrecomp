@@ -28,6 +28,15 @@ does not mention keeps its default; "none" or [] unbinds it.
 of controller; the default) or "xinput" (Xbox controllers only). A device is
 "gamepad:N", the N-th pad through that API; "xinput:N" is what files written
 before SDL3 say, and means the same slot.
+
+"mouse" is mouse look, top level because there is one mouse:
+
+    "mouse": {"stick": "right", "port": 1, "sensitivity": 1.0,
+              "invert_y": false, "anti_deadzone": 0.2}
+
+"stick" is "off" (the default), "right" or "left": which of controller
+"port"'s sticks the mouse's movement turns. The mouse's buttons are sources
+like any other -- "mouse:left", "mouse:wheel_up" -- bound per control.
 """
 
 import json
@@ -85,6 +94,27 @@ PAD_AXES = [a + s for a in ("lx", "ly", "rx", "ry") for s in ("+", "-")]
 PAD_SOURCES = (["pad:" + b for b in PAD_BUTTONS]
                + ["pad:lt", "pad:rt"]
                + ["pad:" + a for a in PAD_AXES])
+
+# What a "mouse:" source may name. Mirrors MOUSE_SOURCES in
+# src/input/input_bindings.c. Left and right are the primary and secondary
+# buttons as Windows has them; a wheel notch is a short press.
+MOUSE_BUTTONS = ["left", "right", "middle", "x1", "x2", "wheel_up", "wheel_down"]
+MOUSE_SOURCES = ["mouse:" + b for b in MOUSE_BUTTONS]
+
+# Mouse look. Mirrors mouse_defaults() in src/input/input_bindings.c.
+MOUSE_STICKS = ("off", "right", "left")
+MOUSE_ANTI_DEADZONE_DEFAULT = 0.2
+MOUSE_SENSITIVITY_RANGE = (0.05, 20.0)
+
+
+def default_mouse():
+    return {
+        "stick": "off",
+        "port": 1,
+        "sensitivity": 1.0,
+        "invert_y": False,
+        "anti_deadzone": MOUSE_ANTI_DEADZONE_DEFAULT,
+    }
 
 # Virtual-key names a "key:" source may use, beyond the single letters and
 # digits (which are their own code on Windows). Mirrors the KEYS table in
@@ -147,7 +177,7 @@ def is_valid_source(source):
     """Is this a source string the runtime will understand?"""
     if not isinstance(source, str) or not source:
         return False
-    if source in PAD_SOURCES:
+    if source in PAD_SOURCES or source in MOUSE_SOURCES:
         return True
     if source.startswith("key:"):
         name = source[4:]
@@ -196,6 +226,11 @@ def source_label(source):
         if len(pretty) == 1:
             pretty = pretty.upper()                     # the face buttons
         return "Pad " + pretty
+    if source.startswith("mouse:"):
+        return "Mouse " + {
+            "x1": "back", "x2": "forward",
+            "wheel_up": "wheel up", "wheel_down": "wheel down",
+        }.get(source[6:], source[6:])
     return source
 
 
@@ -253,8 +288,31 @@ def default_config():
     return {
         "version": VERSION,
         "pad_api": "sdl",
+        "mouse": default_mouse(),
         "controllers": [default_controller(p) for p in range(1, PORTS + 1)],
     }
+
+
+def normalise_mouse(data):
+    """The "mouse" object, with anything missing or out of range defaulted."""
+    mouse = default_mouse()
+    if not isinstance(data, dict):
+        return mouse
+    if data.get("stick") in MOUSE_STICKS:
+        mouse["stick"] = data["stick"]
+    port = data.get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= PORTS:
+        mouse["port"] = port
+    low, high = MOUSE_SENSITIVITY_RANGE
+    sens = data.get("sensitivity")
+    if isinstance(sens, (int, float)) and not isinstance(sens, bool) and low <= sens <= high:
+        mouse["sensitivity"] = float(sens)
+    if isinstance(data.get("invert_y"), bool):
+        mouse["invert_y"] = data["invert_y"]
+    lift = data.get("anti_deadzone")
+    if isinstance(lift, (int, float)) and not isinstance(lift, bool) and 0 <= lift <= 0.9:
+        mouse["anti_deadzone"] = float(lift)
+    return mouse
 
 
 def normalise(data):
@@ -269,6 +327,7 @@ def normalise(data):
         return config
     if data.get("pad_api") in PAD_APIS:
         config["pad_api"] = data["pad_api"]
+    config["mouse"] = normalise_mouse(data.get("mouse"))
     listed = data.get("controllers")
     if not isinstance(listed, list):
         return config

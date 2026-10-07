@@ -15,10 +15,13 @@
  *
  * Pads are read through recomp_pad.h: SDL3 by default, XInput on Windows
  * when the file's "pad_api" or RECOMP_PAD_API says so. The keyboard is
- * read with GetAsyncKeyState on Windows and not yet anywhere else.
+ * read with GetAsyncKeyState on Windows and not yet anywhere else. The
+ * mouse -- its buttons as sources, and its movement as one controller's
+ * stick -- is read from the game window through recomp_mouse.h.
  */
 #include "input_bindings.h"
 #include "recomp_pad.h"
+#include "recomp_mouse.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,7 +123,7 @@ static const struct { const char *control, *pad, *key; } DEFAULTS[] = {
 
 /* ---- the sources a control can be bound to ----------------------------- */
 
-enum { SRC_NONE, SRC_KEY, SRC_PAD_BUTTON, SRC_PAD_TRIGGER, SRC_PAD_AXIS };
+enum { SRC_NONE, SRC_KEY, SRC_PAD_BUTTON, SRC_PAD_TRIGGER, SRC_PAD_AXIS, SRC_MOUSE };
 
 /* Pad buttons, in the order PAD_BUTTONS names them. */
 enum {
@@ -132,6 +135,13 @@ enum {
 static const char *const PAD_BUTTONS[PB_COUNT] = {
     "a", "b", "x", "y", "lshoulder", "rshoulder", "start", "back",
     "lthumb", "rthumb", "dpad_up", "dpad_down", "dpad_left", "dpad_right"
+};
+
+/* What a "mouse:" source may name, in RECOMP_MOUSE_LEFT.. order. A wheel
+ * notch is a short press (recomp_mouse_source), so the wheel binds to a
+ * button the way it does in a PC game: next weapon, previous weapon. */
+static const char *const MOUSE_SOURCES[RECOMP_MOUSE_SOURCE_COUNT] = {
+    "left", "right", "middle", "x1", "x2", "wheel_up", "wheel_down"
 };
 
 typedef struct {
@@ -152,6 +162,7 @@ typedef struct {
     int pad;                /* recomp_pad slot when device == DEV_PAD */
     int deadzone;
     int has_key;            /* any key: source, so the port works with no pad */
+    int has_mouse;          /* any mouse: source, or the mouse moves its stick */
     Binding bind[CONTROL_COUNT];
     char label[40];
 } Controller;
@@ -159,7 +170,15 @@ typedef struct {
 static Controller g_ctl[PORTS];
 static char g_path[520];
 static int g_have_path;
-static int g_ready;
+
+/* Mouse look and its settings: the file's top-level "mouse", then the
+ * RECOMP_MOUSE_* variables over it. Handed to recomp_mouse.c at load. */
+static RecompMouseConfig g_mouse;
+
+/* Default lift for a moving mouse, as a fraction of the stick's travel:
+ * just under the quarter that most titles treat as their own deadzone, so a
+ * slow movement is not swallowed by it. */
+#define MOUSE_ANTI_DEADZONE_DEFAULT 0.2
 
 /* ---- names -> codes ---------------------------------------------------- */
 
@@ -256,6 +275,16 @@ static int parse_source(const char *text, Source *out)
             out->sign = (signed char)(name[2] == '+' ? 1 : -1);
             return 1;
         }
+    }
+    if (strncmp(text, "mouse:", 6) == 0) {
+        int i;
+
+        for (i = 0; i < RECOMP_MOUSE_SOURCE_COUNT; i++)
+            if (strcmp(MOUSE_SOURCES[i], text + 6) == 0) {
+                out->kind = SRC_MOUSE;
+                out->arg = (short)i;
+                return 1;
+            }
     }
     return 0;
 }
@@ -507,12 +536,82 @@ static const char *parse_controller(const char *p, int index, int *bad)
     tmp.has_key = 0;
     for (i = 0; i < CONTROL_COUNT; i++) {
         int s;
-        for (s = 0; s < tmp.bind[i].count; s++)
+        for (s = 0; s < tmp.bind[i].count; s++) {
             if (tmp.bind[i].src[s].kind == SRC_KEY)
                 tmp.has_key = 1;
+            if (tmp.bind[i].src[s].kind == SRC_MOUSE)
+                tmp.has_mouse = 1;
+        }
     }
     g_ctl[port] = tmp;
     return p + 1;
+}
+
+/* "true", "false", or a number: what a JSON switch may be written as. */
+static int jbool(const char *p)
+{
+    if (strncmp(p, "true", 4) == 0 || strncmp(p, "on", 2) == 0)
+        return 1;
+    if (strncmp(p, "false", 5) == 0 || strncmp(p, "null", 4) == 0 ||
+        strncmp(p, "off", 3) == 0)
+        return 0;
+    return strtol(p, NULL, 10) != 0;
+}
+
+static int stick_by_name(const char *name, int fallback)
+{
+    if (strcmp(name, "right") == 0)
+        return RECOMP_MOUSE_STICK_RIGHT;
+    if (strcmp(name, "left") == 0)
+        return RECOMP_MOUSE_STICK_LEFT;
+    if (strcmp(name, "off") == 0 || strcmp(name, "none") == 0)
+        return RECOMP_MOUSE_STICK_OFF;
+    return fallback;
+}
+
+/* "mouse": { "stick": "right", "port": 1, "sensitivity": 1.0,
+ *            "invert_y": false, "anti_deadzone": 0.2 }
+ * Top level rather than per controller because there is one mouse: it can
+ * move one controller's stick, and "port" says which. */
+static const char *parse_mouse(const char *p, RecompMouseConfig *m)
+{
+    char key[48], value[16];
+
+    p = ws(p);
+    if (*p != '{')
+        return NULL;
+    p = ws(p + 1);
+    while (*p && *p != '}') {
+        p = jstring(p, key, sizeof key);
+        if (!p)
+            return NULL;
+        p = ws(p);
+        if (*p != ':')
+            return NULL;
+        p = ws(p + 1);
+        if (strcmp(key, "stick") == 0 && *p == '"') {
+            p = jstring(p, value, sizeof value);
+            if (!p)
+                return NULL;
+            m->stick = stick_by_name(value, m->stick);
+        } else {
+            if (strcmp(key, "port") == 0)
+                m->port = (int)strtol(p, NULL, 10) - 1;      /* 1-based */
+            else if (strcmp(key, "sensitivity") == 0)
+                m->sensitivity = strtod(p, NULL);
+            else if (strcmp(key, "invert_y") == 0)
+                m->invert_y = jbool(p);
+            else if (strcmp(key, "anti_deadzone") == 0)
+                m->anti_deadzone = strtod(p, NULL);
+            p = jskip(p);
+            if (!p)
+                return NULL;
+        }
+        p = ws(p);
+        if (*p == ',')
+            p = ws(p + 1);
+    }
+    return *p == '}' ? p + 1 : NULL;
 }
 
 static int parse_config(const char *text)
@@ -539,6 +638,10 @@ static int parse_config(const char *text)
                 return 0;
             recomp_pad_set_api(strcmp(api, "xinput") == 0 ? RECOMP_PAD_API_XINPUT
                                                           : RECOMP_PAD_API_SDL);
+        } else if (strcmp(key, "mouse") == 0 && *p == '{') {
+            p = parse_mouse(p, &g_mouse);
+            if (!p)
+                return 0;
         } else if (strcmp(key, "controllers") == 0 && *p == '[') {
             p = ws(p + 1);
             while (*p && *p != ']') {
@@ -643,26 +746,95 @@ static char *read_file(const char *path)
 
 static void describe(Controller *c, char *out, size_t n)
 {
+    const char *mouse = c->has_mouse ? " + mouse" : "";
+
     if (c->device == DEV_KEYBOARD)
-        snprintf(out, n, "keyboard");
+        snprintf(out, n, "keyboard%s", mouse);
     else if (c->device == DEV_PAD && c->has_key)
-        snprintf(out, n, "%s pad %d + keyboard", recomp_pad_api_name(), c->pad + 1);
+        snprintf(out, n, "%s pad %d + keyboard%s", recomp_pad_api_name(), c->pad + 1, mouse);
     else if (c->device == DEV_PAD)
-        snprintf(out, n, "%s pad %d", recomp_pad_api_name(), c->pad + 1);
+        snprintf(out, n, "%s pad %d%s", recomp_pad_api_name(), c->pad + 1, mouse);
     else
         snprintf(out, n, "nothing");
 }
 
+static void mouse_defaults(RecompMouseConfig *m)
+{
+    memset(m, 0, sizeof *m);
+    m->stick = RECOMP_MOUSE_STICK_OFF;
+    m->port = 0;
+    m->sensitivity = 1.0;
+    m->anti_deadzone = MOUSE_ANTI_DEADZONE_DEFAULT;
+}
+
+/* The environment over the file, as everywhere else in the runtime: a .bat
+ * or a test run can switch mouse look on without touching the person's
+ * bindings. An empty variable means on, the xbox_EnvSwitch rule. */
+static void mouse_from_environment(RecompMouseConfig *m)
+{
+    const char *v;
+
+    if ((v = getenv("RECOMP_MOUSE_STICK")) != NULL) {
+        if (!*v || strcmp(v, "1") == 0 || strcmp(v, "on") == 0)
+            m->stick = RECOMP_MOUSE_STICK_RIGHT;
+        else if (strcmp(v, "0") == 0)
+            m->stick = RECOMP_MOUSE_STICK_OFF;
+        else
+            m->stick = stick_by_name(v, m->stick);
+    }
+    if ((v = getenv("RECOMP_MOUSE_SENS")) != NULL && *v)
+        m->sensitivity = strtod(v, NULL);
+    if ((v = getenv("RECOMP_MOUSE_INVERT_Y")) != NULL)
+        m->invert_y = !*v || jbool(v);
+    if ((v = getenv("RECOMP_MOUSE_PORT")) != NULL && *v)
+        m->port = (int)strtol(v, NULL, 10) - 1;
+    if ((v = getenv("RECOMP_MOUSE_ANTI_DEADZONE")) != NULL && *v)
+        m->anti_deadzone = strtod(v, NULL);
+}
+
+/* 0 not started, 1 loading, 2 loaded. The game window's thread asks for the
+ * mouse settings while guest threads ask for the pads, so two threads can
+ * arrive here together; the second waits for the first rather than reading
+ * a half-parsed table. */
+#if defined(_WIN32)
+static volatile LONG g_init_state;
+#else
+static volatile long g_init_state;
+#endif
+
+static void load_bindings(void);
+
 void recomp_bindings_init(void)
+{
+    if (g_init_state == 2)
+        return;
+#if defined(_WIN32)
+    if (InterlockedCompareExchange(&g_init_state, 1, 0) != 0) {
+        while (g_init_state != 2)
+            Sleep(0);
+        return;
+    }
+    load_bindings();
+    InterlockedExchange(&g_init_state, 2);
+#else
+    if (!__sync_bool_compare_and_swap(&g_init_state, 0, 1)) {
+        while (__atomic_load_n(&g_init_state, __ATOMIC_ACQUIRE) != 2)
+            ;
+        return;
+    }
+    load_bindings();
+    __atomic_store_n(&g_init_state, 2, __ATOMIC_RELEASE);
+#endif
+}
+
+static void load_bindings(void)
 {
     char *text;
     int i;
 
-    if (g_ready)
-        return;
-    g_ready = 1;
     for (i = 0; i < PORTS; i++)
         defaults_for(&g_ctl[i], i);
+    mouse_defaults(&g_mouse);
     if (find_config(g_path, sizeof g_path) && (text = read_file(g_path)) != NULL) {
         if (parse_config(text)) {
             g_have_path = 1;
@@ -671,9 +843,19 @@ void recomp_bindings_init(void)
                             "can read; using the built-in bindings\n", g_path);
             for (i = 0; i < PORTS; i++)
                 defaults_for(&g_ctl[i], i);
+            mouse_defaults(&g_mouse);
         }
         free(text);
     }
+    mouse_from_environment(&g_mouse);
+    if (g_mouse.port < 0 || g_mouse.port >= PORTS)
+        g_mouse.port = 0;
+    for (i = 0; i < PORTS; i++)
+        if (g_ctl[i].has_mouse)
+            g_mouse.buttons_bound = 1;
+    if (g_mouse.stick != RECOMP_MOUSE_STICK_OFF)
+        g_ctl[g_mouse.port].has_mouse = 1;
+    recomp_mouse_configure(&g_mouse);
     for (i = 0; i < PORTS; i++)
         describe(&g_ctl[i], g_ctl[i].label, sizeof g_ctl[i].label);
     fprintf(stderr, "[INPUT] bindings from %s\n",
@@ -798,6 +980,8 @@ static int source_magnitude(const Source *s, KeyCache *kc,
         t = s->arg ? pad->right_trigger : pad->left_trigger;
         return t < TRIGGER_THRESHOLD ? 0 : t;
     }
+    case SRC_MOUSE:
+        return recomp_mouse_source(s->arg);
     case SRC_PAD_AXIS: {
         int v, span;
         if (!have_pad)
@@ -843,6 +1027,7 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
     RecompPadState pad;
     int have_pad = 0, i;
     int axis[4] = { 0, 0, 0, 0 };
+    int mouse_axis[4] = { 0, 0, 0, 0 };
 
     if (!out)
         return 0;
@@ -885,11 +1070,31 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
             break;
         }
     }
+    /* Mouse look, on top of whatever the stick's own bindings say: a pad
+     * stick and the mouse can both turn the camera, and the sum is clamped
+     * like any two sources on one axis. It keeps the full 16-bit resolution
+     * rather than the 0..255 every other source reads as. */
+    if (c->has_mouse) {
+        int mx, my, which = recomp_mouse_stick(port, &mx, &my);
+
+        if (which) {
+            int ax = which == RECOMP_MOUSE_STICK_LEFT ? AXIS_LX : AXIS_RX;
+            int ay = which == RECOMP_MOUSE_STICK_LEFT ? AXIS_LY : AXIS_RY;
+
+            mouse_axis[ax] = mx;
+            mouse_axis[ay] = my;
+            if (mx || my)
+                say_first_press(port, which == RECOMP_MOUSE_STICK_LEFT
+                                      ? "left stick (mouse)" : "right stick (mouse)");
+        }
+    }
     for (i = 0; i < 4; i++) {
         long v;
         if (axis[i] > 255)  axis[i] = 255;
         if (axis[i] < -255) axis[i] = -255;
-        v = (long)axis[i] * 32767 / 255;
+        v = (long)axis[i] * 32767 / 255 + mouse_axis[i];
+        if (v > 32767)  v = 32767;
+        if (v < -32767) v = -32767;
         switch (i) {
         case AXIS_LX: out->sThumbLX = (SHORT)v; break;
         case AXIS_LY: out->sThumbLY = (SHORT)v; break;
@@ -915,7 +1120,8 @@ unsigned recomp_bindings_present_mask(void)
     mask = 0;
     for (i = 0; i < PORTS; i++) {
         Controller *c = &g_ctl[i];
-        if (c->device == DEV_KEYBOARD || (c->device == DEV_PAD && c->has_key)) {
+        if (c->device == DEV_KEYBOARD ||
+            (c->device == DEV_PAD && (c->has_key || c->has_mouse))) {
             mask |= 1u << i;
         } else if (c->device == DEV_PAD) {
             RecompPadState st;

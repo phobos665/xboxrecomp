@@ -81,6 +81,53 @@ class Sources(unittest.TestCase):
         for source in bindings.PAD_SOURCES:
             self.assertTrue(bindings.is_valid_source(source), source)
 
+    def test_mouse_buttons_and_the_wheel_are_sources(self):
+        for source in ("mouse:left", "mouse:right", "mouse:middle", "mouse:x1",
+                       "mouse:x2", "mouse:wheel_up", "mouse:wheel_down"):
+            self.assertTrue(bindings.is_valid_source(source), source)
+        for source in ("mouse:", "mouse:x3", "mouse:LEFT", "mouse:x"):
+            self.assertFalse(bindings.is_valid_source(source), source)
+
+    def test_a_mouse_source_has_a_readable_label(self):
+        self.assertEqual(bindings.source_label("mouse:left"), "Mouse left")
+        self.assertEqual(bindings.source_label("mouse:x1"), "Mouse back")
+        self.assertEqual(bindings.source_label("mouse:wheel_up"), "Mouse wheel up")
+
+
+class Mouse(unittest.TestCase):
+    def test_mouse_look_is_off_by_default(self):
+        mouse = bindings.default_config()["mouse"]
+        self.assertEqual(mouse["stick"], "off")
+        self.assertEqual(mouse["port"], 1)
+        self.assertEqual(mouse["sensitivity"], 1.0)
+        self.assertFalse(mouse["invert_y"])
+
+    def test_a_file_with_mouse_look_keeps_it(self):
+        config = bindings.normalise({"mouse": {
+            "stick": "right", "port": 2, "sensitivity": 2.5, "invert_y": True,
+            "anti_deadzone": 0.1}})
+        self.assertEqual(config["mouse"], {
+            "stick": "right", "port": 2, "sensitivity": 2.5, "invert_y": True,
+            "anti_deadzone": 0.1})
+
+    def test_bad_mouse_values_fall_back_one_by_one(self):
+        config = bindings.normalise({"mouse": {
+            "stick": "up", "port": 7, "sensitivity": -1, "invert_y": "yes",
+            "anti_deadzone": 3}})
+        self.assertEqual(config["mouse"], bindings.default_mouse())
+        config = bindings.normalise({"mouse": {"stick": "left"}})
+        self.assertEqual(config["mouse"]["stick"], "left")
+        self.assertEqual(config["mouse"]["sensitivity"], 1.0)
+
+    def test_a_mouse_button_can_be_bound_and_survives_a_save(self):
+        config = bindings.default_config()
+        config["mouse"]["stick"] = "right"
+        config["controllers"][0]["bindings"]["rtrigger"] = ["pad:rt", "mouse:left"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "mouse.json")
+            bindings.save(config, path)
+            self.assertEqual(bindings.load(path), config)
+
 
 class Normalising(unittest.TestCase):
     def test_a_file_with_one_binding_changes_one_binding(self):

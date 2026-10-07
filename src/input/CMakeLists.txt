@@ -9,13 +9,18 @@ add_library(xbox_input STATIC
     # The pads themselves: SDL3 everywhere, XInput on Windows behind
     # RECOMP_PAD_API=xinput or the bindings file's "pad_api".
     recomp_pad.c
+    # The mouse: buttons as binding sources, movement as one controller's
+    # stick. Raw input on the game window, which src/hle hands over.
+    recomp_mouse.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
 if(WIN32)
-    target_link_libraries(xbox_input PUBLIC xinput)
+    target_link_libraries(xbox_input PUBLIC xinput user32)
+else()
+    target_link_libraries(xbox_input PUBLIC m)
 endif()
 
 if(MSVC)

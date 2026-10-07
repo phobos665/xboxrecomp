@@ -119,7 +119,7 @@ class CaptureDialog(tk.Toplevel):
         frame = tk.Frame(self, bg=PANEL, padx=28, pady=22)
         frame.pack(padx=2, pady=2)
         _label(frame, title.upper(), fg=TEXT_DIM, font=FONT_SMALL).pack(anchor="w")
-        _label(frame, "Press a key or a button", fg=GLOW,
+        _label(frame, "Press a key, a button, or click", fg=GLOW,
                font=("Segoe UI Light", 16)).pack(anchor="w", pady=(6, 2))
         hint = "Esc cancels."
         if pad_index is None:
@@ -140,7 +140,35 @@ class CaptureDialog(tk.Toplevel):
         self.grab_set()
         self.focus_force()
         self.bind("<KeyPress>", self.on_key)
+        # A mouse button is a source like a key. Bound on the dialog, so it
+        # fires wherever in it the click lands -- except on its own two
+        # buttons, which are filtered out in on_mouse.
+        self.bind("<ButtonPress>", self.on_mouse)
+        self.bind("<MouseWheel>", self.on_wheel)
         self.poll()
+
+    # Tk's button numbers: 1 left, 2 middle, 3 right everywhere. The side
+    # buttons are 4/5 on Windows Tk 8.6 and 8/9 on Tk 9 and X11, where 4/5
+    # are the wheel instead.
+    MOUSE_BUTTONS = {1: "left", 2: "middle", 3: "right", 8: "x1", 9: "x2"}
+
+    def on_mouse(self, event):
+        if isinstance(event.widget, tk.Button):
+            return None                   # "Clear" and "Cancel" do their own thing
+        name = self.MOUSE_BUTTONS.get(event.num)
+        if name is None and event.num in (4, 5):
+            if os.name == "nt":
+                name = "x1" if event.num == 4 else "x2"
+            else:
+                name = "wheel_up" if event.num == 4 else "wheel_down"
+        if name is None:
+            return None
+        return self.finish("mouse:" + name)
+
+    def on_wheel(self, event):
+        if not event.delta:
+            return None
+        return self.finish("mouse:wheel_up" if event.delta > 0 else "mouse:wheel_down")
 
     def on_key(self, event):
         if event.keysym == "Escape":
@@ -240,6 +268,15 @@ class App:
         self.device_row = tk.Frame(device_row, bg=PANEL)
         self.device_row.pack(fill="x", pady=(6, 0))
         _button(device_row, "Rescan", self.refresh_devices).pack(anchor="e", pady=(8, 0))
+
+        # Mouse look: one mouse, so turning it on for this controller takes
+        # it from whichever had it. Sensitivity and invert are the mouse's,
+        # not the controller's.
+        mouse_box = tk.Frame(panel, bg=PANEL, padx=18)
+        mouse_box.pack(fill="x", pady=(0, 12))
+        _label(mouse_box, "MOUSE LOOK", fg=TEXT_DIM, font=FONT_SMALL).pack(anchor="w")
+        self.mouse_row = tk.Frame(mouse_box, bg=PANEL)
+        self.mouse_row.pack(fill="x", pady=(6, 0))
         tk.Frame(panel, bg=GREEN, height=1).pack(fill="x", padx=18)
 
         holder = tk.Frame(panel, bg=PANEL)
@@ -291,7 +328,68 @@ class App:
             device.configure(bg=face,
                              text=bindings.device_label(entry["device"]))
         self.refresh_devices()
+        self.refresh_mouse()
         self.rebuild_rows()
+        self.refresh_status()
+
+    def _toggle(self, parent, text, chosen, command):
+        return tk.Button(
+            parent, text=text, font=FONT,
+            bg=GREEN_DEEP if chosen else PANEL_HI,
+            fg=GLOW if chosen else TEXT, activebackground=GREEN,
+            activeforeground=BLACK, relief="flat", bd=0, padx=10, pady=6,
+            highlightthickness=1, cursor="hand2",
+            highlightbackground=GLOW if chosen else EDGE, command=command)
+
+    def refresh_mouse(self):
+        for widget in self.mouse_row.winfo_children():
+            widget.destroy()
+        mouse = self.config["mouse"]
+        here = mouse["stick"] if mouse["port"] == self.port else "off"
+        for value, label in (("off", "Off"), ("right", "Right stick"),
+                             ("left", "Left stick")):
+            self._toggle(self.mouse_row, label, value == here,
+                         lambda v=value: self.set_mouse_stick(v)).pack(
+                             side="left", padx=(0, 6))
+        tk.Frame(self.mouse_row, bg=PANEL, width=14).pack(side="left")
+        _button(self.mouse_row, "-", lambda: self.step_sensitivity(-1),
+                width=2).pack(side="left")
+        _label(self.mouse_row, "%.2fx" % mouse["sensitivity"], fg=GLOW,
+               width=6, anchor="center").pack(side="left")
+        _button(self.mouse_row, "+", lambda: self.step_sensitivity(1),
+                width=2).pack(side="left", padx=(0, 6))
+        self._toggle(self.mouse_row, "Invert Y", mouse["invert_y"],
+                     self.toggle_invert).pack(side="left")
+        if mouse["stick"] != "off" and mouse["port"] != self.port:
+            _label(self.mouse_row, "  controller %d has it" % mouse["port"],
+                   fg=TEXT_DIM, font=FONT_SMALL).pack(side="left")
+
+    # The launcher's steps, so the two tools offer the same values.
+    SENSITIVITY_STEPS = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
+
+    def set_mouse_stick(self, value):
+        mouse = self.config["mouse"]
+        mouse["stick"] = value
+        if value != "off":
+            mouse["port"] = self.port
+        self.dirty = True
+        self.refresh_mouse()
+        self.refresh_status()
+
+    def step_sensitivity(self, step):
+        mouse = self.config["mouse"]
+        steps = self.SENSITIVITY_STEPS
+        nearest = min(range(len(steps)),
+                      key=lambda i: abs(steps[i] - mouse["sensitivity"]))
+        mouse["sensitivity"] = steps[max(0, min(len(steps) - 1, nearest + step))]
+        self.dirty = True
+        self.refresh_mouse()
+        self.refresh_status()
+
+    def toggle_invert(self):
+        self.config["mouse"]["invert_y"] = not self.config["mouse"]["invert_y"]
+        self.dirty = True
+        self.refresh_mouse()
         self.refresh_status()
 
     def refresh_devices(self):

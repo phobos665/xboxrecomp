@@ -62,6 +62,34 @@ class Vocabulary(unittest.TestCase):
         self.assertEqual({name: int(code, 16) for name, code in rows},
                          bindings.KEY_NAMES)
 
+    def test_the_mouse_source_names_are_the_same_and_in_the_same_order(self):
+        names = re.findall(r'"([a-z_0-9]+)"', table(self.text, "MOUSE_SOURCES"))
+        self.assertEqual(names, bindings.MOUSE_BUTTONS)
+
+    def test_the_mouse_defaults_are_the_same(self):
+        match = re.search(r"#define MOUSE_ANTI_DEADZONE_DEFAULT ([0-9.]+)", self.text)
+        self.assertTrue(match)
+        self.assertEqual(float(match.group(1)), bindings.MOUSE_ANTI_DEADZONE_DEFAULT)
+        defaults = bindings.default_mouse()
+        self.assertIn("m->sensitivity = %.1f;" % defaults["sensitivity"], self.text)
+        self.assertIn("m->stick = RECOMP_MOUSE_STICK_OFF;", self.text)
+
+    def test_the_runtime_reads_every_mouse_key_and_stick_name(self):
+        for key in ("stick", "port", "sensitivity", "invert_y", "anti_deadzone"):
+            self.assertIn('"%s"' % key, self.text)
+        for stick in bindings.MOUSE_STICKS:
+            self.assertIn('"%s"' % stick, self.text)
+
+    def test_the_launcher_writes_the_same_mouse_defaults(self):
+        with open(os.path.join(ROOT, "src", "launcher", "launcher_bindings.c"),
+                  encoding="utf-8") as handle:
+            launcher = handle.read()
+        self.assertIn("c->mouse.anti_deadzone = %s;"
+                      % bindings.MOUSE_ANTI_DEADZONE_DEFAULT, launcher)
+        self.assertIn("c->mouse.sensitivity = 1.0;", launcher)
+        for source in bindings.MOUSE_SOURCES:
+            self.assertIn('"%s"' % source, launcher)
+
     def test_the_deadzone_default_is_the_same(self):
         match = re.search(r"#define DEADZONE_DEFAULT (\d+)", self.text)
         self.assertTrue(match)

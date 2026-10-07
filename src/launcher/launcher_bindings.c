@@ -90,6 +90,12 @@ void bind_defaults(BindConfig *c)
                      p == 0 ? k_defaults[i].key : "");
         }
     }
+    /* The runtime's defaults (input_bindings.c, mouse_defaults). */
+    c->mouse.stick = BIND_MOUSE_OFF;
+    c->mouse.port = 0;
+    c->mouse.sensitivity = 1.0;
+    c->mouse.invert_y = 0;
+    c->mouse.anti_deadzone = 0.2;
 }
 
 int bind_config_path(char *out, size_t n)
@@ -237,7 +243,8 @@ static const char *parse_sources(const char *p, BindPort *bp, int k)
                 if (strncmp(value, "pad:", 4) == 0 && !got_pad) {
                     snprintf(bp->pad_src[k], BIND_SOURCE_LEN, "%s", value);
                     got_pad = 1;
-                } else if (strncmp(value, "key:", 4) == 0 && !got_key) {
+                } else if ((strncmp(value, "key:", 4) == 0 ||
+                            strncmp(value, "mouse:", 6) == 0) && !got_key) {
                     snprintf(bp->key_src[k], BIND_SOURCE_LEN, "%s", value);
                     got_key = 1;
                 }
@@ -255,7 +262,7 @@ static const char *parse_sources(const char *p, BindPort *bp, int k)
     if (!p)
         return NULL;
     if (k >= 0) {
-        if (strncmp(value, "key:", 4) == 0)
+        if (strncmp(value, "key:", 4) == 0 || strncmp(value, "mouse:", 6) == 0)
             snprintf(bp->key_src[k], BIND_SOURCE_LEN, "%s", value);
         else
             snprintf(bp->pad_src[k], BIND_SOURCE_LEN, "%s", value);
@@ -339,6 +346,57 @@ static const char *parse_controller(const char *p, BindConfig *c, int index)
     return p + 1;
 }
 
+/* "mouse": { "stick": "right", "port": 1, "sensitivity": 1.0,
+ *            "invert_y": false, "anti_deadzone": 0.2 } -- the runtime's
+ * parse_mouse, for the fields the launcher shows and the one it keeps. */
+static const char *parse_mouse(const char *p, BindMouse *m)
+{
+    char key[48], value[16];
+
+    p = ws(p);
+    if (*p != '{')
+        return NULL;
+    p = ws(p + 1);
+    while (*p && *p != '}') {
+        p = jstring(p, key, sizeof key);
+        if (!p)
+            return NULL;
+        p = ws(p);
+        if (*p != ':')
+            return NULL;
+        p = ws(p + 1);
+        if (strcmp(key, "stick") == 0 && *p == '"') {
+            p = jstring(p, value, sizeof value);
+            if (!p)
+                return NULL;
+            m->stick = strcmp(value, "right") == 0 ? BIND_MOUSE_RIGHT
+                     : strcmp(value, "left") == 0  ? BIND_MOUSE_LEFT
+                     : BIND_MOUSE_OFF;
+        } else {
+            if (strcmp(key, "port") == 0) {
+                m->port = (int)strtol(p, NULL, 10) - 1;
+                if (m->port < 0 || m->port >= BIND_PORTS)
+                    m->port = 0;
+            } else if (strcmp(key, "sensitivity") == 0) {
+                m->sensitivity = strtod(p, NULL);
+                if (!(m->sensitivity > 0.0))
+                    m->sensitivity = 1.0;
+            } else if (strcmp(key, "invert_y") == 0) {
+                m->invert_y = strncmp(p, "true", 4) == 0 || strtol(p, NULL, 10) != 0;
+            } else if (strcmp(key, "anti_deadzone") == 0) {
+                m->anti_deadzone = strtod(p, NULL);
+            }
+            p = jskip(p);
+            if (!p)
+                return NULL;
+        }
+        p = ws(p);
+        if (*p == ',')
+            p = ws(p + 1);
+    }
+    return *p == '}' ? p + 1 : NULL;
+}
+
 int bind_load(const char *path, BindConfig *c)
 {
     FILE *f;
@@ -378,6 +436,9 @@ int bind_load(const char *path, BindConfig *c)
             p = jstring(p, api, sizeof api);
             if (!p) break;
             c->pad_api = strcmp(api, "xinput") == 0 ? BIND_PAD_API_XINPUT : BIND_PAD_API_SDL;
+        } else if (strcmp(key, "mouse") == 0 && *p == '{') {
+            p = parse_mouse(p, &c->mouse);
+            if (!p) break;
         } else if (strcmp(key, "controllers") == 0 && *p == '[') {
             p = ws(p + 1);
             while (*p && *p != ']') {
@@ -429,8 +490,16 @@ int bind_save(const char *path, const BindConfig *c)
     if (!f)
         return 0;
 
-    fprintf(f, "{\n  \"version\": 1,\n  \"pad_api\": \"%s\",\n  \"controllers\": [\n",
+    fprintf(f, "{\n  \"version\": 1,\n  \"pad_api\": \"%s\",\n",
             c->pad_api == BIND_PAD_API_XINPUT ? "xinput" : "sdl");
+    fprintf(f, "  \"mouse\": {\n    \"stick\": \"%s\",\n    \"port\": %d,\n"
+               "    \"sensitivity\": %g,\n    \"invert_y\": %s,\n"
+               "    \"anti_deadzone\": %g\n  },\n",
+            c->mouse.stick == BIND_MOUSE_RIGHT ? "right"
+            : c->mouse.stick == BIND_MOUSE_LEFT ? "left" : "off",
+            c->mouse.port + 1, c->mouse.sensitivity,
+            c->mouse.invert_y ? "true" : "false", c->mouse.anti_deadzone);
+    fprintf(f, "  \"controllers\": [\n");
     for (p = 0; p < BIND_PORTS; p++) {
         const BindPort *bp = &c->port[p];
         int first = 1;
@@ -489,6 +558,10 @@ static const struct { const char *src, *label; } k_labels[] = {
     { "key:LSHIFT", "Left shift" }, { "key:RSHIFT", "Right shift" },
     { "key:LCTRL", "Left ctrl" }, { "key:RCTRL", "Right ctrl" },
     { "key:TAB", "Tab" },
+    { "mouse:left", "Left mouse button" }, { "mouse:right", "Right mouse button" },
+    { "mouse:middle", "Middle mouse button" },
+    { "mouse:x1", "Mouse back button" }, { "mouse:x2", "Mouse forward button" },
+    { "mouse:wheel_up", "Mouse wheel up" }, { "mouse:wheel_down", "Mouse wheel down" },
     { NULL, NULL }
 };
 

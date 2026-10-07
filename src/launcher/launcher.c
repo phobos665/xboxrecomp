@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,12 +86,39 @@ static int        g_sel;
  * They live in the list rather than off to one side so they are reached
  * the same way as everything else -- one way to move, one way to
  * change, and no second idea to learn. */
-#define BIND_HEAD_ROWS 4
+#define BIND_HEAD_ROWS 7
 #define BIND_ROW_PORT   0
 #define BIND_ROW_DEVICE 1
 #define BIND_ROW_API    2       /* SDL3 or XInput, for every controller */
-#define BIND_ROW_RESET  3
+#define BIND_ROW_MOUSE  3       /* mouse look: which of this controller's sticks */
+#define BIND_ROW_SENS   4       /* how far a movement turns it */
+#define BIND_ROW_INVERT 5
+#define BIND_ROW_RESET  6
 #define BIND_TOTAL_ROWS (BIND_HEAD_ROWS + BIND_CONTROLS)
+
+/* Mouse sensitivity, as steps rather than a free number: a pad moves
+ * through a list, and nobody can tell 1.1 from 1.2 by hand anyway. */
+static const double k_mouse_sens[] = {
+    0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0
+};
+#define MOUSE_SENS_STEPS ((int)(sizeof k_mouse_sens / sizeof k_mouse_sens[0]))
+
+static int mouse_sens_index(double v)
+{
+    int i, best = 0;
+
+    for (i = 1; i < MOUSE_SENS_STEPS; i++)
+        if (fabs(k_mouse_sens[i] - v) < fabs(k_mouse_sens[best] - v))
+            best = i;
+    return best;
+}
+
+/* What the mouse does for the controller being edited. There is one mouse,
+ * so turning it on here takes it from whichever controller had it. */
+static int mouse_stick_here(void)
+{
+    return g_bind.mouse.port == g_bind_port ? g_bind.mouse.stick : BIND_MOUSE_OFF;
+}
 
 static const char *frame_cap_label(int i)
 {
@@ -382,6 +410,27 @@ static const char *capture_key(void)
             snprintf(out, sizeof out, "key:%c", (char)vk);
             return out;
         }
+    {
+        /* The mouse's buttons share the keyboard's column. GetAsyncKeyState
+         * reports the physical buttons; the runtime names the logical ones,
+         * so a swapped (left-handed) mouse is swapped back here. */
+        int swap = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        static const struct { int vk; const char *name; } k_mouse[] = {
+            { VK_LBUTTON, "left" }, { VK_RBUTTON, "right" },
+            { VK_MBUTTON, "middle" }, { VK_XBUTTON1, "x1" },
+            { VK_XBUTTON2, "x2" }, { 0, NULL }
+        };
+
+        for (i = 0; k_mouse[i].name; i++)
+            if (GetAsyncKeyState(k_mouse[i].vk) & 0x8000) {
+                const char *name = k_mouse[i].name;
+
+                if (swap && i < 2)
+                    name = i == 0 ? "right" : "left";
+                snprintf(out, sizeof out, "mouse:%s", name);
+                return out;
+            }
+    }
     return NULL;
 }
 
@@ -392,6 +441,8 @@ static int everything_released(int pad_index)
     return capture_pad(pad_index) == NULL && capture_key() == NULL &&
            !(GetAsyncKeyState(VK_ESCAPE) & 0x8000);
 }
+
+static void capture_store(const char *got);
 
 static void capture_tick(void)
 {
@@ -410,7 +461,12 @@ static void capture_tick(void)
     got = (g_bind_col == 0) ? capture_pad(pad) : capture_key();
     if (!got)
         return;
+    capture_store(got);
+}
 
+/* The answer to a capture, into the control it was for. */
+static void capture_store(const char *got)
+{
     {
         int k = g_bind_top + g_sel - BIND_HEAD_ROWS;
 
@@ -756,6 +812,37 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
                                    ? RECOMP_PAD_API_XINPUT : RECOMP_PAD_API_SDL);
                 g_bind_dirty = 1;
             }
+        } else if (k == BIND_ROW_MOUSE) {
+            if (dx || accept) {
+                /* Off, right stick, left stick: right first, because the
+                 * right stick is the camera in nearly every title. */
+                static const int order[3] = { BIND_MOUSE_OFF, BIND_MOUSE_RIGHT,
+                                              BIND_MOUSE_LEFT };
+                int cur = 0, i;
+
+                for (i = 0; i < 3; i++)
+                    if (order[i] == mouse_stick_here())
+                        cur = i;
+                cur = (cur + (dx < 0 ? -1 : 1) + 3) % 3;
+                g_bind.mouse.stick = order[cur];
+                if (order[cur] != BIND_MOUSE_OFF)
+                    g_bind.mouse.port = g_bind_port;
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_SENS) {
+            if (dx) {
+                int i = mouse_sens_index(g_bind.mouse.sensitivity) + dx;
+
+                if (i < 0) i = 0;
+                if (i >= MOUSE_SENS_STEPS) i = MOUSE_SENS_STEPS - 1;
+                g_bind.mouse.sensitivity = k_mouse_sens[i];
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_INVERT) {
+            if (dx || accept) {
+                g_bind.mouse.invert_y = !g_bind.mouse.invert_y;
+                g_bind_dirty = 1;
+            }
         } else if (k == BIND_ROW_RESET) {
             if (accept) {
                 BindConfig d;
@@ -856,7 +943,7 @@ static void draw(void)
             theme_text(h2, "CONTROLLER", 10, 700,
                        g_bind_col == 0 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
             h2.x += 210;
-            theme_text(h2, "KEYBOARD", 10, 700,
+            theme_text(h2, "KEYBOARD / MOUSE", 10, 700,
                        g_bind_col == 1 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
         }
 
@@ -907,6 +994,32 @@ static void draw(void)
                                    ? "Xbox controllers only (XInput)"
                                    : "All controllers (SDL3)",
                            12, 400, lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_MOUSE || k == BIND_ROW_SENS || k == BIND_ROW_INVERT) {
+                const char *name = k == BIND_ROW_MOUSE ? "Mouse look"
+                                 : k == BIND_ROW_SENS  ? "Mouse sensitivity"
+                                 : "Invert mouse Y";
+
+                if (k == BIND_ROW_MOUSE) {
+                    int here = mouse_stick_here();
+
+                    if (here == BIND_MOUSE_RIGHT)
+                        snprintf(line, sizeof line, "Moves the right stick");
+                    else if (here == BIND_MOUSE_LEFT)
+                        snprintf(line, sizeof line, "Moves the left stick");
+                    else if (g_bind.mouse.stick != BIND_MOUSE_OFF)
+                        snprintf(line, sizeof line, "Off  (controller %d has it)",
+                                 g_bind.mouse.port + 1);
+                    else
+                        snprintf(line, sizeof line, "Off");
+                } else if (k == BIND_ROW_SENS) {
+                    snprintf(line, sizeof line, "%.2fx", g_bind.mouse.sensitivity);
+                } else {
+                    snprintf(line, sizeof line, "%s", g_bind.mouse.invert_y ? "On" : "Off");
+                }
+                theme_text(lr, name, 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
             } else if (k == BIND_ROW_RESET) {
                 theme_text(lr, "Reset this controller", 12, 600,
                            lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
@@ -929,13 +1042,13 @@ static void draw(void)
                 cv.x += 210;
                 theme_text(cv,
                            (g_capturing && lit > 0.5 && g_bind_col == 1)
-                               ? "press a key..." : bind_source_label(bp->key_src[c]),
+                               ? "press a key or click..." : bind_source_label(bp->key_src[c]),
                            12, 400,
                            (lit > 0.5 && g_bind_col == 1) ? THEME_GREEN : THEME_TEXT_DIM,
                            THEME_LEFT);
             }
 
-            if (lit > 0.5 && k <= BIND_ROW_API)
+            if (lit > 0.5 && k < BIND_ROW_RESET)
                 theme_arrows(arrows_rect(rr), 1, 1, lit);
         }
 
@@ -964,8 +1077,14 @@ static void draw(void)
                 : k == BIND_ROW_API    ? "All controllers reads Xbox, PlayStation, Switch and most other pads. "
                                          "Xbox controllers only is the older XInput path, for a pad that misbehaves. "
                                          "Every game uses this."
+                : k == BIND_ROW_MOUSE  ? "Move the mouse to turn this controller's stick: camera control. "
+                                         "The cursor stays on the picture while playing; F8 lets it go, "
+                                         "a click takes it back."
+                : k == BIND_ROW_SENS   ? "How far the stick goes for how fast the mouse moves. "
+                                         "Every game uses this."
+                : k == BIND_ROW_INVERT ? "Pushing the mouse away looks down rather than up."
                 : k == BIND_ROW_RESET  ? "Put this controller back to the built-in mapping."
-                : "Left and right choose the controller or the keyboard column. "
+                : "Left and right choose the controller or the keyboard and mouse column. "
                   "A or Enter rebinds. Bindings are shared by every game.",
                 11, THEME_TEXT_DIM);
         }
@@ -1099,9 +1218,27 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         InvalidateRect(h, NULL, FALSE);
         return 0;
+    case WM_MOUSEWHEEL:
+        /* The wheel cannot be polled, so a capture in the keyboard and
+         * mouse column takes it from here. */
+        if (g_capturing && g_capture_armed && g_bind_col == 1) {
+            capture_store((SHORT)HIWORD(wp) > 0 ? "mouse:wheel_up" : "mouse:wheel_down");
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
     case WM_LBUTTONDOWN: {
         int mx = LOWORD(lp), my = HIWORD(lp), i;
 
+        /* Waiting for a key or a mouse button: this click is the answer,
+         * and capture_tick takes it. It is not a click on whatever it
+         * landed on. */
+        if (g_capturing && g_bind_col == 1) {
+            if (g_capture_armed) {
+                capture_store("mouse:left");    /* WM_ messages are logical */
+                InvalidateRect(h, NULL, FALSE);
+            }
+            return 0;
+        }
         for (i = 0; i < TAB_COUNT; i++) {
             ThemeRect t = tab_rect(i);
 

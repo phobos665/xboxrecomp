@@ -84,6 +84,9 @@ or `[]` unbinds.
 | `pad:dpad_up` .. `pad:dpad_right` | the host D-pad |
 | `pad:lt` `pad:rt` | analog triggers, 0-255 |
 | `pad:lx+` `pad:lx-` `pad:ly+` .. `pad:ry-` | one half of one stick axis |
+| `mouse:left` `mouse:right` `mouse:middle` | mouse buttons, primary and secondary as Windows has them (a left-handed setting carries over) |
+| `mouse:x1` `mouse:x2` | the side buttons (back, forward) |
+| `mouse:wheel_up` `mouse:wheel_down` | one short press per wheel notch (60 ms down, 40 ms up, up to four queued) |
 
 **Controls** are the 24 inputs an Xbox pad has: `a b x y black white start
 back ltrigger rtrigger`, `dpad_up/down/left/right`, `lthumb`, `rthumb`, and
@@ -95,6 +98,86 @@ a digital control fires above a quarter press, an analog button takes the
 magnitude, and a stick axis is the positive half minus the negative one,
 scaled to the signed 16 bits the guest reads. Binding a trigger to a key
 gives a full pull; binding a stick half to a key gives a full deflection.
+
+### The mouse
+
+*October 2026.* Two things, both read from raw input (`WM_INPUT`) on the
+game window, so only while that window is in front:
+
+- **Mouse buttons are sources**, bound like keys: `"rtrigger": ["pad:rt",
+  "mouse:left"]`. The launcher puts them in the keyboard column ("KEYBOARD /
+  MOUSE"): click, or turn the wheel, when it asks for a key.
+- **Mouse look**: the mouse's movement turns one controller's stick. It is a
+  top-level object, because there is one mouse:
+
+```json
+"mouse": {
+  "stick": "right",
+  "port": 1,
+  "sensitivity": 1.0,
+  "invert_y": false,
+  "anti_deadzone": 0.2
+}
+```
+
+`stick` is `off` (the default), `right` or `left`; `port` is the controller
+(1-4) whose stick it is. The mouse's deflection is added to whatever that
+stick's own bindings say, and the sum clamped, so a pad and the mouse can both
+turn the camera.
+
+| variable | overrides | values |
+|---|---|---|
+| `RECOMP_MOUSE_STICK` | `stick` | `right`, `left`, `off`; `1`, `on` or empty mean `right`, `0` means `off` |
+| `RECOMP_MOUSE_SENS` | `sensitivity` | a number; 1.0 is the default |
+| `RECOMP_MOUSE_INVERT_Y` | `invert_y` | `1`/`0`, empty means on |
+| `RECOMP_MOUSE_PORT` | `port` | 1-4 |
+| `RECOMP_MOUSE_ANTI_DEADZONE` | `anti_deadzone` | 0-0.9 |
+
+The launcher's Input tab has three rows for it, after "Controllers":
+**Mouse look** (Off, Moves the right stick, Moves the left stick, for the
+controller being edited; turning it on takes the mouse from whichever
+controller had it), **Mouse sensitivity** (0.25x to 5x in steps) and **Invert
+mouse Y**. `py -3 -m tools.input_ui` has the same, as a "MOUSE LOOK" row
+under the device buttons. Both write the `mouse` object above into the
+bindings file, so it is per person, not per title, like every other binding.
+
+**How movement becomes a stick** (`src/input/recomp_mouse.c`). A mouse says
+how far it moved; a stick says where it is held, and a title turns that into a
+turning rate. So the deflection follows the mouse's speed. The window thread
+adds raw counts to two interlocked accumulators and never waits; each pad poll
+drains them under a small lock and steps a model forward:
+
+- the deflection decays towards centre with a 40 ms time constant;
+- the counts since the last poll are added as if spread evenly over the time
+  since that poll, which makes a steady speed give a steady deflection
+  whatever the title's poll rate -- 300,000 polls a second and one a frame give
+  the same answer (measured: 16,211 and 16,332 for the expected 16,384);
+- at sensitivity 1.0, 2,500 counts a second holds the stick fully over: a slow
+  sweep with an 800 dpi mouse. Faster than that saturates, clamped radially
+  (a stick's gate is round), so a flick stops turning when the hand stops;
+- below 2% it reads as centred; above, it is lifted to at least
+  `anti_deadzone` of the travel, because most titles ignore the first quarter
+  of a stick and a slow movement would otherwise vanish inside it.
+
+**The cursor.** While mouse look is on and the window is in front, the cursor
+is clipped to the picture and hidden: a cursor that wanders off the window
+takes the focus with it at the first click. **F8** lets it go (F9, F10 and F11
+are taken by the frame-rate overlay, the frame cap and the frame capture, and
+F12 breaks into an attached debugger); a click on the picture, or coming back
+with Alt+Tab, takes it again, and that click is not passed to the title.
+Leaving the window lets go of the cursor and of every held mouse button.
+
+Nothing of this runs unless the config asks for it: with mouse look off and no
+`mouse:` source bound, no raw input is registered and the window's messages
+pass through untouched. The window is the D3D8 replacement's
+(`src/hle/hle_d3d8.c`), so a run with `RECOMP_HLE_D3D8=off` has no mouse.
+
+```
+[INPUT]   controller 1: SDL3 pad 1 + keyboard + mouse
+[INPUT] mouse moves controller 1's right stick (sensitivity 1.00, Y not inverted, anti-deadzone 0.20)
+[INPUT] mouse captured: F8 lets the cursor go, a click on the picture takes it back
+[INPUT] port 1 first press: right stick (mouse) (SDL3 pad 1 + keyboard + mouse)
+```
 
 ### Where it lives
 
@@ -212,8 +295,10 @@ defaults, what a partial or broken file means, which sources are valid, and
 that a saved config reloads identical.
 
 `tools/input_ui/test_runtime_vocabulary.py` reads `CONTROLS`, `PAD_BUTTONS`,
-`KEYS` and `DEFAULTS` out of `src/input/input_bindings.c` and fails if the
-Python copies have drifted. Drift is the dangerous failure here: the UI would
+`KEYS`, `MOUSE_SOURCES`, `DEFAULTS` and the mouse defaults out of
+`src/input/input_bindings.c` (and the launcher's mouse defaults out of
+`src/launcher/launcher_bindings.c`) and fails if the Python copies have
+drifted. Drift is the dangerous failure here: the UI would
 write a name the runtime does not recognise, the file would save, and the
 control would simply never fire.
 
@@ -242,5 +327,8 @@ Burnout 2, built from this branch:
   sampling is XInput and `GetAsyncKeyState`, so on POSIX every port reads
   neutral until an SDL2 backend exists (the same gap `src/hle`'s audio and
   input backends already have).
+- **The mouse in a running title.** The stick model and both config readers
+  are tested offline; capture, release and raw input on the game window have
+  not yet been played with. Off Windows the mouse does nothing.
 - **Memory units and other XPP devices.** Only gamepads are bound; the model
   still answers "nothing connected" for everything else.

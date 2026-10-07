@@ -75,6 +75,7 @@
 #include "d3d8_movie.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
+#include "recomp_mouse.h"
 #endif
 
 static void first_call(int *seen, const char *name, uint32_t arg)
@@ -259,6 +260,13 @@ static int  g_shadow_fullscreen;
 
 static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    intptr_t answered = 0;
+
+    /* The mouse first (src/input/recomp_mouse.c): raw movement and buttons,
+     * and keeping the cursor on the picture while it is mouse look. It
+     * answers nothing unless the binding config asked for the mouse. */
+    if (recomp_mouse_window_message(hwnd, msg, (uintptr_t)wp, (intptr_t)lp, &answered))
+        return (LRESULT)answered;
     switch (msg) {
     case WM_SYSKEYDOWN:
         /* Alt+Enter, the usual Windows key for it: fullscreen and back. */
@@ -383,6 +391,10 @@ static DWORD WINAPI shadow_window_thread(LPVOID param)
      * the focus, for a run a script drives while someone works at the same
      * desk. The game neither needs nor notices the focus: a script is its
      * only input, and the frame is drawn and dumped the same either way. */
+    /* Before the window is shown, so the activation that showing it brings
+     * already finds the mouse attached and can take the cursor. */
+    if (req->hwnd)
+        recomp_mouse_attach(req->hwnd);
     if (req->hwnd) {
         const char *bg = getenv("RECOMP_WINDOW_BACKGROUND");
 

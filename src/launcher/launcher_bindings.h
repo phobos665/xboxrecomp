@@ -37,9 +37,10 @@ typedef struct BindPort {
     BindDevice device;
     int        pad;                       /* pad slot, 0..3 */
     int        deadzone;
-    /* One pad source and one keyboard source per control, which is the
-     * shape the defaults have and the shape a player thinks in. A file
-     * with more sources than that keeps them: see `extra`. */
+    /* One pad source and one keyboard-or-mouse source per control, which
+     * is the shape the defaults have and the shape a player thinks in.
+     * key_src holds "key:..." or "mouse:..." -- the mouse's buttons sit in
+     * the keyboard's column, because the two are used together. */
     char pad_src[BIND_CONTROLS][BIND_SOURCE_LEN];
     char key_src[BIND_CONTROLS][BIND_SOURCE_LEN];
 } BindPort;
@@ -48,9 +49,21 @@ typedef struct BindPort {
  * every kind of controller, XInput only Xbox ones. The file's "pad_api". */
 enum { BIND_PAD_API_SDL = 0, BIND_PAD_API_XINPUT = 1 };
 
+/* Mouse look: which stick the mouse moves, the file's "mouse" object. */
+enum { BIND_MOUSE_OFF = 0, BIND_MOUSE_LEFT = 1, BIND_MOUSE_RIGHT = 2 };
+
+typedef struct BindMouse {
+    int    stick;                         /* BIND_MOUSE_* */
+    int    port;                          /* 0..3: whose stick */
+    double sensitivity;                   /* 1.0 is the runtime's default */
+    int    invert_y;
+    double anti_deadzone;                 /* not offered here; kept */
+} BindMouse;
+
 typedef struct BindConfig {
-    BindPort port[BIND_PORTS];
-    int      pad_api;                     /* BIND_PAD_API_* */
+    BindPort  port[BIND_PORTS];
+    int       pad_api;                    /* BIND_PAD_API_* */
+    BindMouse mouse;
 } BindConfig;
 
 /* The built-in mapping, the same one the runtime falls back to with no
