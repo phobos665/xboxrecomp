@@ -837,6 +837,8 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
+static uint32_t g_xbox_last_file_error;
+
 static NTSTATUS errno_to_status(int e)
 {
     switch (e) {
@@ -857,21 +859,68 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     ULONG CreateDisposition, ULONG CreateOptions)
 {
     char host_path[MAX_PATH];
+    struct stat st;
     (void)AllocationSize; (void)FileAttributes; (void)ShareAccess;
 
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
+    /* The same rules as the Win32 half, which says why each one is there;
+     * this half had none of them. */
     const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    if (xbox_path && ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
+        !(xbox_path[0] && xbox_path[1] == ':')) {
+        /* Relative to an open directory (XDeleteSaveGame opens each child
+         * of its save directory this way). */
+        const char *root = w32_handle_path(ObjectAttributes->RootDirectory);
+        if (!root || snprintf(host_path, sizeof host_path, "%s/%s", root, xbox_path)
+                         >= (int)sizeof host_path) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: relative open with no root path");
+            return STATUS_OBJECT_PATH_NOT_FOUND;
+        }
+        for (char *p = host_path; *p; p++)
+            if (*p == '\\') *p = '/';
+    } else if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    /* A partition device opened as a directory (a free-space query): the
+     * directory that holds its image stands in for the volume. */
+    if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        stat(host_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
+        char *slash = strrchr(host_path, '/');
+        if (slash && slash != host_path) {
+            *slash = '\0';
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                     "NtCreateFile: directory open of a device image, "
+                     "using its containing directory instead");
+        }
+    }
+
+    /* A device opened as itself (\Device\CdRom0 is the game directory). */
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        stat(host_path, &st) == 0 && S_ISDIR(st.st_mode))
+        CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+
     int fd;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
-            mkdir(host_path, 0755);   /* EEXIST is fine */
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            /* FILE_CREATE on a directory that exists is a collision, which
+             * TimeSplitters 2's save path depends on hearing. */
+            if (mkdir(host_path, 0755) != 0 && errno == EEXIST &&
+                CreateDisposition == XBOX_FILE_CREATE) {
+                g_xbox_last_file_error = (uint32_t)EEXIST;
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                         "NtCreateFile: FILE_CREATE on existing directory %s -> collision",
+                         host_path);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = STATUS_OBJECT_NAME_COLLISION;
+                    IoStatusBlock->Information = 0;
+                }
+                return STATUS_OBJECT_NAME_COLLISION;
+            }
+        }
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
@@ -879,12 +928,17 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (fd < 0) {
         int e = errno;
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        NTSTATUS status = errno_to_status(e);
+        g_xbox_last_file_error = (uint32_t)e;
+        /* A warning, as on Windows: a failed open is how a title decides a
+         * volume or asset is missing. */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)",
+                 host_path, e);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = status;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return status;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
@@ -1296,11 +1350,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     return STATUS_SUCCESS;
 }
 
-/* The Windows branch records the Win32 error of a failed open for the
- * bridge's [FILE] line; this branch does not yet, so the line says 0. */
+/* The errno of the last failed open, for the bridge's [FILE] line (the
+ * Windows half keeps the Win32 error there). */
 uint32_t xbox_LastFileError(void)
 {
-    return 0;
+    return g_xbox_last_file_error;
 }
 
 #endif /* _WIN32 */
