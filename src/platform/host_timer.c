@@ -95,6 +95,12 @@ int host_timer_wait_us(host_timer *t, int64_t us, uint32_t cap_ms)
                ? HOST_WAIT_ELAPSED : HOST_WAIT_FAILED;
 }
 
+/* A waitable timer never spins, so the precise wait is already the cheap one. */
+int host_timer_wait_us_coarse(host_timer *t, int64_t us, uint32_t cap_ms)
+{
+    return host_timer_wait_us(t, us, cap_ms);
+}
+
 int host_timer_wait_until(host_timer *t, int64_t deadline_ns, uint32_t cap_ms)
 {
     int64_t left = deadline_ns - host_time_ns();
@@ -328,6 +334,24 @@ int host_timer_wait_us(host_timer *t, int64_t us, uint32_t cap_ms)
     if (us < 0)
         us = 0;
     return host_timer_wait_until(t, host_time_ns() + us * 1000, cap_ms);
+}
+
+int host_timer_wait_us_coarse(host_timer *t, int64_t us, uint32_t cap_ms)
+{
+    int capped = 0;
+
+    if (!t)
+        return HOST_WAIT_NOT_ARMED;
+    if (us < 0)
+        us = 0;
+    if (cap_ms != 0xFFFFFFFFu && us > (int64_t)cap_ms * 1000) {
+        us = (int64_t)cap_ms * 1000;
+        capped = 1;
+    }
+    /* One sleep to an absolute deadline, which only ever wakes late, so
+     * "never less than asked" holds without the spin. */
+    sleep_until_ns(host_time_ns() + us * 1000);
+    return capped ? HOST_WAIT_FAILED : HOST_WAIT_ELAPSED;
 }
 
 int host_timer_wait_us_or_event(host_timer *t, int64_t us, void *event, uint32_t cap_ms)

@@ -36,6 +36,7 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
+#include <time.h>     /* clock_gettime(CLOCK_THREAD_CPUTIME_ID), RECOMP_NV2A_ACK_STATS */
 #endif
 #ifdef __APPLE__
 #include <pthread.h>  /* pthread_set_qos_class_self_np (RECOMP_GUEST_ONE_CPU) */
@@ -2248,54 +2249,153 @@ static void framebuffer_probe_tick(void)
  * thread of the same priority is waiting, so the thread spun a whole host
  * core for the life of the process (OutRun 2: 172 s of CPU in a 180 s run)
  * -- on a laptop that is power and thermal headroom the guest's own core
- * needs. A guest waiting on one of these words is spinning on another core,
- * so while words keep changing the thread still goes round at full speed;
- * once nothing has changed for a millisecond it waits on a high-resolution
- * timer between passes instead (RECOMP_NV2A_ACK_IDLE_US, default 500; 0 for
- * the old spin). The cost is that the first wait after a quiet spell -- the
- * first kickoff after a vblank wait, say -- can be answered up to that much
- * later. */
+ * needs. A guest waiting on one of these words is spinning on another core.
+ *
+ * Idle: once nothing has changed for a millisecond the thread waits on a
+ * timer between passes (RECOMP_NV2A_ACK_IDLE_US, default 500; 0 for the old
+ * spin). The cost is that the first wait after a quiet spell -- the first
+ * kickoff after a vblank wait, say -- can be answered up to that much later.
+ * The wait is the coarse one: on macOS the precise wait spins its last
+ * 200 us, which bought nothing here.
+ *
+ * Busy: while words keep changing, the thread yields between passes, and
+ * after ACK_BUSY_YIELDS passes in a row that changed nothing it sleeps
+ * RECOMP_NV2A_ACK_BUSY_US between them instead (0, the old spin, keeps
+ * yielding for the whole millisecond). Every change found resets the count,
+ * so a burst of guest work -- a kickoff, then a fence wait on it -- is still
+ * answered by yielding passes; what the sleep can delay is the first change
+ * after a run of passes that found none. Without a high-resolution timer the
+ * busy phase spins as before. RECOMP_NV2A_ACK_STATS=1 prints, every ten
+ * seconds, this thread's CPU time and how many changes a pass found right
+ * after a sleep (each of those may have waited for the sleep to end).
+ *
+ * Why the busy backoff is off by default. TimeSplitters 2 in its level on an
+ * M4, quiet machine, back-to-back runs (Oct 2026): with the old spin this
+ * thread used 21% of a core, with RECOMP_NV2A_ACK_BUSY_US=50 1.7%, and
+ * D3D_BlockOnTime -- the fence wait -- never waited in either (63 calls a
+ * second, ~7 us a second in total, none over 20 us); frame rate, "title's
+ * Swap" and "rest of frame" stayed within 0.1 ms. But ~170 changes a second
+ * were found right after a sleep, and a title that waits on the FIFO's GET
+ * or on a fence more often than TimeSplitters 2 does (Burnout 2 and OutRun 2
+ * pace on the fence) would wait out the sleep each time. Turn it on after
+ * those have been measured. */
+#define ACK_BUSY_YIELDS 8
+#ifndef ACK_BUSY_US_DEFAULT
+#define ACK_BUSY_US_DEFAULT 0
+#endif
+
+/* This thread's CPU time, for RECOMP_NV2A_ACK_STATS. */
+static int64_t ack_thread_cpu_ns(void)
+{
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
+        return 0;
+    return ((int64_t)(((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+            (int64_t)(((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return 0;
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+#endif
+}
+
 static void nv2a_ack_wait(void)
 {
-    static int        idle_us = -1;
+    enum { ACK_YIELDED, ACK_SLEPT_BUSY, ACK_SLEPT_IDLE };
+    static int        idle_us = -1, busy_us, stats;
     static host_timer *timer;
     static LONG       seen;
     static LONGLONG   quiet_since, qpf;
+    static int        busy_quiet_passes, last_wait = ACK_YIELDED;
+    static struct {
+        int64_t  since_ns, cpu_ns;
+        uint32_t passes, yields, busy_sleeps, idle_sleeps;
+        uint32_t found_after_busy, found_after_idle;
+    } st;
     LARGE_INTEGER     now;
 
     if (idle_us < 0) {
         const char *v = getenv("RECOMP_NV2A_ACK_IDLE_US");
+        const char *b = getenv("RECOMP_NV2A_ACK_BUSY_US");
+        const char *s = getenv("RECOMP_NV2A_ACK_STATS");
         LARGE_INTEGER f;
 
         idle_us = v ? atoi(v) : 500;
         if (idle_us < 0)
             idle_us = 0;
-        if (idle_us) {
+        busy_us = b ? atoi(b) : ACK_BUSY_US_DEFAULT;
+        if (busy_us < 0)
+            busy_us = 0;
+        stats = s && *s && *s != '0';
+        if (idle_us || busy_us) {
             timer = host_timer_create(HOST_TIMER_ANY);
             if (!timer)
-                idle_us = 0;
+                idle_us = busy_us = 0;
+            else if (!host_timer_high_res(timer))
+                busy_us = 0;    /* a scheduler-tick sleep is no backoff */
         }
         QueryPerformanceFrequency(&f);
         qpf = f.QuadPart;
-        fprintf(stderr, "  NV2A busy-bit ack: %s\n",
+        fprintf(stderr, "  NV2A busy-bit ack: %s; %s\n",
                 idle_us ? "waits between passes once idle (RECOMP_NV2A_ACK_IDLE_US)"
-                        : "spins (RECOMP_NV2A_ACK_IDLE_US=0)");
-    }
-    if (!idle_us) {
-        Sleep(0);
-        return;
+                        : "spins when idle (RECOMP_NV2A_ACK_IDLE_US=0)",
+                busy_us ? "backs off when busy (RECOMP_NV2A_ACK_BUSY_US)"
+                        : "yields when busy (RECOMP_NV2A_ACK_BUSY_US=0)");
+        st.since_ns = host_time_ns();
+        st.cpu_ns = ack_thread_cpu_ns();
     }
     QueryPerformanceCounter(&now);
     if (g_ack_activity != seen) {
         seen = g_ack_activity;
         quiet_since = now.QuadPart;
+        busy_quiet_passes = 0;
+        if (last_wait == ACK_SLEPT_BUSY)
+            st.found_after_busy++;
+        else if (last_wait == ACK_SLEPT_IDLE)
+            st.found_after_idle++;
+    }
+    if (stats) {
+        int64_t t = host_time_ns();
+
+        st.passes++;
+        if (t - st.since_ns >= 10000000000LL) {
+            int64_t cpu = ack_thread_cpu_ns();
+            fprintf(stderr, "[NV2A-ACK] last %.1f s: thread CPU %.0f ms, %u passes "
+                    "(%u yields, %u busy sleeps, %u idle sleeps); changes found "
+                    "right after a busy sleep %u, after an idle sleep %u\n",
+                    (double)(t - st.since_ns) / 1e9, (double)(cpu - st.cpu_ns) / 1e6,
+                    st.passes, st.yields, st.busy_sleeps, st.idle_sleeps,
+                    st.found_after_busy, st.found_after_idle);
+            memset(&st, 0, sizeof st);
+            st.since_ns = t;
+            st.cpu_ns = cpu;
+        }
     }
     if (now.QuadPart - quiet_since < qpf / 1000) {
-        Sleep(0);   /* busy: a waiter is spinning on another core */
+        /* Busy: a waiter may be spinning on another core. */
+        if (busy_us && ++busy_quiet_passes > ACK_BUSY_YIELDS
+                && host_timer_wait_us_coarse(timer, busy_us, 50) != HOST_WAIT_NOT_ARMED) {
+            last_wait = ACK_SLEPT_BUSY;
+            st.busy_sleeps++;
+            return;
+        }
+        Sleep(0);
+        last_wait = ACK_YIELDED;
+        st.yields++;
         return;
     }
-    if (host_timer_wait_us(timer, idle_us, 50) == HOST_WAIT_NOT_ARMED)
+    if (!idle_us) {
+        Sleep(0);
+        last_wait = ACK_YIELDED;
+        st.yields++;
+        return;
+    }
+    if (host_timer_wait_us_coarse(timer, idle_us, 50) == HOST_WAIT_NOT_ARMED)
         Sleep(1);
+    last_wait = ACK_SLEPT_IDLE;
+    st.idle_sleeps++;
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -2425,8 +2525,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {
