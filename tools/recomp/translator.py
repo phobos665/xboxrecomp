@@ -20,6 +20,8 @@ import struct
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
+from .runtime_headers import (NO_SIMD_DEFINE, refresh_runtime_headers,
+                              simd_opt_out)
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
@@ -522,6 +524,15 @@ class FunctionTranslator:
             raw_bytes = self._read_func_bytes(caller, end)
             if not raw_bytes:
                 continue
+            # _find_static_indirect_ranges finds nothing in a function with
+            # no `call <register>`, so look for one before paying for the
+            # full decode. The test is looser than the operand check it
+            # stands in for (anything that is neither an immediate nor a
+            # memory operand), so it can only send extra functions on.
+            if not any(m == "call" and "[" not in op and not op.startswith("0x")
+                       for _a, _s, m, op in self.disasm.scan_lite(
+                           raw_bytes, caller, end)):
+                continue
             instructions = self.disasm.disassemble_function(
                 raw_bytes, caller, end)
             for lower, upper in self._find_static_indirect_ranges(instructions):
@@ -733,9 +744,15 @@ class FunctionTranslator:
             else:
                 end = info.get("end", start)
                 raw_bytes = self._read_func_bytes(start, end)
-                instructions = (
-                    self.disasm.disassemble_function(raw_bytes, start, end)
-                    if raw_bytes else [])
+                # Only a `jmp` through memory can be a site; decode in full
+                # only the functions that have one (see scan_lite).
+                if not raw_bytes or not any(
+                        m == "jmp" and "[" in op
+                        for _a, _s, m, op in self.disasm.scan_lite(
+                            raw_bytes, start, end)):
+                    continue
+                instructions = self.disasm.disassemble_function(
+                    raw_bytes, start, end)
             for insn in instructions:
                 if (insn.mnemonic != "jmp" or insn.jump_target
                         or not insn.operands
@@ -1086,6 +1103,21 @@ class FunctionTranslator:
             code = self._translate_function_once(func_addr, func_info,
                                                  force_cf=True)
         return code
+
+    def translate_isolated(self, func_addr, func_info):
+        """translate_function, returning what it added to the Lifter's tallies.
+
+        Returns (code, [(addr, name), ...] call targets it named in the order
+        it named them, {mnemonic: [addr, ...]} it left unimplemented). The
+        tallies start empty, so this is one function's share of each; a
+        process-pool worker sends them back to be replayed in function order
+        (BatchTranslator._lift_all).
+        """
+        self.lifter.referenced_calls = {}
+        self.lifter.unimplemented = {}
+        code = self.translate_function(func_addr, func_info)
+        return (code, list(self.lifter.referenced_calls.items()),
+                self.lifter.unimplemented)
 
     def _translate_function_once(self, func_addr, func_info, force_cf=False):
         start = func_addr
@@ -1798,6 +1830,130 @@ class FunctionTranslator:
         return regs
 
 
+def _cut_here(addr):
+    """True for about one function start in 16, picked by its address alone.
+
+    Knuth's multiplicative hash, top four bits: a fixed property of the
+    address, the same on every platform and every run.
+    """
+    return ((addr * 2654435761) & 0xFFFFFFFF) >> 28 == 0
+
+
+def emitted_lines(code):
+    """A function's share of the lines of the file it is joined into."""
+    return code.count("\n") + 1
+
+
+# Weights of compile_cost: what one label and one x87 stack access cost the
+# compiler, relative to each other. Refit with tools/recomp/fit_compile_cost.py.
+COST_PER_LABEL = 3
+COST_PER_X87 = 1
+
+
+def compile_cost(code):
+    """Estimated compile cost of one generated function, in arbitrary units.
+
+    Lines are a poor predictor of compile time. Fitted against clean builds
+    of TimeSplitters 2, BLiNX and Mortal Kombat: Shaolin Monks (177 files,
+    Apple clang -O3, Oct 2026), lines explain 40% of the per-file variance
+    (R^2 0.40), and these two counts explain 90%:
+
+      labels      one per basic block that is a branch target -- the size
+                  of the control-flow graph the optimiser walks
+      fp_ uses    the x87 stack macros, each an index computation on
+                  g_fp_stack that the optimiser has to see through
+
+    BLiNX's slowest file at 250 functions a file was not its largest (812k
+    lines, 11 s) but one of 182k lines and 132k x87 accesses (27 s), and
+    Mortal Kombat's was 40k lines (17 s) against 122k lines elsewhere (7 s).
+
+    The fit gave 0.45 ms a label and 0.14 ms an x87 access on that machine,
+    so a unit here is about 0.15 ms of Apple clang -O3. Only the ratio
+    matters for cutting files; MSVC /O2 has not been measured, and a
+    different compiler may weigh the two differently. Refit with
+    tools/recomp/fit_compile_cost.py against a build's .ninja_log.
+    """
+    return (COST_PER_LABEL * code.count("\nloc_")
+            + COST_PER_X87 * code.count("fp_"))
+
+
+def chunk_by_weight(translations, target, weight):
+    """Cut [(addr, name, code)] into files of about `target` weight each.
+
+    weight(code) is a function's share: emitted_lines for --split-lines,
+    compile_cost for --split-cost. Cutting by function count (--split N)
+    made file sizes follow function sizes: at 250 functions a file, BLiNX's
+    largest file held 812k lines against a median of 42k, and a parallel
+    build waits for its slowest file.
+
+    No file is over 5/4 of the target unless one function alone is, and
+    none but the last is under 3/4 of it unless the function after it would
+    have taken it over 5/4. Within that window a file ends just before a
+    function _cut_here picks, by address only, so a boundary is a property
+    of the code around it rather than of everything before it: adding,
+    removing or resizing a function moves the boundaries of its own file and
+    perhaps the next, and every later file comes out byte-identical and is
+    not recompiled. Cutting at exactly the target would shift every later
+    boundary instead. Only when no picked function falls inside the window
+    is a file cut at 5/4 of the target.
+
+    Order is kept: the files hold the functions in the order given.
+    """
+    low = max(1, target * 3 // 4)
+    high = max(low, target * 5 // 4)
+    chunks, current, total = [], [], 0
+    for item in translations:
+        size = weight(item[2])
+        if current and (total + size > high
+                        or (total >= low and _cut_here(item[0]))):
+            chunks.append(current)
+            current, total = [], 0
+        current.append(item)
+        total += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# --- Parallel lift (BatchTranslator._lift_all) -------------------------------
+#
+# Module level so a spawned worker can import them by name.
+
+# config's layout and banner state. configure_from_xbe()/set_game_name() set
+# them in the parent; a spawned worker starts from the module's fallback, so
+# they travel with the pickle.
+_CONFIG_STATE = ("_SECTIONS", "SECTIONS", "_configured_from",
+                 "TEXT_VA_START", "TEXT_VA_END", "RDATA_VA_START",
+                 "RDATA_VA_END", "DATA_VA_START", "DATA_VA_END",
+                 "KERNEL_THUNK_ADDR", "ENTRY_POINT", "GAME_NAME",
+                 "_game_name_explicit", "FORCE_CODE_SECTIONS",
+                 "FORCE_DATA_SECTIONS")
+
+# The FunctionTranslator a pool worker lifts with, set by _pool_init.
+_pool_translator = None
+
+
+def _config_state():
+    return {name: getattr(_config, name) for name in _CONFIG_STATE}
+
+
+def _pool_init(state_path):
+    """Worker start-up: the parent's config and FunctionTranslator."""
+    import pickle
+    global _pool_translator
+    with open(state_path, "rb") as fh:
+        config_state, translator = pickle.load(fh)
+    for name, value in config_state.items():
+        setattr(_config, name, value)
+    _pool_translator = translator
+
+
+def _pool_lift(unit):
+    """Lift a unit of [(addr, func_info)]; see translate_isolated."""
+    return [_pool_translator.translate_isolated(addr, func_info)
+            for addr, func_info in unit]
+
+
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
@@ -2035,7 +2191,8 @@ class BatchTranslator:
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
                               prefix="recomp", verbose=False, manual=None,
-                              keep_bodies=None):
+                              keep_bodies=None, jobs=1, target_lines=None,
+                              target_cost=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -2057,6 +2214,14 @@ class BatchTranslator:
         own code first (tools/recomp/hle.py, HLE_ORIGINAL). The body is
         compiled and declared, but kept out of the dispatch table, so the
         address still resolves to the replacement.
+
+        target_lines / target_cost: when one is set, files are cut by
+        emitted lines or by estimated compile cost instead of chunk_size
+        functions each (see chunk_by_weight; cost wins if both).
+
+        jobs: worker processes to lift with (see _lift_all). 1, the default,
+        lifts in this process exactly as before; any other count gives the
+        same files byte for byte.
 
         Returns dict with stats and list of generated files.
         """
@@ -2085,12 +2250,9 @@ class BatchTranslator:
             "total_lines": 0,
         }
 
-        for i, (addr, func_info) in enumerate(func_list):
+        work = []                 # (addr, name, func_info), in emitted order
+        for addr, func_info in func_list:
             name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
-            if verbose and (i % 500 == 0 or i == len(func_list) - 1):
-                print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
-                      file=sys.stderr)
-
             if addr in manual:
                 # Hand-written elsewhere: declare it, emit nothing -- unless a
                 # replacement also runs the original, in which case the body
@@ -2101,8 +2263,11 @@ class BatchTranslator:
                     continue
                 func_info = dict(func_info, name=keep)
                 name = keep
+            work.append((addr, name, func_info))
 
-            code = self.translator.translate_function(addr, func_info)
+        codes = self._lift_all(work, jobs, verbose)
+
+        for (addr, name, func_info), code in zip(work, codes):
             if code:
                 translations.append((addr, name, code))
                 stats["translated"] += 1
@@ -2221,31 +2386,22 @@ class BatchTranslator:
         # So it tracks the template, like the .c files do. A project that
         # genuinely needs its own can put one earlier on the include path --
         # gen/ is only found because recomp_funcs.h sits beside it.
-        types_dst = os.path.join(output_dir, "recomp_types.h")
-        types_src = os.path.join(os.path.dirname(__file__), "..", "..",
-                                 "templates", "runtime", "recomp_types.h")
-        try:
-            with open(types_src, "r", encoding="utf-8") as src:
-                want = src.read()
-            have = None
-            if os.path.exists(types_dst):
-                with open(types_dst, "r", encoding="utf-8") as dst:
-                    have = dst.read()
-            if have != want:
-                with open(types_dst, "w", encoding="utf-8") as dst:
-                    dst.write(want)
-                print("  %s recomp_types.h (runtime register model)"
-                      % ("refreshed" if have is not None else "wrote"),
-                      file=sys.stderr)
-        except OSError as e:
-            print(f"  WARNING: could not write recomp_types.h ({e}); copy "
-                  f"it from templates/runtime/ by hand or the build will "
-                  f"not find it", file=sys.stderr)
+        #
+        # recomp_types_simd.h goes too: recomp_types.h includes it (see
+        # runtime_headers.py). Each is written only when it changed, so a
+        # chunk that skips the SIMD header is not rebuilt by a change to it.
+        refresh_runtime_headers(output_dir)
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
-        chunks = [translations[i:i+chunk_size]
-                  for i in range(0, len(translations), chunk_size)]
+        if target_cost:
+            chunks = chunk_by_weight(translations, target_cost, compile_cost)
+        elif target_lines:
+            chunks = chunk_by_weight(translations, target_lines,
+                                     emitted_lines)
+        else:
+            chunks = [translations[i:i+chunk_size]
+                      for i in range(0, len(translations), chunk_size)]
 
         # Remove chunk files a previous, larger run left behind. Projects glob
         # gen/*.c into their build, so a stale chunk keeps compiling: it still
@@ -2264,6 +2420,7 @@ class BatchTranslator:
 
         for ci, chunk in enumerate(chunks):
             c_path = os.path.join(output_dir, f"{prefix}_{ci:04d}.c")
+            body = [code for _addr, _name, code in chunk]
             c_lines = [
                 "/**",
                 f" * {_config.banner_name(getattr(self, 'title', None))}"
@@ -2273,12 +2430,14 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+                # A chunk with no SSE/MMX skips recomp_types_simd.h, so a
+                # change there rebuilds only the chunks that use it.
+                *simd_opt_out("\n".join(body)),
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",
             ]
-            for addr, name, code in chunk:
-                c_lines.append(code)
+            c_lines.extend(body)
 
             write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)
@@ -2299,6 +2458,7 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+                NO_SIMD_DEFINE,     # stubs move esp and nothing else
                 f'#include "{header_name}"',
                 "",
             ]
@@ -2363,8 +2523,96 @@ class BatchTranslator:
 
         stats["files"] = generated_files
         stats["num_chunks"] = len(chunks)
-        stats["chunk_size"] = chunk_size
+        stats["chunk_size"] = (None if target_lines or target_cost
+                               else chunk_size)
+        stats["target_lines"] = None if target_cost else target_lines
+        stats["target_cost"] = target_cost
         return stats
+
+    def _lift_all(self, work, jobs=1, verbose=False):
+        """Lift each (addr, name, func_info) in `work`; codes in the same order.
+
+        jobs <= 1 is the serial loop this always was. Otherwise the functions
+        are lifted by a pool of worker processes, each holding its own copy
+        of the FunctionTranslator, and the results are put back in `work`
+        order, so the files written from them are byte-identical to a serial
+        lift.
+
+        That holds because lifting one function reads nothing another one
+        wrote. The Lifter carries three things from function to function:
+        _pop_cache (a cache of a pure function of the binary),
+        referenced_calls (addr -> name, written and never read while
+        lifting) and unimplemented (mnemonic -> addresses, likewise). Each
+        worker returns its function's additions to the last two, and they are
+        replayed here in `work` order, which leaves both exactly as the
+        serial loop would. Anything new that makes one function's output
+        depend on an earlier one's breaks this, and test_parallel_lift says
+        so.
+
+        The pool uses the spawn start method on every platform -- it is the
+        only one Windows has, so it is the one tested everywhere -- and the
+        workers load their state from a pickle rather than inheriting it.
+        """
+        import sys
+
+        jobs = max(1, min(int(jobs or 1), len(work)))
+        if sys.platform == "win32":
+            jobs = min(jobs, 61)    # ProcessPoolExecutor's limit there
+        if jobs <= 1:
+            codes = []
+            for i, (addr, name, func_info) in enumerate(work):
+                if verbose and (i % 500 == 0 or i == len(work) - 1):
+                    print(f"  [{i+1}/{len(work)}] Translating {name}...",
+                          file=sys.stderr)
+                codes.append(self.translator.translate_function(addr, func_info))
+            return codes
+
+        import multiprocessing
+        import pickle
+        import tempfile
+        from concurrent.futures import ProcessPoolExecutor
+
+        # Small units keep the workers evenly loaded (one function can be a
+        # hundred times another), large enough that the per-unit overhead
+        # does not matter.
+        size = max(1, min(64, len(work) // (jobs * 8)))
+        units = [[(addr, func_info) for addr, _name, func_info
+                  in work[i:i + size]]
+                 for i in range(0, len(work), size)]
+
+        fd, state_path = tempfile.mkstemp(prefix="recomp-lift-",
+                                          suffix=".pickle")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                pickle.dump((_config_state(), self.translator), fh,
+                            protocol=pickle.HIGHEST_PROTOCOL)
+            lifter = self.translator.lifter
+            codes = []
+            # concurrent.futures rather than multiprocessing.Pool: a worker
+            # that dies (or whose initializer raises) breaks the pool with
+            # an error here, where Pool replaces it and waits for ever.
+            with ProcessPoolExecutor(
+                    jobs, mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_pool_init,
+                    initargs=(state_path,)) as pool:
+                for results in pool.map(_pool_lift, units):
+                    for code, calls, unimplemented in results:
+                        codes.append(code)
+                        for addr, name in calls:
+                            lifter.referenced_calls[addr] = name
+                        for mnemonic, addrs in unimplemented.items():
+                            lifter.unimplemented.setdefault(
+                                mnemonic, []).extend(addrs)
+                    if verbose and (len(codes) // 500 != (len(codes) - len(results)) // 500
+                                    or len(codes) == len(work)):
+                        print(f"  [{len(codes)}/{len(work)}] translated "
+                              f"({jobs} processes)", file=sys.stderr)
+            return codes
+        finally:
+            try:
+                os.remove(state_path)
+            except OSError:
+                pass
 
     def _write_dispatch_table(self, translations, output_path, header_name):
         """
@@ -2384,6 +2632,7 @@ class BatchTranslator:
             " */",
             "",
             "#define RECOMP_DISPATCH_H",
+            NO_SIMD_DEFINE,         # a table of function pointers
             f'#include "{header_name}"',
             '#include <stddef.h>',
             '#include <stdlib.h>',

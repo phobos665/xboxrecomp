@@ -16,7 +16,14 @@ import unittest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 _LIFTER = _ROOT / "tools" / "recomp" / "lifter.py"
-_RUNTIME = _ROOT / "templates" / "runtime" / "recomp_types.h"
+_RUNTIME_DIR = _ROOT / "templates" / "runtime"
+# recomp_types.h and the SIMD half split out of it (recomp_types_simd.h),
+# which it includes: the generated code sees both.
+_RUNTIME = (_RUNTIME_DIR / "recomp_types.h", _RUNTIME_DIR / "recomp_types_simd.h")
+
+
+def _runtime_text():
+    return "\n".join(p.read_text(encoding="utf-8") for p in _RUNTIME)
 
 # XMM_LOAD_/XMM_STORE_ are f-string prefixes completed with LOW/HIGH.
 _PREFIXES = {"XMM_LOAD_": ("LOW", "HIGH"), "XMM_STORE_": ("LOW", "HIGH")}
@@ -34,7 +41,7 @@ def _emitted_helpers():
 
 
 def _defined_helpers():
-    src = _RUNTIME.read_text(encoding="utf-8")
+    src = _runtime_text()
     defined = set(re.findall(r"^\s*#define\s+(XMM_[A-Z0-9_]+)", src, re.M))
     # static inline functions count as definitions too
     defined.update(re.findall(r"\b(XMM_[A-Z0-9_]+)\s*\([^)]*\)\s*\{", src))
@@ -54,7 +61,7 @@ class RuntimeHelpersDefinedTest(unittest.TestCase):
     def test_xmm_registers_are_global_state(self):
         """PR #10 removed the function-local declaration, so the runtime has
         to supply the storage and map the guest names onto it."""
-        runtime = _RUNTIME.read_text(encoding="utf-8")
+        runtime = _runtime_text()
         for i in range(8):
             self.assertIn(f"#define xmm{i} g_xmm{i}", runtime)
         self.assertIn("typedef union RecompXmm", runtime)

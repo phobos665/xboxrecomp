@@ -323,4 +323,9 @@ def render_thunks(replace, variables=None, originals=None):
                 lines.append(f"void (*const hle_original_{name})(void) = "
                              f"{original_name(addr)};")
         lines.append("")
+    # Thunks move esp and call C; none should need the SSE/MMX model, and
+    # skipping it keeps this file out of a recomp_types_simd.h rebuild.
+    from .runtime_headers import simd_opt_out
+    at = lines.index('#include "recomp_types.h"')
+    lines[at:at] = simd_opt_out("\n".join(lines[at + 1:]))
     return "\n".join(lines)

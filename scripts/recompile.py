@@ -119,6 +119,12 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     lift.append("--all" if args.all else "--game-only")
     if args.split:
         lift += ["--split", str(args.split)]
+    elif getattr(args, "split_lines", None):
+        lift += ["--split-lines", str(args.split_lines)]
+    elif getattr(args, "split_cost", None):
+        lift += ["--split-cost", str(args.split_cost)]
+    if getattr(args, "jobs", None):
+        lift += ["--jobs", str(args.jobs)]
     if work:
         lift += ["--disasm-dir", str(work / "disasm"),
                  "--func-id-dir", str(work / "func_id"),
@@ -215,8 +221,29 @@ def main() -> int:
     # 8 chunks of up to 9.2 MB at 1000, 29 of up to 2.9 MB at 250; cold build
     # 221 s -> 198 s, one changed chunk 47 s -> 22-33 s, and no measurable
     # frame-time cost in-level (uncapped, P-cores: 6.5 ms either way).
-    ap.add_argument("--split", type=int, default=250, metavar="N",
-                    help="Functions per generated .c file (default: 250)")
+    #
+    # By estimated compile cost now, not function count (Oct 2026). 250
+    # functions a file let file sizes follow function sizes: BLiNX's largest
+    # file held 812k lines against a median of 42k, and its slowest took 27 s
+    # of a build whose median file took 4. Lines are not the answer either --
+    # they explain 40% of per-file compile time, labels and x87 accesses 90%
+    # (tools.recomp.translator.compile_cost). A file has ~0.1 s of fixed
+    # cost, so more of them is nearly free on a parallel build. 14000 units
+    # was about 2 s a file with Apple clang -O3.
+    ap.add_argument("--split", type=int, default=None, metavar="N",
+                    help="Functions per generated .c file, instead of "
+                         "--split-cost (the old default was 250)")
+    ap.add_argument("--split-lines", type=int, default=None, metavar="LINES",
+                    help="Lines of C per generated .c file, roughly, "
+                         "instead of --split-cost")
+    ap.add_argument("--split-cost", type=int, default=14000, metavar="UNITS",
+                    help="Estimated compile cost per generated .c file "
+                         "(default: 14000; see translator.compile_cost). "
+                         "Ignored when --split or --split-lines is given")
+    ap.add_argument("--jobs", "-j", type=int, metavar="N",
+                    help="Processes the lift stage uses (default: one per "
+                         "CPU). The generated C is the same whatever N is; "
+                         "1 lifts in a single process")
     ap.add_argument("--gen-dir", metavar="DIR",
                     help="Output directory for generated sources")
     ap.add_argument("--work-dir", metavar="DIR",

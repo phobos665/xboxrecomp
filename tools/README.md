@@ -177,6 +177,9 @@ py -3 -m tools.recomp game_files/default.xbe --all --split 1000
 |------|-------------|
 | `--all` | Recompile all detected functions |
 | `--split N` | Split output into files of N functions each |
+| `--split-cost UNITS` | Split into files of about UNITS of estimated compile cost (3 a label, 1 an x87 stack access; `scripts/recompile.py` uses 14000). Cut points are address-hashed, so a one-function change rewrites one or two files. Refit the weights for another compiler with `tools.recomp.fit_compile_cost` |
+| `--split-lines LINES` | The same, by lines of C (lines predict compile time poorly) |
+| `--jobs N` | Lift in N processes (default: one per CPU); the output is byte-identical for any N |
 | `--func ADDR` | Recompile a single function (hex address) |
 | `--output-dir DIR` | Output directory (default: `tools/recomp/output/`) |
 | `--verbose` | Show per-function progress |
@@ -184,7 +187,7 @@ py -3 -m tools.recomp game_files/default.xbe --all --split 1000
 **Output files:**
 | File | Contents |
 |------|----------|
-| `gen/recomp_0000.c` ... `recomp_NNNN.c` | Recompiled function bodies (split by --split) |
+| `gen/recomp_0000.c` ... `recomp_NNNN.c` | Recompiled function bodies (split by --split, --split-cost or --split-lines) |
 | `gen/recomp_dispatch.c` | Binary-search dispatch table (ICALL resolution) |
 | `gen/recomp_funcs.h` | Forward declarations for all recompiled functions |
 | `gen/recomp_stubs.c` | Stub functions for unresolvable targets |

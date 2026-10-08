@@ -237,6 +237,18 @@ def main():
                         help="Generate C header file")
     parser.add_argument("--split", type=int, metavar="N",
                         help="Split output into files of N functions each")
+    parser.add_argument("--split-lines", type=int, metavar="LINES",
+                        help="Split output into files of about LINES lines "
+                             "of C each, cut at stable points so a change to "
+                             "one function rewrites one or two files. "
+                             "Instead of --split, not with it")
+    parser.add_argument("--split-cost", type=int, metavar="UNITS",
+                        help="Like --split-lines, but each file is about "
+                             "UNITS of estimated compile cost "
+                             "(translator.compile_cost: 3 a label, 1 an x87 "
+                             "stack access), which follows real build times "
+                             "far better than lines do. scripts/recompile.py "
+                             "uses this, at 14000")
     parser.add_argument("--gen-dir",
                         help="Output dir for split generated files "
                              "(default: src/game/recomp/gen)")
@@ -315,6 +327,12 @@ def main():
                              "not implement yet: the body still runs, only "
                              "the answer changes, and the emitted code is "
                              "inert unless RECOMP_FORCE_RETURN is set")
+    parser.add_argument("--jobs", "-j", type=int, default=os.cpu_count() or 1,
+                        metavar="N",
+                        help="Worker processes for the split lift (default: "
+                             "one per CPU). The output is byte-identical "
+                             "whatever N is; 1 lifts in this process, as "
+                             "before")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -448,7 +466,11 @@ def main():
 
     print(f"\nTranslating {len(funcs)} functions...", file=sys.stderr)
 
-    if args.split:
+    if sum(1 for v in (args.split, args.split_lines, args.split_cost) if v) > 1:
+        parser.error("--split, --split-lines and --split-cost each say how "
+                     "to cut the output; give one")
+
+    if args.split or args.split_lines or args.split_cost:
         # Split output mode: multiple .c files + header + dispatch table
         gen_dir = args.gen_dir or os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -689,24 +711,8 @@ def main():
             # reproduces exactly that -- Max Payne and Mortal Kombat both
             # failed on an unresolved g_icall_saved_esp from a header left
             # behind by a branch that is not checked out.
-            types_dst = os.path.join(gen_dir, "recomp_types.h")
-            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
-                                     "templates", "runtime", "recomp_types.h")
-            try:
-                with open(types_src, encoding="utf-8") as fh:
-                    want = fh.read()
-                have = None
-                if os.path.exists(types_dst):
-                    with open(types_dst, encoding="utf-8") as fh:
-                        have = fh.read()
-                if have != want:
-                    with open(types_dst, "w", encoding="utf-8") as fh:
-                        fh.write(want)
-                    print("  refreshed recomp_types.h (runtime register model)",
-                          file=sys.stderr)
-            except OSError as exc:
-                print(f"  warning: could not refresh recomp_types.h: {exc}",
-                      file=sys.stderr)
+            from .runtime_headers import refresh_runtime_headers
+            refresh_runtime_headers(gen_dir)
 
             kept = sum(1 for v in hle_originals.values() if v is not None)
             print(f"Rewrote {out}: {len(hle_replace)} replacements, "
@@ -748,9 +754,12 @@ def main():
             funcs,
             output_dir=gen_dir,
             chunk_size=args.split,
+            target_lines=args.split_lines,
+            target_cost=args.split_cost,
             verbose=args.verbose,
             manual=manual,
             keep_bodies=hle_keep,
+            jobs=args.jobs,
         )
 
         # Written after translation, which clears stale files from gen_dir, and
