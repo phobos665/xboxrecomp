@@ -1954,6 +1954,36 @@ def _pool_lift(unit):
             for addr, func_info in unit]
 
 
+# A stretch of guest address space this long with no function entry in it is
+# not code, and the flat dispatch table stops at it (see _flat_cluster). XBE
+# code sections sit back to back at the bottom of the image, so the gaps inside
+# them are a function's size: the largest across TimeSplitters 2 and BLiNX is
+# 20 KB. What follows them is .rdata and .data (1.2-9 MB on the titles in
+# games/), then sections such as DOLBY whose bytes are DSP microcode that
+# discovery picks up as a handful of "functions".
+FLAT_DISPATCH_GAP = 0x100000
+
+
+def _flat_cluster(addrs, gap=FLAT_DISPATCH_GAP):
+    """The [first, last] index range of sorted `addrs` the flat table covers.
+
+    Splits the addresses wherever two neighbours are `gap` or more apart and
+    keeps the run with the most entries (the lowest one on a tie). Everything
+    outside it still resolves, through the binary search, so the choice only
+    decides which lookups are one load and which are a search.
+    """
+    if not addrs:
+        return (0, -1)
+    best = (0, 0)
+    start = 0
+    for i in range(1, len(addrs) + 1):
+        if i == len(addrs) or addrs[i] - addrs[i - 1] >= gap:
+            if (i - 1 - start) > (best[1] - best[0]):
+                best = (start, i - 1)
+            start = i
+    return best
+
+
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
@@ -2618,7 +2648,8 @@ class BatchTranslator:
         """
         Generate a dispatch table mapping Xbox VA -> function pointer.
 
-        Uses a sorted array + binary search for O(log n) lookup.
+        A sorted array with a binary search, plus a flat table of pointers
+        over the main code cluster (_flat_cluster) built at start-up.
         """
         lines = [
             "/**",
@@ -2656,8 +2687,16 @@ class BatchTranslator:
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
 
         addrs = [addr for addr, _, _ in translations]
-        flat_base = min(addrs) if addrs else 0
-        flat_span = (max(addrs) - flat_base + 1) if addrs else 0
+        first, last = _flat_cluster(addrs)
+        inside = (last - first + 1) if addrs else 0
+        flat_base = addrs[first] if addrs else 0
+        flat_span = (addrs[last] - flat_base + 1) if addrs else 0
+        outside = [a for i, a in enumerate(addrs) if not first <= i <= last]
+        if outside:
+            outliers = ("%d entries outside it (0x%08X..0x%08X) go through "
+                        "the search" % (len(outside), outside[0], outside[-1]))
+        else:
+            outliers = "every entry is inside it"
 
         lines.extend([
             "};",
@@ -2677,8 +2716,20 @@ class BatchTranslator:
             f" * about {max(1, len(translations).bit_length())} branches every time the game calls through a",
             " * vtable. The flat table turns that into a bounds check and a load.",
             " *",
-            " * Costs 8 bytes per byte of guest code span. Allocated with calloc so",
-            " * the untouched middle stays uncommitted rather than resident.",
+            " * It covers the main code cluster only: the sorted entries are split",
+            f" * wherever two neighbours are 0x{FLAT_DISPATCH_GAP:X} or more bytes apart, and the",
+            " * run with the most entries is kept (tools/recomp/translator.py,",
+            " * _flat_cluster). Without that, a few \"functions\" discovered in a",
+            " * data section far above the code (DSP microcode in DOLBY) stretch",
+            " * the table over the whole image.",
+            f" * Here: 0x{flat_base:08X}..0x{flat_base + max(flat_span, 1) - 1:08X}, "
+            f"{inside} of {len(addrs)} entries;",
+            f" * {outliers}.",
+            " *",
+            " * Costs 8 bytes per byte of that span. Allocated with calloc, so the",
+            " * untouched middle stays uncommitted. (4-byte slots -- an offset from",
+            " * a fixed function -- halve it, but measured 10-15% slower per lookup",
+            " * when lookups range over the whole table, so slots stay pointers.)",
             " *",
             " * recomp_dispatch_init() is optional by design: if it is never called,",
             " * or the allocation fails, recomp_lookup silently keeps using the",
@@ -2691,7 +2742,19 @@ class BatchTranslator:
             "",
             f"static const uint32_t g_flat_base = 0x{flat_base:08X}u;",
             f"static const uint32_t g_flat_span = 0x{flat_span:08X}u;",
+            f"static const size_t g_flat_first = {first if addrs else 0};",
+            f"static const size_t g_flat_count = {inside};",
             "static recomp_func_t *g_flat_table = NULL;",
+            "",
+            "/* The hit is the path to lay out straight. With the search reachable",
+            " * from inside the bounds check, clang put the hit behind a taken branch",
+            " * otherwise: a third slower per lookup in a tight loop on an M4",
+            " * (0.75 -> 1.01 ns); with the hint it matches the whole-span table. */",
+            "#if defined(__GNUC__) || defined(__clang__)",
+            "#define FLAT_LIKELY(x) __builtin_expect(!!(x), 1)",
+            "#else",
+            "#define FLAT_LIKELY(x) (x)",
+            "#endif",
             "",
             "int recomp_dispatch_init(void)",
             "{",
@@ -2701,7 +2764,7 @@ class BatchTranslator:
             "    g_flat_table = (recomp_func_t *)calloc(g_flat_span,",
             "                                           sizeof(recomp_func_t));",
             "    if (!g_flat_table) return 0;         /* keep the binary search */",
-            "    for (i = 0; i < g_recomp_table_size; i++) {",
+            "    for (i = g_flat_first; i < g_flat_first + g_flat_count; i++) {",
             "        g_flat_table[g_recomp_table[i].xbox_va - g_flat_base] =",
             "            g_recomp_table[i].func;",
             "    }",
@@ -2713,15 +2776,17 @@ class BatchTranslator:
             "    return g_flat_table ? (size_t)g_flat_span * sizeof(recomp_func_t) : 0;",
             "}",
             "",
-            "/* Flat index when built, binary search otherwise. */",
+            "/* Flat index inside the cluster when built, binary search otherwise. */",
             "recomp_func_t recomp_lookup(uint32_t xbox_va)",
             "{",
             "    size_t lo, hi;",
-            "    if (g_flat_table) {",
+            "    if (FLAT_LIKELY(g_flat_table != NULL)) {",
             "        uint32_t off = xbox_va - g_flat_base;",
             "        /* Unsigned: a VA below the base wraps to a huge offset and is",
             "         * rejected by the same compare, so no separate lower bound. */",
-            "        return (off < g_flat_span) ? g_flat_table[off] : NULL;",
+            "        if (FLAT_LIKELY(off < g_flat_span))",
+            "            return g_flat_table[off];",
+            "        /* Outside the cluster: the outliers are found by the search. */",
             "    }",
             "    lo = 0; hi = g_recomp_table_size;",
             "    while (lo < hi) {",

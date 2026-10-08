@@ -45,6 +45,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>            /* malloc_zone_pressure_relief */
+#endif
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
@@ -493,6 +496,19 @@ static int title_main(int argc, char **argv)
         free(xbe_data);
         return 1;
     }
+
+    /* The layout has copied out everything it needs (headers, sections,
+     * certificate, TLS directory) into guest memory and its own statics,
+     * and nothing keeps a pointer into the file buffer, so let it go now
+     * rather than at exit: it is the whole XBE (45 MB on BLiNX). */
+    free(xbe_data);
+    xbe_data = NULL;
+#ifdef __APPLE__
+    /* macOS's allocator keeps a freed large block cached, still resident,
+     * for reuse: BLiNX's 42.7 MB stayed in the footprint as "Malloc Large
+     * (empty)" after the free. Ask it to hand cached memory back now. */
+    malloc_zone_pressure_relief(NULL, 0);
+#endif
 
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
