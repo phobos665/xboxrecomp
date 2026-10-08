@@ -445,7 +445,12 @@ static const char g_ps_tail[] =
     "        float f = compute_pfog(dist);\n"
     "        current.rgb = lerp(FogColor.rgb, current.rgb, f);\n"
     "    }\n"
-    "\n"
+    "\n";
+
+/* Only in the variant whose signature has FF_PS_SIG_ALPHA_TEST: a shader that
+ * contains a discard loses early depth (and, on tile-based GPUs, hidden
+ * surface removal) for every draw, whether or not the discard is taken. */
+static const char g_ps_alpha_test[] =
     "    // Alpha test\n"
     "    if (PSFlags & 1u) {\n"
     "        bool alphaOk = true;\n"
@@ -458,7 +463,9 @@ static const char g_ps_tail[] =
     "        else if (AlphaFunc == 7u) alphaOk = (current.a >= AlphaRef);\n"
     "        if (!alphaOk) discard;\n"
     "    }\n"
-    "\n"
+    "\n";
+
+static const char g_ps_end[] =
     "    return current;\n"
     "}\n";
 
@@ -470,8 +477,11 @@ static const char g_ps_tail[] =
  *   2 = 3D texture   (Texture3D,  float3 sample coord)
  * Texture object declarations must match the dimension of the SRV bound
  * at each stage, otherwise D3D11 fails to sample it correctly.
+ * Above them, FF_PS_SIG_ALPHA_TEST: the alpha test can reject
+ * (d3d8_alpha_test_can_reject), and only then is it in the shader.
  */
 #define FF_PS_SRC_SIZE 16384
+#define FF_PS_SIG_ALPHA_TEST 0x100u
 
 static void build_ps_source(UINT sig, char *buf, int bufsize)
 {
@@ -500,6 +510,9 @@ static void build_ps_source(UINT sig, char *buf, int bufsize)
                         "    if (AlphaOnly[%d]) texels[%d].rgb = 1.0;\n", i, i);
     }
     off += snprintf(buf + off, bufsize - off, "%s", g_ps_tail);
+    if (sig & FF_PS_SIG_ALPHA_TEST)
+        off += snprintf(buf + off, bufsize - off, "%s", g_ps_alpha_test);
+    off += snprintf(buf + off, bufsize - off, "%s", g_ps_end);
 }
 
 /* ================================================================
@@ -515,8 +528,8 @@ static RhiBuffer *g_ps_cb = NULL;       /* PS constant buffer */
  * The texture object declarations must match the dimensions of the SRVs
  * bound at each stage, so the PS is recompiled when the set of
  * 2D/cube/volume textures changes. Practically only a handful of
- * signatures ever occur. */
-#define FF_PS_CACHE_SIZE 16
+ * signatures ever occur; the alpha test bit can double them, hence 32. */
+#define FF_PS_CACHE_SIZE 32
 
 typedef struct {
     UINT       sig;
@@ -559,7 +572,7 @@ static RhiShader *ff_ps_get_shader(UINT sig)
     free(src);
 
     if (!ps) {
-        fprintf(stderr, "D3D8: PS compile failed (sig 0x%02X): %s\n", sig,
+        fprintf(stderr, "D3D8: PS compile failed (sig 0x%03X): %s\n", sig,
                 err[0] ? err : "unknown");
         return NULL;
     }
@@ -579,10 +592,11 @@ static RhiShader *ff_ps_get_shader(UINT sig)
 }
 
 /* Compute the per-stage texture signature from the textures currently
- * bound to the pixel shader stages. */
+ * bound to the pixel shader stages, and the alpha test bit from the render
+ * states. */
 static UINT ff_ps_compute_signature(void)
 {
-    UINT sig = 0;
+    UINT sig = d3d8_alpha_test_can_reject(d3d8_GetRenderStates()) ? FF_PS_SIG_ALPHA_TEST : 0;
     int i;
 
     for (i = 0; i < 4; i++) {
