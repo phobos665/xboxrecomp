@@ -181,8 +181,8 @@ def test_generated_dispatch_flat_matches_binary_search():
         assert "g_flat_span = 0x0000F3FD" in src, \
             [l for l in src.splitlines() if "g_flat_span" in l]
         assert "every entry is inside it" in src
-    # 4 bytes a slot.
-    _compile_and_run(TRANSLATIONS, ABSENT, 0xF3FD * 4, check)
+    # A pointer a slot.
+    _compile_and_run(TRANSLATIONS, ABSENT, "0xF3FD * sizeof(recomp_func_t)", check)
 
 
 def test_outliers_stay_out_of_the_flat_table():
@@ -195,7 +195,7 @@ def test_outliers_stay_out_of_the_flat_table():
         assert "4 of 8 entries" in src
         assert "4 entries outside it (0x00000010..0x031C35F8)" in src
     # The span is the cluster's, not 0x10..0x031C35F8 (50 MB of slots).
-    _compile_and_run(OUTLIER_TRANSLATIONS, OUTLIER_ABSENT, 0x103FD * 4, check)
+    _compile_and_run(OUTLIER_TRANSLATIONS, OUTLIER_ABSENT, "0x103FD * sizeof(recomp_func_t)", check)
 
 
 def test_flat_cluster_rule():
