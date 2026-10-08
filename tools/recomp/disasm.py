@@ -151,7 +151,37 @@ class Disassembler:
     def __init__(self):
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
+        # Same decoder without operand detail, for scan_lite.
+        self._cs_lite = Cs(CS_ARCH_X86, CS_MODE_32)
         _init_reg_names(self._cs)
+
+    # Capstone handles are ctypes objects and do not pickle. The process pool
+    # in translator.py ships a whole FunctionTranslator to its workers, so the
+    # handles are dropped here and rebuilt on the other side.
+    def __getstate__(self):
+        # Not empty: pickle skips __setstate__ for a false state.
+        return {"capstone": "rebuilt on load"}
+
+    def __setstate__(self, state):
+        self.__init__()
+
+    def scan_lite(self, raw_bytes, start_va, end_va):
+        """The linear decode disassemble_function starts from, without detail.
+
+        Returns (address, size, mnemonic, op_str) tuples. Capstone decodes the
+        same instruction boundaries, mnemonics and operand text with detail on
+        or off; what detail adds is the operand structure, and building that
+        in Python is most of what disassemble_function costs (about 10 us an
+        instruction against 1 us for this). A pass that only needs to know
+        whether a function contains some kind of instruction can ask this
+        first and decode in full only the functions that do.
+
+        No resync handling: a caller that needs it needs the full decode.
+        """
+        size = end_va - start_va
+        if size <= 0 or size > len(raw_bytes):
+            return []
+        return list(self._cs_lite.disasm_lite(raw_bytes[:size], start_va))
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
