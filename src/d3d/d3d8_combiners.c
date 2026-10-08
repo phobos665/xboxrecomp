@@ -132,8 +132,18 @@ static int ps_dump_limit(void)
  * per call and was the largest host-side symbol in TimeSplitters 2's
  * profile; the state only changes when a PS render state does, so the
  * result is kept until the next parse. Only this path calls the lookup in
- * the runtime, so the entry cannot be evicted while it is held. */
-static RhiShader *g_last_shader;
+ * the runtime, so the entry cannot be evicted while it is held.
+ *
+ * One per alpha test variant (NV2ACombinerState.alpha_test, indexed by it):
+ * titles switch the alpha test between draws that share a pixel shader, and
+ * the variant is the only structural field that changes without a parse or
+ * a shadow-stage change, both of which forget the pair. */
+static RhiShader *g_last_shader[2];
+
+static void forget_last_shaders(void)
+{
+    g_last_shader[0] = g_last_shader[1] = NULL;
+}
 
 /* ================================================================
  * Color Helpers
@@ -1143,19 +1153,24 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * C = fog colour), and that has already run. Blending again here fogged
      * every pixel twice. */
 
-    /* ---- Alpha test ---- */
-    EMIT("    /* Alpha test */\n");
-    EMIT("    if (alpha_test_enable) {\n");
-    EMIT("        bool alpha_pass = true;\n");
-    EMIT("        if      (alpha_func == 1u) alpha_pass = false;\n");
-    EMIT("        else if (alpha_func == 2u) alpha_pass = (result.a <  alpha_ref);\n");
-    EMIT("        else if (alpha_func == 3u) alpha_pass = (result.a == alpha_ref);\n");
-    EMIT("        else if (alpha_func == 4u) alpha_pass = (result.a <= alpha_ref);\n");
-    EMIT("        else if (alpha_func == 5u) alpha_pass = (result.a >  alpha_ref);\n");
-    EMIT("        else if (alpha_func == 6u) alpha_pass = (result.a != alpha_ref);\n");
-    EMIT("        else if (alpha_func == 7u) alpha_pass = (result.a >= alpha_ref);\n");
-    EMIT("        if (!alpha_pass) discard;\n");
-    EMIT("    }\n\n");
+    /* ---- Alpha test ----
+     * Only in the variant that can reject (NV2ACombinerState.alpha_test):
+     * the discard alone costs early depth and hidden-surface removal for
+     * every draw the shader makes, opaque ones included. */
+    if (state->alpha_test) {
+        EMIT("    /* Alpha test */\n");
+        EMIT("    if (alpha_test_enable) {\n");
+        EMIT("        bool alpha_pass = true;\n");
+        EMIT("        if      (alpha_func == 1u) alpha_pass = false;\n");
+        EMIT("        else if (alpha_func == 2u) alpha_pass = (result.a <  alpha_ref);\n");
+        EMIT("        else if (alpha_func == 3u) alpha_pass = (result.a == alpha_ref);\n");
+        EMIT("        else if (alpha_func == 4u) alpha_pass = (result.a <= alpha_ref);\n");
+        EMIT("        else if (alpha_func == 5u) alpha_pass = (result.a >  alpha_ref);\n");
+        EMIT("        else if (alpha_func == 6u) alpha_pass = (result.a != alpha_ref);\n");
+        EMIT("        else if (alpha_func == 7u) alpha_pass = (result.a >= alpha_ref);\n");
+        EMIT("        if (!alpha_pass) discard;\n");
+        EMIT("    }\n\n");
+    }
 
     {
         /* Debug switch, RECOMP_D3D8_PS_SHOW=v0|v1|t0|t1|r0|r1: replaces
@@ -1256,10 +1271,10 @@ static RhiShader *compile_combiner_shader(const NV2ACombinerState *state)
         if (dumped < limit) {
             dumped++;
             fprintf(stderr, "NV2A combiners: shader %08lX: state stages %d, "
-                    "tex_mode %d %d %d %d, "
+                    "alpha test %d, tex_mode %d %d %d %d, "
                     "c0[0] 0x%08lX c1[0] 0x%08lX, final_c0 0x%08lX final_c1 0x%08lX\n",
                     (unsigned long)combiner_state_hash(state),
-                    state->num_stages, (int)state->tex_mode[0], (int)state->tex_mode[1],
+                    state->num_stages, (int)state->alpha_test, (int)state->tex_mode[0], (int)state->tex_mode[1],
                     (int)state->tex_mode[2], (int)state->tex_mode[3],
                     (unsigned long)state->c0[0], (unsigned long)state->c1[0],
                     (unsigned long)state->final_c0, (unsigned long)state->final_c1);
@@ -1341,8 +1356,10 @@ RhiShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
 
         entry = &g_cache[lru_slot];
         if (entry->shader) {
-            if (g_last_shader == entry->shader)
-                g_last_shader = NULL;
+            if (g_last_shader[0] == entry->shader)
+                g_last_shader[0] = NULL;
+            if (g_last_shader[1] == entry->shader)
+                g_last_shader[1] = NULL;
             rhi_shader_destroy(entry->shader);
             entry->shader = NULL;
         }
@@ -1370,7 +1387,7 @@ HRESULT d3d8_combiners_init(void)
     memset(&g_combiner_state, 0, sizeof(g_combiner_state));
     g_ps_token = 0;
     g_dirty = TRUE;
-    g_last_shader = NULL;
+    forget_last_shaders();
     g_frame_counter = 0;
 
     /* Create the PS constant buffer for combiner shaders.
@@ -1403,7 +1420,7 @@ void d3d8_combiners_shutdown(void)
         }
     }
     memset(g_cache, 0, sizeof(g_cache));
-    g_last_shader = NULL;
+    forget_last_shaders();
 
     rhi_buffer_destroy(g_combiner_cb);
     g_combiner_cb = NULL;
@@ -1458,7 +1475,7 @@ BOOL d3d8_combiners_prepare_draw(void)
     if (g_dirty) {
         d3d8_combiners_parse_token(g_ps_token, rs, &g_combiner_state);
         g_dirty = FALSE;
-        g_last_shader = NULL;
+        forget_last_shaders();
     }
 
     /* Shadow-map stages come from the textures bound for this draw, not the
@@ -1478,15 +1495,21 @@ BOOL d3d8_combiners_prepare_draw(void)
 
             if (sh != g_combiner_state.shadow[i]) {
                 g_combiner_state.shadow[i] = sh;
-                g_last_shader = NULL;
+                forget_last_shaders();
             }
         }
     }
 
+    /* The alpha test, likewise per draw: D3DRS_ALPHATESTENABLE and
+     * D3DRS_ALPHAFUNC do not mark the combiner state dirty, and a title
+     * toggles them between draws that share a pixel shader. Each variant
+     * keeps its own remembered shader, so a toggle costs no lookup. */
+    g_combiner_state.alpha_test = d3d8_alpha_test_can_reject(rs) ? 1 : 0;
+
     /* Get or compile the pixel shader for this combiner state */
-    if (!g_last_shader)
-        g_last_shader = d3d8_combiners_get_shader(&g_combiner_state);
-    ps = g_last_shader;
+    if (!g_last_shader[g_combiner_state.alpha_test])
+        g_last_shader[g_combiner_state.alpha_test] = d3d8_combiners_get_shader(&g_combiner_state);
+    ps = g_last_shader[g_combiner_state.alpha_test];
 
     /* Under RECOMP_D3D8_PS_DUMP, say which shader each draw actually binds.
      * Printed only when it changes, so the log stays readable and still
