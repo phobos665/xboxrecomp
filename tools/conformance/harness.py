@@ -296,8 +296,10 @@ static void cmp_sse(const char *name, const char *why, int *shown, int vec) {
 # per input vector, and the recording also notes the scratch buffer's address,
 # which golden mode reproduces as a guest address.
 _GOLD_TYPES = """
+/* Not `eax`: generated code defines eax as a macro for the register, so a
+   field by that name would expand into the register file (recomp_cpu.h). */
 typedef struct {
-    unsigned int   eax;
+    unsigned int   out_eax;
     unsigned short sw;
     unsigned char  st[64];
     unsigned char  xmm[128];
@@ -305,7 +307,7 @@ typedef struct {
 
 static void gold_load(const conf_gold *g)
 {
-    g_out_eax = g->eax;
+    g_out_eax = g->out_eax;
     g_out_sw = g->sw;
     memcpy(g_out_st, g->st, sizeof g->st);
     memcpy(g_out_xmm, g->xmm, sizeof g->xmm);
