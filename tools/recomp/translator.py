@@ -522,6 +522,15 @@ class FunctionTranslator:
             raw_bytes = self._read_func_bytes(caller, end)
             if not raw_bytes:
                 continue
+            # _find_static_indirect_ranges finds nothing in a function with
+            # no `call <register>`, so look for one before paying for the
+            # full decode. The test is looser than the operand check it
+            # stands in for (anything that is neither an immediate nor a
+            # memory operand), so it can only send extra functions on.
+            if not any(m == "call" and "[" not in op and not op.startswith("0x")
+                       for _a, _s, m, op in self.disasm.scan_lite(
+                           raw_bytes, caller, end)):
+                continue
             instructions = self.disasm.disassemble_function(
                 raw_bytes, caller, end)
             for lower, upper in self._find_static_indirect_ranges(instructions):
@@ -733,9 +742,15 @@ class FunctionTranslator:
             else:
                 end = info.get("end", start)
                 raw_bytes = self._read_func_bytes(start, end)
-                instructions = (
-                    self.disasm.disassemble_function(raw_bytes, start, end)
-                    if raw_bytes else [])
+                # Only a `jmp` through memory can be a site; decode in full
+                # only the functions that have one (see scan_lite).
+                if not raw_bytes or not any(
+                        m == "jmp" and "[" in op
+                        for _a, _s, m, op in self.disasm.scan_lite(
+                            raw_bytes, start, end)):
+                    continue
+                instructions = self.disasm.disassemble_function(
+                    raw_bytes, start, end)
             for insn in instructions:
                 if (insn.mnemonic != "jmp" or insn.jump_target
                         or not insn.operands
