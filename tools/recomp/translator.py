@@ -1828,6 +1828,91 @@ class FunctionTranslator:
         return regs
 
 
+def _cut_here(addr):
+    """True for about one function start in 16, picked by its address alone.
+
+    Knuth's multiplicative hash, top four bits: a fixed property of the
+    address, the same on every platform and every run.
+    """
+    return ((addr * 2654435761) & 0xFFFFFFFF) >> 28 == 0
+
+
+def emitted_lines(code):
+    """A function's share of the lines of the file it is joined into."""
+    return code.count("\n") + 1
+
+
+# Weights of compile_cost: what one label and one x87 stack access cost the
+# compiler, relative to each other. Refit with tools/recomp/fit_compile_cost.py.
+COST_PER_LABEL = 3
+COST_PER_X87 = 1
+
+
+def compile_cost(code):
+    """Estimated compile cost of one generated function, in arbitrary units.
+
+    Lines are a poor predictor of compile time. Fitted against clean builds
+    of TimeSplitters 2, BLiNX and Mortal Kombat: Shaolin Monks (177 files,
+    Apple clang -O3, Oct 2026), lines explain 40% of the per-file variance
+    (R^2 0.40), and these two counts explain 90%:
+
+      labels      one per basic block that is a branch target -- the size
+                  of the control-flow graph the optimiser walks
+      fp_ uses    the x87 stack macros, each an index computation on
+                  g_fp_stack that the optimiser has to see through
+
+    BLiNX's slowest file at 250 functions a file was not its largest (812k
+    lines, 11 s) but one of 182k lines and 132k x87 accesses (27 s), and
+    Mortal Kombat's was 40k lines (17 s) against 122k lines elsewhere (7 s).
+
+    The fit gave 0.45 ms a label and 0.14 ms an x87 access on that machine,
+    so a unit here is about 0.15 ms of Apple clang -O3. Only the ratio
+    matters for cutting files; MSVC /O2 has not been measured, and a
+    different compiler may weigh the two differently. Refit with
+    tools/recomp/fit_compile_cost.py against a build's .ninja_log.
+    """
+    return (COST_PER_LABEL * code.count("\nloc_")
+            + COST_PER_X87 * code.count("fp_"))
+
+
+def chunk_by_weight(translations, target, weight):
+    """Cut [(addr, name, code)] into files of about `target` weight each.
+
+    weight(code) is a function's share: emitted_lines for --split-lines,
+    compile_cost for --split-cost. Cutting by function count (--split N)
+    made file sizes follow function sizes: at 250 functions a file, BLiNX's
+    largest file held 812k lines against a median of 42k, and a parallel
+    build waits for its slowest file.
+
+    No file is over 5/4 of the target unless one function alone is, and
+    none but the last is under 3/4 of it unless the function after it would
+    have taken it over 5/4. Within that window a file ends just before a
+    function _cut_here picks, by address only, so a boundary is a property
+    of the code around it rather than of everything before it: adding,
+    removing or resizing a function moves the boundaries of its own file and
+    perhaps the next, and every later file comes out byte-identical and is
+    not recompiled. Cutting at exactly the target would shift every later
+    boundary instead. Only when no picked function falls inside the window
+    is a file cut at 5/4 of the target.
+
+    Order is kept: the files hold the functions in the order given.
+    """
+    low = max(1, target * 3 // 4)
+    high = max(low, target * 5 // 4)
+    chunks, current, total = [], [], 0
+    for item in translations:
+        size = weight(item[2])
+        if current and (total + size > high
+                        or (total >= low and _cut_here(item[0]))):
+            chunks.append(current)
+            current, total = [], 0
+        current.append(item)
+        total += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 # --- Parallel lift (BatchTranslator._lift_all) -------------------------------
 #
 # Module level so a spawned worker can import them by name.
@@ -2104,7 +2189,8 @@ class BatchTranslator:
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
                               prefix="recomp", verbose=False, manual=None,
-                              keep_bodies=None, jobs=1):
+                              keep_bodies=None, jobs=1, target_lines=None,
+                              target_cost=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -2126,6 +2212,10 @@ class BatchTranslator:
         own code first (tools/recomp/hle.py, HLE_ORIGINAL). The body is
         compiled and declared, but kept out of the dispatch table, so the
         address still resolves to the replacement.
+
+        target_lines / target_cost: when one is set, files are cut by
+        emitted lines or by estimated compile cost instead of chunk_size
+        functions each (see chunk_by_weight; cost wins if both).
 
         jobs: worker processes to lift with (see _lift_all). 1, the default,
         lifts in this process exactly as before; any other count gives the
@@ -2317,8 +2407,14 @@ class BatchTranslator:
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
-        chunks = [translations[i:i+chunk_size]
-                  for i in range(0, len(translations), chunk_size)]
+        if target_cost:
+            chunks = chunk_by_weight(translations, target_cost, compile_cost)
+        elif target_lines:
+            chunks = chunk_by_weight(translations, target_lines,
+                                     emitted_lines)
+        else:
+            chunks = [translations[i:i+chunk_size]
+                      for i in range(0, len(translations), chunk_size)]
 
         # Remove chunk files a previous, larger run left behind. Projects glob
         # gen/*.c into their build, so a stale chunk keeps compiling: it still
@@ -2436,7 +2532,10 @@ class BatchTranslator:
 
         stats["files"] = generated_files
         stats["num_chunks"] = len(chunks)
-        stats["chunk_size"] = chunk_size
+        stats["chunk_size"] = (None if target_lines or target_cost
+                               else chunk_size)
+        stats["target_lines"] = None if target_cost else target_lines
+        stats["target_cost"] = target_cost
         return stats
 
     def _lift_all(self, work, jobs=1, verbose=False):
