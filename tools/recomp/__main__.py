@@ -689,24 +689,8 @@ def main():
             # reproduces exactly that -- Max Payne and Mortal Kombat both
             # failed on an unresolved g_icall_saved_esp from a header left
             # behind by a branch that is not checked out.
-            types_dst = os.path.join(gen_dir, "recomp_types.h")
-            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
-                                     "templates", "runtime", "recomp_types.h")
-            try:
-                with open(types_src, encoding="utf-8") as fh:
-                    want = fh.read()
-                have = None
-                if os.path.exists(types_dst):
-                    with open(types_dst, encoding="utf-8") as fh:
-                        have = fh.read()
-                if have != want:
-                    with open(types_dst, "w", encoding="utf-8") as fh:
-                        fh.write(want)
-                    print("  refreshed recomp_types.h (runtime register model)",
-                          file=sys.stderr)
-            except OSError as exc:
-                print(f"  warning: could not refresh recomp_types.h: {exc}",
-                      file=sys.stderr)
+            from .runtime_headers import refresh_runtime_headers
+            refresh_runtime_headers(gen_dir)
 
             kept = sum(1 for v in hle_originals.values() if v is not None)
             print(f"Rewrote {out}: {len(hle_replace)} replacements, "
