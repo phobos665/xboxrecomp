@@ -1,5 +1,6 @@
 # nv2a_combiners_hlsl -- compile the register combiner translator's output
-# for 400 pseudo-random combiner configurations: D3DCompile on Windows, DXC to
+# for 400 pseudo-random combiner configurations, each without and with the
+# alpha test (800 shaders): D3DCompile on Windows, DXC to
 # SPIR-V elsewhere (rhi_vulkan_dxc.cpp, built in). Links the same sources as
 # tests/d3d8_smoke's d3d8_final_default, with the same device stubs. No
 # device, window or game files; skipped (77) without a compiler.

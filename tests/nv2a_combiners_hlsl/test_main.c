@@ -19,7 +19,10 @@
  * 0x00-0x12 with dot mappings and input stages), and shadow-map stages.
  * Only encodings the hardware accepts are made: a general stage cannot read
  * or write V1R0_SUM or EF_PROD (final combiner only), registers 6 and 7 do
- * not exist, and a shadow-map stage has a texture. Each is generated and compiled the way the
+ * not exist, and a shadow-map stage has a texture. Each configuration is
+ * built twice, without and with the alpha test (NV2ACombinerState.alpha_test,
+ * the only variant that may contain a discard), and checked to contain a
+ * discard exactly when the alpha test is on. Each is generated and compiled the way the
  * runtime compiles a combiner shader: D3DCompile ps_5_0 on Windows, DXC to
  * SPIR-V elsewhere (rhi_vulkan_dxc.cpp). Every failure prints its seed, so
  * it can be reproduced alone: nv2a_combiners_hlsl_test <seed>.
@@ -221,28 +224,41 @@ int main(int argc, char **argv)
     }
     for (seed = first; seed < first + count; seed++) {
         NV2ACombinerState state;
-        int len, r;
+        int len, r, at;
 
         build(seed, &state);
-        len = d3d8_combiners_generate_hlsl(&state, hlsl, (int)sizeof hlsl);
-        checks++;
-        if (len <= 0) {
-            printf("FAIL seed %u: the generator produced nothing\n", seed);
-            failures++;
-            continue;
-        }
-        r = compile(hlsl, len, err, sizeof err);
-        if (r < 0) {
-            printf("nv2a_combiners_hlsl: skipped, no shader compiler on this machine\n");
-            return 77;
-        }
-        if (!r) {
-            failures++;
-            printf("FAIL seed %u: the generated HLSL does not compile\n%s\n", seed, err);
-            if (count == 1 || failures == 1)
-                printf("---- source ----\n%s\n", hlsl);
+        for (at = 0; at < 2; at++) {
+            state.alpha_test = (BYTE)at;
+            len = d3d8_combiners_generate_hlsl(&state, hlsl, (int)sizeof hlsl);
+            checks++;
+            if (len <= 0) {
+                printf("FAIL seed %u alpha test %d: the generator produced nothing\n", seed, at);
+                failures++;
+                continue;
+            }
+            /* The point of the variant: no discard unless the alpha test
+             * is on, since a discard alone costs early depth. */
+            if ((strstr(hlsl, "discard") != NULL) != at) {
+                failures++;
+                printf("FAIL seed %u alpha test %d: the source %s a discard\n", seed, at,
+                       at ? "lacks" : "contains");
+                continue;
+            }
+            r = compile(hlsl, len, err, sizeof err);
+            if (r < 0) {
+                printf("nv2a_combiners_hlsl: skipped, no shader compiler on this machine\n");
+                return 77;
+            }
+            if (!r) {
+                failures++;
+                printf("FAIL seed %u alpha test %d: the generated HLSL does not compile\n%s\n",
+                       seed, at, err);
+                if (count == 1 || failures == 1)
+                    printf("---- source ----\n%s\n", hlsl);
+            }
         }
     }
-    printf("nv2a_combiners_hlsl: %d configurations, %d failed\n", checks, failures);
+    printf("nv2a_combiners_hlsl: %d shaders (%u configurations, each without and with the "
+           "alpha test), %d failed\n", checks, (unsigned)count, failures);
     return failures ? 1 : 0;
 }
