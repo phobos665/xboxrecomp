@@ -284,14 +284,11 @@ _HARNESS = '''/* generated -- a real title's own code, lifted and run against it
 #include <windows.h>
 #include "recomp_types.h"
 
-RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
-RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
-RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
-RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+/* The guest register file (recomp_cpu.h): one thread-local struct. */
+RECOMP_TLS struct recomp_cpu g_cpu = { .r_fp_control_word = 0x027F, .r_fp_cc = 0x4000 };
 RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
 volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
-RECOMP_TLS uint32_t g_icall_saved_esp, g_icall_dispatch_form;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }

@@ -34,9 +34,8 @@
 #include <string.h>
 
 #include "kernel.h"
-#include "xbox_memory_layout.h"     /* RECOMP_TLS */
+#include "xbox_memory_layout.h"     /* g_esp: the calling thread's guest stack */
 
-extern RECOMP_TLS uint32_t g_esp;   /* the calling thread's guest stack */
 extern ptrdiff_t g_xbox_mem_offset;
 
 typedef VOID (WINAPI *ExitProcess_t)(UINT);

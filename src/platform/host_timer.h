@@ -54,6 +54,15 @@ int64_t host_time_ns(void);
  * HOST_WAIT_ELAPSED, _NOT_ARMED or _FAILED. */
 int host_timer_wait_us(host_timer *t, int64_t us, uint32_t cap_ms);
 
+/* Wait about `us` microseconds, never less, as cheaply as the host allows:
+ * one plain sleep, no stepping and no spin, so it may wake late by whatever
+ * leeway the host adds (a quarter of the wait on macOS, ~50 us on Linux, the
+ * timer's granularity on Windows, where it is host_timer_wait_us). For a
+ * thread that polls and gains nothing from precision (the NV2A ack thread),
+ * where host_timer_wait_us would spin the last 200 us of every wait on macOS.
+ * Same results as host_timer_wait_us. */
+int host_timer_wait_us_coarse(host_timer *t, int64_t us, uint32_t cap_ms);
+
 /* Wait until `deadline_ns` on host_time_ns()'s clock; a deadline already
  * past returns HOST_WAIT_ELAPSED at once. Same results as host_timer_wait_us. */
 int host_timer_wait_until(host_timer *t, int64_t deadline_ns, uint32_t cap_ms);

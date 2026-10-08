@@ -425,6 +425,13 @@ void xbox_NameCurrentThread(const wchar_t *name);
 #  define RECOMP_TLS _Thread_local
 #endif
 
+/* The guest register file: g_eax..g_edi, g_esp, g_ebp, g_seh_ebp, g_fs_base,
+ * g_df, the x87 state and the ICALL diagnostics, as fields of one
+ * thread-local struct (g_cpu) behind macros of the old names. The same file
+ * generated code includes, so there is one declaration; never redeclare a
+ * register with `extern` (the names are macros, so it no longer compiles). */
+#include "../../templates/runtime/recomp_cpu.h"
+
 /* SSE register storage, shared with the generated code. Defined in both this
  * header and templates/runtime/recomp_types.h -- a translation unit can end up
  * including both, so the guard keeps that from being a redefinition. Keep the
@@ -505,8 +512,7 @@ extern uint32_t g_xbox_low_shift;
  * code reads fs:[N] as MEM32(XBOX_FS_BASE + N) -- so the move changes no
  * title, on any host. */
 #define XBOX_TIB_MAIN       0x00004000
-extern RECOMP_TLS uint32_t g_fs_base;
-#define XBOX_FS_BASE        g_fs_base
+#define XBOX_FS_BASE        g_fs_base     /* a field of g_cpu, recomp_cpu.h */
 
 #define XBOX_STACK_BASE     XBOX_LOW_VA(0x00780000)   /* see XBOX_LOW_VA */
 

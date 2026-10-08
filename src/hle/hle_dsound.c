@@ -884,6 +884,31 @@ HLE_EXPORT(DirectSoundDoWork)
             ds_count_report(HLE_MEM32(g_esp));
         }
     }
+    /* At most one full pass per millisecond. A title that polls this in a
+     * loop (Dino Crisis 3, above) paid for the lock, the walk of every slot
+     * and a host play-position query per stream on each of its calls, and a
+     * second pass inside the same millisecond finds nothing new: the models
+     * run on now_ms() and pumps are already one per 10 ms. What a skipped
+     * call can delay is a stream packet the host finished playing within
+     * that millisecond, by under a millisecond. Keyed on the performance
+     * counter, not now_ms(): GetTickCount64 moves in 15.6 ms steps on
+     * Windows, which would skip whole frames' worth of calls. */
+    {
+        static LARGE_INTEGER freq;
+        static uint64_t last_pass_ms = UINT64_MAX;
+        LARGE_INTEGER c;
+        uint64_t pass_ms;
+
+        if (!freq.QuadPart)
+            QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&c);
+        pass_ms = freq.QuadPart >= 1000
+                      ? (uint64_t)c.QuadPart / (uint64_t)(freq.QuadPart / 1000)
+                      : now;
+        if (pass_ms == last_pass_ms)
+            HLE_RETURN(0);
+        last_pass_ms = pass_ms;
+    }
     lock();
     for (i = 0; i < SLOTS; i++) {
         if (g_buffers[i].iface != 0u) {

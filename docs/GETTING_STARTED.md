@@ -307,12 +307,17 @@ program but `otool`, `install_name_tool`, `codesign` and `cp`, and has a
 ### macOS: an application bundle (for your own machine)
 
 ```bash
-cmake -S . -B build-mac -G Ninja -DXBOXRECOMP_MACOS_APP=ON -DXBOXRECOMP_APP_NAME="My Game"
+cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DXBOXRECOMP_MACOS_APP=ON -DXBOXRECOMP_APP_NAME="My Game"
 cmake --build build-mac              # also builds build-mac/My Game.app
 # or, for an executable you already have:
 python3 <toolkit>/scripts/make_macos_app.py build-mac/my_game --name "My Game" [--dry-run]
 ```
 
+Ninja and Makefiles are single-configuration generators: the build type is
+chosen when you configure, and `--config` on the build line does nothing.
+The toolkit defaults an empty `CMAKE_BUILD_TYPE` to Release (before October
+2026 it did not, and lifted code was compiled at `-O0`); say
+`-DCMAKE_BUILD_TYPE=Debug` or `RelWithDebInfo` when you want those.
 `-DXBOXRECOMP_MACOS_APP_DRY_RUN=ON` makes the target print what it would do.
 The `.app` carries the Vulkan loader, MoltenVK and its driver manifest, DXC,
 and every non-system library the title links (Homebrew's `libcrypto`), signed

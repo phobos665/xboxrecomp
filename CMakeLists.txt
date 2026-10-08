@@ -1,6 +1,23 @@
 cmake_minimum_required(VERSION 3.20)
 project(xboxrecomp VERSION 0.9.0 LANGUAGES C CXX)
 
+# A single-config generator (Ninja, Makefiles) with no build type compiles with
+# no optimisation at all. The runtime libraries hard-code -O2, but a title's
+# executable and its lifted gen/*.c only get the per-config flags, so a plain
+# `cmake -S . -B build -G Ninja` built every lifted function at -O0. Default to
+# Release here: every title reaches this file through add_subdirectory, and the
+# build type is a cache variable, so the title's own targets pick it up too.
+# Multi-config generators (Visual Studio, Xcode, Ninja Multi-Config) choose the
+# configuration at build time and are left alone. Pass -DCMAKE_BUILD_TYPE=Debug
+# (or RelWithDebInfo) to choose otherwise.
+get_property(_xboxrecomp_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT _xboxrecomp_multi_config AND NOT CMAKE_BUILD_TYPE)
+    message(STATUS "No CMAKE_BUILD_TYPE given; defaulting to Release")
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type for single-config generators (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
+endif()
+unset(_xboxrecomp_multi_config)
+
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
 # Pattern: extract emulator subsystems (xemu) into reusable static libraries.

@@ -71,6 +71,36 @@ static void test_wait_us(host_timer *t)
     }
 }
 
+/* The coarse wait: never early, and not wildly late. It may overshoot by the
+ * host's leeway (it does not spin), so it is held to the same loose bound. */
+static void test_wait_us_coarse(host_timer *t)
+{
+    static const int64_t asks[] = { 50, 500, 2000 };
+    size_t i;
+
+    for (i = 0; i < sizeof asks / sizeof asks[0]; i++) {
+        int64_t worst = 0;
+        int k;
+        for (k = 0; k < 10; k++) {
+            int64_t t0 = host_time_ns(), took_us;
+            int r = host_timer_wait_us_coarse(t, asks[i], 1000);
+            took_us = (host_time_ns() - t0) / 1000;
+            CHECK(r == HOST_WAIT_ELAPSED, "wait_us_coarse(%lld) returned %d",
+                  (long long)asks[i], r);
+            CHECK(took_us >= asks[i] - 50, "wait_us_coarse(%lld) woke after %lld us",
+                  (long long)asks[i], (long long)took_us);
+            if (took_us - asks[i] > worst)
+                worst = took_us - asks[i];
+        }
+        printf("wait_us_coarse(%5lld): worst overshoot %lld us\n",
+               (long long)asks[i], (long long)worst);
+        CHECK(worst < SLACK_US, "wait_us_coarse(%lld) overshot by %lld us",
+              (long long)asks[i], (long long)worst);
+    }
+    CHECK(host_timer_wait_us_coarse(t, 500000, 20) == HOST_WAIT_FAILED,
+          "wait_us_coarse past its cap did not say so");
+}
+
 static void test_wait_until(host_timer *t)
 {
     /* A periodic wait: each deadline is the last plus the period, so a late
@@ -177,6 +207,7 @@ int main(void)
         return 1;
     printf("high resolution: %s\n", host_timer_high_res(t) ? "yes" : "no");
     test_wait_us(t);
+    test_wait_us_coarse(t);
     test_wait_until(t);
     test_wait_or_event(t);
     {

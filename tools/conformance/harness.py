@@ -99,16 +99,12 @@ _PREAMBLE = """/* generated -- both sides, same inputs, compared */
 #include <math.h>
 #include "recomp_types.h"
 
-RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
-RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
-RECOMP_TLS int g_df;   /* EFLAGS.DF: the direction the string ops walk */
-RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
-RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+/* The guest register file (recomp_cpu.h): one thread-local struct. */
+RECOMP_TLS struct recomp_cpu g_cpu = { .r_fp_control_word = 0x027F, .r_fp_cc = 0x4000 };
 RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
 RECOMP_TLS RecompMmx g_mm0,g_mm1,g_mm2,g_mm3,g_mm4,g_mm5,g_mm6,g_mm7;
 volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
-RECOMP_TLS uint32_t g_icall_saved_esp, g_icall_dispatch_form;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
@@ -300,8 +296,10 @@ static void cmp_sse(const char *name, const char *why, int *shown, int vec) {
 # per input vector, and the recording also notes the scratch buffer's address,
 # which golden mode reproduces as a guest address.
 _GOLD_TYPES = """
+/* Not `eax`: generated code defines eax as a macro for the register, so a
+   field by that name would expand into the register file (recomp_cpu.h). */
 typedef struct {
-    unsigned int   eax;
+    unsigned int   out_eax;
     unsigned short sw;
     unsigned char  st[64];
     unsigned char  xmm[128];
@@ -309,7 +307,7 @@ typedef struct {
 
 static void gold_load(const conf_gold *g)
 {
-    g_out_eax = g->eax;
+    g_out_eax = g->out_eax;
     g_out_sw = g->sw;
     memcpy(g_out_st, g->st, sizeof g->st);
     memcpy(g_out_xmm, g->xmm, sizeof g->xmm);
