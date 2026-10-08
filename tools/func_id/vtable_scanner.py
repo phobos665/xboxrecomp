@@ -312,14 +312,24 @@ def _find_constructors(vtables, xbe_data, functions):
 
         func_bytes = xbe_data[file_offset:file_offset + func_size]
 
-        for addr_bytes, vt in vtable_addrs.items():
-            pos = func_bytes.find(addr_bytes)
-            if pos >= 0:
-                if func_addr not in vtable_methods:
-                    constructors[func_addr] = {
-                        "class_id": vt.get("class_id", "cls_???"),
-                        "vtable_addr": vt["address"],
-                    }
-                break
+        # Which vtable addresses appear anywhere in the function, at any byte
+        # offset: one pass over its bytes, rather than one bytes.find per
+        # vtable (functions x vtables -- 83 million finds, 24 s of BLiNX's
+        # identify stage). The pick is unchanged: the first vtable, in
+        # vtable order, that the function contains.
+        present = set()
+        for i in range(len(func_bytes) - 3):
+            window = func_bytes[i:i + 4]
+            if window in vtable_addrs:
+                present.add(window)
+        if present:
+            for addr_bytes, vt in vtable_addrs.items():
+                if addr_bytes in present:
+                    if func_addr not in vtable_methods:
+                        constructors[func_addr] = {
+                            "class_id": vt.get("class_id", "cls_???"),
+                            "vtable_addr": vt["address"],
+                        }
+                    break
 
     return constructors
