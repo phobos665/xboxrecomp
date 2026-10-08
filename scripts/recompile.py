@@ -119,6 +119,8 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     lift.append("--all" if args.all else "--game-only")
     if args.split:
         lift += ["--split", str(args.split)]
+    if getattr(args, "jobs", None):
+        lift += ["--jobs", str(args.jobs)]
     if work:
         lift += ["--disasm-dir", str(work / "disasm"),
                  "--func-id-dir", str(work / "func_id"),
@@ -217,6 +219,10 @@ def main() -> int:
     # frame-time cost in-level (uncapped, P-cores: 6.5 ms either way).
     ap.add_argument("--split", type=int, default=250, metavar="N",
                     help="Functions per generated .c file (default: 250)")
+    ap.add_argument("--jobs", "-j", type=int, metavar="N",
+                    help="Processes the lift stage uses (default: one per "
+                         "CPU). The generated C is the same whatever N is; "
+                         "1 lifts in a single process")
     ap.add_argument("--gen-dir", metavar="DIR",
                     help="Output directory for generated sources")
     ap.add_argument("--work-dir", metavar="DIR",

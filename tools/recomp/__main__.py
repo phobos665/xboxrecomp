@@ -315,6 +315,12 @@ def main():
                              "not implement yet: the body still runs, only "
                              "the answer changes, and the emitted code is "
                              "inert unless RECOMP_FORCE_RETURN is set")
+    parser.add_argument("--jobs", "-j", type=int, default=os.cpu_count() or 1,
+                        metavar="N",
+                        help="Worker processes for the split lift (default: "
+                             "one per CPU). The output is byte-identical "
+                             "whatever N is; 1 lifts in this process, as "
+                             "before")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -751,6 +757,7 @@ def main():
             verbose=args.verbose,
             manual=manual,
             keep_bodies=hle_keep,
+            jobs=args.jobs,
         )
 
         # Written after translation, which clears stale files from gen_dir, and

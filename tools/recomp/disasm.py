@@ -155,6 +155,16 @@ class Disassembler:
         self._cs_lite = Cs(CS_ARCH_X86, CS_MODE_32)
         _init_reg_names(self._cs)
 
+    # Capstone handles are ctypes objects and do not pickle. The process pool
+    # in translator.py ships a whole FunctionTranslator to its workers, so the
+    # handles are dropped here and rebuilt on the other side.
+    def __getstate__(self):
+        # Not empty: pickle skips __setstate__ for a false state.
+        return {"capstone": "rebuilt on load"}
+
+    def __setstate__(self, state):
+        self.__init__()
+
     def scan_lite(self, raw_bytes, start_va, end_va):
         """The linear decode disassemble_function starts from, without detail.
 

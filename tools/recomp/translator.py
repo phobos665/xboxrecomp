@@ -1102,6 +1102,21 @@ class FunctionTranslator:
                                                  force_cf=True)
         return code
 
+    def translate_isolated(self, func_addr, func_info):
+        """translate_function, returning what it added to the Lifter's tallies.
+
+        Returns (code, [(addr, name), ...] call targets it named in the order
+        it named them, {mnemonic: [addr, ...]} it left unimplemented). The
+        tallies start empty, so this is one function's share of each; a
+        process-pool worker sends them back to be replayed in function order
+        (BatchTranslator._lift_all).
+        """
+        self.lifter.referenced_calls = {}
+        self.lifter.unimplemented = {}
+        code = self.translate_function(func_addr, func_info)
+        return (code, list(self.lifter.referenced_calls.items()),
+                self.lifter.unimplemented)
+
     def _translate_function_once(self, func_addr, func_info, force_cf=False):
         start = func_addr
         recovered = self._recovered_cfg.get(start)
@@ -1813,6 +1828,45 @@ class FunctionTranslator:
         return regs
 
 
+# --- Parallel lift (BatchTranslator._lift_all) -------------------------------
+#
+# Module level so a spawned worker can import them by name.
+
+# config's layout and banner state. configure_from_xbe()/set_game_name() set
+# them in the parent; a spawned worker starts from the module's fallback, so
+# they travel with the pickle.
+_CONFIG_STATE = ("_SECTIONS", "SECTIONS", "_configured_from",
+                 "TEXT_VA_START", "TEXT_VA_END", "RDATA_VA_START",
+                 "RDATA_VA_END", "DATA_VA_START", "DATA_VA_END",
+                 "KERNEL_THUNK_ADDR", "ENTRY_POINT", "GAME_NAME",
+                 "_game_name_explicit", "FORCE_CODE_SECTIONS",
+                 "FORCE_DATA_SECTIONS")
+
+# The FunctionTranslator a pool worker lifts with, set by _pool_init.
+_pool_translator = None
+
+
+def _config_state():
+    return {name: getattr(_config, name) for name in _CONFIG_STATE}
+
+
+def _pool_init(state_path):
+    """Worker start-up: the parent's config and FunctionTranslator."""
+    import pickle
+    global _pool_translator
+    with open(state_path, "rb") as fh:
+        config_state, translator = pickle.load(fh)
+    for name, value in config_state.items():
+        setattr(_config, name, value)
+    _pool_translator = translator
+
+
+def _pool_lift(unit):
+    """Lift a unit of [(addr, func_info)]; see translate_isolated."""
+    return [_pool_translator.translate_isolated(addr, func_info)
+            for addr, func_info in unit]
+
+
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
@@ -2050,7 +2104,7 @@ class BatchTranslator:
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
                               prefix="recomp", verbose=False, manual=None,
-                              keep_bodies=None):
+                              keep_bodies=None, jobs=1):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -2072,6 +2126,10 @@ class BatchTranslator:
         own code first (tools/recomp/hle.py, HLE_ORIGINAL). The body is
         compiled and declared, but kept out of the dispatch table, so the
         address still resolves to the replacement.
+
+        jobs: worker processes to lift with (see _lift_all). 1, the default,
+        lifts in this process exactly as before; any other count gives the
+        same files byte for byte.
 
         Returns dict with stats and list of generated files.
         """
@@ -2100,12 +2158,9 @@ class BatchTranslator:
             "total_lines": 0,
         }
 
-        for i, (addr, func_info) in enumerate(func_list):
+        work = []                 # (addr, name, func_info), in emitted order
+        for addr, func_info in func_list:
             name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
-            if verbose and (i % 500 == 0 or i == len(func_list) - 1):
-                print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
-                      file=sys.stderr)
-
             if addr in manual:
                 # Hand-written elsewhere: declare it, emit nothing -- unless a
                 # replacement also runs the original, in which case the body
@@ -2116,8 +2171,11 @@ class BatchTranslator:
                     continue
                 func_info = dict(func_info, name=keep)
                 name = keep
+            work.append((addr, name, func_info))
 
-            code = self.translator.translate_function(addr, func_info)
+        codes = self._lift_all(work, jobs, verbose)
+
+        for (addr, name, func_info), code in zip(work, codes):
             if code:
                 translations.append((addr, name, code))
                 stats["translated"] += 1
@@ -2380,6 +2438,91 @@ class BatchTranslator:
         stats["num_chunks"] = len(chunks)
         stats["chunk_size"] = chunk_size
         return stats
+
+    def _lift_all(self, work, jobs=1, verbose=False):
+        """Lift each (addr, name, func_info) in `work`; codes in the same order.
+
+        jobs <= 1 is the serial loop this always was. Otherwise the functions
+        are lifted by a pool of worker processes, each holding its own copy
+        of the FunctionTranslator, and the results are put back in `work`
+        order, so the files written from them are byte-identical to a serial
+        lift.
+
+        That holds because lifting one function reads nothing another one
+        wrote. The Lifter carries three things from function to function:
+        _pop_cache (a cache of a pure function of the binary),
+        referenced_calls (addr -> name, written and never read while
+        lifting) and unimplemented (mnemonic -> addresses, likewise). Each
+        worker returns its function's additions to the last two, and they are
+        replayed here in `work` order, which leaves both exactly as the
+        serial loop would. Anything new that makes one function's output
+        depend on an earlier one's breaks this, and test_parallel_lift says
+        so.
+
+        The pool uses the spawn start method on every platform -- it is the
+        only one Windows has, so it is the one tested everywhere -- and the
+        workers load their state from a pickle rather than inheriting it.
+        """
+        import sys
+
+        jobs = max(1, min(int(jobs or 1), len(work)))
+        if sys.platform == "win32":
+            jobs = min(jobs, 61)    # ProcessPoolExecutor's limit there
+        if jobs <= 1:
+            codes = []
+            for i, (addr, name, func_info) in enumerate(work):
+                if verbose and (i % 500 == 0 or i == len(work) - 1):
+                    print(f"  [{i+1}/{len(work)}] Translating {name}...",
+                          file=sys.stderr)
+                codes.append(self.translator.translate_function(addr, func_info))
+            return codes
+
+        import multiprocessing
+        import pickle
+        import tempfile
+        from concurrent.futures import ProcessPoolExecutor
+
+        # Small units keep the workers evenly loaded (one function can be a
+        # hundred times another), large enough that the per-unit overhead
+        # does not matter.
+        size = max(1, min(64, len(work) // (jobs * 8)))
+        units = [[(addr, func_info) for addr, _name, func_info
+                  in work[i:i + size]]
+                 for i in range(0, len(work), size)]
+
+        fd, state_path = tempfile.mkstemp(prefix="recomp-lift-",
+                                          suffix=".pickle")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                pickle.dump((_config_state(), self.translator), fh,
+                            protocol=pickle.HIGHEST_PROTOCOL)
+            lifter = self.translator.lifter
+            codes = []
+            # concurrent.futures rather than multiprocessing.Pool: a worker
+            # that dies (or whose initializer raises) breaks the pool with
+            # an error here, where Pool replaces it and waits for ever.
+            with ProcessPoolExecutor(
+                    jobs, mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_pool_init,
+                    initargs=(state_path,)) as pool:
+                for results in pool.map(_pool_lift, units):
+                    for code, calls, unimplemented in results:
+                        codes.append(code)
+                        for addr, name in calls:
+                            lifter.referenced_calls[addr] = name
+                        for mnemonic, addrs in unimplemented.items():
+                            lifter.unimplemented.setdefault(
+                                mnemonic, []).extend(addrs)
+                    if verbose and (len(codes) // 500 != (len(codes) - len(results)) // 500
+                                    or len(codes) == len(work)):
+                        print(f"  [{len(codes)}/{len(work)}] translated "
+                              f"({jobs} processes)", file=sys.stderr)
+            return codes
+        finally:
+            try:
+                os.remove(state_path)
+            except OSError:
+                pass
 
     def _write_dispatch_table(self, translations, output_path, header_name):
         """
