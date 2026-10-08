@@ -2284,6 +2284,21 @@ static void framebuffer_probe_tick(void)
 #define ACK_BUSY_US_DEFAULT 0
 #endif
 
+/* The idle wait, RECOMP_NV2A_ACK_IDLE_US. On POSIX it is a plain sleep
+ * (host_timer_wait_us_coarse), which oversleeps, and a guest thread waiting
+ * on the ack spins for as long as the ack thread is asleep. TimeSplitters 2
+ * in its level on an M4, uncapped (Oct 2026), guest main-thread CPU per
+ * frame: 2.67-2.86 ms on main (the precise 500 us wait), 3.00-3.04 ms with
+ * the coarse 500 us wait, 2.31-2.35 ms with a coarse 100 us wait. Windows
+ * keeps the precise high-resolution wait, and its 500. */
+#ifndef ACK_IDLE_US_DEFAULT
+#  ifdef _WIN32
+#    define ACK_IDLE_US_DEFAULT 500
+#  else
+#    define ACK_IDLE_US_DEFAULT 100
+#  endif
+#endif
+
 /* This thread's CPU time, for RECOMP_NV2A_ACK_STATS. */
 static int64_t ack_thread_cpu_ns(void)
 {
@@ -2322,7 +2337,7 @@ static void nv2a_ack_wait(void)
         const char *s = getenv("RECOMP_NV2A_ACK_STATS");
         LARGE_INTEGER f;
 
-        idle_us = v ? atoi(v) : 500;
+        idle_us = v ? atoi(v) : ACK_IDLE_US_DEFAULT;
         if (idle_us < 0)
             idle_us = 0;
         busy_us = b ? atoi(b) : ACK_BUSY_US_DEFAULT;
