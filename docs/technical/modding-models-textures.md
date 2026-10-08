@@ -183,6 +183,10 @@ reverse engineering or tooling that transfers to no other game.
 | T6 | Offline indexer: hash every `.xbt` payload in every pak, emit `<hash> -> chr.pak:textures/0267.xbt` so dumps have human names | B | 0.5–1 | TS2 |
 | T7 | Extend the mirror to cube, volume and P8 textures so they can be replaced too | B | 3–5 | Toolkit |
 
+`RECOMP_TEX_DUMP` is already taken by the LLE executor's BMP dump; `ai-upscaling.md`
+uses `RECOMP_HLE_D3D8_TEX_DUMP` and `RECOMP_HLE_D3D8_TEX_REPLACE` instead, and breaks
+T4, T5 and T7 into smaller items (R1-R6).
+
 **Route A textures: 2.5–3.5 days** (T1–T3), and the result is a permanently modified
 disc image that the title loads with no runtime involvement at all.
 

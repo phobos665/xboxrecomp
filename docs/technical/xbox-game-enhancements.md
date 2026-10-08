@@ -24,7 +24,7 @@ tells the mechanism something only the game knows.
 | 4 | MSAA / supersampling | Supersampling exists (item 3); MSAA only when the title asks for it | Forced MSAA, resolve, SSAA via item 3 | Passes that must not be multisampled |
 | 5 | Filters / shaders | Anisotropic filtering (`RECOMP_ANISO`); no post-process chain | A post-process chain on the final frame | Game-tuned presets, if any |
 | 6 | Online play replacing Xbox Live | Nothing yet; XNET/XONLINE code runs lifted | System link over a virtual LAN, a Live-shaped service stub | Matchmaking and session rules per game, server if needed |
-| 7 | Model / texture / audio replacement | Designed (`modding-models-textures.md`); dump exists only in the LLE executor | Overlay filesystem, hashed texture dump and replace, audio replace | Asset naming, model formats, anything that adds content |
+| 7 | Model / texture / audio replacement | Designed (`modding-models-textures.md`; AI-upscaled packs in `ai-upscaling.md`); dump exists only in the LLE executor | Overlay filesystem, hashed texture dump and replace, audio replace | Asset naming, model formats, anything that adds content |
 | 8 | FPS display | Done: F9, `RECOMP_FPS_OVERLAY=1` | All of it | Nothing |
 | 9 | Native rendering (Vulkan) | Planned (`vulkan-backend.md`); D3D11 today | All of it | Nothing, unless the game draws through its own push buffers |
 | 10 | Skip cutscenes | Movies: `RECOMP_SKIP_VIDEO`, `RECOMP_XMV_PLAY=0`; in-engine: nothing | Skipping pre-rendered movies, a skip key | In-engine cutscenes: where they start and how to jump past safely |
@@ -160,6 +160,8 @@ shadow renderer; a dump exists only in the LLE push-buffer executor
 - An overlay filesystem, so a mod folder shadows the game's files without editing them.
 - Texture dump and replace, keyed by content hash, at `host_texture()` in
   `src/hle/hle_d3d8_texture.c`. Works on any game on day one.
+  `ai-upscaling.md` breaks this into work items and covers the offline
+  pipeline for AI-upscaled packs.
 - Audio replacement at the same kind of boundary: DirectSound buffers and streams, and
   movie sound, keyed by hash.
 - Mesh replacement for simple vertex layouts.

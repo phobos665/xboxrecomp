@@ -138,6 +138,14 @@ hold its projection and affine matrices with `xbox_D3D8SetInterpRegisters`; with
 the projection blends. The `[INTERP]` five-second line says what was shown and why a frame was
 held. See `docs/technical/frame-interpolation.md`.
 
+**AI-upscaled texture packs (Oct 2026, not built):** `docs/technical/ai-upscaling.md` is the
+plan: a hash-named dump and a replacement folder at `host_texture()` in
+`src/hle/hle_d3d8_texture.c` (work items R1-R7), offline scripts in `tools/texpack/`, and
+the chaiNNer workflow for making a pack. `RECOMP_TEX_DUMP` is taken by the LLE executor, so
+the switches are `RECOMP_HLE_D3D8_TEX_DUMP` / `_TEX_REPLACE`. Before writing it, read §2.2:
+swizzled formats are unswizzled at upload, and linear textures scale their coordinates by
+the *host* texture's size, so a bigger replacement breaks both unless handled.
+
 **Input is bound, not hard-coded (Sep 2026):** all four ports read
 `src/input/input_bindings.c`, which loads a JSON config — `RECOMP_INPUT_CONFIG`, else
 `input_bindings.json` in the per-user folder (`%APPDATA%\xboxrecomp` on Windows; the other
