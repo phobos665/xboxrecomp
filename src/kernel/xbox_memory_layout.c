@@ -2252,7 +2252,8 @@ static void framebuffer_probe_tick(void)
  * needs. A guest waiting on one of these words is spinning on another core.
  *
  * Idle: once nothing has changed for a millisecond the thread waits on a
- * timer between passes (RECOMP_NV2A_ACK_IDLE_US, default 500; 0 for the old
+ * timer between passes (RECOMP_NV2A_ACK_IDLE_US, default 500 on Windows and
+ * 100 elsewhere, see ACK_IDLE_US_DEFAULT; 0 for the old
  * spin). The cost is that the first wait after a quiet spell -- the first
  * kickoff after a vblank wait, say -- can be answered up to that much later.
  * The wait is the coarse one: on macOS the precise wait spins its last
