@@ -48,9 +48,71 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * aborts CRT init before main ever runs -- the process then exits cleanly,
  * which reads as a title that did nothing rather than one that failed.
  *
- * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+ * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check.
+ *
+ * 16 KB is the default, not a constant. A volume the title formatted itself
+ * says what it is: XAPI's utility-drive mount formats the cache partition with
+ * the cluster size the title asked for -- Halo 2 asks for 64 KB -- and then
+ * requires FileFsSizeInformation to report exactly that, or it calls the
+ * volume unrecognized (0xC000014F), formats again, and boots to the dashboard
+ * with XLD_ERROR_INVALID_HARD_DISK. So a handle on a partition image whose
+ * first sector is a FATX superblock reports that superblock's sectors per
+ * cluster (offset 8), and its size from the image (fatx_geometry). */
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
+/* A FATX superblock's sectors per cluster, when `head` (the volume's first 12
+ * bytes) is one: magic "FATX", volume id, sectors per cluster. 0 otherwise, or
+ * for a value no FATX volume has (not a power of two, or above 128 KB). */
+static unsigned fatx_superblock_spc(const unsigned char head[12])
+{
+    unsigned spc;
+
+    if (memcmp(head, "FATX", 4) != 0)
+        return 0;
+    spc = (unsigned)head[8] | ((unsigned)head[9] << 8) |
+          ((unsigned)head[10] << 16) | ((unsigned)head[11] << 24);
+    if (spc == 0 || spc > 256 || (spc & (spc - 1)) != 0)
+        return 0;
+    return spc;
+}
+
+/* A partition image the title has formatted: its first sector is a FATX
+ * superblock. A directory open of such a device opens the image itself (so
+ * FileFsSizeInformation can read the geometry the title chose) instead of the
+ * folder holding it; an image nobody formatted keeps the folder, which is what
+ * Half-Life 2's free-space probe of Partition0 is given. */
+#if defined(_WIN32)
+static int device_image_is_fatx(const WCHAR *path)
+{
+    unsigned char head[12];
+    DWORD got = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    int ok = 0;
+
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    if (ReadFile(h, head, sizeof head, &got, NULL) && got == sizeof head)
+        ok = fatx_superblock_spc(head) != 0;
+    CloseHandle(h);
+    return ok;
+}
+#else
+static int device_image_is_fatx(const char *path)
+{
+    unsigned char head[12];
+    int fd = open(path, O_RDONLY);
+    int ok = 0;
+
+    if (fd < 0)
+        return 0;
+    if (pread(fd, head, sizeof head, 0) == (ssize_t)sizeof head)
+        ok = fatx_superblock_spc(head) != 0;
+    close(fd);
+    return ok;
+}
+#endif
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -160,6 +222,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      * gives a handle that is valid for exactly what the caller is going to do
      * with it, which is NtQueryVolumeInformationFile. */
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
+        !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY) &&
+        device_image_is_fatx(win_path)) {
+        CreateOptions &= ~XBOX_FILE_DIRECTORY_FILE;   /* the formatted volume itself */
+    } else if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
         WCHAR *slash = wcsrchr(win_path, L'\\');
@@ -574,7 +641,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -582,7 +649,31 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            unsigned char head[12];
+            LARGE_INTEGER size, here, zero;
+            OVERLAPPED ov;
+            DWORD got = 0;
+            unsigned spc = 0;
+
+            /* A partition image the title formatted (see fatx_superblock_spc).
+             * The file position is put back: the read is at offset 0. */
+            zero.QuadPart = 0;
+            memset(&ov, 0, sizeof ov);
+            if (FileHandle && GetFileType(FileHandle) == FILE_TYPE_DISK &&
+                    GetFileSizeEx(FileHandle, &size) &&
+                    SetFilePointerEx(FileHandle, zero, &here, FILE_CURRENT)) {
+                if (ReadFile(FileHandle, head, sizeof head, &got, &ov) && got == sizeof head)
+                    spc = fatx_superblock_spc(head);
+                SetFilePointerEx(FileHandle, here, NULL, FILE_BEGIN);
+            }
+            if (spc) {
+                ULONGLONG cs = (ULONGLONG)XBOX_BYTES_PER_SECTOR * spc;
+                info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+                info->SectorsPerAllocationUnit = spc;
+                info->TotalAllocationUnits.QuadPart = (ULONGLONG)size.QuadPart / cs;
+                info->AvailableAllocationUnits.QuadPart =
+                    info->TotalAllocationUnits.QuadPart ? info->TotalAllocationUnits.QuadPart - 1 : 0;
+            } else if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
@@ -888,6 +979,10 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     /* A partition device opened as a directory (a free-space query): the
      * directory that holds its image stands in for the volume. */
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        stat(host_path, &st) == 0 && !S_ISDIR(st.st_mode) &&
+        device_image_is_fatx(host_path)) {
+        CreateOptions &= ~XBOX_FILE_DIRECTORY_FILE;   /* the formatted volume itself */
+    } else if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         stat(host_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
         char *slash = strrchr(host_path, '/');
         if (slash && slash != host_path) {
@@ -1177,12 +1272,25 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
+            struct stat st;
+            unsigned char head[12];
+            unsigned spc = 0;
             int fd = w32_handle_fd(FileHandle);
             /* Xbox geometry, not the host's -- see the note on
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-            if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
+            if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                    pread(fd, head, sizeof head, 0) == (ssize_t)sizeof head)
+                spc = fatx_superblock_spc(head);
+            if (spc) {
+                /* A partition image the title formatted itself. */
+                ULONGLONG cs = (ULONGLONG)XBOX_BYTES_PER_SECTOR * spc;
+                info->SectorsPerAllocationUnit = spc;
+                info->TotalAllocationUnits.QuadPart = (ULONGLONG)st.st_size / cs;
+                info->AvailableAllocationUnits.QuadPart =
+                    info->TotalAllocationUnits.QuadPart ? info->TotalAllocationUnits.QuadPart - 1 : 0;
+            } else if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
