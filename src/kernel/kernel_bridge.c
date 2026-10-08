@@ -29,6 +29,8 @@
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include "platform/host_timer.h"   /* the vblank clock's precise sleep */
+#include "platform/host_main.h"    /* host_relaunch_self: a quick reboot into this title */
+#include "recomp_config.h"         /* recomp_config_title_id */
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -175,8 +177,33 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *relaunch = getenv("RECOMP_LAUNCH_DATA");
+        int carried = 0;
 
-        if (cmdline && *cmdline) {
+        /* A title that quick-rebooted into itself (bridge_HalReturnToFirmware)
+         * left its whole launch data page here, hex-encoded: this is the boot
+         * after that reboot, and XGetLaunchInfo must see what the title
+         * wrote. It wins over RECOMP_CMDLINE, which only seeds a first boot. */
+        if (relaunch && strlen(relaunch) == 2 * 0x1000) {
+            uint32_t page = xbox_HeapAlloc(0x1000, 4096);
+            if (page) {
+                uint32_t i;
+
+                for (i = 0; i < 0x1000; i++) {
+                    unsigned v = 0;
+                    sscanf(relaunch + 2 * i, "%2x", &v);
+                    BRIDGE_MEM8(page + i) = (uint8_t)v;
+                }
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page;
+                fprintf(stderr, "  Launch data: carried over the relaunch, type %u"
+                                " titleid 0x%08X at 0x%08X\n",
+                        BRIDGE_MEM32(page), BRIDGE_MEM32(page + 4), page);
+                carried = 1;
+            }
+        }
+        if (carried) {
+            /* the page above */
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -1271,6 +1298,45 @@ static void bridge_HalReturnToFirmware(void)
                     *(const uint32_t *)(mem + a));
         }
         fflush(stderr);
+    }
+
+    /* A quick reboot into the same title. XLaunchNewImage with no path (or
+     * the update launcher, as Halo 2 does at its first boot) fills the page
+     * with the title's own ID and an empty path and reboots: on a console the
+     * same image starts again and XGetLaunchInfo hands it the page. Do that
+     * -- re-execute with the page in RECOMP_LAUNCH_DATA -- instead of ending
+     * the process, a few times at most so a title that relaunches on every
+     * boot still stops. RECOMP_RELAUNCH=0 restores the plain exit. */
+    {
+        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+        const char *off = getenv("RECOMP_RELAUNCH");
+        const char *cnt = getenv("RECOMP_RELAUNCH_COUNT");
+        int count = cnt ? atoi(cnt) : 0;
+
+        if (routine == 2 && page && !(off && *off == '0') && count < 3
+                && BRIDGE_MEM32(page + 4) == recomp_config_title_id()
+                && BRIDGE_MEM8(page + 8) == 0) {
+            static char hex[2 * 0x1000 + 1];
+            char next[16];
+            uint32_t i;
+
+            for (i = 0; i < 0x1000; i++)
+                snprintf(hex + 2 * i, 3, "%02X", BRIDGE_MEM8(page + i));
+            snprintf(next, sizeof next, "%d", count + 1);
+#ifdef _WIN32
+            SetEnvironmentVariableA("RECOMP_LAUNCH_DATA", hex);
+            SetEnvironmentVariableA("RECOMP_RELAUNCH_COUNT", next);
+#else
+            setenv("RECOMP_LAUNCH_DATA", hex, 1);
+            setenv("RECOMP_RELAUNCH_COUNT", next, 1);
+#endif
+            fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=2 into this title"
+                            " - relaunching with its launch data (relaunch %d of at most 3;"
+                            " RECOMP_RELAUNCH=0 to exit instead)\n", count + 1);
+            fflush(stderr);
+            host_relaunch_self();
+            fprintf(stderr, "  [KERNEL] relaunch failed; exiting instead\n");
+        }
     }
 
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
