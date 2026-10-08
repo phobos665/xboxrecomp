@@ -487,7 +487,10 @@ class DisasmEngine:
                     tbl - 16, end):
                 if insn.end_address > tbl and insn.address < end:
                     del self.instructions[insn.address]
-            self._sorted_addrs = None
+                    # Drop it from the sorted list too, rather than throwing
+                    # the list away (see _note_added).
+                    k = bisect.bisect_left(self._sorted_addrs, insn.address)
+                    del self._sorted_addrs[k]
 
             self.jump_tables[tbl] = end
             self._jt_by_disp[disp] = tbl
@@ -569,12 +572,14 @@ class DisasmEngine:
             return 0
 
         added = 0
-        for cs_insn in self._cs.disasm(data[offset:], addr):
+        new_addrs = []
+        for cs_insn in self._disasm_from(data, offset, addr):
             if cs_insn.address != addr and cs_insn.address in self.instructions:
                 break  # resynced with the existing stream
             if cs_insn.address not in self.instructions:
                 self.instructions[cs_insn.address] = \
                     self._classify_instruction(cs_insn)
+                new_addrs.append(cs_insn.address)
                 added += 1
             insn = self.instructions[cs_insn.address]
             if insn.is_terminator:
@@ -583,8 +588,54 @@ class DisasmEngine:
                 break
 
         if added:
-            self._sorted_addrs = None
+            self._note_added(new_addrs)
         return added
+
+    def _note_added(self, addrs):
+        """Keep the sorted address list current after new decodes. A few
+        inserts into the existing list cost far less than re-sorting a million
+        addresses, which is what dropping it did on every call (38,772 sorts,
+        3 s of NFSU2's disassembly). Many at once: rebuild it lazily."""
+        if self._sorted_addrs is None:
+            return
+        if len(addrs) > 256:
+            self._sorted_addrs = None
+            return
+        for a in addrs:
+            bisect.insort(self._sorted_addrs, a)
+
+    # Bytes handed to capstone at a time by _disasm_from. Capstone's Python
+    # binding decodes its whole buffer before yielding the first instruction,
+    # so passing data[offset:] decoded everything to the end of the section --
+    # megabytes -- for a caller that usually stops after a few instructions:
+    # decode_at's 5,035 calls were 27 s of NFSU2's 50 s disassembly.
+    _DECODE_WINDOW = 4096
+    _MAX_INSN = 15                       # longest x86 instruction, in bytes
+
+    def _disasm_from(self, data: bytes, offset: int, addr: int):
+        """
+        The instructions capstone would yield for data[offset:] at addr, in
+        the same order and stopping at the same place, decoded a window at a
+        time so a caller that stops early pays only for what it read.
+
+        Capstone stops at the first byte it cannot decode. A window can also
+        end inside an instruction; that looks the same, so an early stop
+        within _MAX_INSN bytes of a window's end is retried from the last
+        whole instruction in the next window, where it either decodes (it was
+        cut off) or fails again at the same address (it really is invalid,
+        and the stream ends there exactly as it would have).
+        """
+        pos = offset
+        end = len(data)
+        while pos < end:
+            stop = min(pos + self._DECODE_WINDOW, end)
+            resume = pos
+            for cs_insn in self._cs.disasm(data[pos:stop], addr + (pos - offset)):
+                resume = cs_insn.address - addr + offset + cs_insn.size
+                yield cs_insn
+            if stop == end or resume == pos or resume < stop - self._MAX_INSN:
+                return                   # section end, or an undecodable byte
+            pos = resume
 
     def block_tail_jump(self, addr: int, max_insns: int = 256):
         """
@@ -1067,8 +1118,9 @@ class DisasmEngine:
                 offset = addr - section.virtual_addr
                 if offset < 0 or offset >= len(data):
                     return False
-                decoded = next(self._cs.disasm(data[offset:], addr, count=1),
-                               None)
+                decoded = next(self._cs.disasm(
+                    data[offset:offset + self._MAX_INSN + 1], addr, count=1),
+                    None)
                 if decoded is None:
                     return False  # undecodable: not code
                 mnemonic = decoded.mnemonic.lower()
