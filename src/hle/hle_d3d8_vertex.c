@@ -422,6 +422,107 @@ static void w_index(uint32_t i)
         g_w_idx[g_w_nidx++] = i;
 }
 
+int  hle_d3d8_draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
+                             const uint16_t *idx, uint32_t nidx);
+void hle_d3d8_current_registers(float out[16][4]);
+
+/* One attribute as the NV2A reads it into a float4 input register, from its
+ * SET_VERTEX_DATA_ARRAY_FORMAT: type in bits 0-3, component count in 4-7.
+ * Components it does not supply keep (0, 0, 0, 1). */
+static void w_convert(uint32_t fmt, const uint8_t *src, float out[4])
+{
+    uint32_t type = fmt & 0xFu, n = (fmt >> 4) & 0xFu, k;
+    float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    switch (type) {
+    case 2:                                          /* F */
+        for (k = 0; k < n && k < 4u; k++)
+            memcpy(&v[k], src + 4u * k, 4u);
+        break;
+    case 0:                                          /* UB_D3D: B, G, R, A */
+        if (n == 4u) {
+            v[0] = src[2] / 255.0f; v[1] = src[1] / 255.0f;
+            v[2] = src[0] / 255.0f; v[3] = src[3] / 255.0f;
+            break;
+        }
+        /* fall through: fewer than four, in order */
+    case 4:                                          /* UB_OGL */
+        for (k = 0; k < n && k < 4u; k++)
+            v[k] = src[k] / 255.0f;
+        break;
+    case 1:                                          /* S1: normalised short */
+        for (k = 0; k < n && k < 4u; k++) {
+            int16_t x;
+            memcpy(&x, src + 2u * k, 2u);
+            v[k] = x < 0 ? x / 32768.0f : x / 32767.0f;
+        }
+        break;
+    case 5:                                          /* S32K: short as is */
+        for (k = 0; k < n && k < 4u; k++) {
+            int16_t x;
+            memcpy(&x, src + 2u * k, 2u);
+            v[k] = (float)x;
+        }
+        break;
+    case 6: {                                        /* CMP: 11:11:10 signed */
+        uint32_t w;
+        memcpy(&w, src, 4u);
+        v[0] = (float)((int32_t)(w << 21) >> 21) / 1023.0f;
+        v[1] = (float)((int32_t)(w << 10) >> 21) / 1023.0f;
+        v[2] = (float)((int32_t)w >> 22) / 511.0f;
+        break;
+    }
+    default:
+        return;
+    }
+    memcpy(out, v, sizeof v);
+}
+
+/* `vertices` vertices from `first` as sixteen input registers, from the walk's
+ * arrays (or the packed inline vertices when `inl`). NULL when an array cannot
+ * be read. */
+static float (*w_gather_regs(uint32_t first, uint32_t vertices, const uint8_t *inl,
+                             uint32_t inl_bytes))[16][4]
+{
+    float (*out)[16][4], cur[16][4];
+    uint32_t i, v, packed = 0, at[16];
+
+    if (!vertices)
+        return NULL;
+    for (i = 0; i < 16u; i++) {
+        at[i] = packed;
+        if ((g_w_known & (1u << i)) && (g_w_fmt[i] & 0xF0u))
+            packed += vsdt_bytes(g_w_fmt[i] & 0xFFu);
+    }
+    if (inl && (!packed || (uint64_t)(first + vertices) * packed > inl_bytes))
+        return NULL;
+    out = malloc((size_t)vertices * sizeof *out);
+    if (!out)
+        return NULL;
+    hle_d3d8_current_registers(cur);
+    for (v = 0; v < vertices; v++)
+        memcpy(out[v], cur, sizeof cur);
+    for (i = 0; i < 16u; i++) {
+        uint32_t fmt = g_w_fmt[i], stride = fmt >> 8, size;
+        uint32_t va = (g_w_off[i] & 0x7FFFFFFFu) | CONTIG_BASE;
+
+        if (!(g_w_known & (1u << i)) || !(fmt & 0xF0u) || !(size = vsdt_bytes(fmt & 0xFFu)))
+            continue;
+        if (inl) {
+            for (v = 0; v < vertices; v++)
+                w_convert(fmt, inl + (size_t)(first + v) * packed + at[i], out[v][i]);
+            continue;
+        }
+        if (!guest_readable(va, (uint64_t)(first + vertices - 1u) * stride + size)) {
+            free(out);
+            return NULL;
+        }
+        for (v = 0; v < vertices; v++)
+            w_convert(fmt, (const uint8_t *)HLE_PTR(va + (first + v) * stride), out[v][i]);
+    }
+    return out;
+}
+
 static void w_group_end(void)
 {
     uint32_t stride, i, lo = 0xFFFFFFFFu, hi = 0;
@@ -436,6 +537,23 @@ static void w_group_end(void)
         if (hi - lo >= 0xFFFFu) {
             g_w_failed++;
             return;
+        }
+        {   /* under a vertex program: the registers, as the NV2A reads them */
+            float (*regs)[16][4] = w_gather_regs(lo, hi - lo + 1u, NULL, 0);
+            uint16_t *rb = regs ? (uint16_t *)malloc((size_t)g_w_nidx * sizeof *rb) : NULL;
+            int drawn = 0;
+            if (rb) {
+                for (i = 0; i < g_w_nidx; i++)
+                    rb[i] = (uint16_t)(g_w_idx[i] - lo);
+                drawn = hle_d3d8_draw_registers(g_w_prim, hi - lo + 1u,
+                                                (const float (*)[16][4])regs, rb, g_w_nidx);
+            }
+            free(rb);
+            free(regs);
+            if (drawn) {
+                g_w_draws++;
+                return;
+            }
         }
         gathered = push_gather_from(g_w_off, g_w_fmt, g_w_known, lo, hi - lo + 1u, &stride);
         rebased = (uint16_t *)malloc((size_t)g_w_nidx * sizeof *rebased);
@@ -457,6 +575,17 @@ static void w_group_end(void)
         if (!packed || (g_w_ninl * 4u) % packed) {
             g_w_failed++;
             return;
+        }
+        {
+            float (*regs)[16][4] = w_gather_regs(0, g_w_ninl * 4u / packed,
+                                                 (const uint8_t *)g_w_inl, g_w_ninl * 4u);
+            int drawn = regs && hle_d3d8_draw_registers(g_w_prim, g_w_ninl * 4u / packed,
+                                                        (const float (*)[16][4])regs, NULL, 0);
+            free(regs);
+            if (drawn) {
+                g_w_draws++;
+                return;
+            }
         }
         g_gather_inline = (const uint8_t *)g_w_inl;
         g_gather_inline_bytes = g_w_ninl * 4u;

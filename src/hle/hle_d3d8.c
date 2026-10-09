@@ -3313,6 +3313,62 @@ static void inline_draw_program(uint32_t n)
     g_inline_drawn++;
 }
 
+void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *idx,
+                                  const void *verts, uint32_t stride, int from_buffer);
+
+/* Vertices as the NV2A feeds a vertex program: sixteen float4 input registers
+ * each, v0..v15 at 16 * register. The push-buffer walk (hle_d3d8_vertex.c)
+ * builds these from the title's own vertex arrays for its array draws, as
+ * the hardware reads them -- SET_VERTEX_DATA_ARRAY_FORMAT says what each
+ * register's array holds, and no D3D declaration is involved. Halo 2 selects
+ * programs that have none, and its draws were skipped as "program without
+ * layout". Drawn under the current program with the sixteen-register layout
+ * the immediate-mode path already uses, and its own declaration put back.
+ * 1 when drawn; 0 when no host program is selected (the caller then falls
+ * back to the declaration path). `idx` NULL for a non-indexed draw. */
+int hle_d3d8_draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
+                            const uint16_t *idx, uint32_t nidx)
+{
+    struct shadow_program *p, saved;
+    D3D8VshInput in[16];
+    int i;
+
+    if (!g_shadow || !g_shadow_vs_is_program || g_shadow_vs_kind != SHADER_HOST_PROGRAM ||
+        g_shadow_vs_slot < 0)
+        return 0;
+    p = &g_programs[g_shadow_vs_slot];
+    for (i = 0; i < 16; i++) {
+        in[i].reg = i;
+        in[i].format = RHI_FORMAT_R32G32B32A32_FLOAT;
+        in[i].offset = (UINT)i * 16u;
+    }
+    if (FAILED(host_vsh_set_declaration(p->host, in, 16)))
+        return 0;
+    saved = *p;
+    p->has_declaration = 1;
+    p->extent = 16u * 16u;
+    p->packed_count = 0;
+    p->other_streams = 0;
+    p->expanded_bytes = 0;
+    p->base_stream = 0;
+    if (idx)
+        hle_d3d8_shadow_draw_indexed(xpt, nidx, idx, verts, 16u * 16u, 0);
+    else
+        hle_d3d8_shadow_draw(xpt, nverts, verts, 16u * 16u, 0);
+    *p = saved;
+    if (saved.has_declaration)
+        shadow_read_declaration(g_shadow_vs_slot, g_shadow_vs);
+    return 1;
+}
+
+/* The current value of each input register (SET_VERTEX_DATA* outside a
+ * begin/end pair, g_inline_cur): what a program reads from a register no
+ * array feeds. */
+void hle_d3d8_current_registers(float out[16][4])
+{
+    memcpy(out, g_inline_cur, sizeof g_inline_cur);
+}
+
 /* The recorded vertices in the current FVF's layout, drawn. */
 static void inline_draw(void)
 {
@@ -3400,8 +3456,11 @@ int hle_d3d8_pb_inline_on(void)
 
 static void pbi_attribute(uint32_t reg, const float v[4])
 {
-    if (!inline_vertex_data(reg, v) && g_shadow)
+    if (!inline_vertex_data(reg, v) && g_shadow) {
+        if (reg < 16u)
+            memcpy(g_inline_cur[reg], v, sizeof g_inline_cur[reg]);
         host_vsh_set_vertex_data((int)reg, v);
+    }
 }
 
 void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format);
