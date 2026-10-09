@@ -1285,6 +1285,11 @@ class FunctionTranslator:
         if any(insn.mnemonic == "leave" for insn in instructions):
             used_regs.add("ebp")
 
+        # PUSHAD/POPAD implicitly read or restore every register.
+        if any(i.mnemonic in ("pushal", "pushad", "popal", "popad")
+               for i in instructions):
+            used_regs.update(("ebx", "esi", "edi", "ebp"))
+
         # Guest control leaves the bottom of this function when its last
         # instruction neither returns, jumps, nor traps. A function the lifter
         # split into consecutive pieces continues into the next piece exactly
