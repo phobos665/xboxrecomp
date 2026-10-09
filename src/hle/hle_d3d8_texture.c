@@ -109,6 +109,8 @@ static uint32_t g_pal_data[MAX_STAGES];
 static uint32_t g_pal_sum[MAX_STAGES];
 static unsigned long g_pal_variants, g_pal_switches, g_pal_rebakes, g_pal_first;
 static unsigned long g_midframe_changes;
+/* Re-uploads of a texture still bound from an earlier frame (refresh_bound). */
+static unsigned long g_held_refreshes;
 
 /* Stage 0 currently holds the title's own frame; see SetTexture below and
  * hle_d3d8_stage0_is_framebuffer(). */
@@ -456,9 +458,9 @@ static void note_format(const texture_layout *t)
             return;
     if (nseen < (int)(sizeof seen / sizeof seen[0])) {
         seen[nseen++] = key;
-        fprintf(stderr, "[HLE-D3D8] shadow texture: format 0x%02X %ux%u, %u level(s), %s\n",
-                t->fmt, t->width, t->height, t->levels,
-                t->linear ? "linear" : "swizzled/compressed");
+        fprintf(stderr, "[HLE-D3D8] shadow texture: format 0x%02X %ux%u, %u level(s), %s, "
+                "first at physical 0x%08X\n", t->fmt, t->width, t->height, t->levels,
+                t->linear ? "linear" : "swizzled/compressed", t->phys);
     }
 }
 
@@ -1059,6 +1061,31 @@ void hle_d3d8_texture_frame_end(void)
         g_frames_changed_after_draw++;
 }
 
+/* A texture left bound from an earlier frame, checked again at the first
+ * draw of this frame that uses it. host_texture checks the texels when
+ * SetTexture binds a texture, but the NV2A reads them when it draws: Max
+ * Payne binds its Bink movie texture once and has the decoder rewrite it
+ * every frame, so the host drew the first, empty picture for the whole movie
+ * and every movie was black. Once a frame, as for a texture bound anew. */
+static void refresh_bound(uint32_t s)
+{
+    texture_entry *e = g_bound_entry[s];
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+
+    if (!e || !e->host || e->host != g_bound[s] || e->rendered || e->framebuffer ||
+        e->checked_swap == now)
+        return;
+    e->checked_swap = now;
+    e->used_swap = now;
+    if (read_layout(e->va, &t) && texels_changed(e, &t, now)) {
+        upload(e->host, &t);
+        e->pal_sum = 0;     /* baked through whichever palette */
+        g_reuploads++;
+        g_held_refreshes++;
+    }
+}
+
 static void op_sync_palettes(const void *arg)
 {
     uint32_t s;
@@ -1067,8 +1094,10 @@ static void op_sync_palettes(const void *arg)
     (void)arg;
     if (!dev)
         return;
-    for (s = 0; s < MAX_STAGES; s++)
+    for (s = 0; s < MAX_STAGES; s++) {
+        refresh_bound(s);
         sync_palette(dev, s);
+    }
 }
 
 /* Before a draw. Deferred, it runs where the draw runs, so the palette is
@@ -1598,6 +1627,9 @@ static void report(void)
         if (g_midframe_changes)
             fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed mid-frame "
                     "(RECOMP_HLE_D3D8_TEX_EVERY_BIND)\n", g_midframe_changes);
+        if (g_held_refreshes)
+            fprintf(stderr, "[HLE-D3D8] shadow textures: %lu re-uploaded at a draw, still "
+                    "bound from an earlier frame\n", g_held_refreshes);
         if (g_pal_variants || g_pal_switches || g_pal_first)
             fprintf(stderr, "[HLE-D3D8] shadow palettes: %lu baked after upload, "
                     "%lu more made for another palette, %lu draws switched to "
