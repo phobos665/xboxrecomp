@@ -316,10 +316,37 @@ static int pb_on(void)
     return on;
 }
 
+/* Immediate-mode vertices the title writes into the push buffer itself
+ * (hle_d3d8.c, hle_d3d8_pb_inline_method): SET_BEGIN_END and the
+ * SET_VERTEX_DATA* family, 0x1880-0x1AFF. Halo 2's LTCG build inlines
+ * D3DDevice_Begin, SetVertexData2f and End at every use, so its loading screen
+ * and movie quads exist nowhere but here. */
+#define PB_BEGIN_END        0x17FCu
+#define PB_VDATA_FIRST      0x1880u
+#define PB_VDATA_END        0x1B00u
+int  hle_d3d8_pb_inline_on(void);
+void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value);
+
+static int pb_inline_method(uint32_t method)
+{
+    return method == PB_BEGIN_END || (method >= PB_VDATA_FIRST && method < PB_VDATA_END);
+}
+
 void hle_d3d8_push_constants_sync(void)
 {
     uint32_t device, put, va, ret = 0, words = 0;
     int jumps = 0;
+    int inl = hle_d3d8_pb_inline_on();
+    /* Not re-entrant: an immediate-mode draw from the walk goes through
+     * hle_d3d8_shadow_draw, which syncs before drawing. The walk in progress
+     * is already applying everything in order, so the nested call has
+     * nothing to do -- and starting again from g_pb_scan, which only moves
+     * when a walk ends, would replay the same span and recurse until the
+     * stack ran out. Per thread, as the walk is. */
+    static RECOMP_TLS int walking;
+
+    if (walking)
+        return;
 
     if (!pb_on() || !hle_var_D3D_g_pDevice || !hle_d3d8_shadow_device())
         return;
@@ -334,6 +361,7 @@ void hle_d3d8_push_constants_sync(void)
         return;
     }
     g_pb_walks++;
+    walking = 1;
     va = g_pb_scan;
     while (va != put) {
         uint32_t w, count, method, i;
@@ -368,21 +396,33 @@ void hle_d3d8_push_constants_sync(void)
         count = (w >> 18) & 0x7FFu;
         method = w & 0x1FFCu;
         if (method == PB_CONST_LOAD || (method + 4u * count > PB_CONST_FIRST &&
-                                        method < PB_CONST_END)) {
+                                        method < PB_CONST_END) ||
+            (inl && (method == PB_BEGIN_END || (method + 4u * count > PB_VDATA_FIRST &&
+                                                method < PB_VDATA_END)))) {
             int noninc = (w & 0x40000000u) != 0u;
 
             if (!guest_readable(va + 4u, 4ull * count))
                 goto resync;
-            for (i = 0; i < count; i++)
-                pb_method(noninc ? method : method + 4u * i, HLE_MEM32(va + 4u + 4u * i));
+            for (i = 0; i < count; i++) {
+                uint32_t m = noninc ? method : method + 4u * i;
+                uint32_t v = HLE_MEM32(va + 4u + 4u * i);
+                if (inl && pb_inline_method(m)) {
+                    pb_flush();     /* constants first: they precede it */
+                    hle_d3d8_pb_inline_method(m, v);
+                } else {
+                    pb_method(m, v);
+                }
+            }
         }
         va += 4u + 4u * count;
         words += count;
     }
     pb_flush();
     g_pb_scan = put;
+    walking = 0;
     return;
 resync:
+    walking = 0;
     pb_flush();
     g_pb_resyncs++;
     {
@@ -796,4 +836,23 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant)
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexShaderConstant);
     forward_constants(reg, data, count);
+}
+
+/* Move the walk past whatever is in the push buffer now, unwalked. For the
+ * replacements whose own bodies write immediate-mode vertices (D3DDevice_Begin,
+ * End, SetVertexData*): the replacement draws those itself, and the walk must
+ * not draw them a second time. Constants written in the same span would be
+ * lost, so the walk is brought up to date first by the caller's entry sync. */
+void hle_d3d8_push_skip(void)
+{
+    uint32_t device, put;
+
+    if (!g_pb_scan || !hle_var_D3D_g_pDevice)
+        return;
+    device = HLE_MEM32(hle_var_D3D_g_pDevice);
+    if (!device || !guest_readable(device, 4u))
+        return;
+    put = HLE_MEM32(device);
+    if (put && guest_readable(put, 4u))
+        g_pb_scan = put;
 }

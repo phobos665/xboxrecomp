@@ -77,8 +77,19 @@
 #include "rhi.h"                         /* rhi_set_wait_hooks */
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
 
+void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
+void hle_d3d8_push_skip(void);
+int  hle_d3d8_pb_inline_on(void);
+
+/* Every replacement starts here. Beyond the one-time log line, it brings the
+ * push-buffer walk up to date first (hle_d3d8_vertex.c): what the title wrote
+ * there itself -- constants, and with RECOMP_HLE_D3D8_PB_INLINE immediate-mode
+ * draws -- happened before this call, so it is applied with the state from
+ * before this call. */
 static void first_call(int *seen, const char *name, uint32_t arg)
 {
+    if (hle_d3d8_pb_inline_on())
+        hle_d3d8_push_constants_sync();
     if (!*seen) {
         *seen = 1;
         fprintf(stderr, "[HLE] %s(0x%X) replaced by name\n", name, arg);
@@ -3358,6 +3369,99 @@ static void inline_draw(void)
     g_inline_drawn++;
 }
 
+/* ------------------------------------------------------------------------
+ * Immediate-mode vertices from the push buffer.
+ *
+ * Halo 2's LTCG build inlines D3DDevice_Begin, SetVertexData2f and End at
+ * every use: its loading screen and movie quads are SET_BEGIN_END,
+ * SET_VERTEX_DATA2F (position, texture coordinate), SET_VERTEX_DATA4UB and
+ * SET_BEGIN_END 0, written straight into the push buffer, with no call this
+ * file replaces. The push-buffer walk (hle_d3d8_vertex.c) hands those methods
+ * here in order, and they take the same path as the replaced Begin / End:
+ * inline_vertex_data() collects the vertices, inline_draw() draws them under
+ * the current vertex shader and textures. Outside a begin/end pair a write is
+ * the attribute's current value, as the NV2A treats it.
+ *
+ * The replacements whose own bodies write these methods (Begin, End,
+ * SetVertexData*) move the walk past their writes, so no group is drawn
+ * twice. RECOMP_HLE_D3D8_PB_INLINE=0 turns it off.
+ * ------------------------------------------------------------------------ */
+static unsigned long g_pbi_groups, g_pbi_drawn;
+static int           g_pbi_group;
+static float         g_pbi_part[16][4];
+
+int hle_d3d8_pb_inline_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PB_INLINE", 1);
+    return on && g_shadow;
+}
+
+static void pbi_attribute(uint32_t reg, const float v[4])
+{
+    if (!inline_vertex_data(reg, v) && g_shadow)
+        host_vsh_set_vertex_data((int)reg, v);
+}
+
+void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value)
+{
+    float f, v[4];
+
+    if (method == 0x17FCu) {                         /* SET_BEGIN_END */
+        if (value) {
+            g_inline_on = 1;
+            g_inline_xpt = value;
+            g_inline_nverts = 0;
+            g_pbi_group = 1;
+        } else if (g_pbi_group) {
+            g_pbi_groups++;
+            if (g_inline_nverts) {
+                inline_draw();
+                g_pbi_drawn++;
+            }
+            g_inline_on = 0;
+            g_inline_nverts = 0;
+            g_pbi_group = 0;
+            if (g_pbi_groups == 1 || (g_pbi_groups % 10000u) == 0)
+                fprintf(stderr, "[HLE-D3D8] push buffer immediate mode: %lu begin/end "
+                        "group(s), %lu drawn\n", g_pbi_groups, g_pbi_drawn);
+        }
+        return;
+    }
+    memcpy(&f, &value, sizeof f);
+    if (method >= 0x1880u && method < 0x1900u) {     /* SET_VERTEX_DATA2F_M */
+        uint32_t reg = (method - 0x1880u) / 8u, comp = ((method - 0x1880u) / 4u) & 1u;
+        g_pbi_part[reg][comp] = f;
+        if (comp == 1u) {
+            v[0] = g_pbi_part[reg][0]; v[1] = g_pbi_part[reg][1]; v[2] = 0.0f; v[3] = 1.0f;
+            pbi_attribute(reg, v);
+        }
+    } else if (method >= 0x1900u && method < 0x1940u) {   /* SET_VERTEX_DATA2S */
+        v[0] = (float)(int16_t)(value & 0xFFFFu);
+        v[1] = (float)(int16_t)(value >> 16);
+        v[2] = 0.0f; v[3] = 1.0f;
+        pbi_attribute((method - 0x1900u) / 4u, v);
+    } else if (method >= 0x1940u && method < 0x1980u) {   /* SET_VERTEX_DATA4UB */
+        v[0] = (float)( value        & 0xFFu) / 255.0f;
+        v[1] = (float)((value >>  8) & 0xFFu) / 255.0f;
+        v[2] = (float)((value >> 16) & 0xFFu) / 255.0f;
+        v[3] = (float)((value >> 24) & 0xFFu) / 255.0f;
+        pbi_attribute((method - 0x1940u) / 4u, v);
+    } else if (method >= 0x1980u && method < 0x1A00u) {   /* SET_VERTEX_DATA4S_M */
+        uint32_t reg = (method - 0x1980u) / 8u, half = ((method - 0x1980u) / 4u) & 1u;
+        g_pbi_part[reg][half * 2u]      = (float)(int16_t)(value & 0xFFFFu);
+        g_pbi_part[reg][half * 2u + 1u] = (float)(int16_t)(value >> 16);
+        if (half == 1u)
+            pbi_attribute(reg, g_pbi_part[reg]);
+    } else if (method >= 0x1A00u && method < 0x1B00u) {   /* SET_VERTEX_DATA4F_M */
+        uint32_t reg = (method - 0x1A00u) / 16u, comp = ((method - 0x1A00u) / 4u) & 3u;
+        g_pbi_part[reg][comp] = f;
+        if (comp == 3u)
+            pbi_attribute(reg, g_pbi_part[reg]);
+    }
+}
+
 /* void D3DDevice_SetVertexDataColor(INT Register, D3DCOLOR Color)
  * The current value of an input register: what a vertex program reads from a
  * register the vertex does not carry. Burnout 2 sets v3, the diffuse colour,
@@ -3373,6 +3477,7 @@ HLE_EXPORT(D3DDevice_SetVertexDataColor)
                          "D3DDevice_SetVertexDataColor"))
         return;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexDataColor);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_shadow) {
         float v[4];
 
@@ -3397,6 +3502,7 @@ HLE_EXPORT(D3DDevice_SetVertexData2f)
                          "D3DDevice_SetVertexData2f"))
         return;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexData2f);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_shadow) {
         float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
@@ -3439,6 +3545,7 @@ HLE_EXPORT(D3DDevice_Begin)
     g_inline_begin++;
     g_inline_begin_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_Begin);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     g_inline_on = 1;
     g_inline_xpt = HLE_ARG(0);
     g_inline_nverts = 0;
@@ -3454,6 +3561,7 @@ HLE_EXPORT(D3DDevice_End)
         return;
     g_inline_end++;
     HLE_CALL_ORIGINAL(D3DDevice_End);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_inline_on) {
         inline_draw();
         g_inline_on = 0;
@@ -3637,6 +3745,7 @@ HLE_EXPORT(D3DDevice_SetVertexData4f)
     g_inline_vdata++;
     g_inline_vdata_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexData4f);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_shadow) {
         uint32_t w[4] = { HLE_ARG(1), HLE_ARG(2), HLE_ARG(3), HLE_ARG(4) };
         float v[4];
