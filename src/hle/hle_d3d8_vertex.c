@@ -386,6 +386,54 @@ static int pb_array_method(uint32_t method)
            method == PB_DRAW_ARRAYS || method == PB_INLINE_ARRAY;
 }
 
+/* ...and the simple render states (depth, blend, colour mask, stencil:
+ * 0x0300-0x0388 and SWATHWIDTH 0x09F8), stored in the render-state array as
+ * the replaced SetRenderState_Simple stores them (hle_d3d8_state.c). */
+int hle_d3d8_state_store_simple(uint32_t method, uint32_t value);
+/* ...and the title's own clears: SET_ZSTENCIL_CLEAR_VALUE (0x1D8C),
+ * SET_COLOR_CLEAR_VALUE (0x1D90), CLEAR_SURFACE (0x1D94, which clears) and
+ * SET_CLEAR_RECT_HORIZONTAL / _VERTICAL (0x1D98, 0x1D9C). */
+void hle_d3d8_pb_clear(uint32_t surface, uint32_t color, uint32_t zstencil,
+                       uint32_t horizontal, uint32_t vertical);
+#define PB_CLEAR_FIRST      0x1D8Cu
+#define PB_CLEAR_END        0x1DA0u
+#define PB_CLEAR_SURFACE    0x1D94u
+static uint32_t g_clear_reg[5];
+
+/* ...and the render-target surface, SET_SURFACE_COLOR_OFFSET (0x0210) and
+ * SET_SURFACE_ZETA_OFFSET (0x0214), for a depth switch the title made
+ * without a call this file replaces (hle_d3d8_pb_surface). */
+void hle_d3d8_pb_surface(uint32_t color, uint32_t zeta);
+#define PB_SURFACE_COLOR    0x0210u
+#define PB_SURFACE_ZETA     0x0214u
+static uint32_t g_surface_color;
+
+/* RECOMP_PB_SURFACE_TRACE=<first>-<last>: the surface (0x0200-0x021C) and
+ * clear methods the walk passes over in those swaps, in order. For telling
+ * which depth surface a clear reached on the console. */
+unsigned long hle_d3d8_shadow_swaps(void);
+static int pb_surface_trace(void)
+{
+    static int parsed;
+    static unsigned long lo = 1, hi = 0;
+    unsigned long now;
+
+    if (!parsed) {
+        const char *e = getenv("RECOMP_PB_SURFACE_TRACE");
+        parsed = 1;
+        if (e && sscanf(e, "%lu-%lu", &lo, &hi) < 2)
+            hi = lo;
+    }
+    if (hi < lo)
+        return 0;
+    now = hle_d3d8_shadow_swaps();
+    return now >= lo && now <= hi;
+}
+
+#define PB_SIMPLE_FIRST     0x0300u
+#define PB_SIMPLE_END       0x038Cu
+#define PB_SWATH            0x09F8u
+
 static int pb_inline_method(uint32_t method)
 {
     return method == PB_BEGIN_END || (method >= PB_VDATA_FIRST && method < PB_VDATA_END) ||
@@ -400,6 +448,9 @@ static uint32_t g_w_off[16], g_w_fmt[16], g_w_known;
 static uint32_t g_w_prim, *g_w_idx, g_w_nidx, g_w_cidx, *g_w_inl, g_w_ninl, g_w_cinl;
 static int      g_w_group;
 static unsigned long g_w_draws, g_w_failed;
+/* Set while hle_d3d8_push_skip() walks a replaced call's own writes: state is
+ * applied, but its vertices and draws are left to the replacement. */
+static int      g_w_nodraw;
 
 static int w_grow(uint32_t **buf, uint32_t *cap, uint32_t need)
 {
@@ -706,12 +757,35 @@ void hle_d3d8_push_constants_sync(void)
             goto resync;
         count = (w >> 18) & 0x7FFu;
         method = w & 0x1FFCu;
+        if (inl && method + 4u * count > PB_SURFACE_COLOR && method <= PB_SURFACE_ZETA &&
+            guest_readable(va + 4u, 4ull * count)) {
+            uint32_t k;
+            for (k = 0; k < count; k++) {
+                uint32_t m = (w & 0x40000000u) ? method : method + 4u * k;
+                if (m == PB_SURFACE_COLOR)
+                    g_surface_color = HLE_MEM32(va + 4u + 4u * k);
+                else if (m == PB_SURFACE_ZETA && !g_w_nodraw) {
+                    pb_flush();
+                    hle_d3d8_pb_surface(g_surface_color, HLE_MEM32(va + 4u + 4u * k));
+                }
+            }
+        }
+        if (pb_surface_trace() && method + 4u * count > 0x0200u && method < 0x0220u) {
+            uint32_t k;
+            for (k = 0; k < count && guest_readable(va + 4u + 4u * k, 4u); k++)
+                fprintf(stderr, "[PB-SURF swap %lu] method 0x%04X = 0x%08X%s\n",
+                        hle_d3d8_shadow_swaps(), (w & 0x40000000u) ? method : method + 4u * k,
+                        HLE_MEM32(va + 4u + 4u * k), g_w_nodraw ? " (replaced call)" : "");
+        }
         if (method == PB_CONST_LOAD || (method + 4u * count > PB_CONST_FIRST &&
                                         method < PB_CONST_END) ||
             (inl && (method == PB_BEGIN_END || (method + 4u * count > PB_VDATA_FIRST &&
                                                 method < PB_TEX_END) ||
                      (method + 4u * count > PB_ARRAYS_FIRST && method < PB_ARRAYS_END) ||
-                     (method >= PB_ELEM16 && method <= PB_INLINE_ARRAY)))) {
+                     (method >= PB_ELEM16 && method <= PB_INLINE_ARRAY) ||
+                     (method + 4u * count > PB_SIMPLE_FIRST && method < PB_SIMPLE_END) ||
+                     (method + 4u * count > PB_CLEAR_FIRST && method < PB_CLEAR_END) ||
+                     method == PB_SWATH))) {
             int noninc = (w & 0x40000000u) != 0u;
 
             if (!guest_readable(va + 4u, 4ull * count))
@@ -719,7 +793,24 @@ void hle_d3d8_push_constants_sync(void)
             for (i = 0; i < count; i++) {
                 uint32_t m = noninc ? method : method + 4u * i;
                 uint32_t v = HLE_MEM32(va + 4u + 4u * i);
-                if (inl && pb_array_method(m)) {
+                if (inl && ((m >= PB_SIMPLE_FIRST && m < PB_SIMPLE_END) || m == PB_SWATH)) {
+                    (void)hle_d3d8_state_store_simple(m, v);
+                } else if (inl && m >= PB_CLEAR_FIRST && m < PB_CLEAR_END) {
+                    g_clear_reg[(m - PB_CLEAR_FIRST) / 4u] = v;
+                    if (pb_surface_trace())
+                        fprintf(stderr, "[PB-SURF swap %lu] method 0x%04X = 0x%08X%s\n",
+                                hle_d3d8_shadow_swaps(), m, v,
+                                g_w_nodraw ? " (replaced call)" : "");
+                    if (m == PB_CLEAR_SURFACE && !g_w_nodraw) {
+                        pb_flush();
+                        hle_d3d8_pb_clear(v, g_clear_reg[1], g_clear_reg[0],
+                                          g_clear_reg[3], g_clear_reg[4]);
+                    }
+                } else if (inl && g_w_nodraw && (pb_inline_method(m) ||
+                                                 m == PB_ELEM16 || m == PB_ELEM32 ||
+                                                 m == PB_DRAW_ARRAYS || m == PB_INLINE_ARRAY)) {
+                    /* a replaced call's own draw: it draws, not the walk */
+                } else if (inl && pb_array_method(m)) {
                     pb_flush();
                     pb_array_apply(m, v);
                 } else if (inl && pb_inline_method(m)) {
@@ -905,6 +996,31 @@ HLE_EXPORT(CDevice_SetStateVB)
 
 void hle_d3d8_push_skip(void);
 
+/* A replaced draw with no stream buffer to read: its stream setup was
+ * inlined (Halo 2 writes SET_VERTEX_DATA_ARRAY_OFFSET itself), so the
+ * replacement has nothing to draw from, but the body has just written the
+ * arrays, the begin/end and its indices into the push buffer. The walk draws
+ * it from there, as it draws the title's inlined draws. 1 when it did. */
+static unsigned long g_walk_drawn_calls;
+
+static int walk_draws_it(void)
+{
+    uint32_t base, vb, stride;
+
+    if (g_push_active || !hle_d3d8_shadow_device() || !hle_d3d8_pb_inline_on())
+        return 0;
+    base = hle_d3d8_shadow_base_stream();
+    vb = base ? g_stream_vb[base] : g_stream0_vb;
+    stride = base ? g_stream_stride[base] : g_stream0_stride;
+    if (vb && stride && guest_readable(vb, 12u) && HLE_MEM32(vb + 4u))
+        return 0;
+    hle_d3d8_push_constants_sync();
+    if (++g_walk_drawn_calls == 1)
+        fprintf(stderr, "[HLE-D3D8] shadow buffers: a replaced draw with no stream "
+                "buffer is drawn from its push-buffer writes\n");
+    return 1;
+}
+
 /* void D3DDevice_DrawVertices(D3DPRIMITIVETYPE PrimitiveType,
  *     UINT StartVertex, UINT VertexCount)                                   */
 HLE_EXPORT(D3DDevice_DrawVertices)
@@ -917,6 +1033,8 @@ HLE_EXPORT(D3DDevice_DrawVertices)
     if (original_missing(hle_original_D3DDevice_DrawVertices, "D3DDevice_DrawVertices"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawVertices);
+    if (walk_draws_it())
+        return;
     hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (hle_d3d8_shadow_device() && count && g_push_active) {
         uint32_t stride;
@@ -953,6 +1071,8 @@ HLE_EXPORT(D3DDevice_DrawIndexedVertices)
                          "D3DDevice_DrawIndexedVertices"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawIndexedVertices);
+    if (walk_draws_it())
+        return;
     hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (hle_d3d8_shadow_device() && count && index_va &&
         guest_readable(index_va, (uint64_t)count * 2u)) {
@@ -1160,17 +1280,30 @@ HLE_EXPORT(D3DDevice_SetVertexShaderConstant)
     forward_constants(reg, data, count);
 }
 
-/* Move the walk past whatever is in the push buffer now, unwalked. For the
- * replacements whose own bodies write immediate-mode vertices (D3DDevice_Begin,
- * End, SetVertexData*): the replacement draws those itself, and the walk must
- * not draw them a second time. Constants written in the same span would be
- * lost, so the walk is brought up to date first by the caller's entry sync. */
+/* Walk what a replaced call's own body just wrote, without drawing it. For
+ * the replacements that draw themselves (Begin, End, SetVertexData*,
+ * DrawVertices, DrawIndexedVertices, ...): the walk must not draw their
+ * vertices a second time, but the state the body writes on the way -- the
+ * vertex array offsets and formats the XDK's SetStateVB flushes, constants,
+ * simple render states -- is what the next inlined draw reads. Skipping the
+ * span outright, as this did, lost that state: Halo 2 inlines its stream
+ * setup, and every array draw after a replaced draw read stale arrays.
+ * RECOMP_HLE_D3D8_PB_SKIP_WALK=0 skips the span as before. */
 void hle_d3d8_push_skip(void)
 {
     uint32_t device, put;
+    static int walk = -1;
 
     if (!g_pb_scan || !hle_var_D3D_g_pDevice)
         return;
+    if (walk < 0)
+        walk = xbox_EnvSwitch("RECOMP_HLE_D3D8_PB_SKIP_WALK", 1);
+    if (walk && !g_w_nodraw) {
+        g_w_nodraw = 1;
+        hle_d3d8_push_constants_sync();
+        g_w_nodraw = 0;
+        return;
+    }
     device = HLE_MEM32(hle_var_D3D_g_pDevice);
     if (!device || !guest_readable(device, 4u))
         return;

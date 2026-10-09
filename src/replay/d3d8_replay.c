@@ -1235,7 +1235,20 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
-        r->dev->lpVtbl->SetRenderState(r->dev, (D3DRENDERSTATETYPE)p->state, p->value);
+        {
+            /* RECOMP_REPLAY_STATE=<state>=<value>: hold one render state at a
+             * value, to test whether it is what hides a draw. */
+            static int have = -1;
+            static unsigned long fs, fv;
+            uint32_t value = p->value;
+            if (have < 0) {
+                const char *e = getenv("RECOMP_REPLAY_STATE");
+                have = e && sscanf(e, "%lu=%lu", &fs, &fv) == 2;
+            }
+            if (have && p->state == fs)
+                value = (uint32_t)fv;
+            r->dev->lpVtbl->SetRenderState(r->dev, (D3DRENDERSTATETYPE)p->state, value);
+        }
         break;
     }
     case D3D8CAP_TEXTURE_STAGE_STATE: {
@@ -1430,6 +1443,12 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
                     p->first_reg + 1, p->count > 1 ? data[4] : 0.f,
                     p->count > 1 ? data[5] : 0.f, p->count > 1 ? data[6] : 0.f,
                     p->count > 1 ? data[7] : 0.f);
+            /* RECOMP_REPLAY_CONST_ALL=1: every register of the update. */
+            if (getenv("RECOMP_REPLAY_CONST_ALL"))
+                for (i = 0; i < p->count; i++)
+                    fprintf(stderr, "[constants]   c%u = %g %g %g %g\n", p->first_reg + i,
+                            data[4u * i], data[4u * i + 1u], data[4u * i + 2u],
+                            data[4u * i + 3u]);
         }
         d3d8_vsh_set_constant((int)p->first_reg, data, (int)p->count);
         break;

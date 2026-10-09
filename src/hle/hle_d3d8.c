@@ -2110,6 +2110,7 @@ HLE_EXPORT(D3DDevice_Clear)
     if (original_missing(hle_original_D3DDevice_Clear, "D3DDevice_Clear"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_Clear);
+    hle_d3d8_push_skip();   /* its own clear methods: cleared here, not by the walk */
     if (g_shadow) {
         float z;
 
@@ -2145,6 +2146,49 @@ HLE_EXPORT(D3DDevice_Clear)
         if (shadow_trace_on())
             fprintf(stderr, "[TRACE swap %lu] Clear flags 0x%X color 0x%08X\n",
                     g_shadow_swaps, flags, color);
+    }
+}
+
+/* A clear the title wrote into the push buffer itself (Halo 2 inlines
+ * D3DDevice_Clear): NV097_CLEAR_SURFACE with the clear values and rectangle
+ * set before it, handed over by the push-buffer walk (hle_d3d8_vertex.c).
+ * The surface bits are D3DCLEAR's (Z 0x01, stencil 0x02, colour 0xF0). The
+ * depth-stencil value is in the depth surface's format: D16 in the low half,
+ * otherwise 24 bits of depth over 8 of stencil. Unseen, the title's depth
+ * surface kept the first frame's depth for good and every later draw with a
+ * depth test failed it: Halo 2's menu drew nothing but its particles. The
+ * rectangle is inclusive, in target pixels. */
+void hle_d3d8_pb_clear(uint32_t surface, uint32_t color, uint32_t zstencil,
+                       uint32_t horizontal, uint32_t vertical)
+{
+    D3DRECT rect;
+    float z;
+    uint32_t stencil = 0;
+    int whole;
+
+    if (!g_shadow || !(surface & 0xF3u))
+        return;
+    if (g_z_scale == 65535.0f) {
+        z = (float)(zstencil & 0xFFFFu) / 65535.0f;
+    } else {
+        z = (float)(zstencil >> 8) / 16777215.0f;
+        stencil = zstencil & 0xFFu;
+    }
+    rect.x1 = (LONG)(horizontal & 0xFFFFu);
+    rect.x2 = (LONG)(horizontal >> 16) + 1;
+    rect.y1 = (LONG)(vertical & 0xFFFFu);
+    rect.y2 = (LONG)(vertical >> 16) + 1;
+    whole = !horizontal || (rect.x1 <= 0 && rect.y1 <= 0 &&
+                            rect.x2 >= (LONG)g_target_width && rect.y2 >= (LONG)g_target_height);
+    host_Clear(g_shadow, whole ? 0 : 1, whole ? NULL : &rect,
+               xbox_clear_flags_to_host(surface), color, z, stencil);
+    g_shadow_clears++;
+    {
+        static unsigned long said;
+        if (said++ < 3)
+            fprintf(stderr, "[HLE-D3D8] push buffer clear: surface 0x%02X color 0x%08X "
+                    "z %g stencil %u rect %ld,%ld-%ld,%ld\n", surface, color, z, stencil,
+                    (long)rect.x1, (long)rect.y1, (long)rect.x2, (long)rect.y2);
     }
 }
 
@@ -4155,6 +4199,33 @@ static IDirect3DSurface8 *depth_texture_surface(uint32_t texture_va)
     return cache[i].surface;
 }
 
+static int share_device_depth_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_SHARE_DEVICE_DEPTH", 1);
+    return on;
+}
+
+/* Whether the host's device depth is the size of level `level` of a host
+ * render-target texture -- the host refuses a depth of another size. */
+static int device_depth_fits(IDirect3DTexture8 *texture, UINT level)
+{
+    D3DSURFACE_DESC dd, td;
+
+    if (!g_device_depth ||
+        FAILED(g_device_depth->lpVtbl->GetDesc(g_device_depth, &dd)) ||
+        FAILED(texture->lpVtbl->GetLevelDesc(texture, level, &td)))
+        return 0;
+    return dd.Width == td.Width && dd.Height == td.Height;
+}
+
+/* The guest data of the surface the screen is drawn into now, and of the
+ * depth bound with it, as shadow_set_render_target last saw them: for
+ * hle_d3d8_pb_surface. */
+static uint32_t g_bound_color_data, g_bound_zeta_data, g_bound_zs, g_bound_rt_va;
+static int      g_bound_kind = -1;
+
 static void shadow_set_render_target(uint32_t rt, uint32_t zs)
 {
     static struct { uint32_t va; int kind; } seen[32];
@@ -4171,6 +4242,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     if (!rt)
         rt = current_rt;
     current_rt = rt;
+    g_bound_rt_va = rt;
     g_target_sets++;
     if (!rt) {
         kind = 0;
@@ -4377,6 +4449,16 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
                     g_shadow_map_big_sets++;
             }
         }
+        /* The device's own depth behind an offscreen target of its size:
+         * the same memory on the console, so what this pass writes is what
+         * the next pass to the screen tests against. Halo 2 lays its scene's
+         * depth down into a 640x480 texture with the device depth, then
+         * draws the screen with ZFUNC EQUAL against it; with a scratch depth
+         * here the screen pass tested against the clear value and drew
+         * nothing. RECOMP_HLE_D3D8_SHARE_DEVICE_DEPTH=0 for the scratch. */
+        if (!depth && kind != 0 && kind != 3 && own && g_device_depth && texture &&
+            share_device_depth_on() && device_depth_fits(texture, level))
+            depth = g_device_depth;
         if (!depth)
             depth = depth_surface(w, h);
         g_target_shadow_map = depth && depth_texture_of(zs) && zw == w && zh == h &&
@@ -4411,6 +4493,10 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     }
     g_target_width = w;
     g_target_height = h;
+    g_bound_kind = kind;
+    g_bound_color_data = rt ? (HLE_MEM32(rt + 4) & 0x0FFFFFFFu) : 0;
+    g_bound_zeta_data = zs ? (HLE_MEM32(zs + 4) & 0x0FFFFFFFu) : 0;
+    g_bound_zs = zs;
 
     /* The Xbox resets the viewport to the whole new target. */
     g_title_viewport.X = 0;
@@ -4422,6 +4508,52 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     g_title_viewport_set = 1;
     g_host_viewport_mode = -1;
     shadow_viewport_constants(&g_title_viewport);
+}
+
+/* A render-target switch the title wrote into the push buffer itself, seen
+ * by the walk (hle_d3d8_vertex.c): SET_SURFACE_COLOR_OFFSET and
+ * SET_SURFACE_ZETA_OFFSET, physical. Only the depth half is followed, and
+ * only while the colour surface is still the one bound: the XDK's own Swap
+ * puts the device depth back under the new back buffer without a
+ * SetRenderTarget, and Halo 2 does the same after its post-processing, so
+ * the Clear that starts its next frame -- which the console applies to the
+ * device depth -- found no depth on the host, and the depth surface was
+ * never cleared again. A zeta offset of 0 is no depth. */
+void hle_d3d8_pb_surface(uint32_t color, uint32_t zeta)
+{
+    static int on = -1;
+    uint32_t zs;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PB_SURFACE", 1);
+    if (!on || !g_shadow || g_bound_kind < 0)
+        return;
+    color &= 0x0FFFFFFFu;
+    zeta &= 0x0FFFFFFFu;
+    if (zeta == g_bound_zeta_data)
+        return;
+    if (color != g_bound_color_data) {
+        /* After a Swap the back buffer is the other frame buffer. */
+        int i, screen = 0;
+        for (i = 0; i < g_nswap && g_bound_kind == 0; i++)
+            if ((g_swap_data[i] & 0x0FFFFFFFu) == color)
+                screen = 1;
+        if (!screen)
+            return;
+    }
+    if (!zeta)
+        zs = 0;
+    else if (g_autodepth_va && zeta == (HLE_MEM32(g_autodepth_va + 4) & 0x0FFFFFFFu))
+        zs = g_autodepth_va;
+    else
+        return;                          /* a depth surface this cannot name */
+    {
+        static unsigned long said;
+        if (said++ < 3)
+            fprintf(stderr, "[HLE-D3D8] push buffer surface: depth 0x%08X under colour "
+                    "0x%08X, set by the title's own writes\n", zeta, color);
+    }
+    shadow_set_render_target(g_bound_rt_va, zs);
 }
 
 /* void D3DDevice_InsertCallback(D3DCALLBACKTYPE Type, D3DCALLBACK pCallback,
