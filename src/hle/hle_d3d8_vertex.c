@@ -181,9 +181,27 @@ void hle_d3d8_push_arrays_scan(uint32_t start, uint32_t end)
  * out at its declared offset, so the rest of the draw path sees an ordinary
  * stream 0 vertex. A register no push described stays zero. NULL (counted)
  * when there is no declaration to lay them out by. */
+/* Inline vertices (SET_BEGIN_END ... INLINE_ARRAY ...) gathered the same way:
+ * `inl` holds them packed, every enabled attribute in order. NULL for arrays
+ * in guest memory. */
+static const uint8_t *g_gather_inline;
+static uint32_t       g_gather_inline_bytes;
+
+static uint8_t *push_gather_from(const uint32_t off[16], const uint32_t fmt[16],
+                                 uint32_t known, uint32_t first, uint32_t vertices,
+                                 uint32_t *stride);
+
 static uint8_t *push_gather(uint32_t first, uint32_t vertices, uint32_t *stride)
 {
+    return push_gather_from(g_push_off, g_push_fmt, g_push_known, first, vertices, stride);
+}
+
+static uint8_t *push_gather_from(const uint32_t off[16], const uint32_t fmt[16],
+                                 uint32_t known, uint32_t first, uint32_t vertices,
+                                 uint32_t *stride)
+{
     uint32_t object = hle_d3d8_shadow_program_object(), extent = 0, i, v;
+    uint32_t inl_off[16], inl_size = 0;
     uint8_t *out;
 
     if (!object || !vertices || !guest_readable(object, 20u + 16u * 16u))
@@ -201,16 +219,26 @@ static uint8_t *push_gather(uint32_t first, uint32_t vertices, uint32_t *stride)
     }
     if (!extent || extent > 256u)
         return NULL;
+    if (g_gather_inline) {
+        /* Inline: each enabled attribute packed after the previous one. */
+        for (i = 0; i < 16u; i++) {
+            inl_off[i] = inl_size;
+            if ((known & (1u << i)) && (fmt[i] & 0xFFu) > 0x02u)
+                inl_size += vsdt_bytes(fmt[i] & 0xFFu);
+        }
+        if (!inl_size || (uint64_t)(first + vertices) * inl_size > g_gather_inline_bytes)
+            return NULL;
+    }
     out = calloc((size_t)vertices, extent);
     if (!out)
         return NULL;
     for (i = 0; i < 16u; i++) {
         uint32_t attr = object + 20u + i * 16u, format = HLE_MEM32(attr + 8u);
-        uint32_t offset = HLE_MEM32(attr + 4u), pushed = g_push_fmt[i];
-        uint32_t pstride = pushed >> 8, va = (g_push_off[i] & 0x7FFFFFFFu) | CONTIG_BASE;
+        uint32_t offset = HLE_MEM32(attr + 4u), pushed = fmt[i];
+        uint32_t pstride = pushed >> 8, va = (off[i] & 0x7FFFFFFFu) | CONTIG_BASE;
         UINT size, psize;
 
-        if (format <= 0x02u || !(g_push_known & (1u << i)) || (pushed & 0xFFu) <= 0x02u)
+        if (format <= 0x02u || !(known & (1u << i)) || (pushed & 0xFFu) <= 0x02u)
             continue;
         size = vsdt_bytes(format);
         psize = vsdt_bytes(pushed & 0xFFu);
@@ -222,6 +250,12 @@ static uint8_t *push_gather(uint32_t first, uint32_t vertices, uint32_t *stride)
                 fprintf(stderr, "[HLE-D3D8] pushed vertex array %u is format 0x%02X, the "
                         "declaration says 0x%02X; read as the declaration\n",
                         i, pushed & 0xFFu, format);
+        }
+        if (g_gather_inline) {
+            for (v = 0; v < vertices; v++)
+                memcpy(out + (size_t)v * extent + offset,
+                       g_gather_inline + (size_t)(first + v) * inl_size + inl_off[i], size);
+            continue;
         }
         if (!guest_readable(va, (uint64_t)(first + vertices - 1u) * pstride + size)) {
             g_push_failed++;
@@ -332,10 +366,152 @@ void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value);
 #define PB_TEX_FIRST        0x1B00u
 #define PB_TEX_END          0x1C00u
 
+/* ...and array draws: SET_VERTEX_DATA_ARRAY_OFFSET / _FORMAT (0x1720, 0x1760,
+ * 16 each) and, inside a begin/end pair, ARRAY_ELEMENT16 (0x1800, two indices a
+ * word), ARRAY_ELEMENT32 (0x1808), DRAW_ARRAYS (0x1810: count-1 in the top
+ * byte, the first vertex below) and INLINE_ARRAY (0x1818, packed vertices).
+ * Halo 2's menu draws its 3D scene that way: ~150 million index words in
+ * 100 s, none of them from a call this file replaces. */
+#define PB_ARRAYS_FIRST     0x1720u
+#define PB_ARRAYS_END       0x17A0u
+#define PB_ELEM16           0x1800u
+#define PB_ELEM32           0x1808u
+#define PB_DRAW_ARRAYS      0x1810u
+#define PB_INLINE_ARRAY     0x1818u
+
+static int pb_array_method(uint32_t method)
+{
+    return (method >= PB_ARRAYS_FIRST && method < PB_ARRAYS_END) ||
+           method == PB_ELEM16 || method == PB_ELEM32 ||
+           method == PB_DRAW_ARRAYS || method == PB_INLINE_ARRAY;
+}
+
 static int pb_inline_method(uint32_t method)
 {
     return method == PB_BEGIN_END || (method >= PB_VDATA_FIRST && method < PB_VDATA_END) ||
            (method >= PB_TEX_FIRST && method < PB_TEX_END && (method & 0x3Cu) <= 0x04u);
+}
+
+/* The walk's own copy of the vertex arrays. Not g_push_*: the XDK's own draw
+ * code writes these methods for every title, and the replaced draws decide
+ * by g_push_active how to read their vertices -- which must not change
+ * because a walk went past. */
+static uint32_t g_w_off[16], g_w_fmt[16], g_w_known;
+static uint32_t g_w_prim, *g_w_idx, g_w_nidx, g_w_cidx, *g_w_inl, g_w_ninl, g_w_cinl;
+static int      g_w_group;
+static unsigned long g_w_draws, g_w_failed;
+
+static int w_grow(uint32_t **buf, uint32_t *cap, uint32_t need)
+{
+    if (need <= *cap)
+        return 1;
+    {
+        uint32_t want = need * 2u < 4096u ? 4096u : need * 2u;
+        uint32_t *g = (uint32_t *)realloc(*buf, (size_t)want * 4u);
+        if (!g)
+            return 0;
+        *buf = g;
+        *cap = want;
+    }
+    return 1;
+}
+
+static void w_index(uint32_t i)
+{
+    if (g_w_nidx < (1u << 22) && w_grow(&g_w_idx, &g_w_cidx, g_w_nidx + 1u))
+        g_w_idx[g_w_nidx++] = i;
+}
+
+static void w_group_end(void)
+{
+    uint32_t stride, i, lo = 0xFFFFFFFFu, hi = 0;
+    uint8_t *gathered;
+
+    if (g_w_nidx) {
+        uint16_t *rebased;
+        for (i = 0; i < g_w_nidx; i++) {
+            if (g_w_idx[i] < lo) lo = g_w_idx[i];
+            if (g_w_idx[i] > hi) hi = g_w_idx[i];
+        }
+        if (hi - lo >= 0xFFFFu) {
+            g_w_failed++;
+            return;
+        }
+        gathered = push_gather_from(g_w_off, g_w_fmt, g_w_known, lo, hi - lo + 1u, &stride);
+        rebased = (uint16_t *)malloc((size_t)g_w_nidx * sizeof *rebased);
+        if (gathered && rebased) {
+            for (i = 0; i < g_w_nidx; i++)
+                rebased[i] = (uint16_t)(g_w_idx[i] - lo);
+            hle_d3d8_shadow_draw_indexed(g_w_prim, g_w_nidx, rebased, gathered, stride, 0);
+            g_w_draws++;
+        } else {
+            g_w_failed++;
+        }
+        free(gathered);
+        free(rebased);
+    } else if (g_w_ninl) {
+        uint32_t packed = 0;
+        for (i = 0; i < 16u; i++)
+            if ((g_w_known & (1u << i)) && (g_w_fmt[i] & 0xFFu) > 0x02u)
+                packed += vsdt_bytes(g_w_fmt[i] & 0xFFu);
+        if (!packed || (g_w_ninl * 4u) % packed) {
+            g_w_failed++;
+            return;
+        }
+        g_gather_inline = (const uint8_t *)g_w_inl;
+        g_gather_inline_bytes = g_w_ninl * 4u;
+        gathered = push_gather_from(g_w_off, g_w_fmt, g_w_known, 0,
+                                    g_w_ninl * 4u / packed, &stride);
+        g_gather_inline = NULL;
+        if (gathered) {
+            hle_d3d8_shadow_draw(g_w_prim, g_w_ninl * 4u / packed, gathered, stride, 0);
+            free(gathered);
+            g_w_draws++;
+        } else {
+            g_w_failed++;
+        }
+    }
+}
+
+static void pb_array_apply(uint32_t m, uint32_t v)
+{
+    if (m >= PB_ARRAYS_FIRST && m < PB_ARRAYS_FIRST + 0x40u) {
+        g_w_off[(m - PB_ARRAYS_FIRST) / 4u] = v;
+        g_w_known |= 1u << ((m - PB_ARRAYS_FIRST) / 4u);
+    } else if (m >= PB_ARRAYS_FIRST + 0x40u && m < PB_ARRAYS_END) {
+        g_w_fmt[(m - PB_ARRAYS_FIRST - 0x40u) / 4u] = v;
+        g_w_known |= 1u << ((m - PB_ARRAYS_FIRST - 0x40u) / 4u);
+    } else if (!g_w_group) {
+        return;                          /* elements outside begin/end: nothing */
+    } else if (m == PB_ELEM16) {
+        w_index(v & 0xFFFFu);
+        w_index(v >> 16);
+    } else if (m == PB_ELEM32) {
+        w_index(v);
+    } else if (m == PB_DRAW_ARRAYS) {
+        uint32_t first = v & 0x00FFFFFFu, n = (v >> 24) + 1u, k;
+        for (k = 0; k < n; k++)
+            w_index(first + k);
+    } else if (m == PB_INLINE_ARRAY) {
+        if (g_w_ninl < (1u << 22) && w_grow(&g_w_inl, &g_w_cinl, g_w_ninl + 1u))
+            g_w_inl[g_w_ninl++] = v;
+    }
+}
+
+static void pb_array_begin_end(uint32_t v)
+{
+    if (v) {
+        g_w_prim = v;
+        g_w_nidx = g_w_ninl = 0;
+        g_w_group = 1;
+    } else if (g_w_group) {
+        w_group_end();
+        g_w_group = 0;
+        g_w_nidx = g_w_ninl = 0;
+        if (g_w_draws && (g_w_draws == 1 || (g_w_draws % 50000u) == 0))
+            fprintf(stderr, "[HLE-D3D8] push buffer array draws: %lu drawn, %lu not "
+                    "(no declaration or layout to read them by)\n", g_w_draws, g_w_failed);
+    }
 }
 
 void hle_d3d8_push_constants_sync(void)
@@ -404,7 +580,9 @@ void hle_d3d8_push_constants_sync(void)
         if (method == PB_CONST_LOAD || (method + 4u * count > PB_CONST_FIRST &&
                                         method < PB_CONST_END) ||
             (inl && (method == PB_BEGIN_END || (method + 4u * count > PB_VDATA_FIRST &&
-                                                method < PB_TEX_END)))) {
+                                                method < PB_TEX_END) ||
+                     (method + 4u * count > PB_ARRAYS_FIRST && method < PB_ARRAYS_END) ||
+                     (method >= PB_ELEM16 && method <= PB_INLINE_ARRAY)))) {
             int noninc = (w & 0x40000000u) != 0u;
 
             if (!guest_readable(va + 4u, 4ull * count))
@@ -412,8 +590,13 @@ void hle_d3d8_push_constants_sync(void)
             for (i = 0; i < count; i++) {
                 uint32_t m = noninc ? method : method + 4u * i;
                 uint32_t v = HLE_MEM32(va + 4u + 4u * i);
-                if (inl && pb_inline_method(m)) {
+                if (inl && pb_array_method(m)) {
+                    pb_flush();
+                    pb_array_apply(m, v);
+                } else if (inl && pb_inline_method(m)) {
                     pb_flush();     /* constants first: they precede it */
+                    if (m == PB_BEGIN_END)
+                        pb_array_begin_end(v);
                     hle_d3d8_pb_inline_method(m, v);
                 } else {
                     pb_method(m, v);
@@ -591,6 +774,8 @@ HLE_EXPORT(CDevice_SetStateVB)
     g_base_vertex_seen = 1;
 }
 
+void hle_d3d8_push_skip(void);
+
 /* void D3DDevice_DrawVertices(D3DPRIMITIVETYPE PrimitiveType,
  *     UINT StartVertex, UINT VertexCount)                                   */
 HLE_EXPORT(D3DDevice_DrawVertices)
@@ -603,6 +788,7 @@ HLE_EXPORT(D3DDevice_DrawVertices)
     if (original_missing(hle_original_D3DDevice_DrawVertices, "D3DDevice_DrawVertices"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawVertices);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (hle_d3d8_shadow_device() && count && g_push_active) {
         uint32_t stride;
         uint8_t *gathered = push_gather(start, count, &stride);
@@ -638,6 +824,7 @@ HLE_EXPORT(D3DDevice_DrawIndexedVertices)
                          "D3DDevice_DrawIndexedVertices"))
         HLE_RETURN(0u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawIndexedVertices);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (hle_d3d8_shadow_device() && count && index_va &&
         guest_readable(index_va, (uint64_t)count * 2u)) {
         const uint16_t *idx = (const uint16_t *)HLE_PTR(index_va);

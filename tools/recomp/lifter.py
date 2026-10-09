@@ -2906,11 +2906,11 @@ class Lifter:
                 # A hole -- a case value that cannot happen -- with real
                 # entries after it (Halo 2's sub_00216A50: four cases, two
                 # zeros, three more). Same rule as the disassembler's
-                # resync_jump_tables: up to three zeros, then a code address.
+                # resync_jump_tables: up to eight zeros, then a code address.
                 run = 1
-                while run <= 3 and word(i + run) == 0:
+                while run <= 8 and word(i + run) == 0:
                     run += 1
-                nxt = word(i + run) if run <= 3 else None
+                nxt = word(i + run) if run <= 8 else None
                 if nxt is not None and is_code_address(nxt):
                     i += run
                     continue

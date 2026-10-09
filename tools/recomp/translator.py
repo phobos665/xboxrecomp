@@ -967,12 +967,12 @@ class FunctionTranslator:
                     break
                 if target == 0 and step > 0 and targets:
                     # A hole (a case that cannot happen), as in
-                    # DisasmEngine.resync_jump_tables: step over up to three
+                    # DisasmEngine.resync_jump_tables: step over up to eight
                     # zeros when a real entry follows.
                     run = 1
-                    while run <= 3 and read(table_va + (index + run) * 4) == 0:
+                    while run <= 8 and read(table_va + (index + run) * 4) == 0:
                         run += 1
-                    nxt = read(table_va + (index + run) * 4) if run <= 3 else None
+                    nxt = read(table_va + (index + run) * 4) if run <= 8 else None
                     if nxt is not None and lower <= nxt < upper:
                         index += run
                         continue

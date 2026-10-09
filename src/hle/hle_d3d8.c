@@ -3742,6 +3742,7 @@ HLE_EXPORT(D3DDevice_EndPush)
                 "%lu stopped at another method, %lu with no vertex size\n",
                 g_push_count, g_push_draws, g_push_other, g_push_nostride);
     HLE_CALL_ORIGINAL(D3DDevice_EndPush);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
 }
 
 /* void D3DDevice_SetVertexData4f(INT Register, float a, float b, float c,
@@ -4993,6 +4994,7 @@ HLE_EXPORT(D3DDevice_DrawVerticesUP)
     if (original_missing(hle_original_D3DDevice_DrawVerticesUP, "D3DDevice_DrawVerticesUP"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawVerticesUP);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (data)
         hle_d3d8_shadow_draw(xpt, count, HLE_PTR(data), stride, 0);
 }
@@ -5013,6 +5015,7 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
                          "D3DDevice_DrawIndexedVerticesUP"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (index_va && data)
         hle_d3d8_shadow_draw_indexed(xpt, count, (const uint16_t *)HLE_PTR(index_va),
                                      HLE_PTR(data), stride, 0);

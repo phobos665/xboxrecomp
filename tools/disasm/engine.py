@@ -375,16 +375,17 @@ class DisasmEngine:
                     # A hole: a case value that cannot happen, left as 0
                     # (Halo 2's sub_00216A50 has cases 1-4, two zeros, then
                     # 7-9 -- stopping at the first zero lost the last three,
-                    # and their arms fell outside the function). Step over at
-                    # most three zeros, and only when a real entry follows;
-                    # trailing zeros are not part of the table.
+                    # and their arms fell outside the function; its
+                    # sub_000336F0 has a run of five in a 43-entry table).
+                    # Step over at most eight zeros, and only when a real
+                    # entry follows; trailing zeros are not part of the table.
                     run = 1
-                    while run <= 3:
+                    while run <= 8:
                         nxt = self.image.read_u32_at_va(tbl + (entries + run) * 4)
                         if nxt != 0:
                             break
                         run += 1
-                    if run <= 3 and nxt is not None and lo <= nxt < hi:
+                    if run <= 8 and nxt is not None and lo <= nxt < hi:
                         entries += run
                         continue
                     break
