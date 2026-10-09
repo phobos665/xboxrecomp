@@ -333,6 +333,11 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
+/* Whether every byte of [va, va + bytes) is guest memory the layout mapped:
+ * the base view, a mapped RAM mirror, the contiguous window or the tiled
+ * aperture. Page zero is refused. For a bridge about to let a host call touch
+ * a guest buffer; see the implementation. */
+int xbox_guest_range_mapped(uint32_t va, uint32_t bytes);
 void xbox_ProtectMirrorsForDebug(void);
 
 /* Dump the guest call stack and abort if the title has not exited within

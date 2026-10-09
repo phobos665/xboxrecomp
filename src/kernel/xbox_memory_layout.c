@@ -140,6 +140,7 @@ static HANDLE g_mapping_handle = NULL;
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
 static void *g_tiled_view = NULL;
+static size_t g_tiled_size = 0;      /* bytes g_tiled_view maps */
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
@@ -209,6 +210,60 @@ static HANDLE g_contig_mapping = NULL;
 size_t xbox_GetMappedSize(void)
 {
     return g_memory_size;
+}
+
+/* Whether every byte of [va, va + bytes) is guest memory this layout mapped.
+ *
+ * For a bridge about to hand a guest buffer to a host call that touches
+ * `bytes` of it (sp00nznet/xboxrecomp#89): an unmapped byte there faults in
+ * host code, with no lifted frame on the stack to say who asked. Walks the
+ * range region by region, so a buffer that runs from the base view into
+ * mirror 1 -- adjacent in guest and host address space alike -- passes, and
+ * one that runs off the end of anything mapped does not.
+ *
+ * The regions are the ones this file actually mapped, not a model of them:
+ * the base view [0, g_memory_size) (which includes any xbox_SetMapSize or
+ * demand-section space), each RAM mirror that was mapped (they stop below
+ * the contiguous window, and one overlapping the tiled aperture is skipped),
+ * the contiguous window, and the tiled aperture over it. Page zero -- the
+ * guest null page, a null pointer plus a field offset -- is refused. The
+ * main TIB sits at XBOX_TIB_MAIN (0x4000), above it, on every host.
+ *
+ * Page protection is not checked: a mapped page the guest made read-only is
+ * still "mapped". This answers only what would certainly fault. */
+int xbox_guest_range_mapped(uint32_t va, uint32_t bytes)
+{
+    uint64_t lo = va;
+    uint64_t hi = (uint64_t)va + bytes;
+
+    if (!g_memory_base || !g_memory_size)
+        return 0;
+    if (lo < 0x1000u)
+        return 0;
+    while (lo < hi) {
+        uint64_t region_end;
+        if (lo < g_memory_size) {
+            region_end = g_memory_size;
+        } else if (lo < XBOX_CONTIG_BASE) {
+            uint64_t m = lo / g_memory_size - 1;     /* mirror index */
+            if (m >= XBOX_NUM_MIRRORS || !g_mirror_views[m])
+                return 0;
+            region_end = (m + 2) * (uint64_t)g_memory_size;
+        } else if (lo < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
+            if (!g_contig_memory)
+                return 0;
+            region_end = (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+        } else if (lo >= XBOX_TILED_BASE
+                   && lo < (uint64_t)XBOX_TILED_BASE + g_tiled_size) {
+            if (!g_tiled_view)
+                return 0;
+            region_end = (uint64_t)XBOX_TILED_BASE + g_tiled_size;
+        } else {
+            return 0;
+        }
+        lo = region_end;
+    }
+    return 1;
 }
 
 static size_t xbox_TiledApertureSize(void)
@@ -4178,6 +4233,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 (LPVOID)tiled_native)
             : NULL;
         if (g_tiled_view) {
+            g_tiled_size = tiled_size;
             /* Prove the alias rather than assert it. Everything the title
              * renders goes through this window and is read back through the
              * physical address, so if the two are not the same bytes the GPU
