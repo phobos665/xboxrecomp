@@ -12,9 +12,9 @@ uint32_t esi,edi,ecx;
 int g_df;
 unsigned accesses;
 uint8_t mem[131076],refmem[131076];
-unsigned index(uint32_t a){return (a&0xffffu)+(a>=0xFD000000u?65536u:0u);}
-void* access(uint32_t a){accesses++;return mem+index(a);}
-#define XBOX_PTR(a) (mem+index(a))
+unsigned guest_index(uint32_t a){return (a&0xffffu)+(a>=0xFD000000u?65536u:0u);}
+void* access(uint32_t a){accesses++;return mem+guest_index(a);}
+#define XBOX_PTR(a) (mem+guest_index(a))
 #define MEM8(a) (*(volatile uint8_t*)access(a))
 #define MEM16(a) (*(volatile uint16_t*)access(a))
 #define MEM32(a) (*(volatile uint32_t*)access(a))
@@ -48,7 +48,7 @@ int main(void){
         uint32_t rs=s,rd=d;
         for(unsigned i=0;i<n;i++){
             uint8_t element[4];
-            memcpy(element,refmem+index(rs),z);memcpy(refmem+index(rd),element,z);
+            memcpy(element,refmem+guest_index(rs),z);memcpy(refmem+guest_index(rd),element,z);
             rs+=df?-(int)z:z;rd+=df?-(int)z:z;
         }
         esi=s;edi=d;ecx=n;g_df=df;accesses=0;copies[w]();
