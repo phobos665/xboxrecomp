@@ -38,5 +38,35 @@
   "start": "0x002A89B0",
   "observed": true,
   "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002380C0",
+  "observed": true,
+  "note": "Profile-name validator (table 0x0044A9F8, entries 0-4); unresolved indirect call at 0x002381C1 made every name 'already taken'."
+ },
+ {
+  "start": "0x002380D6",
+  "observed": true,
+  "note": "Text-entry validator (table 0x0044A9F8, entries 5-6), sibling of 0x002380C0."
+ },
+ {
+  "start": "0x002380A6",
+  "observed": true,
+  "note": "Text-entry validator (table 0x0044A9F8, entry 7), sibling of 0x002380C0."
+ },
+ {
+  "start": "0x00237C04",
+  "observed": true,
+  "note": "UI callback observed unresolved at runtime (100+ calls on the profile keyboard)."
+ },
+ {
+  "start": "0x000DC580",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002A8C20",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
  }
 ]
