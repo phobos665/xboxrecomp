@@ -3810,6 +3810,24 @@ static void bridge_mark_async(uint32_t handle_va, uint32_t options)
     }
 }
 
+/* The host file behind a handle, for the [READ] and [WRITE] lines: "?" when
+ * there is none to name. */
+static const char *bridge_handle_name(HANDLE h, char *buf, size_t n)
+{
+#if defined(_WIN32)
+    WCHAR w[MAX_PATH];
+    DWORD wn = GetFinalPathNameByHandleW(h, w, MAX_PATH, FILE_NAME_NORMALIZED);
+    if (!wn || wn >= MAX_PATH)
+        return "?";
+    snprintf(buf, n, "%ls", w);
+    return buf;
+#else
+    const char *p = w32_handle_path(h);
+    (void)buf; (void)n;
+    return p ? p : "?";
+#endif
+}
+
 static int bridge_handle_is_nobuf(uint32_t token)
 {
     uint32_t i;
@@ -4245,13 +4263,13 @@ static void bridge_NtReadFile(void)
         /* A failed read says which file: an end-of-file is only wrong if the
          * file is longer than the offset, and nothing above says which. */
         if (ios.Status) {
-            WCHAR where[MAX_PATH];
-            DWORD wn = GetFinalPathNameByHandleW(handle, where, MAX_PATH, FILE_NAME_NORMALIZED);
+            char where[MAX_PATH * 3];
             LARGE_INTEGER sz;
             sz.QuadPart = -1;
             GetFileSizeEx(handle, &sz);
-            fprintf(stderr, "  [READ]   that file: %ls (%lld bytes, async %d)\n",
-                    wn && wn < MAX_PATH ? where : L"?", (long long)sz.QuadPart, async_file);
+            fprintf(stderr, "  [READ]   that file: %s (%lld bytes, async %d)\n",
+                    bridge_handle_name(handle, where, sizeof where), (long long)sz.QuadPart,
+                    async_file);
         }
         fflush(stderr);
     }
@@ -4525,14 +4543,13 @@ static void bridge_NtWriteFile(void)
         if (said < 24 || (length >= 65536u && said_big < 12)) {
             const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
             if (said < 24) said++; else said_big++;
-            WCHAR where[MAX_PATH];
-            DWORD wn = GetFinalPathNameByHandleW(handle, where, MAX_PATH, FILE_NAME_NORMALIZED);
-            fprintf(stderr, "  [WRITE] @%s%lld want=%u wrote=%u st=0x%08X <- 0x%08X  %02X %02X %02X %02X  %ls\n",
+            char where[MAX_PATH * 3];
+            fprintf(stderr, "  [WRITE] @%s%lld want=%u wrote=%u st=0x%08X <- 0x%08X  %02X %02X %02X %02X  %s\n",
                     poff ? "" : "seq", poff ? (long long)off.QuadPart : 0LL, length,
                     (unsigned)ios.Information, (unsigned)g_eax, buffer_va,
                     p && length > 0 ? p[0] : 0, p && length > 1 ? p[1] : 0,
                     p && length > 2 ? p[2] : 0, p && length > 3 ? p[3] : 0,
-                    wn && wn < MAX_PATH ? where : L"?");
+                    bridge_handle_name(handle, where, sizeof where));
         }
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);

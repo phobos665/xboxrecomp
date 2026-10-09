@@ -1295,6 +1295,21 @@ BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
     return TRUE;
 }
 
+BOOL SetFileInformationByHandle(HANDLE h, int info_class, LPVOID info, DWORD size)
+{
+    int fd = w32_handle_fd(h);
+    if (fd < 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (info_class != FileEndOfFileInfo || !info || size < sizeof(FILE_END_OF_FILE_INFO)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (ftruncate(fd, (off_t)((FILE_END_OF_FILE_INFO *)info)->EndOfFile.QuadPart) != 0) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* The kernel's asynchronous-read path saves and restores the host position
  * around each read, because Windows advances a synchronous handle's pointer
  * and the title then advances it again itself. A POSIX fd has the same
