@@ -16,6 +16,7 @@ import json
 import glob
 import os
 import struct
+import sys
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
@@ -226,6 +227,18 @@ def write_if_changed(path, text):
     return True
 
 
+_SAFE_ICALL_FORMS = ("RECOMP_ICALL_SAFE(", "RECOMP_ICALL_SAFE_AT(",
+                     "RECOMP_ICALL_SAFE_CC(", "RECOMP_ICALL_SAFE_AT_CC(")
+
+
+def _is_safe_icall(line):
+    # Asked of every generated line, twice; the common prefix rejects
+    # nearly all of them in one scan.
+    if "RECOMP_ICALL_SAFE" not in line:
+        return False
+    return any(form in line for form in _SAFE_ICALL_FORMS)
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -291,7 +304,7 @@ def _fixup_icall_esp_save(lines):
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
     for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             icall_indices.append(i)
 
     if not icall_indices:
@@ -365,9 +378,17 @@ def _fixup_icall_esp_save(lines):
         # call put esp 32 bytes high, which its caller's epilogue then popped
         # esi from -- handing the caller a corrupt `this` several frames from
         # anything that looked wrong.
-        caller_cleans = False
+        #
+        # The lifter already knows the answer when it saw the guest's own
+        # `add esp, imm` straight after the call, and says so with the _CC
+        # form of the macro. That is the reliable signal: the generated C
+        # for that add can open with flag-snapshot lines, which the textual
+        # probe below stops at, so on its own it missed exactly the cdecl
+        # sites whose flags are read later (sp00nznet/xboxrecomp#169).
+        caller_cleans = ("RECOMP_ICALL_SAFE_CC(" in lines[icall_idx]
+                         or "RECOMP_ICALL_SAFE_AT_CC(" in lines[icall_idx])
         k = icall_idx + 1
-        while k < len(lines) and k <= icall_idx + 6:
+        while not caller_cleans and k < len(lines) and k <= icall_idx + 6:
             probe = lines[k].strip()
             if not probe or re.match(r'^loc_[0-9A-Fa-f]+:', probe):
                 k += 1
@@ -385,7 +406,7 @@ def _fixup_icall_esp_save(lines):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
         result.append(line)
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
@@ -733,6 +754,11 @@ class FunctionTranslator:
 
         Run after discover_cfg_ownership, which settles translated bounds.
         """
+        # Both passes below ask the same question of a function -- does it
+        # have a `jmp` through memory, and if so what does it decode to --
+        # so they share the answer rather than decoding twice.
+        self._mem_jump_decodes = {}
+        self._extend_over_trailing_tables()
         sites = []
         for start, info in self.func_db.items():
             if start in self.owned_function_starts:
@@ -741,24 +767,21 @@ class FunctionTranslator:
             if recovered:
                 end = recovered["end"]
                 instructions = recovered["instructions"]
+                known = recovered["jump_tables"]
             else:
+                known = {}
                 end = info.get("end", start)
-                raw_bytes = self._read_func_bytes(start, end)
-                # Only a `jmp` through memory can be a site; decode in full
-                # only the functions that have one (see scan_lite).
-                if not raw_bytes or not any(
-                        m == "jmp" and "[" in op
-                        for _a, _s, m, op in self.disasm.scan_lite(
-                            raw_bytes, start, end)):
+                instructions = self._decode_if_mem_jump(start, end)
+                if not instructions:
                     continue
-                instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end)
             for insn in instructions:
                 if (insn.mnemonic != "jmp" or insn.jump_target
                         or not insn.operands
                         or insn.operands[0].type != "mem"):
                     continue
                 operand = insn.operands[0]
+                if operand.mem_disp in known:
+                    continue  # recovered as an in-function switch
                 if operand.mem_index and not operand.mem_base:
                     sites.append((start, end, operand.mem_disp))
 
@@ -813,7 +836,116 @@ class FunctionTranslator:
             }
             self.jump_table_entry_starts.add(target)
 
+        self._mem_jump_decodes = None    # decodes are not kept past the pass
         return self.jump_table_entry_starts
+
+    def _extend_over_trailing_tables(self):
+        """Extend a function cut at its own inline jump tables.
+
+        Hand-written CRT routines (MSVC's memcpy) interleave dword tables with
+        the arms they index, tables first. The function list ends such a
+        function where decoding meets its first table, leaving the arms in an
+        unowned gap. The arms branch back into the body, so they cannot run as
+        functions of their own. Recover the CFG through the gap, up to the next
+        function start, and keep it when every path stays inside it.
+
+        A tail_jump_alias entry is a second entry into another body, so it
+        does not bound the gap.
+
+        Only a function with a `jmp` through memory can qualify, so the
+        lightweight decode (scan_lite) is asked first and the full decode is
+        paid only for those -- this pass visits every function with a gap
+        after it, and the full decode of all of them is what fork PR #50 took
+        out of the other passes.
+        """
+        bounds = sorted(
+            addr for addr, info in self.func_db.items()
+            if info.get("detection_method") != "tail_jump_alias")
+        for start in bounds:
+            info = self.func_db[start]
+            if (start in self.owned_function_starts
+                    or start in self._recovered_cfg):
+                continue
+            end = info.get("end", start)
+            following = bisect.bisect_right(bounds, start)
+            if following >= len(bounds) or bounds[following] <= end:
+                continue
+            upper = bounds[following]
+            decoded = self._decode_if_mem_jump(start, end)
+            if not decoded:
+                continue
+            tables = [
+                insn.operands[0].mem_disp for insn in decoded
+                if insn.mnemonic == "jmp" and insn.jump_target is None
+                and insn.operands and insn.operands[0].type == "mem"
+                and insn.operands[0].mem_index
+                and not insn.operands[0].mem_base
+                and start <= insn.operands[0].mem_disp < upper]
+            if not tables:
+                continue
+            if not self._may_reach_past(decoded, tables, start, end, upper):
+                continue
+            recovered = self._recover_cfg(start, upper, set(), set())
+            if recovered is None or not recovered[1]:
+                continue
+            instructions, jump_tables, _ = recovered
+            new_end = max(insn.end_address for insn in instructions)
+            if new_end <= end or not self._arm_is_whole(start, instructions):
+                continue
+            info["end"] = new_end
+            info["size"] = new_end - start
+            info["num_instructions"] = len(instructions)
+            self._recovered_cfg[start] = {
+                "end": new_end,
+                "instructions": instructions,
+                "jump_tables": jump_tables,
+            }
+            print(f"Extended 0x{start:08X} from 0x{end:08X} to "
+                  f"0x{new_end:08X} over its inline jump tables",
+                  file=sys.stderr)
+
+    def _decode_if_mem_jump(self, start, end):
+        """The full decode of [start, end), or None when it has no `jmp`
+        through memory (asked of scan_lite first, see there). Memoised for
+        one discover_jump_table_entries."""
+        memo = getattr(self, "_mem_jump_decodes", None)
+        key = (start, end)
+        if memo is not None and key in memo:
+            return memo[key]
+        raw_bytes = self._read_func_bytes(start, end)
+        decoded = None
+        if raw_bytes and any(
+                m == "jmp" and "[" in op
+                for _a, _s, m, op in self.disasm.scan_lite(
+                    raw_bytes, start, end)):
+            decoded = self.disasm.disassemble_function(raw_bytes, start, end)
+        if memo is not None:
+            memo[key] = decoded
+        return decoded
+
+    def _may_reach_past(self, decoded, tables, start, end, upper):
+        """Whether control in [start, end) can reach [end, upper) at all.
+
+        The CFG recovery in _extend_over_trailing_tables follows direct edges,
+        fall-through and local table entries, so it can only find code past
+        `end` through one of those. Checking them on the decode already in
+        hand skips the recovery for the common case -- an ordinary switch
+        whose table follows a function whose arms all lie inside it -- which
+        on TimeSplitters 2 is every candidate and doubled the pass's cost.
+        A decode that stops short of `end` cannot answer, so it says yes.
+        """
+        if not decoded or decoded[-1].end_address < end:
+            return True
+        last = decoded[-1]
+        if not (last.is_terminator
+                or last.mnemonic in ("int3", "ud2", "hlt")):
+            return True                      # falls through into the gap
+        if any(insn.jump_target is not None and end <= insn.jump_target < upper
+               for insn in decoded):
+            return True
+        return any(end <= target < upper
+                   for table in tables
+                   for target in self._read_local_jump_table(table, start, upper))
 
     def _arm_is_whole(self, target, instructions):
         """Return whether a recovered arm can run as a function of its own.
@@ -1226,6 +1358,22 @@ class FunctionTranslator:
         if not blocks:
             return None
 
+        # Calls the guest caller cleans up after itself: the instruction
+        # immediately after the call is `add esp, imm`. Classified on the
+        # decoded guest instructions, not the generated C, because the C for
+        # that add can open with flag snapshots that hide it. The lifter then
+        # emits the _CC dispatch macro, whose failure path pops only the
+        # return address and leaves the arguments for the caller's own add.
+        self.lifter.caller_cleanup_sites = {
+            call.address for call, following in zip(instructions, instructions[1:])
+            if call.is_call and call.end_address == following.address
+            and following.mnemonic == "add" and len(following.operands) == 2
+            and following.operands[0].type == "reg"
+            and following.operands[0].reg == "esp"
+            and following.operands[1].type == "imm"
+            and following.operands[1].imm > 0
+        }
+
         # Get classification and ABI info
         cls_info = self.classification_db.get(start, {})
         category = cls_info.get("category", "unknown")
@@ -1254,6 +1402,11 @@ class FunctionTranslator:
         # Ensure ebp tracked if function uses 'leave' (implicit ebp)
         if any(insn.mnemonic == "leave" for insn in instructions):
             used_regs.add("ebp")
+
+        # PUSHAD/POPAD implicitly read or restore every register.
+        if any(i.mnemonic in ("pushal", "pushad", "popal", "popad")
+               for i in instructions):
+            used_regs.update(("ebx", "esi", "edi", "ebp"))
 
         # Guest control leaves the bottom of this function when its last
         # instruction neither returns, jumps, nor traps. A function the lifter

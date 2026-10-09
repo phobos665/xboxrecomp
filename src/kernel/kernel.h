@@ -674,6 +674,13 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
+/* Releases what the file layer keeps per handle -- a directory search, and on
+ * Windows the partition-volume record -- before the handle is closed. Every
+ * path that closes a guest file handle calls xbox_file_handle_closing: the
+ * NtClose export and the kernel bridge's ordinal 187, which closes the host
+ * handle itself. Harmless for a handle the file layer never saw. */
+void xbox_dir_context_drop(HANDLE FileHandle);
+void xbox_file_handle_closing(HANDLE FileHandle);
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 

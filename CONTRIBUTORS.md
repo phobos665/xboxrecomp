@@ -80,6 +80,28 @@ the generated C compiles, links and runs, and is quietly wrong.
   position field, DirectSound cursors, and XAudio2 errors reported as success.
 - **[doaxbv-re](https://github.com/NoRain211/doaxbv-re),** NoRain211's own project, is the source
   of the DirectSound model and ADPCM decoder adapted in `src/hle/`.
+- **Brought in from upstream in October 2026:** a function cut at its own inline jump tables
+  (MSVC's hand-written memcpy) is extended over them so its arms lift as in-function gotos
+  (sp00nznet/xboxrecomp#173), and gap aliases stay inside their gap and the bytes their section
+  backs (#174).
+
+### vyanhursky — [@vyanhursky](https://github.com/vyanhursky)
+Lifter and kernel correctness fixes, each with a test that runs the generated code, brought in
+from upstream in October 2026:
+
+- **Indirect calls the caller cleans up after** no longer lose their arguments twice when the
+  lookup fails (sp00nznet/xboxrecomp#169).
+- **x87 and SSE:** `FPREM` clears C2 when its reduction completes (#177), and `COMISD`/`UCOMISD`
+  compare the double lanes (#178).
+- **Instructions:** parity `SETcc`/`CMOVcc` (#180), `PUSHAD`/`POPAD` (#167), and `REP MOVS`
+  that keeps hardware accesses element-sized (#170).
+- **Kernel:** a closed directory handle releases its search (#171).
+
+### andeecollard — [@andeecollard](https://github.com/andeecollard)
+- **Guest buffers bounds-checked in the kernel bridges** (sp00nznet/xboxrecomp#89): a file read,
+  write or information call whose buffer is not mapped guest memory answers
+  `STATUS_ACCESS_VIOLATION` instead of faulting in host code. Brought in October 2026, with
+  "mapped" answered by this fork's memory layout.
 
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **`tools/abi_analysis`** — the missing stage that recovers calling convention, parameter count

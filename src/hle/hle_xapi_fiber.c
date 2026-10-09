@@ -41,10 +41,8 @@ typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
-/* The guest's registers, per host thread (xbox_memory_layout.c). */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
-extern RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
-extern RECOMP_TLS int g_df, g_fp_top;
+/* The guest's registers come from hle.h (recomp_cpu.h, one thread-local
+ * struct); a redeclaration here no longer compiles. */
 
 #define XAPI_CURRENT_FIBER  0x0Cu     /* XapiCurrentFiber_OFFSET */
 #define XAPI_THREAD_FIBER   0x10u     /* XapiThreadFiberData_OFFSET */

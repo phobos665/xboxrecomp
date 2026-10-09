@@ -168,6 +168,30 @@ int main(int argc, char **argv)
     CHECK("TIB at 0x4000: SEH end of chain", *G32(0x4000u) == 0xFFFFFFFFu);
     CHECK("TIB at 0x4000: self pointer", *G32(0x4018u) == 0x4000u);
 
+    /* xbox_guest_range_mapped, the bridges' buffer check: what the layout
+     * mapped, region by region, and nothing else. */
+    {
+        uint64_t mirrors_end = (uint64_t)(expect_mirrors + 1) * map;
+        CHECK("range: null page refused", !xbox_guest_range_mapped(0x20u, 4));
+        CHECK("range: XBE header", xbox_guest_range_mapped(0x10000u, 0x200u));
+        CHECK("range: main TIB", xbox_guest_range_mapped(0x4000u, 0x100u));
+        CHECK("range: top of the base view", xbox_guest_range_mapped((uint32_t)map - 4u, 4));
+        CHECK("range: base view into mirror 1", xbox_guest_range_mapped((uint32_t)map - 4u, 8));
+        CHECK("range: end of the last mirror",
+              xbox_guest_range_mapped((uint32_t)(mirrors_end - 4u), 4));
+        if (mirrors_end < 0x80000000ull)
+            CHECK("range: past the last mirror refused",
+                  !xbox_guest_range_mapped((uint32_t)mirrors_end, 4)
+                  && !xbox_guest_range_mapped((uint32_t)(mirrors_end - 4u), 8));
+        CHECK("range: contiguous window", xbox_guest_range_mapped(0x80000000u, 0x10000u));
+        CHECK("range: off the end of the contiguous window refused",
+              !xbox_guest_range_mapped(0x80000000u + XBOX_CONTIG_SIZE - 4u, 8));
+        CHECK("range: tiled aperture", xbox_guest_range_mapped(0xF0001000u, 0x1000u));
+        CHECK("range: device registers are not a buffer",
+              !xbox_guest_range_mapped(0xFD000000u, 4));
+        CHECK("range: wrap past 4 GB refused", !xbox_guest_range_mapped(0xFFFFFFF0u, 0x20u));
+    }
+
     if (failures) {
         printf("memory_layout %d MB: %d FAILURE(S)\n", map_mb, failures);
         return 1;

@@ -63,6 +63,63 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
 #define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
 
+/* ── Guest buffers the host is about to touch ───────────
+ *
+ * A bridge turns a guest VA into a host pointer by adding an offset, so a VA
+ * the guest got wrong does not fail the call -- it faults inside the kernel
+ * implementation, on a host stack with no recompiled frame in it and a fault
+ * address that means nothing on its own.
+ *
+ * The dangerous shape is an address AND a length that both come from the
+ * guest. NtReadFile is the clearest case: the host WRITES `length` bytes
+ * through the pointer, so a buffer near the top of the mapping, or a length
+ * that does not match the buffer it names, walks the host past the end of
+ * guest memory writing file contents into whatever follows. Nothing above this
+ * layer can catch it, because xbox_NtReadFile receives a host pointer and a
+ * count and cannot know where the mapping ends.
+ */
+/* "Mapped" is answered by the memory layout, which knows what it mapped
+ * (xbox_guest_range_mapped). Upstream's version modelled it here as "below
+ * the map size, or in the contiguous window, and not below XBOX_FS_BASE";
+ * on this fork XBOX_FS_BASE is the calling thread's own TIB (g_fs_base), so
+ * a spawned thread whose TIB sits in the heap would have had every buffer
+ * below its TIB refused, and buffers in a RAM mirror or the tiled aperture
+ * -- both mapped -- would have been refused too. */
+static int bridge_va_mapped(uint32_t va, uint32_t bytes)
+{
+    return xbox_guest_range_mapped(va, bytes);
+}
+
+/* STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot
+ * touch, and it is far more useful to a title than a host crash: the call
+ * fails, the guest gets a status it has a branch for, and the log names the
+ * export, the buffer and the length. Warned once per export so a title that
+ * does this in a loop does not bury the rest of the log. */
+static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
+{
+    static const char *seen[16];
+    static int distinct;
+    int i;
+
+    if (!bytes)                                   /* nothing is accessed */
+        return 1;
+    if (va && bridge_va_mapped(va, bytes))
+        return 1;
+
+    for (i = 0; i < distinct; ++i)
+        if (seen[i] == export_name)
+            return 0;
+    if (distinct < (int)(sizeof(seen) / sizeof(seen[0])))
+        seen[distinct++] = export_name;
+
+    fprintf(stderr,
+            "  [KERNEL] %s: buffer 0x%08X length %u is not mapped guest "
+            "memory; returning STATUS_ACCESS_VIOLATION\n",
+            export_name, va, (unsigned)bytes);
+    fflush(stderr);
+    return 0;
+}
+
 /* ── Synthetic VA range (for function exports) ─────────── */
 
 #define KERNEL_VA_BASE  0xFE000000u
@@ -658,8 +715,15 @@ static void bridge_NtClose(void)
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
-        if (h && h != INVALID_HANDLE_VALUE)
+        if (h && h != INVALID_HANDLE_VALUE) {
+            /* Closed here rather than through xbox_NtClose, so the file
+             * layer's per-handle state is released here too: an abandoned
+             * directory search, and on Windows the volume record, would
+             * otherwise outlive the handle and answer for the next one
+             * opened at the same value. */
+            xbox_file_handle_closing(h);
             CloseHandle(h);
+        }
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -3004,6 +3068,15 @@ static void bridge_KeInitializeDpc(void)
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
 
+    /* XBOX_TO_NATIVE maps a guest 0 to NULL, so an unchecked object pointer
+     * makes this memset write through NULL inside the bridge. The export
+     * returns void, so refusing is doing nothing -- which is what the real
+     * kernel does with an object it cannot write. */
+    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+        g_eax = 0;
+        return;
+    }
+
     /* Zero the structure (32 bytes) */
     memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
 
@@ -3051,6 +3124,11 @@ static void bridge_KeInitializeInterrupt(void)
     uint32_t routine      = STACK_ARG(1);
     uint32_t context      = STACK_ARG(2);
     uint32_t vector       = STACK_ARG(3);
+
+    if (!bridge_buf_ok(interrupt_va, 44, "KeInitializeInterrupt")) {
+        g_eax = 0;
+        return;
+    }
 
     /* Xbox KINTERRUPT is 44 bytes. */
     memset(XBOX_TO_NATIVE(interrupt_va), 0, 44);
@@ -3475,6 +3553,10 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     static RECOMP_TLS char path[65536];
     uint16_t length=BRIDGE_MEM16(ansi_str_va);
     if(length>BRIDGE_MEM16(ansi_str_va+2)) return NULL;
+    /* Length <= MaximumLength says the string is self-consistent; it does not
+     * say the buffer it names is inside the mapping. Without this, a string
+     * near the top of guest memory reads up to 64 KB off the end. */
+    if (length && !bridge_va_mapped(buf_va, length)) return NULL;
     memcpy(path,XBOX_TO_NATIVE(buf_va),length);
     path[length]='\0';
     return path;
@@ -3808,6 +3890,24 @@ static void bridge_mark_async(uint32_t handle_va, uint32_t options)
                                         XBOX_FILE_SYNCHRONOUS_IO_NONALERT)) == 0;
         s_handle_nobuf[i] = (options & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) != 0;
     }
+}
+
+/* The host file behind a handle, for the [READ] and [WRITE] lines: "?" when
+ * there is none to name. */
+static const char *bridge_handle_name(HANDLE h, char *buf, size_t n)
+{
+#if defined(_WIN32)
+    WCHAR w[MAX_PATH];
+    DWORD wn = GetFinalPathNameByHandleW(h, w, MAX_PATH, FILE_NAME_NORMALIZED);
+    if (!wn || wn >= MAX_PATH)
+        return "?";
+    snprintf(buf, n, "%ls", w);
+    return buf;
+#else
+    const char *p = w32_handle_path(h);
+    (void)buf; (void)n;
+    return p ? p : "?";
+#endif
 }
 
 static int bridge_handle_is_nobuf(uint32_t token)
@@ -4187,6 +4287,11 @@ static void bridge_NtReadFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(buffer_va, length, "NtReadFile")) {
+        bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (offset_va) {
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
@@ -4245,13 +4350,13 @@ static void bridge_NtReadFile(void)
         /* A failed read says which file: an end-of-file is only wrong if the
          * file is longer than the offset, and nothing above says which. */
         if (ios.Status) {
-            WCHAR where[MAX_PATH];
-            DWORD wn = GetFinalPathNameByHandleW(handle, where, MAX_PATH, FILE_NAME_NORMALIZED);
+            char where[MAX_PATH * 3];
             LARGE_INTEGER sz;
             sz.QuadPart = -1;
             GetFileSizeEx(handle, &sz);
-            fprintf(stderr, "  [READ]   that file: %ls (%lld bytes, async %d)\n",
-                    wn && wn < MAX_PATH ? where : L"?", (long long)sz.QuadPart, async_file);
+            fprintf(stderr, "  [READ]   that file: %s (%lld bytes, async %d)\n",
+                    bridge_handle_name(handle, where, sizeof where), (long long)sz.QuadPart,
+                    async_file);
         }
         fflush(stderr);
     }
@@ -4490,6 +4595,11 @@ static void bridge_NtWriteFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(buffer_va, length, "NtWriteFile")) {
+        bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (offset_va) {
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
@@ -4525,14 +4635,13 @@ static void bridge_NtWriteFile(void)
         if (said < 24 || (length >= 65536u && said_big < 12)) {
             const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
             if (said < 24) said++; else said_big++;
-            WCHAR where[MAX_PATH];
-            DWORD wn = GetFinalPathNameByHandleW(handle, where, MAX_PATH, FILE_NAME_NORMALIZED);
-            fprintf(stderr, "  [WRITE] @%s%lld want=%u wrote=%u st=0x%08X <- 0x%08X  %02X %02X %02X %02X  %ls\n",
+            char where[MAX_PATH * 3];
+            fprintf(stderr, "  [WRITE] @%s%lld want=%u wrote=%u st=0x%08X <- 0x%08X  %02X %02X %02X %02X  %s\n",
                     poff ? "" : "seq", poff ? (long long)off.QuadPart : 0LL, length,
                     (unsigned)ios.Information, (unsigned)g_eax, buffer_va,
                     p && length > 0 ? p[0] : 0, p && length > 1 ? p[1] : 0,
                     p && length > 2 ? p[2] : 0, p && length > 3 ? p[3] : 0,
-                    wn && wn < MAX_PATH ? where : L"?");
+                    bridge_handle_name(handle, where, sizeof where));
         }
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
@@ -4561,6 +4670,11 @@ static void bridge_NtQueryInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtQueryInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -4578,6 +4692,11 @@ static void bridge_NtSetInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtSetInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     {
         /* What a title changes about an open file, the first few times:
          * end-of-file, allocation, position, rename, delete. */
@@ -4607,6 +4726,11 @@ static void bridge_NtQueryVolumeInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtQueryVolumeInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FS_INFORMATION_CLASS)infoclass);

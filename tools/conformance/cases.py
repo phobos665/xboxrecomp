@@ -87,6 +87,28 @@ _SSE = [
 ]
 
 CASES = [
+    Case("comisd_register_lane", "double register compare uses the 64-bit lane",
+         ["movsd xmm0, qword ptr [eax]", "movsd xmm1, qword ptr [eax+16]",
+          "comisd xmm0, xmm1", "setb al", "movzx eax, al"], _FP_NAN, kind="fpu"),
+    Case("ucomisd_register_lane", "double register compare uses the 64-bit lane",
+         ["movsd xmm0, qword ptr [eax]", "movsd xmm1, qword ptr [eax+16]",
+          "ucomisd xmm0, xmm1", "setb al", "movzx eax, al"], _FP_NAN, kind="fpu"),
+    Case("cmp_setp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'setp al', 'movzx eax, al'], _PAIRS),
+    Case("cmp_setnp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'setnp al', 'movzx eax, al'], _PAIRS),
+    Case("cmp_cmovp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'cmovp eax, ecx'], _PAIRS),
+    Case("cmp_cmovnp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'cmovnp eax, ecx'], _PAIRS),
+    Case("test_setp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'setp al', 'movzx eax, al'], _PAIRS),
+    Case("test_setnp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'setnp al', 'movzx eax, al'], _PAIRS),
+    Case("test_cmovp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'cmovp eax, ecx'], _PAIRS),
+    Case("test_cmovnp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'cmovnp eax, ecx'], _PAIRS),
     # -- signed compare width (the RECOMP_SIGNED vs SXV decision) -------------
     Case("setl_i8", "cmp at byte width, then jl's condition",
          ["cmp al, cl", "setl al", "movzx eax, al"], _PAIRS),
@@ -471,6 +493,22 @@ CASES = [
     # model reported "equal", so `fucompp; fnstsw ax; test ah,44h; jp` -- how
     # this era's CRT asks "is this a NaN" -- answered no every time. Found by
     # running Crimson Skies' own float classification against itself.
+    Case("fpu_fprem_completion", "FPREM clears FXAM's C2 after complete reduction",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
+    Case("fpu_fprem1_completion", "FPREM1 clears C2 and rounds the quotient to nearest",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem1", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
+
+    # ══ SSE ═════════════════════════════════════════════════════════════════
+    #
+    # All four lanes are compared, which is the whole point: modelling XMM as a
+    # scalar float made movaps move 4 of 16 bytes and nothing noticed.
+
     Case("fpu_nan_unordered",
          "comparing a value with itself is the isnan idiom; NaN is unordered",
          ["fld qword ptr [eax]", "fld qword ptr [eax]", "fucompp",
@@ -498,3 +536,18 @@ for _op in (
             "MMX preserves the comparison/carry consumed afterward",
             ["pxor mm0, mm0", "pxor mm1, mm1", "xorps xmm0, xmm0"]
             + _before + [_op] + _after + ["emms"], [(0, 7), (1, 7)]))
+
+CASES.append(Case("pushad_popad", "POPAD restores registers and skips saved ESP",
+    ["pushad", "mov eax, 0", "mov ecx, 0", "popad", "add eax, ecx"], _PAIRS))
+
+# Exercise ordinary-RAM REP semantics against the real CPU. MMIO side effects
+# are covered by the access-counting fixture, since host RAM is not a device.
+for _name, _setup, _count, _copy, _result in (
+        ("rep_copy_byte", ["mov esi, eax", "lea edi, [eax+16]"], 4, "rep movsb", "mov eax, [edi-4]"),
+        ("rep_copy_word", ["mov esi, eax", "lea edi, [eax+16]"], 4, "rep movsw", "mov eax, [edi-8]"),
+        ("rep_copy_dword", ["mov esi, eax", "lea edi, [eax+16]"], 4, "rep movsd", "mov eax, [edi-16]"),
+        ("rep_copy_overlap", ["mov esi, eax", "lea edi, [eax+4]"], 3, "rep movsd", "mov eax, [edi-4]"),
+        ("rep_copy_backward", ["lea esi, [eax+12]", "lea edi, [eax+28]", "std"], 4, "rep movsd", "mov eax, [edi+4]"),
+        ("rep_copy_zero", ["mov esi, eax", "lea edi, [eax+16]"], 0, "rep movsd", "mov eax, [edi]")):
+    CASES.append(Case(_name, "REP copy preserves element order, direction and count",
+        ["cld"] + _setup + ["mov ecx, %d" % _count, _copy, "cld", _result], _SSE, "sse"))

@@ -1070,6 +1070,38 @@ extern volatile uint64_t g_icall_guard_misses;
 } while(0)
 
 /**
+ * RECOMP_ICALL_SAFE_CC - RECOMP_ICALL_SAFE for a call the caller cleans up.
+ *
+ * The lifter picks this form when the guest instruction straight after the
+ * call is `add esp, imm` (cdecl): the caller pops the arguments itself, so a
+ * failed lookup must pop only the return address. Rewinding to saved_esp
+ * there cleaned the arguments twice and left esp high for the caller's
+ * epilogue (sp00nznet/xboxrecomp#169). saved_esp is unused for the rewind:
+ * g_esp on entry is the esp just after the return-address push, so the
+ * pre-push esp -- what the not-code log reads the caller from -- is g_esp + 4.
+ * The fail-log hand-off is the same as RECOMP_ICALL_SAFE's.
+ */
+#define RECOMP_ICALL_SAFE_CC(xbox_va, saved_esp) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, g_esp + 4); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+} while(0)
+
+/**
  * RECOMP_ICALL_SAFE_AT - RECOMP_ICALL_SAFE that also names the call SITE.
  *
  * `site` is the guest address of the `call` instruction. Under
@@ -1098,6 +1130,29 @@ extern volatile uint64_t g_icall_guard_misses;
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+} while(0)
+
+/* RECOMP_ICALL_SAFE_AT_CC - RECOMP_ICALL_SAFE_AT for a call the caller
+ * cleans up; see RECOMP_ICALL_SAFE_CC. Keep the four macros in step. */
+#define RECOMP_ICALL_SAFE_AT_CC(xbox_va, saved_esp, site) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, g_esp + 4); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    RECOMP_ICALL_OBSERVE_SITE((site), _va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
 /**
