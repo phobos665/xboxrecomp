@@ -4463,6 +4463,15 @@ uint32_t xbox_AllocThreadTib(void)
                    XBOX_THREAD_OBJ_SIZE);
             *(uint32_t *)TIB_VA(obj + XBOX_THREAD_ID_OFF) =
                 g_next_guest_thread_id++;
+            /* And its own TLS data. KTHREAD.TlsData (+0x28) is where XAPI's
+             * thread start-up finds the block it zero-fills and copies the
+             * template into; inherited, it was the main thread's block, so
+             * every new thread reset the main thread's thread-locals. Forza
+             * lost XAPI's current fiber that way -- each worker's start-up
+             * zeroed it -- and its first SwitchToFiber had nowhere to come
+             * from. The loader points the main thread's at its block the
+             * same way. */
+            *(uint32_t *)TIB_VA(obj + 0x28) = block;
             *(uint32_t *)TIB_VA(tib + 0x28) = obj;
         }
     }
@@ -4930,6 +4939,19 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
             }
         }
         return 0;
+    }
+
+    /* The space alignment skipped stays usable. A 64 KB-aligned virtual
+     * allocation (bridge_NtAllocateVirtualMemory) can leave most of a 64 KB
+     * window behind it; recorded as a free block -- before the new one, so
+     * the table stays in address order -- it serves the next request with a
+     * smaller alignment instead of being lost. */
+    if (alignment >= 0x10000u && result - g_heap_next >= 64u &&
+        g_heap_block_count + 1 < XBOX_HEAP_MAX_BLOCKS) {
+        g_heap_blocks[g_heap_block_count].addr = g_heap_next;
+        g_heap_blocks[g_heap_block_count].size = result - g_heap_next;
+        g_heap_blocks[g_heap_block_count].free = 1;
+        g_heap_block_count++;
     }
 
     g_heap_next = result + size;

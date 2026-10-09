@@ -545,6 +545,52 @@ HLE_EXPORT(IDirectSoundBuffer_StopEx)
     HLE_RETURN(HLE_ARG(0) ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
 }
 
+/* The C++ methods under the interface, which XACT calls directly.
+ *
+ * IDirectSoundBuffer_PlayEx is `CDirectSoundBuffer_PlayEx(pThis ? pThis - 0x1C
+ * : 0, ...)`, and the rest of the interface wraps its method the same way. A
+ * title that plays through XACT never goes through the interface: Forza's
+ * engine and tyre sounds start with CDirectSoundBuffer_PlayEx, whose lifted
+ * body drives CMcpxBuffer_Play against voice hardware nothing emulates and
+ * polls the clock until it gives up -- once per voice, so the race ran at a
+ * frame a second. These map `this` back to the interface the models are keyed
+ * by and do what the interface replacements do. PlayEx's time stamp is two
+ * words, so its flags sit where Play's do. */
+#define DS_BUFFER_FROM_OBJECT(this_) ((this_) ? (this_) + 0x1Cu : 0u)
+
+HLE_EXPORT(IDirectSoundBuffer_PlayEx)
+{
+    hle_IDirectSoundBuffer_Play();
+}
+
+HLE_EXPORT(CDirectSoundBuffer_Play)
+{
+    HLE_MEM32(g_esp + 4u) = DS_BUFFER_FROM_OBJECT(HLE_ARG(0));
+    hle_IDirectSoundBuffer_Play();
+}
+
+HLE_EXPORT(CDirectSoundBuffer_PlayEx)
+{
+    HLE_MEM32(g_esp + 4u) = DS_BUFFER_FROM_OBJECT(HLE_ARG(0));
+    hle_IDirectSoundBuffer_Play();
+}
+
+HLE_EXPORT(CDirectSoundBuffer_Stop)
+{
+    uint32_t iface = DS_BUFFER_FROM_OBJECT(HLE_ARG(0));
+    g_ds_calls[DS_CALL_BUF_STOP]++;
+    stop(iface);
+    HLE_RETURN(iface ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
+}
+
+HLE_EXPORT(CDirectSoundBuffer_StopEx)
+{
+    uint32_t iface = DS_BUFFER_FROM_OBJECT(HLE_ARG(0));
+    g_ds_calls[DS_CALL_BUF_STOPEX]++;
+    stop(iface);
+    HLE_RETURN(iface ? RECOMP_DSOUND_OK : RECOMP_DSOUND_POINTER_ERROR);
+}
+
 /* DSBPAUSE_RESUME, DSBPAUSE_PAUSE, DSBPAUSE_SYNCHPLAYBACK. */
 enum { DSBPAUSE_RESUME = 0u, DSBPAUSE_PAUSE = 1u, DSBPAUSE_SYNCHPLAYBACK = 2u };
 

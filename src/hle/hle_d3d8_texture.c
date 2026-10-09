@@ -85,8 +85,9 @@ typedef struct {
      * side draws them, so it is never re-uploaded. */
     int                rendered;
     /* The texels are the frame buffer's, so the content comes from the
-     * host's finished frame and is refreshed every frame it is bound. */
+     * host's frame, refreshed when it is bound after the screen changed. */
     int                framebuffer;
+    unsigned long      screen_copied;   /* hle_d3d8_screen_changes() at the copy */
     /* P8: the host texture holds the texels expanded through a palette, and
      * this is the checksum of that palette (0: not known, bake again). */
     int                p8;
@@ -750,11 +751,23 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
     e->format = format;
     e->size = size;
     e->used_swap = now;
-    /* Once per frame: the picture it should hold is this frame's, so far. */
-    if (e->checked_swap != now) {
-        e->checked_swap = now;
-        host_CopyBackBufferToTexture(e->host);
-        framebuffer_probe(e, now);
+    /* The picture it should hold is the screen as it stands, so it is copied
+     * again whenever the screen has been drawn into or cleared since the last
+     * copy -- not once per frame. A frame that is two Swaps long (Forza:
+     * BYPASSCOPY, then FINISH) binds it in its first half, before the world
+     * is drawn, and again in the composite that follows the world; copied
+     * once, the composite read the empty first-half screen and painted the
+     * race black. A title that binds it several times with no drawing in
+     * between still pays for one copy. */
+    {
+        extern unsigned long hle_d3d8_screen_changes(void);
+        unsigned long changes = hle_d3d8_screen_changes();
+        if (e->checked_swap != now || e->screen_copied != changes) {
+            e->checked_swap = now;
+            e->screen_copied = changes;
+            host_CopyBackBufferToTexture(e->host);
+            framebuffer_probe(e, now);
+        }
     }
     return e->host;
 }
@@ -770,6 +783,19 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     uint32_t data = obj_field(va, 4), format = obj_field(va, 12), size = obj_field(va, 16);
     int i;
 
+    /* Memory the title rendered into as a bare surface: the host's drawing
+     * is the content (hle_d3d8_render_surface). First, even over frame-buffer
+     * memory: Forza borrows its idle front buffer as a 320x240 scratch target
+     * for its bloom, and the pass after reads it back as a texture of that
+     * shape. Taken for the title's own frame, that read got the screen, not
+     * the downsample. A match needs this exact memory, format and size drawn
+     * into as an offscreen surface, which a title reading its real frame
+     * (Future Perfect, XGRA) never does. */
+    {
+        IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
+        if (rs)
+            return rs;
+    }
     /* Before the ordinary lookup, because these are not identified by
      * their texels -- they have none of their own -- and because they
      * must be refreshed every frame, which a cache hit would skip. */
@@ -777,13 +803,6 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
         IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
         if (fb)
             return fb;
-    }
-    /* Memory the title rendered into as a bare surface: the host's drawing
-     * is the content (hle_d3d8_render_surface). */
-    {
-        IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
-        if (rs)
-            return rs;
     }
 
     for (i = 0; i < g_texture_count; i++) {

@@ -289,6 +289,10 @@ BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
 BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
+/* SetFileInformationByHandle, end-of-file only (what the kernel bridge uses). */
+typedef struct { LARGE_INTEGER EndOfFile; } FILE_END_OF_FILE_INFO;
+#define FileEndOfFileInfo 6
+BOOL   SetFileInformationByHandle(HANDLE h, int info_class, LPVOID info, DWORD size);
 BOOL   FlushFileBuffers(HANDLE h);
 
 /* SetFilePointerEx move methods, with their Win32 values. */

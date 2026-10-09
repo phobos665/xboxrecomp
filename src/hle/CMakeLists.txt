@@ -28,6 +28,7 @@ add_library(xbox_hle STATIC
     hle_input.c
     hle_xmv.c
     hle_xmv_play.c
+    hle_xapi_fiber.c
     input_model.c
     # The host pads behind the replaced XAPI input, through src/input's
     # bindings (SDL3 or XInput), plus RECOMP_FAKE_INPUT / RECOMP_INPUT_SEQ.

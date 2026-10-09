@@ -144,6 +144,8 @@ static unsigned long      g_shadow_map_big_sets, g_shadow_map_big_draws;   /* 25
  * alone (another method, or no vertex size). */
 static unsigned long      g_push_count, g_push_draws, g_push_other, g_push_nostride;
 static unsigned long      g_frame_draws;    /* draws since the last Swap */
+static int                g_target_is_screen = 1;   /* the bound target is the screen */
+static unsigned long      g_screen_changes;          /* draws and clears that reached it */
 static HWND               g_shadow_hwnd;
 static DWORD              g_shadow_create_thread;
 static DWORD              g_shadow_swap_thread;
@@ -1041,11 +1043,15 @@ static void shadow_read_declaration(int slot, uint32_t handle);
  * when the XDK writes its own again, which a new declaration makes it do. */
 void hle_d3d8_push_arrays_off(void);
 
+
 static void shadow_select_vertex_shader(uint32_t handle, uint32_t address)
 {
     int i;
 
     hle_d3d8_push_arrays_off();
+    if (shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] vertex shader 0x%08X (slot %u)\n",
+                g_shadow_swaps, handle, address);
     g_shadow_vs = handle;
     g_shadow_vs_is_program = (handle & 1) != 0;
     if (!g_shadow_vs_is_program) {
@@ -1541,7 +1547,17 @@ states:
     hle_d3d8_shadow_apply_states(g_shadow);
     hle_d3d8_sync_palettes(g_shadow);
     g_frame_draws++;
+    if (g_target_is_screen)
+        g_screen_changes++;
     return 1;
+}
+
+/* How many times the screen has been drawn into or cleared, ever. The
+ * texture layer refills a texture over the title's own frame when this has
+ * moved since its last copy (hle_d3d8_texture.c, framebuffer_texture). */
+unsigned long hle_d3d8_screen_changes(void)
+{
+    return g_screen_changes;
 }
 
 /* ------------------------------------------------------------ frame dumps */
@@ -2152,11 +2168,13 @@ HLE_EXPORT(D3DDevice_Clear)
                 done += n;
             }
         }
+        if (g_target_is_screen)
+            g_screen_changes++;
         g_shadow_clears++;
         g_shadow_last_color = color;
         if (shadow_trace_on())
-            fprintf(stderr, "[TRACE swap %lu] Clear flags 0x%X color 0x%08X\n",
-                    g_shadow_swaps, flags, color);
+            fprintf(stderr, "[TRACE swap %lu] (after %lu draws) Clear flags 0x%X color 0x%08X\n",
+                    g_shadow_swaps, g_frame_draws, flags, color);
     }
 }
 
@@ -2494,6 +2512,33 @@ static void frame_end_shadow(void)
 HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
+    /* D3DSWAP_BYPASSCOPY (0x2) without D3DSWAP_FINISH (0x4) is the first half
+     * of a frame, not a flip: the title finishes the image itself and then
+     * calls Swap(D3DSWAP_FINISH). Forza draws its world, swaps with BYPASSCOPY,
+     * builds the shown frame (bloom composite, HUD) and swaps with FINISH;
+     * presenting both halves showed the world and the finished frame on
+     * alternate refreshes, and gating both paced the race at two vblanks a
+     * frame. Future Perfect draws its whole frame inside the bypass Swap's own
+     * body and then finishes, which presents the same image as before. A
+     * bypass Swap that is not followed by a FINISH before the next one
+     * presents as it always did. */
+    static int bypass_pending;
+    uint32_t swap_flags = HLE_ARG(0);
+    int half = (swap_flags & 0x2u) && !(swap_flags & 0x4u) && !bypass_pending;
+
+    bypass_pending = half;
+    if (half) {
+        if (original_missing(hle_original_D3DDevice_Swap, "D3DDevice_Swap"))
+            HLE_RETURN(0x80004005u);
+#ifdef _WIN32
+        /* The frame so far, for the half that composites it. */
+        if (shadow_trace_on())
+            fprintf(stderr, "[TRACE swap %lu] (after %lu draws) Swap flags 0x%X: first half of a frame\n",
+                    g_shadow_swaps, g_frame_draws, swap_flags);
+#endif
+        HLE_CALL_ORIGINAL(D3DDevice_Swap);
+        return;
+    }
 
     /* Counted before anything else here runs, so RECOMP_FPS means the same
      * thing whatever is switched on below. */
@@ -3433,6 +3478,9 @@ static void inline_draw(void)
 
     if (!g_shadow || !n)
         return;
+    if (shadow_trace_on())
+        fprintf(stderr, "[TRACE swap %lu] inline draw: %u vertices, primitive %u, vertex shader 0x%08X\n",
+                g_shadow_swaps, n, g_inline_xpt, g_shadow_vs);
     if (g_shadow_vs_is_program) {
         inline_draw_program(n);
         return;
@@ -4276,13 +4324,20 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             } else {
                 kind = 2;
             }
-        } else if (is_swap_data(HLE_MEM32(rt + 4))) {
+        } else if (is_swap_data(HLE_MEM32(rt + 4)) &&
+                   w >= g_shadow_width && h >= g_shadow_height) {
             /* The surface's memory is a frame buffer, so this is the screen
              * even when the surface hangs off a texture the title made over
              * that memory (see g_swap_data). Measured on Future Perfect,
              * frame 900 of a capture: all 110 draws of its front end went to
              * a surface of texture 0x00563154, whose data is the frame
-             * buffer 0x00204000, and none to either swap surface. */
+             * buffer 0x00204000, and none to either swap surface.
+             *
+             * Only a surface the size of the screen, though. Forza borrows
+             * the idle front buffer (0x0211C000) as a 320x240 scratch target
+             * for its bloom downsample; taken for the screen, that pass and
+             * the next were drawn over the top-left of the frame, and the
+             * composite that reads the scratch back painted the race black. */
             kind = 0;
         } else if (depth_texture_of(rt)) {
             /* A colour surface over a depth texture's memory. Xbox titles
@@ -4341,8 +4396,8 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
             g_target_scratch++;
         }
         if (shadow_trace_on())
-            fprintf(stderr, "[TRACE swap %lu] SetRenderTarget 0x%08X data 0x%08X parent 0x%08X "
-                    "%ux%u zs 0x%08X -> %s\n", g_shadow_swaps, rt, HLE_MEM32(rt + 4),
+            fprintf(stderr, "[TRACE swap %lu] (after %lu draws) SetRenderTarget 0x%08X data 0x%08X parent 0x%08X "
+                    "%ux%u zs 0x%08X -> %s\n", g_shadow_swaps, g_frame_draws, rt, HLE_MEM32(rt + 4),
                     parent, w, h, zs,
                     kind == 0 ? "back buffer" : kind == 1 ? "render target texture"
                                   : kind == 3 ? "cube face" : "scratch target");
@@ -4479,6 +4534,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         g_target_shadow_map = 0;
     }
 
+    g_target_is_screen = kind == 0;
     if (FAILED(host_SetRenderTarget(g_shadow, kind == 0 ? NULL : target, level, face,
                                     depth))) {
         IDirect3DTexture8 *scratch = kind != 0 ? scratch_target(w, h) : NULL;
@@ -4641,6 +4697,86 @@ HLE_EXPORT(D3DDevice_EnableOverlay)
     }
 }
 
+#ifdef _WIN32
+/* A picture the title decoded itself, put on the overlay plane.
+ *
+ * The plane's picture came only from hle_xmv.c, which decodes XMV movies on
+ * the host. A title with its own decoder fills the surface and hands it to
+ * UpdateOverlay, and the scan-out shows that surface -- so it is what the
+ * plane has to show. Forza's attract video is Bink, decoded into a YUY2
+ * surface each frame, and its front end was black. A surface the XMV player
+ * already writes is its own movie and is left to it.
+ *
+ * A D3DSurface is Common, Data (physical), Lock, Format, Size, as in
+ * hle_xmv_play.c's write_surface; YUY2 is BT.601 studio range. */
+static void overlay_from_surface(uint32_t surface)
+{
+    static uint8_t *bgra;
+    static size_t cap;
+    static int logged;
+    uint32_t data, format, size, fmt, w, h, pitch, x, y;
+    const uint8_t *src;
+
+    if (!surface)
+        return;
+    data = HLE_MEM32(surface + 4);
+    format = HLE_MEM32(surface + 12);
+    size = HLE_MEM32(surface + 16);
+    fmt = (format >> 8) & 0xFFu;
+    w = (size & 0xFFFu) + 1u;
+    h = ((size >> 12) & 0xFFFu) + 1u;
+    pitch = (((size >> 24) & 0xFFu) + 1u) * 64u;
+    if (g_movie_phys && (data & 0x0FFFFFFFu) == g_movie_phys)
+        return;
+    if (logged < 2) {
+        logged++;
+        fprintf(stderr, "[HLE-D3D8] overlay surface 0x%08X: format 0x%02X %ux%u pitch %u, data "
+                "0x%08X, colour key %s 0x%08X -- %s\n", surface, fmt, w, h, pitch, data,
+                HLE_ARG(3) ? "on" : "off", HLE_ARG(4),
+                !size ? "swizzled, not shown"
+                : (fmt == 0x24u || fmt == 0x12u || fmt == 0x1Eu) ? "shown" : "a format not shown");
+    }
+    if (!size || !data || (fmt != 0x24u && fmt != 0x12u && fmt != 0x1Eu) ||
+        pitch < w * (fmt == 0x24u ? 2u : 4u) ||
+        (uint64_t)(data & 0x03FFFFFFu) + (uint64_t)pitch * h > 0x04000000u)
+        return;
+    if ((size_t)w * h * 4u > cap) {
+        free(bgra);
+        cap = (size_t)w * h * 4u;
+        bgra = (uint8_t *)malloc(cap);
+        if (!bgra) {
+            cap = 0;
+            return;
+        }
+    }
+    src = (const uint8_t *)HLE_PTR(0x80000000u | (data & 0x0FFFFFFFu));
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = src + (size_t)y * pitch;
+        uint8_t *out = bgra + (size_t)y * w * 4u;
+
+        if (fmt != 0x24u) {                       /* LIN_A8R8G8B8 / X8R8G8B8 */
+            memcpy(out, row, (size_t)w * 4u);
+            for (x = 0; x < w; x++)
+                out[x * 4u + 3u] = 0xFF;
+            continue;
+        }
+        for (x = 0; x < w; x++) {                 /* YUY2: Y0 U Y1 V */
+            const uint8_t *q = row + (x & ~1u) * 2u;
+            int c = 298 * ((int)q[(x & 1u) * 2u] - 16);
+            int d = (int)q[1] - 128, e = (int)q[3] - 128;
+            int r = (c + 409 * e + 128) >> 8;
+            int g = (c - 100 * d - 208 * e + 128) >> 8;
+            int b = (c + 516 * d + 128) >> 8;
+            out[x * 4u + 0u] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+            out[x * 4u + 1u] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+            out[x * 4u + 2u] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+            out[x * 4u + 3u] = 0xFF;
+        }
+    }
+    d3d8_movie_set_frame(bgra, w, h);
+}
+#endif
+
 /* void D3DDevice_UpdateOverlay(D3DSurface *pSurface, const RECT *SrcRect,
  *     const RECT *DstRect, BOOL EnableColorKey, D3DCOLOR ColorKey)          */
 HLE_EXPORT(D3DDevice_UpdateOverlay)
@@ -4650,6 +4786,10 @@ HLE_EXPORT(D3DDevice_UpdateOverlay)
     first_call(&seen, "D3DDevice_UpdateOverlay", HLE_ARG(0));
     if (original_missing(hle_original_D3DDevice_UpdateOverlay, "D3DDevice_UpdateOverlay"))
         HLE_RETURN(0u);
+#ifdef _WIN32
+    /* Before the body: it pops the arguments. */
+    overlay_from_surface(HLE_ARG(0));
+#endif
     HLE_CALL_ORIGINAL(D3DDevice_UpdateOverlay);
     /* A title that never calls EnableOverlay still means the plane to show
      * when it updates it; the XDK turns it on at the first update. */
