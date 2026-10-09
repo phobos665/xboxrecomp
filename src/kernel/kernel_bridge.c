@@ -2340,7 +2340,17 @@ static void bridge_MmSetAddressProtect(void)
     uint32_t addr = STACK_ARG(0);
     uint32_t size = STACK_ARG(1);
     uint32_t prot = STACK_ARG(2);
+    static int said;
 
+    /* Which pages a title protects, and how: a 4 KB protection on a POSIX
+     * host takes the whole 16 KB host page with it (see xbox_fault_route.c,
+     * RECOMP_FAULT_STATS), so this is the first thing to read when a profile
+     * fills with _sigtramp. The first 64 calls. */
+    if (said < 64) {
+        said++;
+        fprintf(stderr, "  [KERNEL] MmSetAddressProtect: 0x%08X..0x%08X protect 0x%X\n",
+                addr, addr + size, prot);
+    }
     xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
     g_eax = 0;
 }
@@ -8583,7 +8593,11 @@ static void bridge_NtProtectVirtualMemory(void)
     uint32_t size    = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
     DWORD old = 0;
 
+#ifdef _WIN32
     if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
+#else
+    if (w32_guest_protect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
+#endif
         if (old_ptr)
             BRIDGE_MEM32(old_ptr) = (uint32_t)old;
         g_eax = 0;  /* STATUS_SUCCESS */
