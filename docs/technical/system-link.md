@@ -19,7 +19,7 @@ added each way, and with 50 ms and 5% loss. Next is playing against xemu
 
 | Piece | Where | Switch |
 | --- | --- | --- |
-| The network card | `src/kernel/xbox_nic.c`, routed from `route_device_fault` in the title's `main.c`; interrupt from the kernel's timer thread | `RECOMP_SYSLINK=udp` |
+| The network card | `src/kernel/xbox_nic.c`, a fault range it registers itself (`recomp_fault_add_range`, routed by `xbox_fault_route.c`); interrupt from the kernel's timer thread | `RECOMP_SYSLINK=udp` |
 | A UDP tunnel in xemu's format | `src/kernel/xbox_net_udp.c` | `RECOMP_SYSLINK_REMOTE=host:port`, `RECOMP_SYSLINK_LOCAL=port`, `RECOMP_SYSLINK_DELAY_MS`, `RECOMP_SYSLINK_LOSS` |
 | Real Diffie-Hellman and triple DES in the kernel | `src/kernel/xbox_crypto_soft.c`, behind `XcModExp`, `XcKeyTable`, `XcBlockCrypt(CBC)`, `XcDESKeyParity`; checked by `tests/crypto_soft` | |
 | `XboxLANKey` from the player | `xbox_NetLanKey` in `xbox_nic.c` | `%APPDATA%\xboxrecomp\keys.ini` `lan_key = ...`, or `RECOMP_XBOX_LAN_KEY` |

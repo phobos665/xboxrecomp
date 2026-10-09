@@ -63,6 +63,7 @@
 #include <bcrypt.h>
 #include <dbghelp.h>
 #include "platform/mmio_decode.h"
+#include "platform/fault_emulate.h"   /* recomp_fault_add_range */
 #endif
 
 /* ---- the Ethernet address -------------------------------------------- */
@@ -827,6 +828,14 @@ static void untrap(const char *why)
     fflush(stderr);
 }
 
+/* The fault route's way in (xbox_fault_route.c). The page used to be routed
+ * by each title's main.c; since faults are routed by the runtime, a trapped
+ * device registers its own range. */
+static int nic_fault(recomp_fault *f, uint32_t va)
+{
+    return xbox_NicHandleMmio(f->ctx, va, f->is_write == 1);
+}
+
 void xbox_NicInit(void *host)
 {
     const char *trace = getenv("RECOMP_NIC_TRACE");
@@ -848,6 +857,9 @@ void xbox_NicInit(void *host)
     InitializeCriticalSection(&s_nic.lock);
     s_nic.budget = (budget && *budget) ? strtol(budget, NULL, 0) : 2000;
     memcpy(s_nic.reg, host, XBOX_NIC_SIZE);
+    /* Before the page is trapped, so no access to it ever goes unrouted. */
+    recomp_fault_add_range(XBOX_NIC_BASE, XBOX_NIC_BASE + XBOX_NIC_SIZE, 0,
+                           nic_fault, "NIC registers");
     if (!VirtualProtect(host, XBOX_NIC_SIZE, PAGE_NOACCESS, &old)) {
         fprintf(stderr, "[NIC] cannot trap 0x%08X (error %lu); no card\n",
                 XBOX_NIC_BASE, GetLastError());
