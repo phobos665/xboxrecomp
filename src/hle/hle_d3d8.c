@@ -2050,6 +2050,16 @@ static int original_missing(void (*fn)(void), const char *name)
     return 1;
 }
 
+/* Whether the title's Direct3D is an LTCG build, which inlines the small
+ * device calls at their uses: known from CreateDevice, which such a build
+ * enters through a register-argument thunk (g_hle_ltcg_nargs). */
+static int g_title_ltcg;
+
+int hle_d3d8_title_ltcg(void)
+{
+    return g_title_ltcg;
+}
+
 /* HRESULT Direct3D_CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType,
  *     HWND hFocusWindow, DWORD BehaviorFlags,
  *     D3DPRESENT_PARAMETERS *pPresentationParameters,
@@ -2067,6 +2077,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
     if (original_missing(hle_original_Direct3D_CreateDevice, "Direct3D_CreateDevice"))
         HLE_RETURN(0x80004005u);                 /* E_FAIL */
     g_in_create_device = 1;
+    g_title_ltcg = g_hle_ltcg_nargs != 0;
     /* Before the original, not after: some XDKs wait on the fence inside
      * CreateDevice itself. XGRA's (5558) calls D3D_KickOffAndWaitForIdle
      * there and spun in D3D_BlockOnTime before the device was ever returned.
