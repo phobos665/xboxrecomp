@@ -1609,7 +1609,8 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
 
     tex->image = rhi_image_create(&td, NULL);
     if (!tex->image) {
-        fprintf(stderr, "D3D8: CreateTexture2D failed (fmt=%d %ux%u)\n", Format, Width, Height);
+        fprintf(stderr, "D3D8: CreateTexture2D failed (fmt=%d %ux%u, %u level(s), usage 0x%X)\n",
+                Format, Width, Height, tex->levels, (unsigned)Usage);
         free(tex->sys_mem);
         free(tex);
         return E_FAIL;

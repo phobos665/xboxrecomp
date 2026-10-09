@@ -777,6 +777,18 @@ static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va
 static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
                                                unsigned long now);
 
+/* Whether a texture over frame-buffer memory can be the title reading its
+ * screen. A frame buffer is linear and uncompressed, so a swizzled or DXT
+ * texture there is a texture of its own: memory once a frame buffer, freed
+ * and reused. Max Payne frees its frame buffers for each movie and display
+ * mode, and its graphic novel pages (DXT1 1024x512) land on the old ones;
+ * taken for the screen, each bind asked the host for a DXT1 render target,
+ * which it cannot make. */
+static int can_be_screen(const texture_layout *t)
+{
+    return t->linear && !d3d8_format_is_compressed((D3DFORMAT)t->fmt);
+}
+
 static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
 {
     unsigned long now = hle_d3d8_shadow_swaps();
@@ -801,7 +813,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     /* Before the ordinary lookup, because these are not identified by
      * their texels -- they have none of their own -- and because they
      * must be refreshed every frame, which a cache hit would skip. */
-    if (hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) && read_layout(va, &t)) {
+    if (hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) && read_layout(va, &t) &&
+        can_be_screen(&t)) {
         IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
         if (fb)
             return fb;
@@ -854,7 +867,7 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     /* The title's own frame, bound as a texture. Nothing drew those texels on
      * the guest side, so they are zeros; the host's frame goes in instead, and
      * the entry is marked so the zeros never overwrite it. */
-    if (hle_d3d8_is_framebuffer(t.phys)) {
+    if (hle_d3d8_is_framebuffer(t.phys) && can_be_screen(&t)) {
         IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t);
         if (fb)
             return fb;

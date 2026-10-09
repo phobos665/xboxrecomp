@@ -631,9 +631,16 @@ static int is_swap_data(uint32_t data)
  * that samples what the GPU just drew; here nothing draws on the guest side,
  * so those texels are zeros and the effect blends black over the picture.
  * Recognising the address is what lets the texture layer fill it from the
- * host's own frame instead. There are two, flipped between. */
-static uint32_t g_framebuffer_phys[4];
-static int      g_framebuffer_count;
+ * host's own frame instead. There are two, flipped between.
+ *
+ * The most recent FRAMEBUFFER_SLOTS are kept, not the first ones: a title
+ * that changes display mode gets new frame buffers each time (Max Payne:
+ * four addresses by its first level, through the movie, the 16-bit graphic
+ * novel and the game), and with the first four kept for good a later frame
+ * buffer was never recognised. Only the first few are logged. */
+#define FRAMEBUFFER_SLOTS 8
+static uint32_t g_framebuffer_phys[FRAMEBUFFER_SLOTS];
+static int      g_framebuffer_count, g_framebuffer_next, g_framebuffer_logged;
 
 static void note_framebuffer_phys(uint32_t data)
 {
@@ -645,8 +652,11 @@ static void note_framebuffer_phys(uint32_t data)
     for (i = 0; i < g_framebuffer_count; i++)
         if (g_framebuffer_phys[i] == phys)
             return;
-    if (g_framebuffer_count < 4) {
-        g_framebuffer_phys[g_framebuffer_count++] = phys;
+    g_framebuffer_phys[g_framebuffer_next] = phys;
+    g_framebuffer_next = (g_framebuffer_next + 1) % FRAMEBUFFER_SLOTS;
+    if (g_framebuffer_count < FRAMEBUFFER_SLOTS)
+        g_framebuffer_count++;
+    if (g_framebuffer_logged++ < 8) {
         fprintf(stderr, "[HLE-D3D8] frame buffer at physical 0x%08X; a texture"
                 " whose texels live there is the title reading its own screen\n", phys);
         fflush(stderr);
