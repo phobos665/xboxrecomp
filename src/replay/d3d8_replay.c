@@ -1275,8 +1275,26 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
-        r->dev->lpVtbl->SetTextureStageState(r->dev, p->stage,
-                                             (D3DTEXTURESTAGESTATETYPE)p->type, p->value);
+        {
+            /* RECOMP_REPLAY_TSS=<type>=<value>: hold one stage state at a value
+             * on every stage (16/17/18 are MAG/MIN/MIPFILTER), and print what
+             * the frame asked for, the first few times. */
+            static int have = -1;
+            static unsigned long ft, fv, said;
+            uint32_t value = p->value;
+            if (have < 0) {
+                const char *e = getenv("RECOMP_REPLAY_TSS");
+                have = e && sscanf(e, "%lu=%lu", &ft, &fv) == 2;
+            }
+            if (have && p->type == ft) {
+                if (said++ < 8)
+                    fprintf(stderr, "[replay] stage %u state %u was %u, held at %lu\n",
+                            p->stage, p->type, p->value, fv);
+                value = (uint32_t)fv;
+            }
+            r->dev->lpVtbl->SetTextureStageState(r->dev, p->stage,
+                                                 (D3DTEXTURESTAGESTATETYPE)p->type, value);
+        }
         break;
     }
     case D3D8CAP_TRANSFORM: {

@@ -812,6 +812,29 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
             break;
         }
     }
+    /* RECOMP_HLE_D3D8_TEX_PROBE=<w>x<h>: every lookup of a texture that size,
+     * with where its texels are and whether any are non-zero. */
+    {
+        static int pw = -1, ph;
+        if (pw < 0) {
+            const char *v = getenv("RECOMP_HLE_D3D8_TEX_PROBE");
+            pw = 0;
+            if (v) sscanf(v, "%dx%d", &pw, &ph);
+        }
+        if (pw > 0 && read_layout(va, &t) && (int)t.width == pw && (int)t.height == ph) {
+            static unsigned long said;
+            const uint8_t *px = (const uint8_t *)HLE_PTR(CONTIG_BASE + t.phys);
+            uint32_t k, nz = 0;
+            for (k = 0; k < t.bytes; k++)
+                nz += px[k] != 0;
+            if (said++ < 40)
+                fprintf(stderr, "[TEX-PROBE] swap %lu va 0x%08X data 0x%08X phys 0x%08X "
+                        "fmt 0x%02X %s pitch %u: %u of %u bytes non-zero, sum 0x%08X%s%s\n",
+                        now, va, data, t.phys, t.fmt, t.linear ? "linear" : "swizzled",
+                        t.guest_pitch, nz, t.bytes, level0_checksum(&t),
+                        e ? " (cached)" : " (new)", e && e->rendered ? " rendered" : "");
+        }
+    }
     if (e) {
         e->used_swap = now;
         /* RECOMP_HLE_D3D8_TEX_EVERY_BIND=1: check the texels at every bind,
