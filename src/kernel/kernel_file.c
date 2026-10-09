@@ -417,8 +417,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
-        volume_handle_forget(Handle);
-        xbox_dir_context_drop(Handle);
+        xbox_file_handle_closing(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -848,6 +847,12 @@ void xbox_dir_context_drop(HANDLE FileHandle)
     LeaveCriticalSection(&s_dir_cs);
 }
 
+void xbox_file_handle_closing(HANDLE FileHandle)
+{
+    volume_handle_forget(FileHandle);
+    xbox_dir_context_drop(FileHandle);
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -1188,6 +1193,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_file_handle_closing(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1416,6 +1422,34 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* The POSIX twin of the Windows drop above. A search the title abandons
+ * part-way kept its DIR* open and its slot taken until it ran to the end,
+ * and host handle values are reused, so the next directory opened at the
+ * same value carried on the old enumeration -- and 64 abandoned searches
+ * filled the table for good. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init || !FileHandle)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == FileHandle) {
+            if (s_dir_contexts[i].dir)
+                closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
+/* No partition-volume records on this host (those are the Windows
+ * backend's); the directory search is all there is to release. */
+void xbox_file_handle_closing(HANDLE FileHandle)
+{
+    xbox_dir_context_drop(FileHandle);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,

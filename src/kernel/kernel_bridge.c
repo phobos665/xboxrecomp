@@ -659,9 +659,12 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
-#ifdef _WIN32
-            xbox_dir_context_drop(h);
-#endif
+            /* Closed here rather than through xbox_NtClose, so the file
+             * layer's per-handle state is released here too: an abandoned
+             * directory search, and on Windows the volume record, would
+             * otherwise outlive the handle and answer for the next one
+             * opened at the same value. */
+            xbox_file_handle_closing(h);
             CloseHandle(h);
         }
     }
