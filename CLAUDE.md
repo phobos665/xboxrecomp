@@ -280,6 +280,12 @@ touching it:
 - **Changes that alter Windows behaviour** (lifter output, shared HLE, shared HLSL) need a
   Windows regression of TS2 and BLiNX before `main`.
 
+**Android (plan, Oct 2026): `docs/technical/android-port.md`.** Per-title APKs for the AYN Thor
+and KONKR Pocket FIT, built on a desktop and installed with `adb`. Desktop Linux comes first:
+the Vulkan RHI has no window surface off Windows and macOS (`surface_ext()` in
+`rhi_vulkan.c`), and POSIX file opens are case-sensitive, which macOS's case-insensitive
+disk has been hiding.
+
 ---
 
 ## Planned changes, in dependency order

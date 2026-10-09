@@ -626,6 +626,10 @@ and already scoped in the build system.
 
 ### Android: the renderer is maybe a third of it
 
+> **Superseded (Oct 2026) by `android-port.md`.** The macOS port retired two of
+> the three blockers below: lifted code runs correctly on arm64, and the x87
+> stack is double-backed, so `long double` width never enters.
+
 The host is ARM64, so **the recompiled x86 code itself has to compile and run
 there**, and that is a bigger question than the graphics API.
 
@@ -731,7 +735,7 @@ the F9 overlay (it is GDI today), F11 capture, the flip gate. Join with phase 1
 for Linux. *Pass: TimeSplitters 2 plays on Vulkan on Windows within measuring
 distance of D3D11, and plays on Linux.*
 
-**Phase 7 — Android, and the two items that are not the renderer.** The lifted
+**Phase 7 — Android, and the two items that are not the renderer.** *(Superseded by `android-port.md`.)* The lifted
 output is already portable (§6.5). What is not settled is CLAUDE.md's item #2
 (register model) and item #3 (x87 policy), and both bake into generated code,
 so if Android is the destination they belong *before* phases 2-5, not after —
