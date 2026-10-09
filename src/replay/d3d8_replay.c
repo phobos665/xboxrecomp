@@ -1133,8 +1133,11 @@ static void do_draw_up(Replay *r, const D3D8CapChunk *c)
             for (v = 0; v < nv; v++) {
                 const float *fv = (const float *)((const uint8_t *)verts + (size_t)v * d->stride);
                 fprintf(stderr, "[draw %4ld]   vertex %u:", g_draw_index - 1, v);
-                for (uint32_t k = 0; k < n && k < 10; k++)
-                    fprintf(stderr, " %g", fv[k]);
+                /* RECOMP_REPLAY_VERTEX_ALL=1: every float, not the first ten
+                 * (a register-layout vertex is 64). */
+                uint32_t most = getenv("RECOMP_REPLAY_VERTEX_ALL") ? n : 10u;
+                for (uint32_t k = 0; k < n && k < most; k++)
+                    fprintf(stderr, "%s%g", most > 10u && k && k % 4u == 0 ? " |" : " ", fv[k]);
                 fprintf(stderr, "\n");
             }
         }

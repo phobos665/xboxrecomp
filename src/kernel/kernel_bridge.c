@@ -1612,6 +1612,19 @@ static volatile LONG *bridge_guest_event(uint32_t va, int *sync)
 {
     uint8_t type;
 
+    /* An event in contiguous memory, at XBOX_CONTIG_BASE + its physical
+     * address: the same RAM, seen through the window. Halo 2 keeps the
+     * completion events of its DirectSound stream packets there; read as a
+     * handle, the address reached the host's SetEvent and faulted. */
+    if (va >= XBOX_CONTIG_BASE + 0x00010000u &&
+        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - 8u) {
+        type = *(volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
+        if (type != GUEST_EVENT_NOTIFICATION && type != GUEST_EVENT_SYNCHRONIZATION)
+            return NULL;
+        if (sync)
+            *sync = (type == GUEST_EVENT_SYNCHRONIZATION);
+        return (volatile LONG *)((uintptr_t)va + 4u + g_xbox_mem_offset);
+    }
     if (va < 0x00010000u || va >= GUEST_RAM_END - 8u)
         return NULL;
     type = *(volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
@@ -3695,6 +3708,21 @@ static HANDLE bridge_take_handle(uint32_t token)
  * file that is handed a guest HANDLE: a DirectSound stream packet's completion
  * event (src/hle/hle_dsound_stream.c). Same rule as the bridges: a tagged token
  * goes through the table, anything else passes through unchanged. */
+/* For the HLE: set a dispatcher object the title built in its own memory
+ * (a KEVENT, which KeSetEvent sets in place), if `va` is one. 1 when it was;
+ * 0 means `va` is a handle, to resolve with xbox_bridge_resolve_handle. A
+ * packet's hCompletionEvent may be either. */
+int xbox_bridge_set_guest_event(uint32_t va)
+{
+    volatile LONG *state = bridge_guest_event(va, NULL);
+
+    if (!state)
+        return 0;
+    InterlockedExchange(state, 1);
+    event_wake_waiters(va);
+    return 1;
+}
+
 void *xbox_bridge_resolve_handle(uint32_t token)
 {
     return (void *)bridge_resolve_handle(token);

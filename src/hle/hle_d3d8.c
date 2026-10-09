@@ -1698,8 +1698,52 @@ int hle_d3d8_dump_back_buffer(const char *path)
     return dump_back_buffer(path);
 }
 
+/* RECOMP_RAM_DUMP=<prefix> with RECOMP_RAM_DUMP_SWAPS=<n>[,<n>...]: guest
+ * RAM, 0 to the end of title memory, written to <prefix>_<swap>.bin at those
+ * swaps. For finding a structure by what changed between two moments of a
+ * run -- a string the title typed, a counter that moved -- when nothing yet
+ * says where it lives. */
+static void ram_dump_at_swap(void)
+{
+    static int parsed;
+    static unsigned long want[16];
+    static int nwant;
+    const char *prefix = getenv("RECOMP_RAM_DUMP");
+    int i;
+
+    if (!prefix || !*prefix)
+        return;
+    if (!parsed) {
+        const char *e = getenv("RECOMP_RAM_DUMP_SWAPS");
+        parsed = 1;
+        while (e && *e && nwant < 16) {
+            char *end;
+            want[nwant] = strtoul(e, &end, 0);
+            if (end == e)
+                break;
+            nwant++;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+    for (i = 0; i < nwant; i++) {
+        if (want[i] == g_shadow_swaps) {
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s_%lu.bin", prefix, g_shadow_swaps);
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(HLE_PTR(0), 1, g_xbox_total_ram, f);
+                fclose(f);
+                fprintf(stderr, "[RAM-DUMP] swap %lu: %lu bytes to %s\n", g_shadow_swaps,
+                        (unsigned long)g_xbox_total_ram, path);
+            }
+        }
+    }
+}
+
 static void shadow_dump_frame(void)
 {
+    ram_dump_at_swap();
     static const char *prefix;
     static int configured, every = 300, written, keep_last;
     static unsigned long min_draws, last_dump, from_swap;
@@ -4258,6 +4302,14 @@ static IDirect3DSurface8 *depth_texture_surface(uint32_t texture_va)
     return cache[i].surface;
 }
 
+static int nodepth_zscale_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_NODEPTH_ZSCALE", 1);
+    return on;
+}
+
 static int share_device_depth_on(void)
 {
     static int on = -1;
@@ -4530,7 +4582,23 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
         g_target_shadow_map = depth && depth_texture_of(zs) && zw == w && zh == h &&
                               shadow_maps_on() && kind != 0;
     } else {
+        /* No depth surface: Z decides nothing but clipping, and the scale
+         * is the device depth's. A program that writes the XDK's reserved
+         * viewport constants gets them from this same scale
+         * (shadow_viewport_constants), so the two agree whatever it is; a
+         * title that keeps its own screen transform wrote it for the depth
+         * buffer it has. Halo 2's interface programs scale Z by 2^24-1
+         * (c10) and draw with no depth bound; undone at a scale of 1, every
+         * glyph of its menus came out 8 million deep and was clipped, so
+         * the main menu showed nothing but its darkened background.
+         * RECOMP_HLE_D3D8_NODEPTH_ZSCALE=0 for the old scale of 1. */
         g_z_scale = 1.0f;
+        if (g_autodepth_va && nodepth_zscale_on()) {
+            UINT aw, ah;
+            uint32_t afmt = 0;
+            surface_measure(g_autodepth_va, &aw, &ah, &afmt);
+            g_z_scale = xbox_depth_z_scale(afmt);
+        }
         g_target_shadow_map = 0;
     }
 
