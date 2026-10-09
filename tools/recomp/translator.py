@@ -952,17 +952,35 @@ class FunctionTranslator:
     def _read_local_jump_table(self, table_va, lower, upper,
                                max_entries=256):
         """Read the contiguous pointer cluster around an indexed-jump base."""
+        def read(entry_va):
+            offset = va_to_file_offset(entry_va)
+            if offset is None or offset + 4 > len(self.xbe_data):
+                return None
+            return struct.unpack_from('<I', self.xbe_data, offset)[0]
+
         def scan(step, first):
             targets = []
-            for index in range(first, max_entries + first):
-                entry_va = table_va + step * index * 4
-                offset = va_to_file_offset(entry_va)
-                if offset is None or offset + 4 > len(self.xbe_data):
+            index = first
+            while index < max_entries + first:
+                target = read(table_va + step * index * 4)
+                if target is None:
                     break
-                target = struct.unpack_from('<I', self.xbe_data, offset)[0]
+                if target == 0 and step > 0 and targets:
+                    # A hole (a case that cannot happen), as in
+                    # DisasmEngine.resync_jump_tables: step over up to three
+                    # zeros when a real entry follows.
+                    run = 1
+                    while run <= 3 and read(table_va + (index + run) * 4) == 0:
+                        run += 1
+                    nxt = read(table_va + (index + run) * 4) if run <= 3 else None
+                    if nxt is not None and lower <= nxt < upper:
+                        index += run
+                        continue
+                    break
                 if not (lower <= target < upper):
                     break
                 targets.append(target)
+                index += 1
             return targets
 
         backward = scan(-1, 1)

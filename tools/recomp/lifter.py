@@ -2890,14 +2890,35 @@ class Lifter:
         if offset is None:
             return []
         targets = []
-        for i in range(max_entries):
-            o = offset + i * 4
+
+        def word(k):
+            o = offset + k * 4
             if o + 4 > len(self.xbe_data):
+                return None
+            return struct.unpack_from('<I', self.xbe_data, o)[0]
+
+        i = 0
+        while i < max_entries:
+            val = word(i)
+            if val is None:
                 break
-            val = struct.unpack_from('<I', self.xbe_data, o)[0]
+            if val == 0 and targets:
+                # A hole -- a case value that cannot happen -- with real
+                # entries after it (Halo 2's sub_00216A50: four cases, two
+                # zeros, three more). Same rule as the disassembler's
+                # resync_jump_tables: up to three zeros, then a code address.
+                run = 1
+                while run <= 3 and word(i + run) == 0:
+                    run += 1
+                nxt = word(i + run) if run <= 3 else None
+                if nxt is not None and is_code_address(nxt):
+                    i += run
+                    continue
+                break
             if not is_code_address(val):
                 break
             targets.append(val)
+            i += 1
 
         # The displacement names index 0, which is not always the first entry.
         #
