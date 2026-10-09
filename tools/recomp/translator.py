@@ -226,6 +226,12 @@ def write_if_changed(path, text):
     return True
 
 
+def _is_safe_icall(line):
+    return any(name + "(" in line for name in (
+        "RECOMP_ICALL_SAFE", "RECOMP_ICALL_SAFE_AT",
+        "RECOMP_ICALL_SAFE_CC", "RECOMP_ICALL_SAFE_AT_CC"))
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -291,7 +297,7 @@ def _fixup_icall_esp_save(lines):
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
     for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             icall_indices.append(i)
 
     if not icall_indices:
@@ -365,9 +371,17 @@ def _fixup_icall_esp_save(lines):
         # call put esp 32 bytes high, which its caller's epilogue then popped
         # esi from -- handing the caller a corrupt `this` several frames from
         # anything that looked wrong.
-        caller_cleans = False
+        #
+        # The lifter already knows the answer when it saw the guest's own
+        # `add esp, imm` straight after the call, and says so with the _CC
+        # form of the macro. That is the reliable signal: the generated C
+        # for that add can open with flag-snapshot lines, which the textual
+        # probe below stops at, so on its own it missed exactly the cdecl
+        # sites whose flags are read later (sp00nznet/xboxrecomp#169).
+        caller_cleans = ("RECOMP_ICALL_SAFE_CC(" in lines[icall_idx]
+                         or "RECOMP_ICALL_SAFE_AT_CC(" in lines[icall_idx])
         k = icall_idx + 1
-        while k < len(lines) and k <= icall_idx + 6:
+        while not caller_cleans and k < len(lines) and k <= icall_idx + 6:
             probe = lines[k].strip()
             if not probe or re.match(r'^loc_[0-9A-Fa-f]+:', probe):
                 k += 1
@@ -385,7 +399,7 @@ def _fixup_icall_esp_save(lines):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
         result.append(line)
-        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
+        if _is_safe_icall(line):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
@@ -1225,6 +1239,22 @@ class FunctionTranslator:
             extra_leaders=switch_leaders if switch_leaders else None)
         if not blocks:
             return None
+
+        # Calls the guest caller cleans up after itself: the instruction
+        # immediately after the call is `add esp, imm`. Classified on the
+        # decoded guest instructions, not the generated C, because the C for
+        # that add can open with flag snapshots that hide it. The lifter then
+        # emits the _CC dispatch macro, whose failure path pops only the
+        # return address and leaves the arguments for the caller's own add.
+        self.lifter.caller_cleanup_sites = {
+            call.address for call, following in zip(instructions, instructions[1:])
+            if call.is_call and call.end_address == following.address
+            and following.mnemonic == "add" and len(following.operands) == 2
+            and following.operands[0].type == "reg"
+            and following.operands[0].reg == "esp"
+            and following.operands[1].type == "imm"
+            and following.operands[1].imm > 0
+        }
 
         # Get classification and ABI info
         cls_info = self.classification_db.get(start, {})
