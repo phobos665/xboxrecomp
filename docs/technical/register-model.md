@@ -10,6 +10,13 @@ When you statically recompile x86 machine code to C, you need to preserve this s
 
 ## Register Categories
 
+**Storage (Oct 2026).** The declarations below show what each name means, not how it is
+stored. Every register is per guest thread, and they are all fields of one thread-local
+struct, `g_cpu` (`templates/runtime/recomp_cpu.h`), with the old names as macros over
+the fields (`#define g_eax (g_cpu.r_eax)`). On macOS each separate thread-local cost a
+`_tlv_get_addr` call per register per function; one struct costs one. Generated code is
+unchanged, and nothing else may redeclare a register: include the runtime header.
+
 ### Volatile Registers (Caller-Saved)
 
 These registers can be freely clobbered by any function call. The caller must save them if it needs their values after a call.

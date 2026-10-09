@@ -24,9 +24,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "../kernel/xbox_memory_layout.h"   /* RECOMP_TLS */
+#include "../kernel/xbox_memory_layout.h"   /* the guest registers (g_cpu) */
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* Marks an implementation, and names it hle_<name>. */

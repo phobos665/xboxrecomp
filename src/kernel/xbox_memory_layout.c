@@ -36,6 +36,7 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
+#include <time.h>     /* clock_gettime(CLOCK_THREAD_CPUTIME_ID), RECOMP_NV2A_ACK_STATS */
 #endif
 #ifdef __APPLE__
 #include <pthread.h>  /* pthread_set_qos_class_self_np (RECOMP_GUEST_ONE_CPU) */
@@ -2248,54 +2249,169 @@ static void framebuffer_probe_tick(void)
  * thread of the same priority is waiting, so the thread spun a whole host
  * core for the life of the process (OutRun 2: 172 s of CPU in a 180 s run)
  * -- on a laptop that is power and thermal headroom the guest's own core
- * needs. A guest waiting on one of these words is spinning on another core,
- * so while words keep changing the thread still goes round at full speed;
- * once nothing has changed for a millisecond it waits on a high-resolution
- * timer between passes instead (RECOMP_NV2A_ACK_IDLE_US, default 500; 0 for
- * the old spin). The cost is that the first wait after a quiet spell -- the
- * first kickoff after a vblank wait, say -- can be answered up to that much
- * later. */
+ * needs. A guest waiting on one of these words is spinning on another core.
+ *
+ * Idle: once nothing has changed for a millisecond the thread waits on a
+ * timer between passes (RECOMP_NV2A_ACK_IDLE_US, default 500 on Windows and
+ * 100 elsewhere, see ACK_IDLE_US_DEFAULT; 0 for the old
+ * spin). The cost is that the first wait after a quiet spell -- the first
+ * kickoff after a vblank wait, say -- can be answered up to that much later.
+ * The wait is the coarse one: on macOS the precise wait spins its last
+ * 200 us, which bought nothing here.
+ *
+ * Busy: while words keep changing, the thread yields between passes, and
+ * after ACK_BUSY_YIELDS passes in a row that changed nothing it sleeps
+ * RECOMP_NV2A_ACK_BUSY_US between them instead (0, the old spin, keeps
+ * yielding for the whole millisecond). Every change found resets the count,
+ * so a burst of guest work -- a kickoff, then a fence wait on it -- is still
+ * answered by yielding passes; what the sleep can delay is the first change
+ * after a run of passes that found none. Without a high-resolution timer the
+ * busy phase spins as before. RECOMP_NV2A_ACK_STATS=1 prints, every ten
+ * seconds, this thread's CPU time and how many changes a pass found right
+ * after a sleep (each of those may have waited for the sleep to end).
+ *
+ * Why the busy backoff is off by default. TimeSplitters 2 in its level on an
+ * M4, quiet machine, back-to-back runs (Oct 2026): with the old spin this
+ * thread used 21% of a core, with RECOMP_NV2A_ACK_BUSY_US=50 1.7%, and
+ * D3D_BlockOnTime -- the fence wait -- never waited in either (63 calls a
+ * second, ~7 us a second in total, none over 20 us); frame rate, "title's
+ * Swap" and "rest of frame" stayed within 0.1 ms. But ~170 changes a second
+ * were found right after a sleep, and a title that waits on the FIFO's GET
+ * or on a fence more often than TimeSplitters 2 does (Burnout 2 and OutRun 2
+ * pace on the fence) would wait out the sleep each time. Turn it on after
+ * those have been measured. */
+#define ACK_BUSY_YIELDS 8
+#ifndef ACK_BUSY_US_DEFAULT
+#define ACK_BUSY_US_DEFAULT 0
+#endif
+
+/* The idle wait, RECOMP_NV2A_ACK_IDLE_US. On POSIX it is a plain sleep
+ * (host_timer_wait_us_coarse), which oversleeps, and a guest thread waiting
+ * on the ack spins for as long as the ack thread is asleep. TimeSplitters 2
+ * in its level on an M4, uncapped (Oct 2026), guest main-thread CPU per
+ * frame: 2.67-2.86 ms on main (the precise 500 us wait), 3.00-3.04 ms with
+ * the coarse 500 us wait, 2.31-2.35 ms with a coarse 100 us wait. Windows
+ * keeps the precise high-resolution wait, and its 500. */
+#ifndef ACK_IDLE_US_DEFAULT
+#  ifdef _WIN32
+#    define ACK_IDLE_US_DEFAULT 500
+#  else
+#    define ACK_IDLE_US_DEFAULT 100
+#  endif
+#endif
+
+/* This thread's CPU time, for RECOMP_NV2A_ACK_STATS. */
+static int64_t ack_thread_cpu_ns(void)
+{
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
+        return 0;
+    return ((int64_t)(((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+            (int64_t)(((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return 0;
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+#endif
+}
+
 static void nv2a_ack_wait(void)
 {
-    static int        idle_us = -1;
+    enum { ACK_YIELDED, ACK_SLEPT_BUSY, ACK_SLEPT_IDLE };
+    static int        idle_us = -1, busy_us, stats;
     static host_timer *timer;
     static LONG       seen;
     static LONGLONG   quiet_since, qpf;
+    static int        busy_quiet_passes, last_wait = ACK_YIELDED;
+    static struct {
+        int64_t  since_ns, cpu_ns;
+        uint32_t passes, yields, busy_sleeps, idle_sleeps;
+        uint32_t found_after_busy, found_after_idle;
+    } st;
     LARGE_INTEGER     now;
 
     if (idle_us < 0) {
         const char *v = getenv("RECOMP_NV2A_ACK_IDLE_US");
+        const char *b = getenv("RECOMP_NV2A_ACK_BUSY_US");
+        const char *s = getenv("RECOMP_NV2A_ACK_STATS");
         LARGE_INTEGER f;
 
-        idle_us = v ? atoi(v) : 500;
+        idle_us = v ? atoi(v) : ACK_IDLE_US_DEFAULT;
         if (idle_us < 0)
             idle_us = 0;
-        if (idle_us) {
+        busy_us = b ? atoi(b) : ACK_BUSY_US_DEFAULT;
+        if (busy_us < 0)
+            busy_us = 0;
+        stats = s && *s && *s != '0';
+        if (idle_us || busy_us) {
             timer = host_timer_create(HOST_TIMER_ANY);
             if (!timer)
-                idle_us = 0;
+                idle_us = busy_us = 0;
+            else if (!host_timer_high_res(timer))
+                busy_us = 0;    /* a scheduler-tick sleep is no backoff */
         }
         QueryPerformanceFrequency(&f);
         qpf = f.QuadPart;
-        fprintf(stderr, "  NV2A busy-bit ack: %s\n",
+        fprintf(stderr, "  NV2A busy-bit ack: %s; %s\n",
                 idle_us ? "waits between passes once idle (RECOMP_NV2A_ACK_IDLE_US)"
-                        : "spins (RECOMP_NV2A_ACK_IDLE_US=0)");
-    }
-    if (!idle_us) {
-        Sleep(0);
-        return;
+                        : "spins when idle (RECOMP_NV2A_ACK_IDLE_US=0)",
+                busy_us ? "backs off when busy (RECOMP_NV2A_ACK_BUSY_US)"
+                        : "yields when busy (RECOMP_NV2A_ACK_BUSY_US=0)");
+        st.since_ns = host_time_ns();
+        st.cpu_ns = ack_thread_cpu_ns();
     }
     QueryPerformanceCounter(&now);
     if (g_ack_activity != seen) {
         seen = g_ack_activity;
         quiet_since = now.QuadPart;
+        busy_quiet_passes = 0;
+        if (last_wait == ACK_SLEPT_BUSY)
+            st.found_after_busy++;
+        else if (last_wait == ACK_SLEPT_IDLE)
+            st.found_after_idle++;
+    }
+    if (stats) {
+        int64_t t = host_time_ns();
+
+        st.passes++;
+        if (t - st.since_ns >= 10000000000LL) {
+            int64_t cpu = ack_thread_cpu_ns();
+            fprintf(stderr, "[NV2A-ACK] last %.1f s: thread CPU %.0f ms, %u passes "
+                    "(%u yields, %u busy sleeps, %u idle sleeps); changes found "
+                    "right after a busy sleep %u, after an idle sleep %u\n",
+                    (double)(t - st.since_ns) / 1e9, (double)(cpu - st.cpu_ns) / 1e6,
+                    st.passes, st.yields, st.busy_sleeps, st.idle_sleeps,
+                    st.found_after_busy, st.found_after_idle);
+            memset(&st, 0, sizeof st);
+            st.since_ns = t;
+            st.cpu_ns = cpu;
+        }
     }
     if (now.QuadPart - quiet_since < qpf / 1000) {
-        Sleep(0);   /* busy: a waiter is spinning on another core */
+        /* Busy: a waiter may be spinning on another core. */
+        if (busy_us && ++busy_quiet_passes > ACK_BUSY_YIELDS
+                && host_timer_wait_us_coarse(timer, busy_us, 50) != HOST_WAIT_NOT_ARMED) {
+            last_wait = ACK_SLEPT_BUSY;
+            st.busy_sleeps++;
+            return;
+        }
+        Sleep(0);
+        last_wait = ACK_YIELDED;
+        st.yields++;
         return;
     }
-    if (host_timer_wait_us(timer, idle_us, 50) == HOST_WAIT_NOT_ARMED)
+    if (!idle_us) {
+        Sleep(0);
+        last_wait = ACK_YIELDED;
+        st.yields++;
+        return;
+    }
+    if (host_timer_wait_us_coarse(timer, idle_us, 50) == HOST_WAIT_NOT_ARMED)
         Sleep(1);
+    last_wait = ACK_SLEPT_IDLE;
+    st.idle_sleeps++;
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -2425,8 +2541,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {
@@ -2497,10 +2613,21 @@ uint32_t g_xbox_image_hi = 0;
 uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
-/* Global registers for recompiled code (via recomp_types.h) */
-/* Each guest thread's TIB. The first thread uses the one the loader built;
- * a spawned thread gets its own from xbox_AllocThreadTib(). */
-RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
+/* The guest register file for recompiled code: every register lifted code
+ * and the runtime share, one thread-local struct (recomp_cpu.h says why).
+ * A new thread starts from these values:
+ *   g_fs_base          the TIB the loader built for the first thread; a
+ *                      spawned thread gets its own from xbox_AllocThreadTib()
+ *   g_fp_control_word  the x87 reset default: every exception masked, round
+ *                      to nearest, which is what the CRT expects before
+ *                      _control87
+ *   g_fp_cc            condition codes of an empty compare
+ * and everything else zero. */
+RECOMP_TLS struct recomp_cpu g_cpu = {
+    .r_fs_base         = XBOX_TIB_MAIN,
+    .r_fp_control_word = 0x037Fu,
+    .r_fp_cc           = 0x4000u,
+};
 
 /* How far the runtime's low memory moved to clear the image; see XBOX_LOW_VA. */
 uint32_t g_xbox_low_shift = 0;
@@ -2540,20 +2667,15 @@ uint32_t xbox_CurrentThreadObject(void)
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
-RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
-
-/* The guest esp an indirect-call dispatch captured, for the diagnostics that
+/* g_icall_saved_esp: the guest esp an indirect-call dispatch captured, for the diagnostics that
  * need the call site. g_esp is not it: a lifted caller pushes its return
  * address onto a *local* esp and only syncs g_esp at certain points, so by
  * the time a refused call is reported g_esp is stale and reads as 0. The
  * dispatch macros set this to the esp they were handed; a title whose
  * generated header predates them leaves it 0, and the log says so rather
  * than inventing a caller. */
-RECOMP_TLS uint32_t g_icall_saved_esp = 0;
-
-/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump. */
-RECOMP_TLS uint32_t g_icall_dispatch_form = 0;
-RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+/* g_icall_dispatch_form: which dispatch form was refused: 0 unknown, 1 call,
+ * 2 jump. Both are fields of g_cpu, defined above. */
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -2656,25 +2778,16 @@ void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 }
 #endif
 
-/* SEH frame pointer bridge (see recomp_types.h for explanation) */
-RECOMP_TLS uint32_t g_seh_ebp = 0;
-RECOMP_TLS double g_fp_stack[8];
-RECOMP_TLS int g_fp_top = 0;
+/* g_seh_ebp (the SEH frame pointer bridge, see recomp_types.h), g_fp_stack
+ * and g_fp_top are fields of g_cpu, defined above. */
 
 /* Set once at startup. The generated code reads it at the ret of every
  * --force-return function, so it has to be cheap and it has to default to
  * off: a build carrying forced functions behaves normally until the
  * variable is set. */
 int g_force_return = 0;
-/* x87 control and status. The reset default masks every exception and
- * rounds to nearest, which is what the CRT expects before _control87. */
-RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
-RECOMP_TLS int g_fp_cmp = 0;
-RECOMP_TLS uint16_t g_fp_cc = 0x4000;
-
-/* Defined below, with the other guest registers. */
-extern RECOMP_TLS uint32_t g_ebp;
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi;
+/* x87 control and status (g_fp_control_word, g_fp_cmp, g_fp_cc): fields of
+ * g_cpu, whose initialiser above holds the reset defaults. */
 
 /* ---- non-local jumps ---------------------------------------------------
  *
@@ -2942,9 +3055,8 @@ RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
 RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
-/* Last frame established by `mov ebp, esp`. Read by frameless functions
- * that address their caller's frame through ebp. */
-RECOMP_TLS uint32_t g_ebp = 0;
+/* g_ebp, the last frame established by `mov ebp, esp`, read by frameless
+ * functions that address their caller's frame through ebp: a field of g_cpu. */
 
 /* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
  * ABI's resting state and what almost every one of them does -- so this is
@@ -2953,7 +3065,7 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * `std; repne scasb`, and memmove goes backwards when its regions overlap the
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
-RECOMP_TLS int g_df = 0;
+/* (g_df: a field of g_cpu.) */
 
 /* The EFLAGS bits a program can set and read back through popfd/pushfd
  * without the lifter's flag model knowing: AC (bit 18) and ID (bit 21).

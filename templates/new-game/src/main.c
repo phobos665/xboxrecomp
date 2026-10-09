@@ -45,6 +45,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>            /* malloc_zone_pressure_relief */
+#endif
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
@@ -64,23 +67,19 @@
 
 /* ── Global register state (defined in xbox_memory_layout.c) ── */
 
-/* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
- * a plain `extern` referencing a __declspec(thread) variable does not resolve
- * to the calling thread's copy -- it resolves to the image's TLS template. The
- * host side then writes g_esp somewhere the generated code never reads, so the
- * guest starts with every register at zero and faults immediately, having
- * apparently ignored the setup that visibly ran. */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
-extern RECOMP_TLS uint32_t g_seh_ebp;
-/* x87 and SSE state. Global for the same reason the volatile GPRs are: one
- * guest routine can lift to several C functions, so a value written in one
- * body is read in the next. Defined in xbox_memory_layout.c like the rest of
- * the register file. */
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
-extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS int g_fp_cmp;
+/* g_eax..g_edi, g_esp, g_seh_ebp and the x87 state (g_fp_stack, g_fp_top,
+ * g_fp_control_word, g_fp_cmp) come from xbox_memory_layout.h, through
+ * xboxrecomp.h above: fields of one thread-local struct, declared once in
+ * templates/runtime/recomp_cpu.h. Do not redeclare them here -- the names are
+ * macros, so it does not compile, and the hand-written declarations it
+ * replaces were how a register once came to be read from the wrong storage
+ * (a plain `extern` of a __declspec(thread) variable resolves to the image's
+ * TLS template, and the guest started with every register at zero).
+ *
+ * SSE state stays separate thread-locals. RECOMP_TLS is not optional here: a
+ * plain `extern` would resolve to the TLS template, as above. Global for the
+ * same reason the GPRs are: one guest routine can lift to several C
+ * functions, so a value written in one body is read in the next. */
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern ptrdiff_t g_xbox_mem_offset;
@@ -490,6 +489,19 @@ static int title_main(int argc, char **argv)
         free(xbe_data);
         return 1;
     }
+
+    /* The layout has copied out everything it needs (headers, sections,
+     * certificate, TLS directory) into guest memory and its own statics,
+     * and nothing keeps a pointer into the file buffer, so let it go now
+     * rather than at exit: it is the whole XBE (45 MB on BLiNX). */
+    free(xbe_data);
+    xbe_data = NULL;
+#ifdef __APPLE__
+    /* macOS's allocator keeps a freed large block cached, still resident,
+     * for reuse: BLiNX's 42.7 MB stayed in the footprint as "Malloc Large
+     * (empty)" after the free. Ask it to hand cached memory back now. */
+    malloc_zone_pressure_relief(NULL, 0);
+#endif
 
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);

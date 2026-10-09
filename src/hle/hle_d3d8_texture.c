@@ -91,6 +91,10 @@ typedef struct {
      * this is the checksum of that palette (0: not known, bake again). */
     int                p8;
     uint32_t           pal_sum;
+    /* What this entry counts against the texture budget: set only for an
+     * entry uploaded from guest texels, which can be rebuilt from them, and
+     * 0 for everything the host drew (render targets, the frame buffer). */
+    uint32_t           bytes;
 } texture_entry;
 
 static texture_entry g_textures[TEXTURE_CACHE];
@@ -457,17 +461,157 @@ static void note_format(const texture_layout *t)
     }
 }
 
-/* Frees the least recently bound entry that no stage holds. */
+/* Texture memory: a byte budget and an age-out, on top of the entry count.
+ *
+ * The 512 entries alone let textures from levels long gone hold host and GPU
+ * memory until 512 newer ones push them out, and nothing notices the guest
+ * freeing or reusing their memory. So an entry uploaded from guest texels
+ * also counts its bytes (entry_bytes), and:
+ *
+ *   RECOMP_HLE_D3D8_TEX_BUDGET_MB=<n> (default 256, 0 = no budget): while
+ *     uploaded entries hold more than n MB, the least recently bound one is
+ *     released.
+ *   RECOMP_HLE_D3D8_TEX_AGE=<frames> (default 0, off): at the end of a frame,
+ *     an uploaded entry not bound for that many frames is released.
+ *
+ * Only entries that can be rebuilt from guest memory go (evictable): never
+ * one bound to a stage, one used this frame, or anything the host drew --
+ * render target textures and surfaces, the frame buffer copy -- whose content
+ * exists nowhere else. A released texture that comes back is uploaded again
+ * from the guest's bytes, as a new one is, so the cost is a re-upload and
+ * never a wrong picture. A P8 texture's palette variants are entries of
+ * their own and go one at a time like any other.
+ *
+ * The bytes are the mip chain in the guest's packing, P8 at four bytes a
+ * texel because the host expands it. The host keeps a CPU copy as well as the
+ * GPU texture (d3d8_resources.c sys_mem), so what is held is about twice the
+ * figure. Age-out is off by default because the budget already bounds the
+ * memory, and what it adds -- returning a texture's memory sooner -- is paid
+ * for with a re-upload when a title comes back to an old screen. */
+static uint64_t      g_tex_bytes;               /* held by uploaded entries */
+static int           g_tex_holes;               /* entries released and not reused */
+static unsigned long g_evict_full, g_evict_budget, g_evict_age;
+
+static uint64_t tex_budget(void)
+{
+    static int64_t budget = -1;
+    if (budget < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_BUDGET_MB");
+        budget = (int64_t)(v && *v ? strtoul(v, NULL, 0) : 256ul) * 1024 * 1024;
+    }
+    return (uint64_t)budget;
+}
+
+static unsigned long tex_age(void)
+{
+    static long age = -1;
+    if (age < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_AGE");
+        age = v && atol(v) > 0 ? atol(v) : 0;
+    }
+    return (unsigned long)age;
+}
+
+static uint32_t entry_bytes(const texture_layout *t)
+{
+    uint64_t b = (uint64_t)t->bytes * (t->fmt == XFMT_P8 ? 4u : 1u);
+    return b ? (b > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)b) : 1u;
+}
+
+/* An uploaded entry made: its bytes count from now. */
+static void entry_count(texture_entry *e, const texture_layout *t)
+{
+    e->bytes = entry_bytes(t);
+    g_tex_bytes += e->bytes;
+}
+
+/* Releases an entry's host texture and empties the slot. */
+static void entry_release(texture_entry *e)
+{
+    if (e->host)
+        host_ReleaseTexture(e->host);
+    g_tex_bytes -= e->bytes;
+    memset(e, 0, sizeof *e);
+}
+
+/* Whether the budget or the age-out may release this entry; see above. */
+static int evictable(const texture_entry *e, unsigned long now)
+{
+    int s;
+
+    if (!e->host || !e->bytes || e->rendered || e->framebuffer || e->used_swap == now)
+        return 0;
+    for (s = 0; s < MAX_STAGES; s++)
+        if (g_bound[s] == e->host || g_bound_entry[s] == e)
+            return 0;
+    return 1;
+}
+
+/* Releases least recently bound uploaded entries until the budget holds, or
+ * nothing more may go. */
+static void enforce_budget(unsigned long now)
+{
+    uint64_t budget = tex_budget();
+    int i;
+
+    while (budget && g_tex_bytes > budget) {
+        texture_entry *victim = NULL;
+        for (i = 0; i < g_texture_count; i++) {
+            texture_entry *e = &g_textures[i];
+            if (evictable(e, now) && (!victim || e->used_swap < victim->used_swap))
+                victim = e;
+        }
+        if (!victim)
+            return;
+        entry_release(victim);
+        g_tex_holes++;
+        g_evict_budget++;
+    }
+}
+
+/* At the end of a frame: uploaded entries not bound for RECOMP_HLE_D3D8_TEX_AGE
+ * frames go. */
+static void age_out(unsigned long now)
+{
+    unsigned long age = tex_age();
+    int i;
+
+    if (!age)
+        return;
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *e = &g_textures[i];
+        if (evictable(e, now) && now - e->used_swap >= age) {
+            entry_release(e);
+            g_tex_holes++;
+            g_evict_age++;
+        }
+    }
+}
+
+/* A free entry: one the budget or the age-out emptied, else a new one, else
+ * the least recently bound entry that no stage holds, freed. */
 static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
 {
     texture_entry *victim = NULL;
     int i, s;
 
+    if (g_tex_holes) {
+        for (i = 0; i < g_texture_count; i++)
+            if (!g_textures[i].host) {
+                g_tex_holes--;
+                return &g_textures[i];
+            }
+        g_tex_holes = 0;
+    }
     if (g_texture_count < TEXTURE_CACHE)
         return &g_textures[g_texture_count++];
     for (i = 0; i < TEXTURE_CACHE; i++) {
         texture_entry *e = &g_textures[i];
         int held = 0;
+        if (!e->host) {          /* empty already (a failed create) */
+            victim = e;
+            break;
+        }
         for (s = 0; s < MAX_STAGES; s++)
             held |= g_bound[s] == e->host;
         if (!held && e->used_swap != now && (!victim || e->used_swap < victim->used_swap))
@@ -477,8 +621,8 @@ static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
         return NULL;
     (void)dev;
     if (victim->host)
-        host_ReleaseTexture(victim->host);
-    memset(victim, 0, sizeof *victim);
+        g_evict_full++;
+    entry_release(victim);
     return victim;
 }
 
@@ -720,6 +864,8 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
     e->pal_sum = 0;
     upload(e->host, &t);
     g_uploads++;
+    entry_count(e, &t);
+    enforce_budget(now);         /* this one was used now, so it stays */
     return e->host;
 }
 
@@ -845,12 +991,15 @@ static void sync_palette(IDirect3DDevice8 *dev, uint32_t stage)
         v->p8 = 1;
         bake(dev, stage, v, &t, sum);
         g_pal_variants++;
+        entry_count(v, &t);
     }
     v->used_swap = now;
     host_stage_palette(dev, stage, sum);
     host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)v->host);
     g_bound[stage] = v->host;
     g_bound_entry[stage] = v;
+    /* After the bind: the variant is used now and the stage holds it. */
+    enforce_budget(now);
 }
 
 /* At the end of a frame: which textures this frame drew with have different
@@ -873,6 +1022,7 @@ void hle_d3d8_texture_frame_end(void)
     /* RECOMP_HLE_D3D8_TEX_AFTER_DRAW=1. It hashes every texture the frame
      * used a second time, for a count, and was a fifth of Outrun 2's main
      * thread in a race; so it is asked for, not paid for by default. */
+    age_out(now);
     if (on < 0)
         on = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_AFTER_DRAW", 0);
     if (!on)
@@ -1267,8 +1417,7 @@ IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
                 g_bound[s] = NULL;
                 host_SetTexture(dev, (DWORD)s, (IDirect3DBaseTexture8 *)white_texture(dev));
             }
-        host_ReleaseTexture(e->host);
-        memset(e, 0, sizeof *e);
+        entry_release(e);
     }
     if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, D3DUSAGE_RENDERTARGET,
                                   (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT, &e->host)) ||
@@ -1399,6 +1548,24 @@ static void report(void)
                 "%lu out of range, %lu create failed\n",
                 g_bound_count, g_texture_count, g_uploads, g_reuploads, g_skip_type,
                 g_skip_cube, g_skip_format, g_skip_range, g_skip_create);
+        {
+            int i, uploaded = 0, drawn = 0;
+            for (i = 0; i < g_texture_count; i++) {
+                if (!g_textures[i].host)
+                    continue;
+                if (g_textures[i].bytes)
+                    uploaded++;
+                else
+                    drawn++;
+            }
+            fprintf(stderr, "[HLE-D3D8] shadow texture memory: %.1f MB in %d uploaded "
+                    "entries (budget %llu MB%s), %d drawn by the host; released %lu "
+                    "for a slot, %lu over budget, %lu unbound %lu frames%s\n",
+                    (double)g_tex_bytes / (1024.0 * 1024.0), uploaded,
+                    (unsigned long long)(tex_budget() >> 20), tex_budget() ? "" : ", off",
+                    drawn, g_evict_full, g_evict_budget, g_evict_age, tex_age(),
+                    tex_age() ? "" : " (age-out off)");
+        }
         if (g_switch_hits || g_switch_misses)
             fprintf(stderr, "[HLE-D3D8] SwitchTexture: %lu bound, %lu matched no mirrored "
                     "texture\n", g_switch_hits, g_switch_misses);

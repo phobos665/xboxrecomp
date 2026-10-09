@@ -170,13 +170,17 @@ extern uint32_t g_xbox_code_hi;
 #  define RECOMP_TLS _Thread_local
 #endif
 
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
-
-/* x87 stack. Per-thread for the same reason the integer registers are:
+/* The registers themselves -- g_eax..g_edi, g_esp, g_ebp, g_seh_ebp,
+ * g_fs_base, g_df, the x87 stack and status, g_icall_saved_esp and
+ * g_icall_dispatch_form -- are fields of one thread-local struct, g_cpu, so
+ * a lifted function reaches all of them through one thread-local base
+ * (on Mach-O, one _tlv_get_addr call instead of one per register). The
+ * names stay as macros, so generated code is unchanged. recomp_cpu.h is
+ * copied into gen/ beside this file; see it for the layout rules.
+ *
+ * x87 stack: per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
+#include "recomp_cpu.h"
 
 /**
  * SEH frame pointer bridge.
@@ -193,11 +197,9 @@ extern RECOMP_TLS int g_fp_top;
  *
  * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
  * reaches the CRT's per-thread data, so a single shared base makes every
- * guest thread the same thread as far as the CRT is concerned. */
-extern RECOMP_TLS uint32_t g_fs_base;
+ * guest thread the same thread as far as the CRT is concerned.
+ * (g_fs_base and g_seh_ebp are fields of g_cpu, recomp_cpu.h.) */
 #define XBOX_FS_BASE g_fs_base
-
-extern RECOMP_TLS uint32_t g_seh_ebp;
 
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
@@ -364,7 +366,7 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
 typedef void (*recomp_foreign_longjmp_fn)(jmp_buf *target, int value,
                                           uintptr_t armed_stack);
 void recomp_set_foreign_longjmp(recomp_foreign_longjmp_fn fn);
-extern RECOMP_TLS uint32_t g_ebp;
+/* g_ebp is a field of g_cpu (recomp_cpu.h). */
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -378,16 +380,14 @@ extern RECOMP_TLS uint32_t g_ebp;
  * be found by name, and the dashboard rebooted rather than showing a UI.
  * memmove's overlapping case is the same instruction and the same bug.
  */
-extern RECOMP_TLS int g_df;
+/* g_df is a field of g_cpu (recomp_cpu.h). */
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
-extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS int g_fp_cmp;
-extern RECOMP_TLS uint16_t g_fp_cc;
+/* g_fp_control_word, g_fp_cmp and g_fp_cc are fields of g_cpu (recomp_cpu.h). */
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
  * Xbox runs with -- rounds every arithmetic result to float. A title that
@@ -488,7 +488,7 @@ extern volatile uint64_t g_icall_count;
  * RECOMP_ICALL_SAFE, and the current frame's own for RECOMP_ITAIL, which
  * pushes nothing. Set here rather than passed, so a title whose generated
  * header predates this still compiles and simply reports no callers. */
-extern RECOMP_TLS uint32_t g_icall_saved_esp;
+/* g_icall_saved_esp: a field of g_cpu (recomp_cpu.h). */
 /* Which dispatch form was refused: 0 unknown, 1 call, 2 jump.
  *
  * The two mean different things and want different next steps. A call to
@@ -501,7 +501,7 @@ extern RECOMP_TLS uint32_t g_icall_saved_esp;
  * predates this never assigns it, and a two-valued flag would then read
  * as "call" for every refusal including the jumps -- the exact wrong
  * answer this exists to stop giving. Unknown is reported as unknown. */
-extern RECOMP_TLS uint32_t g_icall_dispatch_form;
+/* g_icall_dispatch_form: a field of g_cpu (recomp_cpu.h). */
 
 void recomp_icall_fail_log(uint32_t va);
 

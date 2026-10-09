@@ -267,6 +267,18 @@ typedef struct NV2ACombinerState {
      * Set per draw from the bound textures, not from the token. */
     BYTE shadow[NV2A_MAX_TEXTURES];
 
+    /* --- Alpha test --- */
+    /* 1 when the alpha test can reject a fragment (d3d8_alpha_test_can_reject):
+     * only then does the shader contain the test and its `discard`. A shader
+     * that merely contains a discard loses early depth on desktop GPUs and
+     * hidden-surface removal on tile-based ones (Apple), for every draw it
+     * makes, so the test is a variant rather than a uniform branch. The
+     * compare and the reference stay uniforms (NV2APSConstants), so this is
+     * at most twice the shaders, not eight times. Set per draw from the
+     * render states, like `shadow`, not from the token. */
+    BYTE alpha_test;
+    BYTE key_pad[3];   /* zero: part of the key bytes, so never left unset */
+
     /* Everything above decides the generated shader and is its cache key
      * (NV2A_COMBINER_KEY_BYTES). Everything below is uploaded to the
      * constant buffer each draw and never appears in the HLSL, so it must

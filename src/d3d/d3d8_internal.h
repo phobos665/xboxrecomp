@@ -371,6 +371,18 @@ void    d3d8_shaders_prepare_draw(DWORD handle);
 
 #include "d3d8_combiners.h"
 
+/* Whether the alpha test, as the render states set it, can reject a
+ * fragment. Off, ALWAYS (8) or a value that is no compare at all passes
+ * everything, and the pixel shaders test exactly that way, so a draw in one
+ * of those states is drawn by the shader variant with no alpha test in it
+ * (NV2ACombinerState.alpha_test, and the fixed-function signature's
+ * FF_PS_SIG_ALPHA_TEST) and keeps early depth. */
+static inline int d3d8_alpha_test_can_reject(const DWORD *rs)
+{
+    return rs && rs[D3DRS_ALPHATESTENABLE] &&
+           rs[D3DRS_ALPHAFUNC] >= 1 && rs[D3DRS_ALPHAFUNC] <= 7;
+}
+
 /* ================================================================
  * NV2A Programmable Vertex Shaders (d3d8_vsh.c)
  * ================================================================ */
