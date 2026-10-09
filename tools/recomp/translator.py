@@ -227,10 +227,16 @@ def write_if_changed(path, text):
     return True
 
 
+_SAFE_ICALL_FORMS = ("RECOMP_ICALL_SAFE(", "RECOMP_ICALL_SAFE_AT(",
+                     "RECOMP_ICALL_SAFE_CC(", "RECOMP_ICALL_SAFE_AT_CC(")
+
+
 def _is_safe_icall(line):
-    return any(name + "(" in line for name in (
-        "RECOMP_ICALL_SAFE", "RECOMP_ICALL_SAFE_AT",
-        "RECOMP_ICALL_SAFE_CC", "RECOMP_ICALL_SAFE_AT_CC"))
+    # Asked of every generated line, twice; the common prefix rejects
+    # nearly all of them in one scan.
+    if "RECOMP_ICALL_SAFE" not in line:
+        return False
+    return any(form in line for form in _SAFE_ICALL_FORMS)
 
 
 def _fixup_icall_esp_save(lines):
@@ -748,6 +754,10 @@ class FunctionTranslator:
 
         Run after discover_cfg_ownership, which settles translated bounds.
         """
+        # Both passes below ask the same question of a function -- does it
+        # have a `jmp` through memory, and if so what does it decode to --
+        # so they share the answer rather than decoding twice.
+        self._mem_jump_decodes = {}
         self._extend_over_trailing_tables()
         sites = []
         for start, info in self.func_db.items():
@@ -761,16 +771,9 @@ class FunctionTranslator:
             else:
                 known = {}
                 end = info.get("end", start)
-                raw_bytes = self._read_func_bytes(start, end)
-                # Only a `jmp` through memory can be a site; decode in full
-                # only the functions that have one (see scan_lite).
-                if not raw_bytes or not any(
-                        m == "jmp" and "[" in op
-                        for _a, _s, m, op in self.disasm.scan_lite(
-                            raw_bytes, start, end)):
+                instructions = self._decode_if_mem_jump(start, end)
+                if not instructions:
                     continue
-                instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end)
             for insn in instructions:
                 if (insn.mnemonic != "jmp" or insn.jump_target
                         or not insn.operands
@@ -833,6 +836,7 @@ class FunctionTranslator:
             }
             self.jump_table_entry_starts.add(target)
 
+        self._mem_jump_decodes = None    # decodes are not kept past the pass
         return self.jump_table_entry_starts
 
     def _extend_over_trailing_tables(self):
@@ -867,20 +871,19 @@ class FunctionTranslator:
             if following >= len(bounds) or bounds[following] <= end:
                 continue
             upper = bounds[following]
-            raw_bytes = self._read_func_bytes(start, end)
-            if not raw_bytes or not any(
-                    m == "jmp" and "[" in op
-                    for _a, _s, m, op in self.disasm.scan_lite(
-                        raw_bytes, start, end)):
+            decoded = self._decode_if_mem_jump(start, end)
+            if not decoded:
                 continue
-            if not any(
-                    insn.mnemonic == "jmp" and insn.jump_target is None
-                    and insn.operands and insn.operands[0].type == "mem"
-                    and insn.operands[0].mem_index
-                    and not insn.operands[0].mem_base
-                    and start <= insn.operands[0].mem_disp < upper
-                    for insn in self.disasm.disassemble_function(
-                        raw_bytes, start, end)):
+            tables = [
+                insn.operands[0].mem_disp for insn in decoded
+                if insn.mnemonic == "jmp" and insn.jump_target is None
+                and insn.operands and insn.operands[0].type == "mem"
+                and insn.operands[0].mem_index
+                and not insn.operands[0].mem_base
+                and start <= insn.operands[0].mem_disp < upper]
+            if not tables:
+                continue
+            if not self._may_reach_past(decoded, tables, start, end, upper):
                 continue
             recovered = self._recover_cfg(start, upper, set(), set())
             if recovered is None or not recovered[1]:
@@ -900,6 +903,49 @@ class FunctionTranslator:
             print(f"Extended 0x{start:08X} from 0x{end:08X} to "
                   f"0x{new_end:08X} over its inline jump tables",
                   file=sys.stderr)
+
+    def _decode_if_mem_jump(self, start, end):
+        """The full decode of [start, end), or None when it has no `jmp`
+        through memory (asked of scan_lite first, see there). Memoised for
+        one discover_jump_table_entries."""
+        memo = getattr(self, "_mem_jump_decodes", None)
+        key = (start, end)
+        if memo is not None and key in memo:
+            return memo[key]
+        raw_bytes = self._read_func_bytes(start, end)
+        decoded = None
+        if raw_bytes and any(
+                m == "jmp" and "[" in op
+                for _a, _s, m, op in self.disasm.scan_lite(
+                    raw_bytes, start, end)):
+            decoded = self.disasm.disassemble_function(raw_bytes, start, end)
+        if memo is not None:
+            memo[key] = decoded
+        return decoded
+
+    def _may_reach_past(self, decoded, tables, start, end, upper):
+        """Whether control in [start, end) can reach [end, upper) at all.
+
+        The CFG recovery in _extend_over_trailing_tables follows direct edges,
+        fall-through and local table entries, so it can only find code past
+        `end` through one of those. Checking them on the decode already in
+        hand skips the recovery for the common case -- an ordinary switch
+        whose table follows a function whose arms all lie inside it -- which
+        on TimeSplitters 2 is every candidate and doubled the pass's cost.
+        A decode that stops short of `end` cannot answer, so it says yes.
+        """
+        if not decoded or decoded[-1].end_address < end:
+            return True
+        last = decoded[-1]
+        if not (last.is_terminator
+                or last.mnemonic in ("int3", "ud2", "hlt")):
+            return True                      # falls through into the gap
+        if any(insn.jump_target is not None and end <= insn.jump_target < upper
+               for insn in decoded):
+            return True
+        return any(end <= target < upper
+                   for table in tables
+                   for target in self._read_local_jump_table(table, start, upper))
 
     def _arm_is_whole(self, target, instructions):
         """Return whether a recovered arm can run as a function of its own.
