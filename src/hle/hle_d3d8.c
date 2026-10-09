@@ -2046,7 +2046,11 @@ static int original_missing(void (*fn)(void), const char *name)
 HLE_EXPORT(Direct3D_CreateDevice)
 {
     static int seen;
-    uint32_t pp_va = HLE_ARG(4);
+    /* The LTCG build of 5849 (Halo 2's Direct3D_CreateDevice_4__LTCG_eax1_ecx3)
+     * keeps only three arguments: BehaviorFlags in eax, the presentation
+     * parameters on the stack, the returned-device pointer in ecx. Its thunk
+     * builds a three-argument frame, so they are found at 1, not 4. */
+    uint32_t pp_va = g_hle_ltcg_nargs == 3 ? HLE_ARG(1) : HLE_ARG(4);
 
     first_call(&seen, "Direct3D_CreateDevice", pp_va);
     if (original_missing(hle_original_Direct3D_CreateDevice, "Direct3D_CreateDevice"))
