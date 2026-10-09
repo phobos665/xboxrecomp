@@ -3404,9 +3404,21 @@ static void pbi_attribute(uint32_t reg, const float v[4])
         host_vsh_set_vertex_data((int)reg, v);
 }
 
+void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format);
+
 void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value)
 {
+    static uint32_t tex_data[4];
     float f, v[4];
+
+    if (method >= 0x1B00u && method < 0x1C00u) {     /* SET_TEXTURE_OFFSET / _FORMAT */
+        uint32_t stage = (method - 0x1B00u) / 0x40u;
+        if ((method & 0x3Cu) == 0x00u)
+            tex_data[stage] = value;
+        else if ((method & 0x3Cu) == 0x04u)
+            hle_d3d8_texture_by_state(stage, tex_data[stage], value);
+        return;
+    }
 
     if (method == 0x17FCu) {                         /* SET_BEGIN_END */
         if (value) {

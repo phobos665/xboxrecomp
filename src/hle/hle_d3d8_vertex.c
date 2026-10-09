@@ -327,9 +327,15 @@ static int pb_on(void)
 int  hle_d3d8_pb_inline_on(void);
 void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value);
 
+/* ...and a stage's texture, SET_TEXTURE_OFFSET / _FORMAT (0x1B00 and 0x1B04,
+ * 64 bytes a stage, four stages), which the same build writes inline too. */
+#define PB_TEX_FIRST        0x1B00u
+#define PB_TEX_END          0x1C00u
+
 static int pb_inline_method(uint32_t method)
 {
-    return method == PB_BEGIN_END || (method >= PB_VDATA_FIRST && method < PB_VDATA_END);
+    return method == PB_BEGIN_END || (method >= PB_VDATA_FIRST && method < PB_VDATA_END) ||
+           (method >= PB_TEX_FIRST && method < PB_TEX_END && (method & 0x3Cu) <= 0x04u);
 }
 
 void hle_d3d8_push_constants_sync(void)
@@ -398,7 +404,7 @@ void hle_d3d8_push_constants_sync(void)
         if (method == PB_CONST_LOAD || (method + 4u * count > PB_CONST_FIRST &&
                                         method < PB_CONST_END) ||
             (inl && (method == PB_BEGIN_END || (method + 4u * count > PB_VDATA_FIRST &&
-                                                method < PB_VDATA_END)))) {
+                                                method < PB_TEX_END)))) {
             int noninc = (w & 0x40000000u) != 0u;
 
             if (!guest_readable(va + 4u, 4ull * count))
