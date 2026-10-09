@@ -16,6 +16,7 @@ import json
 import glob
 import os
 import struct
+import sys
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
@@ -747,6 +748,7 @@ class FunctionTranslator:
 
         Run after discover_cfg_ownership, which settles translated bounds.
         """
+        self._extend_over_trailing_tables()
         sites = []
         for start, info in self.func_db.items():
             if start in self.owned_function_starts:
@@ -755,7 +757,9 @@ class FunctionTranslator:
             if recovered:
                 end = recovered["end"]
                 instructions = recovered["instructions"]
+                known = recovered["jump_tables"]
             else:
+                known = {}
                 end = info.get("end", start)
                 raw_bytes = self._read_func_bytes(start, end)
                 # Only a `jmp` through memory can be a site; decode in full
@@ -773,6 +777,8 @@ class FunctionTranslator:
                         or insn.operands[0].type != "mem"):
                     continue
                 operand = insn.operands[0]
+                if operand.mem_disp in known:
+                    continue  # recovered as an in-function switch
                 if operand.mem_index and not operand.mem_base:
                     sites.append((start, end, operand.mem_disp))
 
@@ -828,6 +834,72 @@ class FunctionTranslator:
             self.jump_table_entry_starts.add(target)
 
         return self.jump_table_entry_starts
+
+    def _extend_over_trailing_tables(self):
+        """Extend a function cut at its own inline jump tables.
+
+        Hand-written CRT routines (MSVC's memcpy) interleave dword tables with
+        the arms they index, tables first. The function list ends such a
+        function where decoding meets its first table, leaving the arms in an
+        unowned gap. The arms branch back into the body, so they cannot run as
+        functions of their own. Recover the CFG through the gap, up to the next
+        function start, and keep it when every path stays inside it.
+
+        A tail_jump_alias entry is a second entry into another body, so it
+        does not bound the gap.
+
+        Only a function with a `jmp` through memory can qualify, so the
+        lightweight decode (scan_lite) is asked first and the full decode is
+        paid only for those -- this pass visits every function with a gap
+        after it, and the full decode of all of them is what fork PR #50 took
+        out of the other passes.
+        """
+        bounds = sorted(
+            addr for addr, info in self.func_db.items()
+            if info.get("detection_method") != "tail_jump_alias")
+        for start in bounds:
+            info = self.func_db[start]
+            if (start in self.owned_function_starts
+                    or start in self._recovered_cfg):
+                continue
+            end = info.get("end", start)
+            following = bisect.bisect_right(bounds, start)
+            if following >= len(bounds) or bounds[following] <= end:
+                continue
+            upper = bounds[following]
+            raw_bytes = self._read_func_bytes(start, end)
+            if not raw_bytes or not any(
+                    m == "jmp" and "[" in op
+                    for _a, _s, m, op in self.disasm.scan_lite(
+                        raw_bytes, start, end)):
+                continue
+            if not any(
+                    insn.mnemonic == "jmp" and insn.jump_target is None
+                    and insn.operands and insn.operands[0].type == "mem"
+                    and insn.operands[0].mem_index
+                    and not insn.operands[0].mem_base
+                    and start <= insn.operands[0].mem_disp < upper
+                    for insn in self.disasm.disassemble_function(
+                        raw_bytes, start, end)):
+                continue
+            recovered = self._recover_cfg(start, upper, set(), set())
+            if recovered is None or not recovered[1]:
+                continue
+            instructions, jump_tables, _ = recovered
+            new_end = max(insn.end_address for insn in instructions)
+            if new_end <= end or not self._arm_is_whole(start, instructions):
+                continue
+            info["end"] = new_end
+            info["size"] = new_end - start
+            info["num_instructions"] = len(instructions)
+            self._recovered_cfg[start] = {
+                "end": new_end,
+                "instructions": instructions,
+                "jump_tables": jump_tables,
+            }
+            print(f"Extended 0x{start:08X} from 0x{end:08X} to "
+                  f"0x{new_end:08X} over its inline jump tables",
+                  file=sys.stderr)
 
     def _arm_is_whole(self, target, instructions):
         """Return whether a recovered arm can run as a function of its own.
