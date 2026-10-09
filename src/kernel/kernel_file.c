@@ -38,6 +38,50 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
+/* The folders a console keeps at the root of E: (Partition1).
+ *
+ * The dashboard creates TDATA, UDATA and CACHE on a formatted hard disk, so a
+ * title may create a file in one without creating the folder first. Here
+ * Partition1 is the game folder, which has none of them until a title makes
+ * one. Halo 2 opens E:\CACHE\LocalCache00.bin with FILE_OPEN_IF, never checks
+ * the result, and goes on to NtSetInformationFile with the -1 handle. So
+ * before a create in one of those folders, the folder is made. Only on a
+ * disposition that can create: an open of something absent still fails. */
+static void ensure_e_root_folder(const char *xbox_path, ULONG disposition)
+{
+    static const char *const prefixes[] = { "\\Device\\Harddisk0\\Partition1\\", "E:\\" };
+    static const char *const folders[] = { "TDATA", "UDATA", "CACHE" };
+    size_t i, j;
+
+    if (!xbox_path)
+        return;
+    if (disposition != XBOX_FILE_SUPERSEDE && disposition != XBOX_FILE_CREATE &&
+        disposition != XBOX_FILE_OPEN_IF && disposition != XBOX_FILE_OVERWRITE_IF)
+        return;
+    for (i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
+        size_t pl = strlen(prefixes[i]);
+        if (_strnicmp(xbox_path, prefixes[i], pl) != 0)
+            continue;
+        for (j = 0; j < sizeof folders / sizeof folders[0]; j++) {
+            size_t fl = strlen(folders[j]);
+            char folder[64];
+            xbox_host_char host[MAX_PATH];
+
+            if (_strnicmp(xbox_path + pl, folders[j], fl) != 0 || xbox_path[pl + fl] != '\\')
+                continue;
+            snprintf(folder, sizeof folder, "%.*s%s", (int)pl, xbox_path, folders[j]);
+            if (!xbox_translate_path(folder, host, MAX_PATH))
+                return;
+#if defined(_WIN32)
+            CreateDirectoryW(host, NULL);
+#else
+            mkdir(host, 0755);
+#endif
+            return;
+        }
+    }
+}
+
 /* Xbox volume geometry.
  *
  * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
@@ -208,6 +252,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    ensure_e_root_folder(get_xbox_path(ObjectAttributes), CreateDisposition);
 
     /* A partition device opened as a directory.
      *
@@ -975,6 +1020,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    ensure_e_root_folder(xbox_path, CreateDisposition);
 
     /* A partition device opened as a directory (a free-space query): the
      * directory that holds its image stands in for the volume. */
@@ -1228,6 +1274,22 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
+                return STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+        case XboxFileAllocationInformation: {
+            /* Reserve space for a file, as the Win32 half does (it says why:
+             * Halo's save path). Halo 2 sizes its save and cache files this
+             * way and got STATUS_NOT_IMPLEMENTED here. Same semantics as NT
+             * FileAllocationInfo: an allocation below the end of file cuts the
+             * file to it; one above leaves the end of file where it is, and a
+             * POSIX file needs no reservation to grow into it. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            struct stat st;
+            if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size &&
+                    ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
