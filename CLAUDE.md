@@ -123,6 +123,20 @@ played them (`RECOMP_DSOUND_WALLCLOCK=1` for the old wall clock). If a title's s
 drifts again, read `[audio-output] dropped=` and the `[DSOUND] ... from the host's play
 position` line before suspecting anything else.
 
+**Sound breaking up in movies was the title's pauses, not the data (Oct 2026).** Buffers and
+streams used to reach the host only when the title called DirectSound, and a buffer pump more
+than 100 ms late threw that stretch away. Max Payne's Bink thread polls its movie ring every
+~20 ms but stops for 140-300 ms at a time: up to 640 ms of every five seconds was lost, the
+rest crackled. A host thread in `hle_dsound.c` now pumps every playing buffer and services the
+streams every 5 ms whatever the title is doing (`RECOMP_DSOUND_SERVICE=0` for the old
+behaviour; it runs no guest code, so a stream completed by a callback still completes on a
+guest thread), and each buffer voice starts behind 50 ms of silence so a late pump does not
+leave it dry. To look at sound: `[DSOUND] buffer ... discarded` and `[DSOUND] stream ...
+never sent to the host` count sound lost; on Windows, `[audio-output] ran dry:` counts gaps
+per slot and `RECOMP_AUDIO_CAPTURE=<dir>` writes what each slot was given as raw PCM. A
+muted run (`RECOMP_MUTE=1`) still produces all of it. A stream's `ran dry` is also the
+silence between two lines of dialogue, so compare runs rather than reading one.
+
 **Widescreen and internal resolution** are investigated in
 `docs/technical/widescreen-and-resolution.md`, with every work item classified toolkit or
 game-specific. Two things to know before touching either: `XGetVideoFlags` returns 0 today

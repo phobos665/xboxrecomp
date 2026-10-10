@@ -59,6 +59,7 @@ recomp_func_t recomp_lookup(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 long __stdcall xbox_NtSetEvent(void *EventHandle, long *PreviousState);   /* NTSTATUS */
 void *xbox_bridge_resolve_handle(uint32_t token);                          /* kernel_bridge.c */
+void hle_dsound_service_start(void);                                       /* hle_dsound.c */
 
 enum {
     MAX_STREAMS = 16,
@@ -117,6 +118,8 @@ typedef struct Stream {
      * the voice and moves this. */
     uint64_t play_origin;
     int      play_anchored;          /* the host clock has been read at least once */
+    uint64_t skipped;                /* decoded bytes stepped over unsent; note_skip */
+    const char *last_event;          /* flush, pause, resume, restart: for note_skip */
 } Stream;
 
 /* What the title asks of its streams, reported every five seconds while any
@@ -228,6 +231,7 @@ static uint64_t consumed(const Stream *s, uint64_t now)
  * starve, or the first packet ever, it starts again from there. */
 static void restart_clock(Stream *s, uint64_t now)
 {
+    s->last_event = s->queued ? "restarted after running out" : "first packet";
     s->consumed_base = s->queued;
     s->resumed_ms = s->paused ? 0u : now;
 }
@@ -362,6 +366,25 @@ static void complete_passed(Stream *s, uint64_t now)
     }
 }
 
+/* Sound the stream stepped over without ever giving it to the host: heard as
+ * a hole in it. Totalled for the five-second line, and the first few said
+ * with what last happened to the stream, which is usually the cause. */
+static void note_skip(Stream *s, uint64_t bytes, const char *why)
+{
+    static int said;
+    uint64_t bps = bytes_per_ms_x1000(s);
+
+    s->skipped += bytes;
+    if (said < 12 && bps) {
+        said++;
+        fprintf(stderr, "[DSOUND] stream %08X: %llu ms never sent to the host (%s; "
+                "last event: %s)\n", s->iface,
+                (unsigned long long)(bytes * 1000u / bps), why,
+                s->last_event ? s->last_event : "none");
+        fflush(stderr);
+    }
+}
+
 /* Feed the host from `sent` up to the clock plus the lead, in chunks. */
 static void pump(Stream *s, uint64_t now)
 {
@@ -378,6 +401,7 @@ static void pump(Stream *s, uint64_t now)
      * clock that far back, holding the packets for as long as the sound was
      * refused. Start the voice again at the clock instead, as refeed does. */
     if (s->sent < consumed(s, now)) {
+        note_skip(s, consumed(s, now) - s->sent, "behind the clock");
         recomp_audio_output_reset_voice(slot_of(s));
         s->sent = consumed(s, now);
         s->play_origin = s->sent;
@@ -401,6 +425,7 @@ static void pump(Stream *s, uint64_t now)
              * so what the voice holds is no longer contiguous with the
              * stream. Start it again from here, or its played-sample count
              * would read as a position it is not at. */
+            note_skip(s, target - s->sent, "gap");
             recomp_audio_output_reset_voice(slot_of(s));
             s->sent = target;
             s->play_origin = target;
@@ -473,6 +498,33 @@ static void tick(Stream *s, uint64_t now)
     pump(s, now);
 }
 
+/* From hle_dsound.c's service thread, which keeps the streams going while
+ * the title is not calling in -- as the console's audio hardware consumes
+ * packets and signals their events on its own. Max Payne completes its
+ * packets by event and services DirectSound only from guest threads that
+ * stop for disc reads, so the 400 ms lead could run out under a load and
+ * the next packet was never asked for.
+ *
+ * Feeding the host and setting events need no guest thread. A completion
+ * callback does -- it is guest code, and this thread has no guest stack --
+ * so a stream with one is fed here and completed by the guest-side ticks as
+ * before. */
+void hle_dsound_stream_service(uint64_t now)
+{
+    int i;
+    lock();
+    for (i = 0; i < MAX_STREAMS; i++) {
+        Stream *s = &g_streams[i];
+        if (!s->iface)
+            continue;
+        sync_to_host(s, now);
+        if (!s->callback)
+            complete_passed(s, now);
+        pump(s, now);
+    }
+    unlock();
+}
+
 void hle_dsound_stream_tick(uint64_t now)
 {
     static uint64_t last_report;
@@ -488,10 +540,12 @@ void hle_dsound_stream_tick(uint64_t now)
         for (i = 0; i < MAX_STREAMS; i++) {
             Stream *s = &g_streams[i];
             if (!s->iface) continue;
-            fprintf(stderr, "[DSOUND] stream %08X: %d queued, consumed %llu of %llu, %s; "
+            fprintf(stderr, "[DSOUND] stream %08X: %d queued, consumed %llu of %llu, "
+                    "%llu skipped unsent, %s; "
                     "calls: process %lu status %lu pause %lu flush %lu, %lu packets done\n",
                     s->iface, s->count, (unsigned long long)consumed(s, now),
-                    (unsigned long long)s->queued, s->paused ? "paused" : "running",
+                    (unsigned long long)s->queued, (unsigned long long)s->skipped,
+                    s->paused ? "paused" : "running",
                     g_calls_process, g_calls_status, g_calls_pause, g_calls_flush,
                     g_packets_done);
             if (s->play_anchored)
@@ -537,6 +591,7 @@ static void record_stream(uint32_t iface, uint32_t desc)
                     MAX_STREAMS);
         return;
     }
+    hle_dsound_service_start();
     memset(s, 0, sizeof *s);
     s->iface       = iface;
     s->tag         = HLE_MEM32(wfx) & 0xFFFFu;
@@ -667,10 +722,17 @@ static void flush_stream(uint32_t object)
             s->head = (s->head + 1) % MAX_PACKETS;
             s->count--;
         }
+        s->last_event = "flush";
         s->consumed_base = s->queued;
         s->resumed_ms = 0u;
         s->sent = s->queued;
         recomp_audio_output_reset_voice(slot_of(s));
+        /* The next voice starts here. Left at its old value, the first play
+         * position read after the next packet would put the clock back by
+         * everything played before the flush, unless a resume (refeed)
+         * happened to reset it first, as it does in Max Payne. */
+        s->play_origin = s->sent;
+        s->play_anchored = 0;
         for (i = 0; i < n; i++)
             complete(s, &flushed[i], XMP_STATUS_FLUSHED, 0u);
         (void)now;
@@ -753,6 +815,7 @@ HLE_EXPORT(CDirectSoundStream_Pause)
     if (s) {
         if (mode == DSSTREAMPAUSE_RESUME) {
             if (s->paused) {
+                s->last_event = "resume";
                 s->paused = 0;
                 s->resumed_ms = s->consumed_base < s->queued ? now : 0u;
                 if (!s->resumed_ms)
@@ -765,6 +828,7 @@ HLE_EXPORT(CDirectSoundStream_Pause)
              * output never drains looks exactly like one that has
              * failed, and this tells the two apart in one run. */
             if (!s->paused && !xbox_EnvSwitch("RECOMP_DSOUND_IGNORE_PAUSE", 0)) {
+                s->last_event = "pause";
                 s->consumed_base = consumed(s, now);
                 s->paused = 1;
                 s->resumed_ms = 0u;
