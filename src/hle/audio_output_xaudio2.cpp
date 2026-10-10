@@ -41,6 +41,10 @@ struct OutputVoice {
     PcmBuffer buffers[kQueueSize];
     uint32_t sample_rate, channels, bits_per_sample;
     uint32_t front, queued;
+    /* Times the voice had played everything it was given before the next
+       submission arrived: each one is a gap in the sound. */
+    uint32_t starved;
+    bool fed;
 };
 
 std::atomic<HRESULT> critical_error{S_OK};
@@ -62,6 +66,48 @@ bool reported_nonzero[kVoiceCount];
 bool attempted, com_initialized, callback_registered, summary_printed;
 unsigned long long submitted_buffers, submitted_bytes, nonzero_buffers;
 unsigned long long dropped_buffers;
+/* Gaps since the last report, by slot, and in all. */
+unsigned long starved_total;
+unsigned long long last_starve_report;
+
+/* RECOMP_AUDIO_CAPTURE=<dir>: everything a slot is given, as raw PCM in
+   <dir>/slot<N>_<rate>_<channels>ch_<bits>.raw, so what reached the host
+   can be listened to or compared with what the title wrote. */
+const char *capture_dir()
+{
+    static int read;
+    static const char *dir;
+    if (!read) {
+        read = 1;
+        dir = std::getenv("RECOMP_AUDIO_CAPTURE");
+        if (dir && !*dir) dir = nullptr;
+    }
+    return dir;
+}
+
+void capture(uint32_t slot, const uint8_t *pcm, uint32_t bytes,
+             uint32_t rate, uint32_t channels, uint32_t bits)
+{
+    static FILE *files[kVoiceCount];
+    static uint32_t formats[kVoiceCount];
+    const char *dir = capture_dir();
+    const uint32_t format = rate << 8 | channels << 6 | bits;
+    if (!dir) return;
+    if (files[slot] && formats[slot] != format) {
+        std::fclose(files[slot]);
+        files[slot] = nullptr;
+    }
+    if (!files[slot]) {
+        char path[1024];
+        std::snprintf(path, sizeof path, "%s/slot%u_%u_%uch_%u.raw", dir, slot,
+                      rate, channels, bits);
+        files[slot] = std::fopen(path, "ab");
+        formats[slot] = format;
+        if (!files[slot]) return;
+    }
+    std::fwrite(pcm, 1, bytes, files[slot]);
+    std::fflush(files[slot]);
+}
 
 void destroyVoice(OutputVoice &voice)
 {
@@ -280,6 +326,25 @@ extern "C" int recomp_audio_output_submit(
         voice.front = (voice.front + 1) % kQueueSize;
         --voice.queued;
     }
+    if (voice.fed && state.BuffersQueued == 0) {
+        ++voice.starved;
+        ++starved_total;
+    }
+    {
+        const unsigned long long now = GetTickCount64();
+        if (starved_total && now - last_starve_report >= 5000) {
+            last_starve_report = now;
+            std::fprintf(stderr, "[audio-output] ran dry:");
+            for (uint32_t i = 0; i < kVoiceCount; ++i)
+                if (voices[i].starved) {
+                    std::fprintf(stderr, " slot %u x%u", i, voices[i].starved);
+                    voices[i].starved = 0;
+                }
+            std::fprintf(stderr, " (in the last 5 s)\n");
+            std::fflush(stderr);
+            starved_total = 0;
+        }
+    }
     if (voice.queued == kQueueSize) {
         dropBuffer(slot, "queue-full");
         return 0;
@@ -305,6 +370,8 @@ extern "C" int recomp_audio_output_submit(
         return 0;
     }
     ++voice.queued;
+    voice.fed = true;
+    capture(slot, pcm, bytes, sample_rate, channels, bits_per_sample);
     ++submitted_buffers;
     submitted_bytes += bytes;
     bool nonzero = false;

@@ -46,6 +46,7 @@
 #include <string.h>
 
 #include "hle.h"
+#include "platform/host_timer.h"
 #include "dsound_buffer_model.h"
 #include "xbox_adpcm.h"
 #include "audio_output.h"
@@ -71,6 +72,9 @@ enum {
     TAG_PCM   = 0x0001u,
     TAG_ADPCM = 0x0069u,
     SLOTS     = 256u,
+
+    PRE_ROLL_MS       = 50u,     /* silence ahead of a buffer's sound; see prime() */
+    SERVICE_PERIOD_US = 5000,    /* the service thread's cadence; see service_thread() */
 };
 
 typedef struct Buffer {
@@ -83,6 +87,12 @@ typedef struct Buffer {
     uint32_t paused_flags;
     RecompDsoundBufferModel model;        /* what the game is told */
     RecompDsoundBufferModel output_model; /* what has been sent */
+    int      primed;             /* the host voice has had its pre-roll */
+    /* Since the last five-second report: the longest the output went
+     * without a pump, the sound thrown away for it, and how often the host
+     * voice ran dry. */
+    uint32_t gap_max_ms, discarded_ms, discards, dry;
+    uint64_t report_ms;
 } Buffer;
 
 static Buffer g_buffers[SLOTS];
@@ -142,10 +152,48 @@ static uint32_t setting(uint32_t iface, uint32_t offset)
 
 static uint32_t slot_of(const Buffer *b) { return (uint32_t)(b - g_buffers); }
 
+/* Drop what the host has queued for this buffer; the next submission starts
+ * a new voice, behind a fresh pre-roll. */
+static void reset_output(Buffer *b)
+{
+    recomp_audio_output_reset_voice(slot_of(b));
+    b->primed = 0;
+}
+
 static void retire(Buffer *b)
 {
     recomp_audio_output_reset_voice(slot_of(b));
     memset(b, 0, sizeof *b);
+}
+
+/* The pre-roll. pump() sends each slice of the buffer as the clock passes
+ * it -- not before, because a title streaming into a ring rewrites what is
+ * ahead of the cursor right up to the moment it is played -- so without a
+ * cushion the host voice holds at most one slice, and any pump that comes
+ * late leaves it dry: a gap in the sound. Bink's movie ring in Max Payne ran
+ * dry several times every five seconds. This much silence first, each time
+ * the voice starts or has run dry, plays everything that much later and
+ * absorbs a late pump up to the same length. */
+static void prime(Buffer *b, uint32_t rate, uint32_t channels, uint32_t bits,
+                  int32_t volume)
+{
+    static uint8_t silence[PRE_ROLL_MS * 200 * 2 * 2];   /* 200 kHz, stereo, 16 bit */
+    uint32_t frame = channels * bits / 8u;
+    uint32_t bytes = rate / 1000u * PRE_ROLL_MS * frame;
+    uint32_t queued = 0u;
+
+    if (b->primed) {
+        uint64_t played;
+        if (!recomp_audio_output_position(slot_of(b), &played, &queued) || queued != 0u)
+            return;
+        b->dry++;
+    }
+    if (bytes == 0u || bytes > sizeof silence)
+        return;
+    memset(silence, bits == 8u ? 0x80 : 0x00, bytes);
+    /* The buffer's own volume: the voice has one gain, set at each submission. */
+    if (recomp_audio_output_submit(slot_of(b), silence, bytes, rate, channels, bits, volume))
+        b->primed = 1;
 }
 
 /* Send the samples the output clock has consumed since the last pump. */
@@ -168,6 +216,27 @@ static void pump(Buffer *b, uint64_t now)
     channels = (b->format >> 16) & 0xFFu;
     bits = b->format >> 24;
     adpcm = (b->format & 0xFFFFu) == TAG_ADPCM;
+    /* What was lost, reported when anything was: a pump more than 100 ms
+     * after the last one is thrown away (recomp_dsound_buffer_consume), and
+     * a voice that ran dry was re-primed. */
+    {
+        uint32_t gap = (uint32_t)(now - out->last_ms);
+        if (gap > b->gap_max_ms) b->gap_max_ms = gap;
+        if (gap > 100u) { b->discarded_ms += gap; b->discards++; }
+        if (!b->report_ms) b->report_ms = now;
+        if (now - b->report_ms >= 5000u) {
+            if (b->discards || b->dry) {
+                fprintf(stderr, "[DSOUND] buffer %08X (slot %u, %u bytes), last %u ms: "
+                        "longest gap between pumps %u ms, %u ms discarded in %u gaps, "
+                        "ran dry %u times\n", b->iface, slot_of(b), out->size_bytes,
+                        (uint32_t)(now - b->report_ms), b->gap_max_ms, b->discarded_ms,
+                        b->discards, b->dry);
+                fflush(stderr);
+            }
+            b->gap_max_ms = b->discarded_ms = b->discards = b->dry = 0u;
+            b->report_ms = now;
+        }
+    }
     bytes = recomp_dsound_buffer_consume(out, now, &offset);
     if (bytes == 0u || b->data == 0u || bytes > sizeof pcm)
         return;
@@ -185,7 +254,7 @@ static void pump(Buffer *b, uint64_t now)
                     (const uint8_t *)HLE_PTR(b->data + offset / decoded_bytes * block_bytes),
                     block_bytes, channels, decoded, XBOX_ADPCM_BLOCK_SAMPLES * 2u)) {
                 b->output = 0;          /* bad data: keep the clock, stop the sound */
-                recomp_audio_output_reset_voice(slot_of(b));
+                reset_output(b);
                 return;
             }
             memcpy(pcm + written, (uint8_t *)decoded + within, count);
@@ -205,6 +274,7 @@ static void pump(Buffer *b, uint64_t now)
             if (offset == out->size_bytes) offset = out->loop_start_bytes;
         }
     }
+    prime(b, out->sample_rate, channels, bits, (int32_t)setting(b->iface, SET_VOLUME));
     recomp_audio_output_submit(slot_of(b), pcm, bytes, out->sample_rate,
                                channels, bits,
                                (int32_t)setting(b->iface, SET_VOLUME));
@@ -300,7 +370,7 @@ static Buffer *model_for_known(Buffer *known, uint32_t iface, uint64_t now)
         if (b->model.loop_start_bytes != decoded_loop) {
             pump(b, now);
             recomp_dsound_buffer_cursor(&b->model, now);
-            recomp_audio_output_reset_voice(slot_of(b));
+            reset_output(b);
             b->model.loop_start_bytes = decoded_loop;
             b->output_model = b->model;
         }
@@ -345,11 +415,94 @@ static uint64_t now_ms(void) { return GetTickCount64(); }
 static void resync_output(Buffer *b, int continuing)
 {
     if (!continuing)
-        recomp_audio_output_reset_voice(slot_of(b));
+        reset_output(b);
     if (continuing)
         b->output_model.play_flags = b->model.play_flags;
     else
         b->output_model = b->model;
+}
+
+/* ── The service thread ──────────────────────────────────────────
+ *
+ * On the console the audio hardware plays a buffer and consumes a stream's
+ * packets by itself; the title only refills them. Here nothing reached the
+ * host unless the title happened to call in: a buffer was pumped from inside
+ * GetCurrentPosition, GetStatus, Play and DirectSoundDoWork, a stream ticked
+ * from DoWork, Process and GetStatus. A title whose audio code pauses -- for a
+ * disc read, a page of a graphic novel loading -- left the host voice dry for
+ * the length of the pause, and a buffer pump more than 100 ms late threw that
+ * stretch of sound away. Max Payne's Bink sound thread polls its 0.6 s movie
+ * ring every 20 ms or so but stops for 140-300 ms at a time: up to 640 ms of
+ * every five seconds was dropped, the rest crackled.
+ *
+ * This thread is the hardware's half: every SERVICE_PERIOD_US it pumps each
+ * playing buffer and services the streams, whatever the title is doing. The
+ * title-driven pumps stay, and they matter: the one inside GetCurrentPosition
+ * reads the ring up to the cursor before the title is told the cursor and
+ * starts rewriting behind it. It runs no guest code -- it has no guest stack
+ * -- so a stream packet whose completion is a guest callback is still
+ * completed on a guest thread (hle_dsound_stream.c).
+ *
+ * RECOMP_DSOUND_SERVICE=0 switches it off, for comparing with the old
+ * behaviour. */
+void hle_dsound_stream_service(uint64_t now);   /* hle_dsound_stream.c */
+
+static DWORD WINAPI service_thread(LPVOID param)
+{
+    host_timer *timer = host_timer_create(HOST_TIMER_ANY);
+    int64_t next = host_time_ns();
+
+    (void)param;
+    for (;;) {
+        uint64_t now = now_ms();
+        uint32_t i;
+
+        lock();
+        for (i = 0; i < SLOTS; i++) {
+            Buffer *b = &g_buffers[i];
+            if (b->iface && b->output && b->output_model.playing)
+                pump(b, now);
+        }
+        unlock();
+        hle_dsound_stream_service(now);
+
+        next += (int64_t)SERVICE_PERIOD_US * 1000;
+        if (host_time_ns() - next > 100000000)   /* 100 ms behind: do not catch up */
+            next = host_time_ns();
+        if (!timer || host_timer_wait_until(timer, next, 50u) == HOST_WAIT_NOT_ARMED)
+            Sleep(SERVICE_PERIOD_US / 1000);
+    }
+    return 0;
+}
+
+static BOOL CALLBACK start_service(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    HANDLE thread;
+    (void)once; (void)param; (void)ctx;
+
+    if (!xbox_EnvSwitch("RECOMP_DSOUND_SERVICE", 1)) {
+        fprintf(stderr, "[DSOUND] RECOMP_DSOUND_SERVICE=0: sound is fed only when "
+                        "the title calls DirectSound\n");
+        return TRUE;
+    }
+    thread = CreateThread(NULL, 0, service_thread, NULL, 0, NULL);
+    if (!thread) {
+        fprintf(stderr, "[DSOUND] could not start the service thread; sound is fed "
+                        "only when the title calls DirectSound\n");
+        return TRUE;
+    }
+    CloseHandle(thread);
+    fprintf(stderr, "[DSOUND] service thread feeds buffers and streams every %d ms\n",
+            SERVICE_PERIOD_US / 1000);
+    fflush(stderr);
+    return TRUE;
+}
+
+/* Started by the first buffer played or stream created. */
+void hle_dsound_service_start(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, start_service, NULL, NULL);
 }
 
 /* HRESULT IDirectSoundBuffer_Play(this, reserved1, reserved2, flags) */
@@ -441,6 +594,7 @@ HLE_EXPORT(IDirectSoundBuffer_Play)
     Buffer *b;
     int continuing;
 
+    hle_dsound_service_start();
     lock();
     b = model_for(iface, now);
     if (said < 16) {
@@ -741,13 +895,20 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
     uint64_t now = now_ms();
     Buffer *b;
 
+    /* The output carries on from where it is at the new rate; it is not
+     * restarted. Max Payne calls this several times for each menu sound it
+     * plays, mostly with the rate it already has, and restarting the voice
+     * each time -- dropping what was queued and starting again behind the
+     * pre-roll -- left a 0.4 s cursor sound as a scatter of 2-30 ms pieces:
+     * no menu sounds at all. */
     lock();
     b = model_for(iface, now);
     if (b) {
+        uint32_t before = b->model.sample_rate;
         pump(b, now);
         result = recomp_dsound_buffer_set_frequency(&b->model, frequency, now);
-        if (result == RECOMP_DSOUND_OK)
-            resync_output(b, 0);
+        if (result == RECOMP_DSOUND_OK && b->model.sample_rate != before)
+            (void)recomp_dsound_buffer_set_frequency(&b->output_model, frequency, now);
     }
     unlock();
     HLE_RETURN(result);
@@ -969,7 +1130,7 @@ HLE_EXPORT(DirectSoundDoWork)
     HLE_RETURN(0);
 }
 
-/* ── The chip side of a voice's settings ──────────────────────────
+/* â”€â”€ The chip side of a voice's settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * CDirectSoundVoice_SetVolume, SetHeadroom, SetPitch, SetMixBins and
  * SetMixBinVolumes each write the voice settings object (the volume this
