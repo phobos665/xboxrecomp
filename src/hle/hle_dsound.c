@@ -895,13 +895,20 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
     uint64_t now = now_ms();
     Buffer *b;
 
+    /* The output carries on from where it is at the new rate; it is not
+     * restarted. Max Payne calls this several times for each menu sound it
+     * plays, mostly with the rate it already has, and restarting the voice
+     * each time -- dropping what was queued and starting again behind the
+     * pre-roll -- left a 0.4 s cursor sound as a scatter of 2-30 ms pieces:
+     * no menu sounds at all. */
     lock();
     b = model_for(iface, now);
     if (b) {
+        uint32_t before = b->model.sample_rate;
         pump(b, now);
         result = recomp_dsound_buffer_set_frequency(&b->model, frequency, now);
-        if (result == RECOMP_DSOUND_OK)
-            resync_output(b, 0);
+        if (result == RECOMP_DSOUND_OK && b->model.sample_rate != before)
+            (void)recomp_dsound_buffer_set_frequency(&b->output_model, frequency, now);
     }
     unlock();
     HLE_RETURN(result);
