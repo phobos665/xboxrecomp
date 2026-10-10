@@ -440,6 +440,10 @@ typedef enum D3DTEXTURESTAGESTATETYPE {
     D3DTSS_MIPMAPLODBIAS = 19,
     D3DTSS_MAXMIPLEVEL  = 20,
     D3DTSS_MAXANISOTROPY = 21,
+    /* Whether the stage's texture matrix is applied at all, and to how many
+     * coordinates (D3DTTFF_*). Not the PC's 24, which this enumeration
+     * already uses for COLORKEYOP. */
+    D3DTSS_TEXTURETRANSFORMFLAGS = 23,
     D3DTSS_COLORKEYOP   = 24,
     D3DTSS_COLORSIGN    = 25,
     D3DTSS_ALPHAKILL    = 26,
@@ -478,6 +482,14 @@ typedef enum D3DTEXTUREOP {
 #define D3DTA_SPECULAR          0x04
 #define D3DTA_COMPLEMENT        0x10
 #define D3DTA_ALPHAREPLICATE    0x20
+
+/* D3DTSS_TEXTURETRANSFORMFLAGS */
+#define D3DTTFF_DISABLE     0
+#define D3DTTFF_COUNT1      1
+#define D3DTTFF_COUNT2      2
+#define D3DTTFF_COUNT3      3
+#define D3DTTFF_COUNT4      4
+#define D3DTTFF_PROJECTED   256
 
 /* Texture coordinate generation (D3DTSS_TEXCOORDINDEX high bits) */
 #define D3DTSS_TCI_PASSTHRU                      0x00000000

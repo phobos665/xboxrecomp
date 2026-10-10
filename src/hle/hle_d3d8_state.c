@@ -46,7 +46,7 @@
  * MAXMIPLEVEL, BORDERCOLOR. Not forwarded: WRAP0-3, VERTEXBLEND, LOCALVIEWER, ZBIAS,
  * EDGEANTIALIAS, BLENDCOLOR, the back-face material and two-sided lighting
  * states, point sprite and multisample states, and the
- * texture stage states ADDRESSW, TEXTURETRANSFORMFLAGS, BUMPENVLSCALE/LOFFSET,
+ * texture stage states ADDRESSW, BUMPENVLSCALE/LOFFSET,
  * COLORKEYOP, COLORSIGN, ALPHAKILL, COLORKEYCOLOR, COLORARG0 (its host number
  * is ALPHAKILL's) and ALPHAARG0.
  */
@@ -457,6 +457,7 @@ static const struct {
     { 18, D3DTSS_ALPHAARG1,     TS_AS_IS },
     { 19, D3DTSS_ALPHAARG2,     TS_AS_IS },
     { 20, D3DTSS_RESULTARG,     TS_AS_IS },
+    { 21, D3DTSS_TEXTURETRANSFORMFLAGS, TS_AS_IS },  /* D3DTTFF_* match the PC's */
     { 22, D3DTSS_BUMPENVMAT00,  TS_AS_IS },
     { 23, D3DTSS_BUMPENVMAT01,  TS_AS_IS },
     { 24, D3DTSS_BUMPENVMAT11,  TS_AS_IS },  /* Xbox has 11 before 10 */

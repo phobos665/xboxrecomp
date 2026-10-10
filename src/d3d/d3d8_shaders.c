@@ -1066,6 +1066,15 @@ static void ff_vs_prepare_draw(DWORD fvf)
         for (i = 0; i < 4; i++) {
             const float *tm = (const float *)d3d8_GetTransform(D3DTS_TEXTURE0 + i);
             const DWORD *ts = d3d8_GetTSS(i);
+            /* A stage's matrix applies only while its TEXTURETRANSFORMFLAGS
+             * say so. A title sets a matrix for one effect and leaves it
+             * behind with the flags back at DISABLE: Max Payne's stage 1
+             * keeps a (0.5, -0.5, +0.5) environment-map matrix, and applied
+             * regardless it moved every stage 1 lookup -- decal lightmaps
+             * landed on other texels (litter drawn black, a graffiti tag at
+             * full brightness). */
+            if (ts && (ts[D3DTSS_TEXTURETRANSFORMFLAGS] & 0xFFu) == D3DTTFF_DISABLE)
+                tm = NULL;
             if (tm) {
                 float tm_t[16];
                 mat4_transpose(tm_t, tm);
