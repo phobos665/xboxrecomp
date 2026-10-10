@@ -1151,8 +1151,48 @@ static unsigned long g_draws_off_thread;
 
 /* The vertex formats draws arrive with, whether or not they are then drawn:
  * a shader handle seen for the first time is logged, up to a limit. */
+/* RECOMP_HLE_D3D8_TRACE_DRAW=<handle>: which of the title's routines make
+ * the draws with this vertex shader handle (an FVF such as 0x142). The first
+ * sixteen draws whose chain of guest return addresses is new print it. How
+ * a title project finds the code behind one kind of draw -- its HUD, say --
+ * to tell the renderer what those draws are. The stack is read as it stands
+ * after the title's own body ran: the return addresses are still there. */
+static void trace_draw_callers(void)
+{
+    static long want = -2;
+    static int shown;
+    static uint32_t seen[16];
+    extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+    uint32_t chain[6], sum = 0, v;
+    int i, n = 0;
+
+    if (want == -2) {
+        const char *e = getenv("RECOMP_HLE_D3D8_TRACE_DRAW");
+        want = e && *e ? (long)strtoul(e, NULL, 0) : -1;
+    }
+    if (want < 0 || (uint32_t)want != g_shadow_vs || shown >= 16)
+        return;
+    for (i = -8; i < 120 && n < 6; i++) {
+        v = HLE_MEM32(g_esp + 4u * (uint32_t)i);
+        if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+            chain[n++] = v;
+            sum = sum * 31u + v;
+        }
+    }
+    for (i = 0; i < shown; i++)
+        if (seen[i] == sum)
+            return;
+    seen[shown++] = sum;
+    fprintf(stderr, "[HLE-D3D8] draw with 0x%08X at swap %lu, callers:", g_shadow_vs,
+            g_shadow_swaps);
+    for (i = 0; i < n; i++)
+        fprintf(stderr, "%s 0x%08X", i ? " <-" : "", chain[i]);
+    fprintf(stderr, "\n");
+}
+
 static void note_draw_format(uint32_t xpt, uint32_t stride)
 {
+    trace_draw_callers();
     static uint32_t seen[24];
     static int nseen;
     int i;
@@ -3701,6 +3741,55 @@ HLE_EXPORT(D3DDevice_SetVertexData4f)
     }
 }
 
+/* RECOMP_HLE_D3D8_TRACE_TRANSFORM=<state>: where a title's matrix comes
+ * from. For the Xbox transform state named (0 view, 1 projection, 2-5
+ * texture, 6-9 world), the first twelve calls whose matrix or caller is new
+ * print the matrix's guest address, its rows and the guest return addresses
+ * above the call. The address is what RECOMP_WATCH_WRITE then names the
+ * writer of -- how a title project finds the routine that builds its
+ * projection, to widen it there (xbox_D3D8ClaimHorPlus). Before the body:
+ * it pops the arguments. */
+static void trace_transform(uint32_t state, uint32_t matrix)
+{
+    static int want = -2, shown;
+    static uint32_t seen_m[12], seen_c[12];
+    extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+    uint32_t caller = 0, v;
+    float m[16];
+    int i, n = 0;
+
+    if (want == -2) {
+        const char *e = getenv("RECOMP_HLE_D3D8_TRACE_TRANSFORM");
+        want = e && *e ? atoi(e) : -1;
+    }
+    if (want < 0 || (uint32_t)want != state || !matrix || shown >= 12)
+        return;
+    /* Past this function's own return address and its two arguments. */
+    for (i = 3; i < 64 && !caller; i++) {
+        v = HLE_MEM32(g_esp + 4u * (uint32_t)i);
+        if (v > g_xbox_code_lo && v < g_xbox_code_hi)
+            caller = v;
+    }
+    for (i = 0; i < shown; i++)
+        if (seen_m[i] == matrix && seen_c[i] == caller)
+            return;
+    seen_m[shown] = matrix;
+    seen_c[shown++] = caller;
+    memcpy(m, HLE_PTR(matrix), sizeof m);
+    fprintf(stderr, "[HLE-D3D8] SetTransform(%u) matrix at 0x%08X, swap %lu:\n", state, matrix,
+            g_shadow_swaps);
+    for (i = 0; i < 4; i++)
+        fprintf(stderr, "[HLE-D3D8]   %12.6g %12.6g %12.6g %12.6g\n", (double)m[i * 4],
+                (double)m[i * 4 + 1], (double)m[i * 4 + 2], (double)m[i * 4 + 3]);
+    fprintf(stderr, "[HLE-D3D8]   callers:");
+    for (i = 0; i < 96 && n < 6; i++) {
+        v = HLE_MEM32(g_esp + 4u * (uint32_t)i);
+        if (v > g_xbox_code_lo && v < g_xbox_code_hi)
+            fprintf(stderr, "%s 0x%08X", n++ ? " <-" : "", v);
+    }
+    fprintf(stderr, "\n");
+}
+
 /* HRESULT D3DDevice_SetTransform(D3DTRANSFORMSTATETYPE State,
  *     const D3DMATRIX *pMatrix)
  * The Xbox packs the states together -- VIEW 0, PROJECTION 1, TEXTURE0-3
@@ -3715,6 +3804,7 @@ HLE_EXPORT(D3DDevice_SetTransform)
     first_call(&seen, "D3DDevice_SetTransform", state);
     if (original_missing(hle_original_D3DDevice_SetTransform, "D3DDevice_SetTransform"))
         HLE_RETURN(0x80004005u);
+    trace_transform(state, matrix);
     HLE_CALL_ORIGINAL(D3DDevice_SetTransform);
     if (g_shadow && matrix && state < 10) {
         D3DMATRIX m;
