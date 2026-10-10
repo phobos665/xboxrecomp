@@ -55,6 +55,8 @@ const D3D8DisplayPolicy *d3d8_display_policy(void);
 int  d3d8_display_wide_now(void);
 /* A frame has been presented (it notes each change of shape in the log). */
 void d3d8_display_frame_done(void);
+/* A draw in perspective onto the screen, for xbox_D3D8SetWideFramesAuto. */
+void d3d8_display_note_3d_draw(void);
 
 /* The size the scene is rendered at, for a guest presenting at guest_w by
  * guest_h. Equal to the guest's own size when nothing is scaled. */

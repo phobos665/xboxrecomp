@@ -497,3 +497,53 @@ Three sentences, since the brief asked for them plainly:
 - **Whether TimeSplitters 2's "Screen Adjust" interacts with a pillarboxed
   viewport.** It nudges a safe-area offset; whether that offset is applied in guest
   pixels before or after the viewport was not traced.
+
+---
+
+## 8. A title that can widen its view but not change its aspect (Oct 2026)
+
+Max Payne (XDK 4134) is the case sections 3 and 4 did not have: fixed-function,
+no 16:9 mode, one viewport for each portal it draws through, and an engine that
+keeps a **horizontal** field of view and takes the vertical from a 640x480
+rectangle it also draws into. There is no aspect to hand a wider value, and no
+single projection to scale: each portal has its own, and its own rectangle.
+
+What worked is a split, and each half is small:
+
+- **The title widens its field of view where it sets it** (one wrapped function:
+  the factor from `xbox_D3D8ClaimHorPlus` applied to tan(fov / 2)). Its culling,
+  its portals and its projections all follow, because to the engine it is just
+  a wider camera. The picture grows by the same amount both ways.
+- **The renderer crops the rows that added:** `xbox_D3D8SetVerticalZoom(1 /
+  factor)` draws every 3D viewport on the screen that much taller about the
+  middle (`apply_host_viewport`). Scaling the rectangle and not the projection
+  is what keeps several viewports in one frame joined up -- each rectangle
+  moves the way the picture inside it does. A scissor follows; so does a
+  depth-only `Clear` rectangle, which belongs to a viewport, while one that
+  clears colour (letterbox bars) stays where the title put it.
+
+Two more hooks came out of the same title, both for 2D:
+
+- **`xbox_D3D8SetScreenSpaceTest`.** The renderer knows two kinds of
+  screen-space draw: pre-transformed vertices, and a vertex program that does
+  not use the projection. Max Payne draws its HUD, menus and graphic novel a
+  third way -- quads at one depth in front of the camera that draws the world,
+  issued through the same batch flush as the world -- which only the title can
+  recognise. Its test says which draws those are and how wide each reaches, and
+  from there they are placed like any other 2D. Without it the HUD was zoomed
+  and cropped with the world.
+- **`xbox_D3D8SetWideFramesAuto`.** `xbox_D3D8SetWideFrames` by the renderer's
+  own count: a frame is 16:9 if the frame before it drew anything in
+  perspective onto the screen, and 4:3 between bars otherwise. Right for a
+  title whose 2D screens (menus, movies, loading) have no 3D in them; a front
+  end that mixes the two still needs the title to say.
+
+Finding the pieces took two diagnostics that are now switches:
+`RECOMP_HLE_D3D8_TRACE_TRANSFORM=<state>` (where a title's projection lives and
+who sets it) and `RECOMP_HLE_D3D8_TRACE_DRAW=<handle>` (which of its routines
+issue the draws with one vertex format).
+
+Not done: the vertical zoom is not recorded in a frame capture, so a replay of a
+widescreen frame draws the title's own viewports; and a HUD placed this way sits
+in the centre 4:3 block (`XBOX_D3D8_2D_SIDE` would pin it to the edges, but it
+does not let a whole-screen fade span the picture).
