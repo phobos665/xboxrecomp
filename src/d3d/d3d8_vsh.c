@@ -1399,9 +1399,13 @@ const float *d3d8_vsh_constants(void)
     return &g_vsh_constants.c[0][0];
 }
 
-/* Hor+ widescreen, experimental: RECOMP_HOR_PLUS=<factor> scales one
- * constant register as it is uploaded, and RECOMP_HOR_PLUS_REG=<n> says
- * which (60 by default, which is what TimeSplitters 2 uses).
+/* Hor+ widescreen, experimental: one constant register is scaled as it is
+ * uploaded. Whether, by how much and which register are resolved for the
+ * title in recomp_config.c (recomp_widescreen_resolve): widescreen on a
+ * title whose project says it has no 16:9 mode gives 0.75 on the register
+ * the project names, and RECOMP_HOR_PLUS=<factor> and
+ * RECOMP_HOR_PLUS_REG=<n> override either (60 when nobody names one, which
+ * is what TimeSplitters 2 uses).
  *
  * A title whose vertex program transforms by a matrix in constant
  * registers keeps that matrix transposed for dp4, so the register that
@@ -1424,34 +1428,80 @@ const float *d3d8_vsh_constants(void)
  * xbox_D3D8ClaimHorPlus, and the register is then left as uploaded. */
 static BOOL g_hor_plus_claimed;
 
+/* The resolution, kept: this is asked on every constant upload. Resolved
+ * again when the title says something new about itself, which a title
+ * that widens its own camera does late -- at its first camera, well after
+ * its first constants (xbox_D3D8ClaimHorPlus below). */
+static float    g_hor_plus = 1.0f;
+static int      g_projection_reg = RECOMP_PROJECTION_REGISTER_DEFAULT;
+static int      g_wide_resolved;
+static unsigned g_wide_serial;
+
+static void wide_resolve(void)
+{
+    unsigned serial = recomp_widescreen_title_serial();
+    RecompWidescreen w;
+    float factor;
+
+    if (g_wide_resolved && serial == g_wide_serial)
+        return;
+    recomp_widescreen_resolve(&w);
+    factor = (float)w.hor_plus;
+    if (w.projection_register < 0 || w.projection_register >= NV2A_VS_MAX_CONSTANTS)
+        w.projection_register = RECOMP_PROJECTION_REGISTER_DEFAULT;
+
+    /* The register is read when a program is translated, to mark the ones
+     * that are 3D, and that mark is kept with the program. One named after
+     * the first program was built is too late for those already built. */
+    if (g_wide_resolved && w.projection_register != g_projection_reg)
+        fprintf(stderr, "D3D8 VSH: the projection register is now c[%d], was c[%d]; "
+                "vertex programs already built keep the old one. A title names "
+                "its register before it creates its device\n",
+                w.projection_register, g_projection_reg);
+    if (w.register_named && w.title_register >= 0 &&
+        w.title_register != w.projection_register && !g_wide_resolved)
+        fprintf(stderr, "D3D8 VSH: hor_plus_register = %d overrides c[%d], which this "
+                "title's project names as its projection; remove the setting to "
+                "use the title's\n", w.projection_register, w.title_register);
+    if (factor != 1.0f && !g_hor_plus_claimed &&
+        (!g_wide_resolved || factor != g_hor_plus))
+        fprintf(stderr, "D3D8 VSH: Hor+ scaling c[%d] by %.4f (experimental; %s)\n",
+                w.projection_register, (double)factor,
+                w.hor_plus_named ? "hor_plus is set"
+                                 : "widescreen, and this title has no 16:9 mode of its own");
+
+    g_hor_plus = factor;
+    g_projection_reg = w.projection_register;
+    g_wide_serial = serial;
+    g_wide_resolved = 1;
+}
+
 static float hor_plus_factor(void)
 {
-    static float factor = -1.0f;
-
-    if (factor < 0.0f) {
-        const char *v = recomp_config_lookup("RECOMP_HOR_PLUS", "hor_plus");
-
-        factor = (v && *v) ? (float)atof(v) : 1.0f;
-        if (factor == 0.0f)
-            factor = 1.0f;              /* the config's "leave it alone" */
-        if (factor <= 0.0f || factor > 4.0f)
-            factor = 1.0f;
-        if (factor != 1.0f)
-            fprintf(stderr, "D3D8 VSH: Hor+ scaling c[%d] by %.4f (experimental)\n",
-                    d3d8_vsh_hor_plus_reg(), (double)factor);
-    }
-    return factor;
+    wide_resolve();
+    return g_hor_plus;
 }
 
 float xbox_D3D8ClaimHorPlus(void)
 {
-    float factor = hor_plus_factor();
+    float factor;
 
-    if (!g_hor_plus_claimed && factor != 1.0f)
-        fprintf(stderr, "D3D8 VSH: Hor+ %.4f taken over by the caller; "
-                "c[%d] is left as uploaded\n", (double)factor, d3d8_vsh_hor_plus_reg());
-    g_hor_plus_claimed = TRUE;
-    return factor;
+    /* A title that widens its own camera has no 16:9 mode to do it for
+     * it: the claim is the declaration, so widescreen alone now carries
+     * the 4:3-to-16:9 factor to it and its project need say nothing else.
+     * Marked claimed first, so the resolution this causes does not report
+     * a register scaling that is not going to happen. */
+    if (!g_hor_plus_claimed) {
+        g_hor_plus_claimed = TRUE;
+        if (recomp_widescreen_title_mode() != RECOMP_WIDE_HOR_PLUS)
+            recomp_widescreen_title(RECOMP_WIDE_HOR_PLUS, -1);
+        factor = hor_plus_factor();
+        if (factor != 1.0f)
+            fprintf(stderr, "D3D8 VSH: Hor+ %.4f taken over by the caller; "
+                    "c[%d] is left as uploaded\n", (double)factor,
+                    d3d8_vsh_hor_plus_reg());
+    }
+    return hor_plus_factor();
 }
 
 /* RECOMP_CAMERA_ZOOM (settings file: camera_zoom): narrow the field of
@@ -1486,16 +1536,8 @@ static float camera_zoom(void)
 
 int d3d8_vsh_hor_plus_reg(void)
 {
-    static int reg = -1;
-
-    if (reg < 0) {
-        const char *v = recomp_config_lookup("RECOMP_HOR_PLUS_REG", "hor_plus_register");
-
-        reg = (v && *v) ? atoi(v) : 60;
-        if (reg < 0 || reg >= NV2A_VS_MAX_CONSTANTS)
-            reg = 60;
-    }
-    return reg;
+    wide_resolve();
+    return g_projection_reg;
 }
 
 /* Frame interpolation's registers: what the title said

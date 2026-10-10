@@ -19,7 +19,7 @@ tells the mechanism something only the game knows.
 | # | Enhancement | Today | Toolkit | Title project |
 |---|---|---|---|---|
 | 1 | Higher frame rates | Frame cap exists (adaptive 60 / 60 / 30 / off); above 60 is unsafe; frame interpolation shows 2-4x with logic at 60 (`frame_interp`) | Pacing, cap settings, frame interpolation | Which registers hold its matrices; or making the game's logic correct at a higher rate: the bulk of the work |
-| 2 | Native widescreen | Console flag and 16:9 presentation exist; Hor+ is experimental | The flag, 16:9 presentation, Hor+ mechanisms | Which register holds the projection, which draws are HUD, 4:3-authored 2D |
+| 2 | Native widescreen | Console flag and 16:9 presentation exist; Hor+ is experimental; one player switch resolves to either | The flag, 16:9 presentation, Hor+ mechanisms, resolving the switch per title | Whether it has a 16:9 mode, which register holds the projection, which draws are HUD, 4:3-authored 2D |
 | 3 | Internal resolution scaling | `RECOMP_RES_SCALE=1..8` exists | All of it | Fixes for passes that break at scale (post effects, read-backs) |
 | 4 | MSAA / supersampling | Supersampling exists (item 3); MSAA only when the title asks for it | Forced MSAA, resolve, SSAA via item 3 | Passes that must not be multisampled |
 | 5 | Filters / shaders | Anisotropic filtering (`RECOMP_ANISO`); no post-process chain | A post-process chain on the final frame | Game-tuned presets, if any |
@@ -68,22 +68,56 @@ where it is attempted, and where this list is least toolkit-shaped.
 sets the widescreen bit the game reads through `XC_VIDEO` and presents the frame at 16:9.
 Xbox widescreen is anamorphic (the game renders a squeezed 640x480 frame for the TV to
 stretch), so for a game with its own 16:9 mode that is the whole job. A game without one
-still draws 4:3 and comes out stretched, which is why the switch is off by default.
-`RECOMP_HOR_PLUS` widens the field of view by scaling one vertex constant register as it
-is uploaded, and `RECOMP_HOR_PLUS_REG` says which register (60 for TimeSplitters 2).
-That is experimental, and it scales the HUD's projection too if the HUD shares it.
+still draws 4:3 and comes out stretched unless its camera is widened as well: Hor+, which
+scales one vertex constant register as it is uploaded (experimental; it scales the HUD's
+projection too if the HUD shares it), or is done by the title's own project where the
+game builds its camera (`xbox_D3D8ClaimHorPlus`).
+
+**One switch (Oct 2026).** The player chooses `widescreen`, on or off, and nothing else:
+the launcher has one Widescreen row where it had Widescreen and Wide camera. Whether on
+means the flag alone or the flag and Hor+, and on which register, is resolved when the
+game starts (`recomp_widescreen_resolve`, `src/config/recomp_config.c`) from what the
+title's project has said:
+
+| The title's project says | Widescreen on resolves to |
+|---|---|
+| `recomp_title_widescreen(NATIVE [REGISTER n])` in its CMakeLists | The flag and 16:9. No Hor+. |
+| `recomp_title_widescreen(HOR_PLUS [REGISTER n])` | The flag, 16:9, and c[n] scaled by 0.75. |
+| Its code calls `xbox_D3D8ClaimHorPlus()` | The flag, 16:9, and 0.75 handed to the title; no register is scaled. The claim is the declaration, so nothing else is needed. |
+| Nothing | As `NATIVE`, with a line in the log saying nobody has said. |
+| `recomp_add_launcher(... NO_WIDESCREEN)` | The launcher does not offer it. |
+
+A title nobody has described is treated as having its own 16:9 mode because that is what
+`widescreen = 1` alone has always done, it is right for every title that has one, and the
+other guess is worse: scaling c[60] of an unexamined title corrupts whatever it keeps
+there, and widens a title with its own mode twice. The cost is that a 4:3-only title
+looks stretched until its project says so.
+
+The detailed settings are still there, for overriding rather than choosing, and still
+win: `RECOMP_HOR_PLUS` / `hor_plus` as a number (0 leaves the camera alone whatever the
+title, a factor applies even with widescreen off) and `RECOMP_HOR_PLUS_REG` /
+`hor_plus_register`. `auto`, or no line, leaves each to the title; a new settings file
+has both commented out. A file from before this, with `hor_plus = 0` or `0.75` written
+by the two-switch launcher, means what it meant: the launcher keeps the value until the
+player moves the switch, and only then hands it back to `auto`. While a kept value gives
+the game a different camera from the one the switch alone would (widescreen on with the
+camera not widened, say), the row says "camera set in the settings file" and that
+switching it off and on hands the camera back.
 
 **Toolkit part.** The console flag and 16:9 presentation (done); the register-scaling
-mechanism (done); the same for games using the fixed-function transform, where the
-projection matrix is visible at `SetTransform` and needs no per-game register; and
-drawing a 4:3-only game centred with bars, as an alternative to stretching.
+mechanism (done); resolving the two from one switch (done); the same for games using the
+fixed-function transform, where the projection matrix is visible at `SetTransform` and
+needs no per-game register; and drawing a 4:3-only game centred with bars, as an
+alternative to stretching.
 
 **Title project part.**
-- *A game with its own 16:9 mode* (Burnout 2) needs nothing: the flag is the whole job.
-- *A 4:3-only game with vertex programs* (TimeSplitters 2) needs its projection register
-  found, and its 2D layer (HUD, menus) kept at 4:3 and centred, or re-laid out. Deciding
-  which pre-transformed draws are HUD and which are full-screen (a fade and a health bar
-  are the same kind of draw) is only knowable per game.
+- *A game with its own 16:9 mode* (Burnout 2, OutRun 2) says `NATIVE`, with its
+  projection register if it is not 60; the flag is the rest of the job.
+- *A 4:3-only game with vertex programs* (TimeSplitters 2) says `HOR_PLUS` and its
+  projection register, or widens its own camera and claims the factor. Its 2D layer
+  (HUD, menus) has to be kept at 4:3 and centred, or re-laid out. Deciding which
+  pre-transformed draws are HUD and which are full-screen (a fade and a health bar are
+  the same kind of draw) is only knowable per game.
 
 ## 3. Internal resolution scaling
 
