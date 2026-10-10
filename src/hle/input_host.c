@@ -117,8 +117,12 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * no save state to restore a native process to -- lifted code is mid-flight
  * on real threads with host GPU objects behind it -- so replaying the presses
  * is how a run gets back to the same screen. The sequence is the save state.
- * Nothing is pressed after the last step ends. */
-#define SEQ_MAX 128
+ * Nothing is pressed after the last step ends.
+ *
+ * SEQ_MAX was 128, and a longer script was cut short in silence: a six-minute
+ * MK Shaolin Monks play test stopped pressing at three minutes and looked like
+ * the game had stopped answering the pad. A script cut short now says so. */
+#define SEQ_MAX 1024
 static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; } s_seq[SEQ_MAX];
 static int s_seq_count = -1;
 static unsigned long long s_seq_t0;
@@ -166,10 +170,15 @@ static void seq_parse(const char *env)
                 q++;
         }
         s_seq_count++;
-        if (!step_end)
+        if (!step_end) {
+            p += len;
             break;
+        }
         p = step_end + 1;
     }
+    if (*p && s_seq_count >= SEQ_MAX)
+        fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: more than %d steps; the rest are ignored"
+                " (from '%.24s')\n", SEQ_MAX, p);
 }
 
 /* Whether an input script is driving this run (RECOMP_INPUT_SEQ), parsing

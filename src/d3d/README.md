@@ -122,7 +122,7 @@ R4G4B4A4→bit-reordered).
 | D3DFMT_R8B8 | 0x29 | R8G8_UNORM | |
 | D3DFMT_D24S8 | 0x2A | D24_UNORM_S8_UINT | also F24S8 (0x2B) |
 | D3DFMT_D16 | 0x2C | D16_UNORM | |
-| D3DFMT_F16 | 0x2D | R16_FLOAT | no D3D11 float depth; falls back to D16 for DSV |
+| D3DFMT_F16 | 0x2D | R16_FLOAT | no D3D11 float depth; depth surfaces and textures fall back to D16 |
 | D3DFMT_L16 | 0x32 | R16_UNORM | |
 | D3DFMT_V16U16 | 0x33 | R16G16_SNORM | |
 | D3DFMT_R5G5B5A1 | 0x38 | B5G5R5A1 | bit-reordered at upload |

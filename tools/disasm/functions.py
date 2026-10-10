@@ -120,6 +120,10 @@ class FunctionDetector:
         # Pass 4b: Function addresses installed into indirect-call slots
         self._pass_indirect_call_slots()
 
+        # Pass 4c: Incremental-link thunk tables (every entry, and every target)
+        for sec in sections:
+            self._pass_jump_thunk_tables(sec)
+
         # Pass 5: Build functions from candidates
         self._build_functions(sections)
 
@@ -566,6 +570,81 @@ class FunctionDetector:
         if found:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
+
+    def _pass_jump_thunk_tables(self, section: SectionInfo) -> None:
+        """
+        Pass 4c: An incremental-link thunk table. Every entry is a function,
+        and so is every entry's target.
+
+        A build linked with /INCREMENTAL routes each function through a 5-byte
+        `jmp rel32` thunk, and the thunks sit back to back at the start of
+        .text with no padding between them. Every address the program takes --
+        a vtable slot, a callback, a function-pointer table -- is the thunk's,
+        not the function's. Direct calls make the thunks they reach into call
+        targets; the rest exist only as values in data, and one missing is an
+        indirect call the runtime cannot resolve, so it is skipped and returns
+        0. MK Shaolin Monks has 4,753 thunks at 0x00011005 and discovery had
+        2,064 of them; its first virtual call through one of those
+        (0x00012EEB, from the title screen) was where it stopped.
+
+        The targets matter as much: the linker sends every function through
+        its thunk, so a target is a function start by construction. Four of
+        Shaolin Monks' were the second half of the function before them (a
+        `mov eax, 0x5B; ret` folded into its neighbour's body).
+
+        Only a run of MIN_ILT_RUN or more `E9 rel32` at a 5-byte stride, every
+        target inside an executable section, counts. One function never holds
+        two unconditional jumps in a row, so such a run is not ordinary code.
+        """
+        data = self.image.get_section_data(section)
+        if not data:
+            return
+        va_start = section.virtual_addr
+
+        def target_of(off: int) -> Optional[int]:
+            if off + 5 > len(data) or data[off] != 0xE9:
+                return None
+            rel = int.from_bytes(data[off + 1:off + 5], "little", signed=True)
+            tgt = (va_start + off + 5 + rel) & 0xFFFFFFFF
+            sec = self.image.get_section_at_va(tgt)
+            return tgt if (sec and sec.executable) else None
+
+        tables = entries = targets = 0
+        i = 0
+        while i + 5 <= len(data):
+            if data[i] != 0xE9:
+                i += 1
+                continue
+            run = []
+            j = i
+            while True:
+                tgt = target_of(j)
+                if tgt is None:
+                    break
+                run.append((va_start + j, tgt))
+                j += 5
+            if len(run) < config.MIN_ILT_RUN:
+                i += 1
+                continue
+            tables += 1
+            for entry, tgt in run:
+                if entry not in self.engine.instructions:
+                    self.engine.decode_at(entry)
+                self._add_candidate(entry, config.CONFIDENCE_CALL_TARGET,
+                                    "ilt_thunk")
+                entries += 1
+                if tgt not in self.engine.instructions:
+                    if not self.engine.probes_as_function_body(tgt):
+                        continue
+                    if not self.engine.decode_at(tgt):
+                        continue
+                self._add_candidate(tgt, config.CONFIDENCE_CALL_TARGET,
+                                    "ilt_target")
+                targets += 1
+            i = j
+        if tables:
+            print(f"  {section.name}: {tables} incremental-link thunk table(s),"
+                  f" {entries} thunks, {targets} targets")
 
     def _pass_imm_ref_targets(self, sections: List[SectionInfo]) -> bool:
         """

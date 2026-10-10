@@ -154,6 +154,16 @@ CC_PADDING = 0xCC
 # Minimum CC padding run length to consider as function boundary
 MIN_CC_RUN = 1
 
+# Shortest run of `jmp rel32` thunks packed at a 5-byte stride that is taken
+# for an incremental-link thunk table (functions.py _pass_jump_thunk_tables).
+# MK Shaolin Monks' table is 4,753 entries long. Shorter runs exist that are
+# not thunk tables: across the 40 titles in games/ (Oct 2026) the next longest
+# are 27 (NFSU2), 23 (Panzer Dragoon Orta) and 18 (WWE Raw 2), and Orta's and
+# WWE's entries are none of them reached as functions -- a computed jump into a
+# row of `jmp` arms inside one function looks the same, and making its arms
+# functions would cut that function up. 64 keeps every one of those out.
+MIN_ILT_RUN = 64
+
 # ============================================================
 # Function Detection Confidence Scores
 # ============================================================

@@ -1372,6 +1372,10 @@ IDirect3DSurface8 *d3d8_surface_create(RhiImage *image,
 
     host = d3d8_to_dxgi_format(fmt);
     is_depth = d3d8_format_is_depth(fmt);
+    /* An F16 texture is held as D16 (d3d8_CreateTextureImpl), so its levels
+     * get a D16 depth view. */
+    if (is_depth && host == RHI_FORMAT_R16_FLOAT)
+        host = RHI_FORMAT_D16_UNORM;
 
     memset(&vd, 0, sizeof(vd));
     vd.format = host;
@@ -1554,6 +1558,14 @@ HRESULT d3d8_CreateTextureImpl(UINT Width, UINT Height, UINT Levels, DWORD Usage
 
     tex->d3d8_format = Format;
     tex->host_format = d3d8_to_dxgi_format(Format);
+    /* F16 is float depth, which D3D11 has no format for. As a texture it
+     * mapped to R16_FLOAT and was then bound as depth (it is a depth format),
+     * which no backend accepts: MK Shaolin Monks' 256x256 LIN_F16 shadow
+     * texture failed 22,000 times in two minutes. Hold it as D16, the same
+     * fallback dev_CreateDepthStencilSurface makes; D16 is sampled as well
+     * below, so a shadow map still works. */
+    if (tex->host_format == RHI_FORMAT_R16_FLOAT && d3d8_format_is_depth(Format))
+        tex->host_format = RHI_FORMAT_D16_UNORM;
     tex->width = Width;
     tex->height = Height;
     tex->usage = Usage;
