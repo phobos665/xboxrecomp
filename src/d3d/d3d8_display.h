@@ -30,8 +30,10 @@ typedef struct D3D8DisplayPolicy {
      * therefore anamorphic -- authored squeezed, to be stretched back out
      * by the display. Only true of a title with a 16:9 mode of its own,
      * which is why it is off by default; a 4:3-only title told this
-     * renders 4:3 content that then gets stretched. The kernel reads the
-     * same variable to answer XC_VIDEO. */
+     * renders 4:3 content that then gets stretched, unless its camera is
+     * widened as well, which is resolved per title beside the settings
+     * (recomp_widescreen_resolve). The kernel reads the same variable to
+     * answer XC_VIDEO. */
     int  widescreen;
     /* RECOMP_WIDESCREEN_2D=centre: in widescreen, every 2D draw is kept at
      * 4:3 in the middle, backdrops included, and only whole-screen passes

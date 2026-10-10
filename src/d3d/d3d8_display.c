@@ -73,12 +73,35 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
             fprintf(stderr, "D3D8 display: RECOMP_WIDESCREEN_2D=%s is neither auto nor "
                     "centre; using auto\n", v);
 
-        if (g_policy.widescreen)
+        if (g_policy.widescreen) {
+            /* What else widescreen takes for this title is resolved beside
+             * the settings (recomp_widescreen_resolve); said here because
+             * a stretched picture is the first thing anyone asks about.
+             * As known now: a title that widens its own camera says so
+             * later, at its first camera (xbox_D3D8ClaimHorPlus). */
+            RecompWidescreen w;
+            const char *what;
+
+            recomp_widescreen_resolve(&w);
+            if (w.hor_plus_named)
+                what = w.hor_plus != 1.0
+                     ? "hor_plus is set, so the camera is widened by that."
+                     : "hor_plus is set to leave the camera alone, so a title with no "
+                       "16:9 mode of its own will look stretched.";
+            else if (w.mode == RECOMP_WIDE_HOR_PLUS)
+                what = "This title has no 16:9 mode of its own, so its camera is "
+                       "widened to match (Hor+).";
+            else if (w.mode == RECOMP_WIDE_NATIVE)
+                what = "This title has a 16:9 mode of its own.";
+            else
+                what = "Nothing has said whether this title has a 16:9 mode of its own: "
+                       "one without draws 4:3 and will look stretched until its project "
+                       "says so (recomp_title_widescreen) or hor_plus is set.";
             fprintf(stderr, "D3D8 display: widescreen, so the title's frame is presented "
-                    "at 16:9. A title with no 16:9 mode of its own draws 4:3 and will "
-                    "look stretched; leave this off for those.%s\n",
+                    "at 16:9. %s%s\n", what,
                     g_policy.centre_2d ? " All 2D but whole-screen passes is kept at 4:3."
                                        : "");
+        }
         if (g_policy.anisotropy > 1)
             fprintf(stderr, "D3D8 display: anisotropic filtering forced to %ux where the "
                     "title filters linearly\n", g_policy.anisotropy);

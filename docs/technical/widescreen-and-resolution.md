@@ -11,6 +11,18 @@ not the world, not the HUD, not menus, fonts, sprites, full-screen quads, fades 
 FMV. "The image is stretched" is a failure, not a trade-off. Every option below is
 judged against that.
 
+**Since this was written (Oct 2026):** both features exist, and so does the Hor+ this
+document files under W5. What section 4 classifies as game-specific is now something a
+title's project *declares* rather than something a player has to choose: W4b ("knowing a
+title has no 16:9 mode") and W5b ("which register holds the projection") are one line in
+the title's CMakeLists, `recomp_title_widescreen(NATIVE | HOR_PLUS [REGISTER n])`, or
+implied by the title's code calling `xbox_D3D8ClaimHorPlus`. The player has one
+`widescreen` switch and the runtime resolves what it means for the title being run
+(`recomp_widescreen_resolve` in `src/config/recomp_config.c`; the table is in
+`xbox-game-enhancements.md`, section 2). A title that declares nothing is treated as
+having a 16:9 mode of its own, which is what `widescreen = 1` alone always did. The rest
+of this document is the investigation as it stood, line numbers and all.
+
 Everything here was read out of the tree and out of the two titles' disassembly.
 Nothing was run: the machine was building and running TimeSplitters 2 for another
 session throughout (eight `MSBuild.exe`, one `timesplitters2_recomp.exe`), so no

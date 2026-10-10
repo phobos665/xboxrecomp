@@ -169,6 +169,13 @@ endif()
 #     VERBOSE_KERNEL_LOG=1
 # )
 
+# ── Widescreen ──────────────────────────────────────────────────
+# TimeSplitters 2 has no 16:9 mode: it never asks the console whether it is
+# widescreen (no caller of ExQueryNonVolatileSetting passes XC_VIDEO) and
+# has no option for it, so widescreen here means widening its camera. Its
+# projection is in c[60..63]. docs/technical/widescreen-and-resolution.md.
+recomp_title_widescreen(HOR_PLUS REGISTER 60)
+
 # ── Launcher ────────────────────────────────────────────────────
 # A settings window that writes the per-title settings file and starts
 # the game. Windows only; see "The launcher" in the top-level README.

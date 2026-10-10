@@ -171,3 +171,11 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+
+# ── Widescreen ──────────────────────────────────────────────────
+# OutRun 2 has a 16:9 mode of its own: it asks D3D for a widescreen mode
+# (D3DPRESENTFLAG_WIDESCREEN) and opens its own camera, so no camera is
+# widened for it. Its projection is in c[160..163], which the renderer has
+# to know to tell the race from the HUD drawn through the same programs
+# (src/d3d/d3d8_vsh.c, d3d8_vsh_bound_projection_is_ortho).
+recomp_title_widescreen(NATIVE REGISTER 160)

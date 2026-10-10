@@ -32,7 +32,7 @@
 #endif
 
 #define WINDOW_W 900
-#define WINDOW_H 862                    /* nine Video rows, their help, the footer */
+#define WINDOW_H 800                    /* eight Video rows, their help, the footer */
 
 /* The client area as it really is. On a display at 125% these are not
  * WINDOW_W/H: asking Windows not to scale us and then laying out
@@ -59,7 +59,7 @@ static const char *const k_frame_caps[] = { "adaptive", "60", "30", "0", NULL };
 
 static RecompSettings g_settings;
 static int            g_frame_cap_index;   /* into k_frame_caps */
-static int            g_wide_camera;       /* hor_plus as a switch, see below */
+static int            g_widescreen;        /* the row; settings_save applies it */
 
 static Row  g_video_rows[12];
 static int  g_video_count;
@@ -113,16 +113,30 @@ static void build_rows(void)
 
 #ifndef LAUNCHER_NO_WIDESCREEN
     /* Hidden for a title built with recomp_add_launcher(... NO_WIDESCREEN),
-     * where a wider picture cannot be right; settings_save writes both off. */
+     * where a wider picture cannot be right; settings_save writes it off.
+     *
+     * One switch. There were two -- this and "Wide camera", the Hor+ factor
+     * -- and which pair was right depended on whether the game has a 16:9
+     * mode of its own, which a player has no way to know: the wrong pair
+     * was a stretched picture, or a view widened twice. The game works that
+     * out for itself now, when it starts (recomp_config.h, "widescreen"),
+     * and all that is left to say here is what this game will do with the
+     * switch, as its project describes it. */
     r->label = "Widescreen";
-    r->help  = "Present at 16:9. This game has no widescreen mode of its own, so"
-               " turn on Wide camera with it or the picture will be stretched.";
-    r->kind  = ROW_BOOL; r->ival = &g_settings.widescreen;
-    r++;
-
-    r->label = "Wide camera";
-    r->help  = "See more to the sides rather than the same view stretched.";
-    r->kind  = ROW_BOOL; r->ival = &g_wide_camera;
+    switch (recomp_widescreen_title_mode()) {
+    case RECOMP_WIDE_NATIVE:
+        r->help = "Play at 16:9, in the game's own widescreen mode.";
+        break;
+    case RECOMP_WIDE_HOR_PLUS:
+        r->help = "Play at 16:9. The camera is widened to match, so you see more"
+                  " to the sides.";
+        break;
+    default:
+        r->help = "Play at 16:9, in the game's own widescreen mode. A game without"
+                  " one will look stretched.";
+        break;
+    }
+    r->kind  = ROW_BOOL; r->ival = &g_widescreen;
     r++;
 #endif
 
@@ -161,10 +175,51 @@ static void build_rows(void)
     g_video_count = (int)(r - g_video_rows);
 }
 
+#ifndef LAUNCHER_NO_WIDESCREEN
+/* Whether the file's own hor_plus, which settings_save keeps while the
+ * switch is where it was found, gives this game a different camera from
+ * the one the switch alone would. An older launcher's second switch left
+ * such files behind -- widescreen on with the camera not widened, or the
+ * camera widened with widescreen off -- and they are left meaning what
+ * they meant. But with one switch there is nowhere else to see that, so
+ * the row says so, and how to hand the camera back. */
+static int camera_overridden(void)
+{
+    RecompWidescreen kept, alone;
+    char factor[32];
+
+    if (g_widescreen != g_settings.widescreen || g_settings.hor_plus < 0.0)
+        return 0;
+    snprintf(factor, sizeof factor, "%g", g_settings.hor_plus);
+    recomp_widescreen_resolve_from(g_widescreen, factor, NULL,
+                                   recomp_widescreen_title_mode(), -1, &kept);
+    recomp_widescreen_resolve_from(g_widescreen, NULL, NULL,
+                                   recomp_widescreen_title_mode(), -1, &alone);
+    return kept.hor_plus != alone.hor_plus;
+}
+#endif
+
+static const char *row_help(const Row *r)
+{
+#ifndef LAUNCHER_NO_WIDESCREEN
+    if (r->ival == &g_widescreen && camera_overridden())
+        return "The settings file sets the camera's width itself (hor_plus). Switch"
+               " this off and on again to let the game decide.";
+#endif
+    return r->help;
+}
+
 static void row_value(const Row *r, char *out, size_t n)
 {
     switch (r->kind) {
     case ROW_BOOL:
+#ifndef LAUNCHER_NO_WIDESCREEN
+        if (r->ival == &g_widescreen && camera_overridden()) {
+            snprintf(out, n, "%s  (camera set in the settings file)",
+                     *r->ival ? "On" : "Off");
+            break;
+        }
+#endif
         snprintf(out, n, "%s", *r->ival ? "On" : "Off");
         break;
     case ROW_INT:
@@ -434,7 +489,7 @@ static void settings_load(void)
     if (recomp_settings_path(g_title_id, path, sizeof path))
         recomp_settings_read(path, &g_settings);
 
-    g_wide_camera = g_settings.hor_plus > 0.01;
+    g_widescreen = g_settings.widescreen;
     g_frame_cap_index = 0;
     {
         int i;
@@ -471,14 +526,18 @@ static int settings_save(void)
 {
     char path[1024];
 
-    /* The camera widening is one switch here and two numbers in the file:
-     * a player should not have to know that 0.75 is (4/3)/(16/9), and the
-     * register is a per-game constant they have no way to choose. */
-    g_settings.hor_plus = g_wide_camera ? 0.75 : 0.0;
 #ifdef LAUNCHER_NO_WIDESCREEN
     /* Not offered, so not left on by an older file either. */
     g_settings.widescreen = 0;
     g_settings.hor_plus = 0.0;
+#else
+    /* The file holds more than the switch: how far the camera is widened
+     * and which register its projection is in. Neither is asked for here --
+     * a player should not have to know that 0.75 is (4/3)/(16/9), nor have
+     * any way to choose a per-game constant -- and neither is overwritten
+     * unless the switch was moved, so a value set by hand in the file
+     * survives every Play. */
+    recomp_settings_set_widescreen(&g_settings, g_widescreen);
 #endif
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
@@ -841,7 +900,8 @@ static void draw(void)
         r.x = 62; r.y = 168 + g_video_count * 62 + 10;
         r.w = g_cw - 124; r.h = 46;
         if (g_sel < g_video_count)
-            theme_text(r, g_video_rows[g_sel].help, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+            theme_text(r, row_help(&g_video_rows[g_sel]), 11, 400, THEME_TEXT_DIM,
+                       THEME_LEFT);
     } else if (g_tab == TAB_INPUT) {
         BindPort *bp = &g_bind.port[g_bind_port];
         char line[160];

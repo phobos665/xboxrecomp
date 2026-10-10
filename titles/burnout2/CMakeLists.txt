@@ -168,3 +168,11 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+
+# ── Widescreen ──────────────────────────────────────────────────
+# Burnout 2 has a 16:9 mode of its own, switched by the console flag: it
+# reads XGetVideoFlags once at start-up (sub_00018390) and from it sets the
+# camera aspect to 1.7778 and picks its 16:9 HUD and menu layouts. The flag
+# and a 16:9 presentation are the whole job; no camera is widened for it.
+# docs/technical/widescreen-and-resolution.md.
+recomp_title_widescreen(NATIVE)

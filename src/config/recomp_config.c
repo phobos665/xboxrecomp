@@ -29,6 +29,11 @@
 #define MAX_KEY     64
 #define MAX_VALUE   512
 
+/* The NV2A's vertex constant registers, c[0..191]: NV2A_VS_MAX_CONSTANTS in
+ * src/kernel/nv2a_vsh.h, which this library cannot include -- it depends
+ * on nothing, so that everything can depend on it. */
+#define VS_CONSTANTS 192
+
 typedef struct {
     char key[MAX_KEY];
     char value[MAX_VALUE];
@@ -288,8 +293,8 @@ void recomp_settings_defaults(RecompSettings *s)
     memset(s, 0, sizeof *s);
     s->resolution_scale  = 1;
     s->widescreen        = 0;
-    s->hor_plus          = 0.0;
-    s->hor_plus_register = 60;
+    s->hor_plus          = RECOMP_HOR_PLUS_AUTO;
+    s->hor_plus_register = RECOMP_REGISTER_AUTO;
     snprintf(s->widescreen_2d, sizeof s->widescreen_2d, "auto");
     s->anisotropy        = 1;
     s->fps_overlay       = 0;
@@ -330,10 +335,25 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             s->resolution_scale = clamp_int(atoi(v), 1, 8);
         if ((v = from_table("widescreen")) != NULL)
             s->widescreen = !off_word(v);
-        if ((v = from_table("hor_plus")) != NULL)
-            s->hor_plus = atof(v);
-        if ((v = from_table("hor_plus_register")) != NULL)
-            s->hor_plus_register = clamp_int(atoi(v), 0, 191);
+        /* A number is an override and is kept as one; "auto", like no
+         * line at all, leaves it to the title (recomp_widescreen_resolve).
+         * Nothing below zero is a factor, and the runtime has always read
+         * one as "leave the camera alone", so it is kept as that rather
+         * than colliding with the mark for auto. */
+        if ((v = from_table("hor_plus")) != NULL) {
+            double factor = atof(v);
+
+            if (ieq(v, "auto"))
+                s->hor_plus = RECOMP_HOR_PLUS_AUTO;
+            else
+                s->hor_plus = factor < 0.0 ? 0.0 : factor;
+        }
+        if ((v = from_table("hor_plus_register")) != NULL) {
+            if (ieq(v, "auto"))
+                s->hor_plus_register = RECOMP_REGISTER_AUTO;
+            else
+                s->hor_plus_register = clamp_int(atoi(v), 0, VS_CONSTANTS - 1);
+        }
         if ((v = from_table("widescreen_2d")) != NULL)
             snprintf(s->widescreen_2d, sizeof s->widescreen_2d, "%s", v);
         if ((v = from_table("anisotropy")) != NULL)
@@ -383,6 +403,7 @@ static void make_parents(const char *path)
 int recomp_settings_write(const char *path, const RecompSettings *s)
 {
     RecompSettings d;
+    char hor_plus[48], reg[48];
     FILE *f;
 
     if (!path)
@@ -397,6 +418,19 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
     if (!f)
         return 0;
 
+    /* An override is written as a line, auto as the same line commented
+     * out. Not as the word alone: a build from before "auto" would read it
+     * as a number -- 0, which for the register is c[0] -- where a missing
+     * key is something every build has always understood. */
+    if (s->hor_plus < 0.0)
+        snprintf(hor_plus, sizeof hor_plus, "# hor_plus = auto");
+    else
+        snprintf(hor_plus, sizeof hor_plus, "hor_plus = %g", s->hor_plus);
+    if (s->hor_plus_register < 0)
+        snprintf(reg, sizeof reg, "# hor_plus_register = auto");
+    else
+        snprintf(reg, sizeof reg, "hor_plus_register = %d", s->hor_plus_register);
+
     fprintf(f,
         "# Settings for this title, written by the launcher and read when the\n"
         "# game starts. Every line can be overridden by the environment\n"
@@ -409,19 +443,30 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# a good default and costs little. Up to 8.        [RECOMP_RES_SCALE]\n"
         "resolution_scale = %d\n"
         "\n"
-        "# Present at 16:9 rather than 4:3, and tell the game the console is\n"
-        "# widescreen. Only right for a game with a widescreen mode of its own;\n"
-        "# one without draws 4:3 and will look stretched.  [RECOMP_WIDESCREEN]\n"
+        "# Widescreen: play at 16:9 rather than 4:3. The game is told the\n"
+        "# console is widescreen and its picture is shown at 16:9; what more\n"
+        "# that takes is worked out for the game when it starts. One with a\n"
+        "# 16:9 mode of its own needs nothing else. One without has its camera\n"
+        "# widened to match, so you see more to the sides rather than the same\n"
+        "# view stretched -- once its project has said it is that kind. A game\n"
+        "# nobody has described is treated as the first kind and, if it is\n"
+        "# not, looks stretched.                           [RECOMP_WIDESCREEN]\n"
         "widescreen = %d\n"
         "\n"
-        "# Widen the camera's horizontal field of view to match, so you see\n"
-        "# more to the sides instead of the same view stretched. 0.75 is the\n"
-        "# 4:3-to-16:9 figure; 0 leaves the camera alone.     [RECOMP_HOR_PLUS]\n"
-        "hor_plus = %g\n"
-        "\n"
-        "# Which vertex constant register holds the projection, for the line\n"
-        "# above. Per game; 60 for TimeSplitters 2.       [RECOMP_HOR_PLUS_REG]\n"
-        "hor_plus_register = %d\n"
+        "# The next two follow from the line above and are here to be\n"
+        "# overridden, not chosen: take the '#' off a line to set it yourself.\n"
+        "#\n"
+        "# How far the camera is widened, as the projection's horizontal\n"
+        "# scale. 0.75 is the 4:3-to-16:9 figure; 0 leaves the camera alone.\n"
+        "# A number here applies whatever the game, widescreen or not. auto,\n"
+        "# or no line, widens only a game that needs it, and only in\n"
+        "# widescreen.                                       [RECOMP_HOR_PLUS]\n"
+        "%s\n"
+        "#\n"
+        "# Which vertex constant register holds the game's projection. auto,\n"
+        "# or no line, is the one the game's project names, else 60.\n"
+        "#                                               [RECOMP_HOR_PLUS_REG]\n"
+        "%s\n"
         "\n"
         "# In widescreen, where the game's 2D layer (menus, HUD, text) goes.\n"
         "# auto keeps it at 4:3 in the middle but lets anything most of the\n"
@@ -459,7 +504,7 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "\n"
         "# Where the game's files are, if they are not beside the executable.\n"
         "#                                                   [RECOMP_GAME_DIR]\n",
-        s->resolution_scale, s->widescreen, s->hor_plus, s->hor_plus_register,
+        s->resolution_scale, s->widescreen, hor_plus, reg,
         s->widescreen_2d[0] ? s->widescreen_2d : "auto",
         s->anisotropy, s->frame_cap[0] ? s->frame_cap : "adaptive", s->fps_overlay,
         s->fullscreen, s->vrr, s->frame_interp < 1 ? 1 : s->frame_interp);
@@ -471,6 +516,19 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
 
     fclose(f);
     return 1;
+}
+
+void recomp_settings_set_widescreen(RecompSettings *s, int on)
+{
+    if (!s)
+        return;
+    on = on ? 1 : 0;
+    if (s->widescreen != on) {
+        s->widescreen = on;
+        s->hor_plus = RECOMP_HOR_PLUS_AUTO;
+    }
+    if (s->hor_plus_register == RECOMP_PROJECTION_REGISTER_DEFAULT)
+        s->hor_plus_register = RECOMP_REGISTER_AUTO;
 }
 
 int recomp_settings_path(uint32_t title_id, char *out, size_t n)
@@ -639,4 +697,91 @@ int recomp_config_bool(const char *env_name, const char *key, int fallback)
     if (!v || !*v)
         return fallback;
     return !off_word(v);
+}
+
+/* ------------------------------------------------------------ widescreen */
+
+/* What the title's project said in its CMakeLists
+ * (recomp_title_widescreen, src/config/CMakeLists.txt), which arrives as
+ * these two definitions on this file. Compiled in rather than read from a
+ * file beside the game: there is nothing to go missing when an executable
+ * is copied somewhere, and the launcher, which links this library too, is
+ * told the same thing by the same line. */
+#ifndef RECOMP_TITLE_WIDESCREEN
+#define RECOMP_TITLE_WIDESCREEN 0           /* RECOMP_WIDE_UNKNOWN */
+#endif
+#ifndef RECOMP_TITLE_PROJECTION_REGISTER
+#define RECOMP_TITLE_PROJECTION_REGISTER (-1)
+#endif
+
+static RecompWideMode g_wide_mode = (RecompWideMode)(RECOMP_TITLE_WIDESCREEN);
+static int            g_wide_register = (RECOMP_TITLE_PROJECTION_REGISTER);
+static unsigned       g_wide_serial;
+
+void recomp_widescreen_title(RecompWideMode mode, int projection_register)
+{
+    g_wide_mode = mode;
+    if (projection_register >= 0 && projection_register < VS_CONSTANTS)
+        g_wide_register = projection_register;
+    g_wide_serial++;
+}
+
+RecompWideMode recomp_widescreen_title_mode(void)
+{
+    return g_wide_mode;
+}
+
+unsigned recomp_widescreen_title_serial(void)
+{
+    return g_wide_serial;
+}
+
+void recomp_widescreen_resolve_from(int on, const char *hor_plus, const char *reg,
+                                    RecompWideMode mode, int title_register,
+                                    RecompWidescreen *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof *out);
+    out->on = on ? 1 : 0;
+    out->mode = mode;
+    out->title_register =
+        (title_register >= 0 && title_register < VS_CONSTANTS) ? title_register : -1;
+
+    /* A number is somebody's decision and is taken as given, with
+     * widescreen off as well: RECOMP_HOR_PLUS alone has always widened the
+     * view, which is how a projection register is hunted for. 0, and
+     * anything else that is not a usable factor, leaves the camera alone
+     * -- for a HOR_PLUS title too, which is how to see one stretched. */
+    out->hor_plus = 1.0;
+    if (hor_plus && *hor_plus && !ieq(hor_plus, "auto")) {
+        double f = atof(hor_plus);
+
+        out->hor_plus_named = 1;
+        if (f > 0.0 && f <= 4.0)
+            out->hor_plus = f;
+    } else if (out->on && mode == RECOMP_WIDE_HOR_PLUS) {
+        out->hor_plus = RECOMP_HOR_PLUS_16_9;
+    }
+
+    out->projection_register = out->title_register >= 0
+                             ? out->title_register : RECOMP_PROJECTION_REGISTER_DEFAULT;
+    if (reg && *reg && !ieq(reg, "auto")) {
+        char *end = NULL;
+        long n = strtol(reg, &end, 10);
+
+        if (end != reg && n >= 0 && n < VS_CONSTANTS) {
+            out->projection_register = (int)n;
+            out->register_named = 1;
+        }
+    }
+}
+
+void recomp_widescreen_resolve(RecompWidescreen *out)
+{
+    recomp_widescreen_resolve_from(
+        recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0),
+        recomp_config_lookup("RECOMP_HOR_PLUS", "hor_plus"),
+        recomp_config_lookup("RECOMP_HOR_PLUS_REG", "hor_plus_register"),
+        g_wide_mode, g_wide_register, out);
 }

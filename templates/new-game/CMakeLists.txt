@@ -171,3 +171,11 @@ endif()
 #     ENABLE_ICALL_TRACE=1
 #     VERBOSE_KERNEL_LOG=1
 # )
+#
+# # What the player's one Widescreen switch means for this game. Say it
+# # once you know: a game with a 16:9 mode of its own needs only the console
+# # flag (NATIVE); one without needs its camera widened (HOR_PLUS). REGISTER
+# # is the vertex constant register holding its projection, 60 if left out.
+# # A game nobody has described is treated as NATIVE, and looks stretched
+# # if it is not. See src/config/CMakeLists.txt.
+# recomp_title_widescreen(HOR_PLUS REGISTER 60)

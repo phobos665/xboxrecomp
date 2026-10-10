@@ -17,11 +17,17 @@
  * is computed into a local before anything is written, because the MAC and
  * ILU run in parallel on the hardware.
  *
+ * And, since this is the one test that links d3d8_vsh.c, what the
+ * projection register does under the one widescreen switch: scaled for a
+ * title whose project says it has no 16:9 mode, left alone for any other,
+ * and handed to a title that widens its own camera (test_hor_plus).
+ *
  * No device, window or game files. Off Windows it needs DXC (a Vulkan SDK);
  * without one it reports itself skipped (exit 77).
  */
 
 #include "d3d8_internal.h"
+#include "recomp_config.h"
 #if defined(_WIN32)
 #include <d3d11.h>   /* this test drives D3D11 itself */
 #include <d3dcompiler.h>
@@ -264,11 +270,113 @@ static void compile_program(const char *name, const uint32_t *words, int count)
 #endif
 }
 
+/* NULL unsets. */
+static void set_env(const char *name, const char *value)
+{
+#if defined(_WIN32)
+    _putenv_s(name, value ? value : "");     /* empty removes it, on Windows */
+#else
+    if (value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
+#endif
+}
+
+/* Upload (1, 2, 3, 4) to a register and say what it now holds, as a
+ * multiple of that: 1 when left alone, 0.75 when Hor+ scaled it. */
+static float upload_and_measure(int reg)
+{
+    static const float row[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+
+    d3d8_vsh_set_constant(reg, row, 1);
+    return d3d8_vsh_constants()[reg * 4 + 1] / row[1];
+}
+
+/* The one widescreen switch, as the renderer acts on it. What it resolves
+ * to is tested with the settings (tests/config_smoke); this is the part
+ * only d3d8_vsh.c can get wrong -- which register is scaled, when it stops
+ * being, and what a title that widens its own camera is handed. The order
+ * is a title's: constants first, the claim later, and never unclaimed. */
+static void test_hor_plus(void)
+{
+    const char *t = "hor_plus";
+
+    set_env("RECOMP_WIDESCREEN", "1");
+    set_env("RECOMP_HOR_PLUS", NULL);
+    set_env("RECOMP_HOR_PLUS_REG", NULL);
+
+    /* A title nobody has described: the flag and 16:9 only. Scaling c[60]
+     * on a guess would corrupt whatever the title keeps there. */
+    recomp_widescreen_title(RECOMP_WIDE_UNKNOWN, 60);
+    check(d3d8_vsh_hor_plus_reg() == 60, t, "the register is 60 when nobody names one");
+    check(upload_and_measure(60) == 1.0f, t, "an unknown title's c[60] is left alone");
+
+    /* A title with a 16:9 mode of its own widens its own camera. */
+    recomp_widescreen_title(RECOMP_WIDE_NATIVE, 160);
+    check(d3d8_vsh_hor_plus_reg() == 160, t, "a native title's register is the one it names");
+    check(upload_and_measure(160) == 1.0f, t, "a native title's projection is left alone");
+
+    /* A title with none, relying on the toolkit: its register, by 0.75. */
+    recomp_widescreen_title(RECOMP_WIDE_HOR_PLUS, 96);
+    check(d3d8_vsh_hor_plus_reg() == 96, t, "a Hor+ title's register is the one it names");
+    check(upload_and_measure(96) == 0.75f, t, "a Hor+ title's projection is scaled by 0.75");
+    check(upload_and_measure(60) == 1.0f, t, "and no other register is");
+
+    /* Settings set by hand still decide. */
+    set_env("RECOMP_HOR_PLUS", "0");
+    recomp_widescreen_title(RECOMP_WIDE_HOR_PLUS, -1);
+    check(upload_and_measure(96) == 1.0f, t, "RECOMP_HOR_PLUS=0 leaves a Hor+ title alone");
+    set_env("RECOMP_HOR_PLUS", "0.5");
+    set_env("RECOMP_HOR_PLUS_REG", "60");
+    recomp_widescreen_title(RECOMP_WIDE_NATIVE, -1);
+    check(upload_and_measure(60) == 0.5f, t, "RECOMP_HOR_PLUS and _REG override any title");
+    check(upload_and_measure(96) == 1.0f, t, "and the title's own register is then left alone");
+    set_env("RECOMP_HOR_PLUS", NULL);
+    set_env("RECOMP_HOR_PLUS_REG", NULL);
+
+    /* Widescreen off: nothing is widened for anyone. */
+    set_env("RECOMP_WIDESCREEN", "0");
+    recomp_widescreen_title(RECOMP_WIDE_HOR_PLUS, -1);
+    check(upload_and_measure(96) == 1.0f, t, "widescreen off leaves a Hor+ title alone");
+
+    /* A title that widens its own camera, and has said nothing else: the
+     * claim is how it says it has no 16:9 mode, so widescreen alone hands
+     * it the factor -- and its register is no longer scaled as well. */
+    set_env("RECOMP_WIDESCREEN", "1");
+    recomp_widescreen_title(RECOMP_WIDE_UNKNOWN, -1);
+    check(upload_and_measure(96) == 1.0f, t, "before the claim, nothing is scaled");
+    check(xbox_D3D8ClaimHorPlus() == 0.75f, t, "the claim is handed 0.75");
+    check(recomp_widescreen_title_mode() == RECOMP_WIDE_HOR_PLUS, t,
+          "and declares the title Hor+");
+    check(upload_and_measure(96) == 1.0f, t, "a claimed register is left as uploaded");
+    check(xbox_D3D8ClaimHorPlus() == 0.75f, t, "asked again, the same answer");
+
+    set_env("RECOMP_HOR_PLUS", "0");
+    recomp_widescreen_title(RECOMP_WIDE_HOR_PLUS, -1);
+    check(xbox_D3D8ClaimHorPlus() == 1.0f, t, "RECOMP_HOR_PLUS=0 reaches the claimer as 1");
+    set_env("RECOMP_HOR_PLUS", NULL);
+    set_env("RECOMP_WIDESCREEN", "0");
+    recomp_widescreen_title(RECOMP_WIDE_HOR_PLUS, -1);
+    check(xbox_D3D8ClaimHorPlus() == 1.0f, t, "widescreen off reaches the claimer as 1");
+
+    /* As it was found, for the programs compiled below. */
+    set_env("RECOMP_WIDESCREEN", NULL);
+    recomp_widescreen_title(RECOMP_WIDE_UNKNOWN, 60);
+}
+
 int main(void)
 {
     uint32_t w[4];
     char name[64];
     unsigned op;
+
+    /* d3d8_vsh.c reads its settings from the per-user file. A test must not
+     * depend on what a player keeps there, nor create one: a file named
+     * outright is the only one looked for, and this one does not exist. */
+    set_env("RECOMP_DISPLAY_CONFIG", "nv2a_vsh_hlsl_no_settings.conf");
+
+    test_hor_plus();
 
     compile_program("frontend", FRONTEND, 12);
 
@@ -310,7 +418,9 @@ int main(void)
     compile_program("read_r13_is_zero", w, 1);
 
 #if !defined(_WIN32)
-    if (g_no_compiler) {
+    /* The compiles are skipped; what needs no compiler is not, and a
+     * failure there must not hide behind the skip. */
+    if (g_no_compiler && !g_failures) {
         printf("nv2a_vsh_hlsl: skipped, no DXC to compile with\n");
         return 77;
     }

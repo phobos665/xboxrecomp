@@ -148,7 +148,10 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
  * @param count      Number of float4 registers to set
  */
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
-/* Which constant register the experimental Hor+ scale applies to. */
+/* The register holding the first row of the title's projection: the one
+ * the experimental Hor+ scale applies to, and the one that marks a program
+ * as 3D. The setting, else the title's own, else 60
+ * (recomp_widescreen_resolve). */
 int  d3d8_vsh_hor_plus_reg(void);
 /* The registers frame interpolation blends (xbox_D3D8SetInterpRegisters):
  * the projection's first register or -1, and a run of 4-register affine

@@ -161,6 +161,10 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     endif()
     # Built under src/d3d (tests/d3d8_smoke); pure parsing, no device.
     add_test(NAME d3d8_final_default COMMAND d3d8_final_default)
+    # Built under src/config (tests/config_smoke): the settings file, and
+    # what one widescreen switch resolves to for each kind of title. It
+    # names its own file (RECOMP_DISPLAY_CONFIG) and touches no per-user one.
+    add_test(NAME config_smoke COMMAND config_smoke)
     if(WIN32)
         add_subdirectory(tests/nv2a_vsh_hlsl)       # D3DCompile
         add_subdirectory(tests/nv2a_combiners_hlsl)
