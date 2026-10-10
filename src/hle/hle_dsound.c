@@ -62,12 +62,14 @@ enum {
     SET_RATE       = 0x10u,
     SET_ALIGN      = 0x14u,
     SET_VOLUME     = 0x1Cu,   /* hundredths of a dB, headroom applied */
-    SET_DATA       = 0xB8u,
-    SET_SIZE       = 0xBCu,
-    SET_PLAY_START = 0xC0u,
-    SET_PLAY_LEN   = 0xC4u,
-    SET_LOOP_START = 0xC8u,
-    SET_LOOP_LEN   = 0xCCu,
+    /* The buffer settings as DSOUND 5344 and earlier lay them out; later
+     * builds put them 4 bytes on (buf_shift below). */
+    BUF_DATA       = 0xB8u,
+    BUF_SIZE       = 0xBCu,
+    BUF_PLAY_START = 0xC0u,
+    BUF_PLAY_LEN   = 0xC4u,
+    BUF_LOOP_START = 0xC8u,
+    BUF_LOOP_LEN   = 0xCCu,
 
     TAG_PCM   = 0x0001u,
     TAG_ADPCM = 0x0069u,
@@ -93,6 +95,7 @@ typedef struct Buffer {
      * voice ran dry. */
     uint32_t gap_max_ms, discarded_ms, discards, dry;
     uint64_t report_ms;
+    uint64_t cursor_trace_ms;    /* RECOMP_DSOUND_CURSOR_TRACE */
 } Buffer;
 
 static Buffer g_buffers[SLOTS];
@@ -113,6 +116,61 @@ static void lock(void)
 }
 
 static void unlock(void) { LeaveCriticalSection(&g_lock); }
+
+/* Where the buffer settings (data, size, play and loop regions) sit moved by
+ * 4 bytes between DSOUND 5344 and 5455: the XDK's own
+ * CDirectSoundBufferSettings_SetBufferData keeps the data pointer at +0xB8
+ * up to 5344 and at +0xBC from 5455 on. Read from that function in all 25
+ * titles in games/ (Oct 2026): 3925 has none, 4134-5344 +0xB8, 5455-5849
+ * +0xBC, with no exception. Read with the old offsets, a 5849 buffer's size
+ * was a pointer: MK Shaolin Monks' 64 KB movie-sound ring was clocked as
+ * 22.7 MB, so its play cursor ran on past the ring and wrapped 118 s later
+ * instead of every 0.34 s, and the movie, paced by that cursor, froze where
+ * it wrapped. The build comes from the XBE's own library table, which the
+ * loader copies to 0x00010000 with the rest of the image header. */
+static uint32_t dsound_build(void)
+{
+    static uint32_t build = 0xFFFFFFFFu;
+    uint32_t n, table, i;
+
+    if (build != 0xFFFFFFFFu)
+        return build;
+    build = 0u;
+    if (HLE_MEM32(0x00010000u) != 0x48454258u) {     /* "XBEH" */
+        fprintf(stderr, "[DSOUND] no XBE header at 0x00010000 (%08X, %u libraries at %08X)\n",
+                HLE_MEM32(0x00010000u), HLE_MEM32(0x00010160u), HLE_MEM32(0x00010164u));
+        return build;
+    }
+    n = HLE_MEM32(0x00010160u);
+    table = HLE_MEM32(0x00010164u);
+    for (i = 0; i < n && i < 64u; i++) {
+        uint32_t e = table + i * 16u;
+        if (e < 0x00010000u || e + 16u > 0x00020000u)
+            break;
+        if (HLE_MEM32(e) == 0x554F5344u && HLE_MEM32(e + 4u) == 0x0000444Eu) {  /* "DSOUND\0\0" */
+            build = HLE_MEM32(e + 12u) & 0xFFFFu;
+            break;
+        }
+    }
+    fprintf(stderr, "[DSOUND] library build %u: buffer settings at +0x%02X\n",
+            build, BUF_DATA + (build >= 5455u ? 4u : 0u));
+    return build;
+}
+
+static uint32_t buf_shift(void)
+{
+    static int shift = -1;
+    if (shift < 0)
+        shift = dsound_build() >= 5455u ? 4 : 0;
+    return (uint32_t)shift;
+}
+
+#define SET_DATA       (BUF_DATA + buf_shift())
+#define SET_SIZE       (BUF_SIZE + buf_shift())
+#define SET_PLAY_START (BUF_PLAY_START + buf_shift())
+#define SET_PLAY_LEN   (BUF_PLAY_LEN + buf_shift())
+#define SET_LOOP_START (BUF_LOOP_START + buf_shift())
+#define SET_LOOP_LEN   (BUF_LOOP_LEN + buf_shift())
 
 /* Buffer settings: [iface] = [object + 0x1C]. Voice settings: [object + 0x10],
  * i.e. [iface - 0x0C]. */
@@ -848,6 +906,25 @@ HLE_EXPORT(IDirectSoundBuffer_GetCurrentPosition)
         if ((b->format & 0xFFFFu) == TAG_ADPCM && b->output)
             cursor = cursor / (XBOX_ADPCM_BLOCK_SAMPLES * b->model.block_align) *
                      (XBOX_ADPCM_BLOCK_BYTES * b->model.block_align / 2u);
+        /* RECOMP_DSOUND_CURSOR_TRACE=1: what a title polling for its clock
+         * sees, once a second per buffer. A movie paced by its sound stops
+         * dead when this stops moving. */
+        {
+            static int trace = -1;
+            if (trace < 0)
+                trace = xbox_EnvSwitch("RECOMP_DSOUND_CURSOR_TRACE", 0);
+            if (trace && now - b->cursor_trace_ms >= 1000u) {
+                b->cursor_trace_ms = now;
+                fprintf(stderr, "[DSOUND] cursor %08X (slot %d): %u of %u, %s%s, %u Hz;"
+                        " play region %u+%u, loop region %u+%u\n",
+                        iface, slot_of(b), cursor, b->size,
+                        b->model.playing ? "playing" : "stopped",
+                        (b->model.play_flags & RECOMP_DSOUND_PLAY_LOOPING) ? " looping" : "",
+                        b->model.sample_rate,
+                        setting(iface, SET_PLAY_START), setting(iface, SET_PLAY_LEN),
+                        setting(iface, SET_LOOP_START), setting(iface, SET_LOOP_LEN));
+            }
+        }
     }
     unlock();
     for (i = 1u; i <= 2u; i++) {
