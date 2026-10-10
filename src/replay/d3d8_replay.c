@@ -41,6 +41,12 @@
  *   --present        also write <prefix>NNN_present.bmp: the frame as it
  *                    reaches the swap chain, after the display resolve, which
  *                    the scene image (the default) never shows.
+ *   --no-scene       do not restore the scene the frame began with. A title
+ *                    that never clears colour (Max Payne) redraws over the
+ *                    frame before, so with it restored a --draws image looks
+ *                    complete whatever n is; without it the frame starts
+ *                    black with depth cleared, and only what the first n
+ *                    draws drew is there.
  *   --backend <name> the renderer backend to replay through (d3d11, vulkan);
  *                    the same as setting RECOMP_D3D8_BACKEND. Replaying one
  *                    capture through two backends and diffing the images is
@@ -838,6 +844,8 @@ static void do_depth_surface(Replay *r, const D3D8CapChunk *c)
 /* The scene as the frame began (version 9), written back through the back
  * buffer surface. A scene of another size -- the capture was taken at a
  * different RECOMP_RES_SCALE -- is left alone, and said once. */
+static int g_no_scene;   /* --no-scene */
+
 static void do_scene(Replay *r, const D3D8CapChunk *c)
 {
     const D3D8CapScene *p = c->data;
@@ -847,6 +855,14 @@ static void do_scene(Replay *r, const D3D8CapChunk *c)
     D3DLOCKED_RECT lr;
     uint32_t y;
 
+    if (g_no_scene) {
+        /* An empty target instead: black, and depth at the far plane, so
+         * what the draws drew is all there is and none of it is rejected
+         * against depth nothing cleared. */
+        r->dev->lpVtbl->Clear(r->dev, 0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER |
+                              D3DCLEAR_STENCIL, 0, 1.0f, 0);
+        return;
+    }
     if (c->bytes < sizeof *p || !p->width || !p->height || p->pitch < p->width * 4u ||
         !(rows = d3d8cap_tail(c, sizeof *p, (size_t)p->pitch * p->height))) {
         r->malformed++;
@@ -1586,7 +1602,7 @@ static void usage(void)
         "usage: d3d8_replay <capture%s> [--out <prefix>] [--loops <n>]\n"
         "                   [--dump-every] [--hold] [--quiet]\n"
         "                   [--no-combiners] [--draws <n>] [--skip-draw <n>]\n"
-        "                   [--list-draws] [--dump-target] [--present] [--backend <name>]\n"
+        "                   [--list-draws] [--dump-target] [--present] [--no-scene] [--backend <name>]\n"
         "                   [--place <tag|all>=<placement>]...\n"
         "                   [--solo-tag <tag>] [--each-tag]\n"
         "                   [--hide-tag <tag>] [--each-tag-hidden]\n"
@@ -1635,6 +1651,8 @@ static int replay_main(int argc, char **argv)
             g_max_draws = atol(argv[++i]);
         else if (!strcmp(argv[i], "--skip-draw") && i + 1 < argc)
             g_skip_draw = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--no-scene"))
+            g_no_scene = 1;
         else if (!strcmp(argv[i], "--present"))
             present = 1;
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc)
