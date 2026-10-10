@@ -328,6 +328,42 @@ static int      g_2d_anchor = XBOX_D3D8_2D_CENTRE;
  * with a scissor rectangle hands it in the same 4:3 pixels, and a squeezed
  * draw under an unsqueezed scissor comes out cut off at the old edge --
  * TimeSplitters 2's character portraits and difficulty list both were. */
+static BOOL two_d_squeeze(float *k_out, float *cx_out);
+
+/* Hor+ by field of view (xbox_D3D8SetVerticalZoom): how much taller than
+ * the title asked a 3D viewport on the screen is drawn, about the middle of
+ * the picture. 1 is off. */
+static float g_3d_vzoom = 1.0f;
+
+/* The vertical zoom for the draw in hand, about cy_out in host pixels of
+ * the scene, or FALSE: off, a screen-space draw, an offscreen target, or a
+ * frame shown at 4:3. */
+static BOOL three_d_vzoom(float *zoom_out, float *cy_out)
+{
+    if (g_3d_vzoom == 1.0f || g_2d_screen_space || g_cur_rt ||
+        !g_device_state.height || !d3d8_display_wide_now())
+        return FALSE;
+    *zoom_out = g_3d_vzoom;
+    *cy_out = (float)g_device_state.height * 0.5f;
+    return TRUE;
+}
+
+static void apply_host_viewport(void);
+
+void xbox_D3D8SetVerticalZoom(float zoom)
+{
+    if (!(zoom >= 1.0f && zoom <= 4.0f))
+        zoom = 1.0f;
+    if (zoom == g_3d_vzoom)
+        return;
+    if (g_3d_vzoom == 1.0f)
+        fprintf(stderr, "D3D8 display: the title widens its own field of view; 3D "
+                "viewports are drawn %.4gx taller about the middle, which crops the "
+                "rows that added\n", (double)zoom);
+    g_3d_vzoom = zoom;
+    apply_host_viewport();
+}
+
 static BOOL two_d_squeeze(float *k_out, float *cx_out)
 {
     float k;
@@ -470,14 +506,22 @@ BOOL d3d8_GetScissor(RhiRect *out)
         /* Stored as the title gave them, converted here, so the stored
          * rectangle stays comparable with anything else in guest pixels
          * and GetScissors keeps answering in the title's own units. */
+        float top = g_scissor.top * sy, bottom = g_scissor.bottom * sy;
+        float zoom, cy;
+
         if (two_d_squeeze(&k, &cx)) {
             left  = cx + (left  - cx) * k;
             right = cx + (right - cx) * k;
         }
+        /* And a 3D draw's with its viewport (apply_host_viewport). */
+        if (three_d_vzoom(&zoom, &cy)) {
+            top    = cy + (top    - cy) * zoom;
+            bottom = cy + (bottom - cy) * zoom;
+        }
         out->left   = (int32_t)left;
-        out->top    = (int32_t)(g_scissor.top    * sy);
+        out->top    = (int32_t)top;
         out->right  = (int32_t)right;
-        out->bottom = (int32_t)(g_scissor.bottom * sy);
+        out->bottom = (int32_t)bottom;
     }
     return g_scissor_enabled;
 }
@@ -916,6 +960,25 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
     target_w = g_cur_rt ? g_cur_rt->width : g_device_state.width;
     target_h = g_cur_rt ? g_cur_rt->height : g_device_state.height;
     if (!clear_rects_to_host(Count, pRects, target_w, target_h, host_rects, &n_rects)) {
+        /* A depth-only rectangle belongs to the 3D viewport it was worked
+         * out for (Max Payne clears a portal's rectangle before drawing
+         * through it), so under the vertical zoom it grows with that
+         * viewport. One that clears colour is the title painting the
+         * screen -- letterbox bars -- and stays where it was put. */
+        if (!(Flags & D3DCLEAR_TARGET) && g_3d_vzoom != 1.0f && !g_cur_rt &&
+            d3d8_display_wide_now()) {
+            float cy = (float)target_h * 0.5f;
+            UINT i;
+
+            for (i = 0; i < n_rects; i++) {
+                float t = cy + ((float)host_rects[i].top - cy) * g_3d_vzoom;
+                float b = cy + ((float)host_rects[i].bottom - cy) * g_3d_vzoom;
+
+                host_rects[i].top = t < 0.0f ? 0 : (int32_t)t;
+                host_rects[i].bottom = b > (float)target_h ? (int32_t)target_h
+                                                           : (int32_t)(b + 0.999f);
+            }
+        }
         if (n_rects &&
             d3d8_clear_rects(rtv, dsv, target_w, target_h, host_rects, n_rects,
                              (Flags & D3DCLEAR_TARGET) != 0, (Flags & D3DCLEAR_ZBUFFER) != 0,
@@ -1926,21 +1989,52 @@ static void apply_host_viewport(void)
         hv.width *= k;
     }
 
+    /* Hor+ for a title that can widen its field of view but not change its
+     * aspect: its wider picture is taller by the same amount, so each 3D
+     * viewport is drawn that much taller about the middle of the screen and
+     * the rows that added fall off the top and bottom. Scaling the
+     * rectangle rather than the projection keeps a title that draws through
+     * several viewports in one frame (Max Payne, one for each portal)
+     * joined up: every rectangle moves the way the picture inside it does.
+     * A viewport may reach past its target; the rasteriser clips. */
+    {
+        float zoom, cy;
+
+        if (three_d_vzoom(&zoom, &cy)) {
+            hv.y = cy + (hv.y - cy) * zoom;
+            hv.height *= zoom;
+        }
+    }
+
     rhi_set_viewports(1, &hv);
 }
 
 /* Called once per draw, from the shader path that knows which kind of
  * draw it is. Cheap when nothing changes, which is the common case: a
  * frame is a run of 3D draws and then a run of 2D ones. */
-void d3d8_SetTwoDSqueeze(BOOL on)
+static void set_squeeze(BOOL on)
 {
-    g_2d_screen_space = on ? TRUE : FALSE;
     if (!d3d8_display_wide_now())
         on = FALSE;
     if (g_2d_squeeze == (on ? TRUE : FALSE))
         return;
     g_2d_squeeze = on ? TRUE : FALSE;
     apply_host_viewport();
+}
+
+void d3d8_SetTwoDSqueeze(BOOL on)
+{
+    BOOL was = g_2d_screen_space;
+
+    g_2d_screen_space = on ? TRUE : FALSE;
+    /* The vertical zoom is for 3D draws only, so the viewport changes with
+     * the kind of draw even where the squeeze does not. */
+    if (was != g_2d_screen_space && g_3d_vzoom != 1.0f) {
+        g_2d_squeeze = (on && d3d8_display_wide_now()) ? TRUE : FALSE;
+        apply_host_viewport();
+        return;
+    }
+    set_squeeze(on);
 }
 
 BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
@@ -1957,6 +2051,17 @@ BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
 /* Whether the last draw_extent measured a fixed-function draw. */
 static BOOL g_extent_fixed_function;
 
+/* The title's own test for a screen-space draw (xbox_D3D8SetScreenSpaceTest),
+ * and what it said of the draw in hand. */
+static XboxD3D8ScreenSpaceTest g_title_2d_test;
+static BOOL  g_title_2d_draw;
+static float g_title_2d_lo, g_title_2d_hi;
+
+void xbox_D3D8SetScreenSpaceTest(XboxD3D8ScreenSpaceTest test)
+{
+    g_title_2d_test = test;
+}
+
 static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
                         float *lo_out, float *hi_out)
 {
@@ -1968,6 +2073,20 @@ static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
     g_extent_fixed_function = FALSE;
     if (!p || !stride || !count)
         return FALSE;
+    /* A draw the title's own test called screen-space: the extent is the
+     * one that test worked out, since the vertices are not in pixels. */
+    if (g_title_2d_draw) {
+        lo = g_title_2d_lo;
+        hi = g_title_2d_hi;
+        g_extent_fixed_function = TRUE;
+        if (g_scissor_enabled && !g_cur_rt) {
+            if ((float)g_scissor.left > lo)  lo = (float)g_scissor.left;
+            if ((float)g_scissor.right < hi) hi = (float)g_scissor.right;
+        }
+        *lo_out = lo;
+        *hi_out = hi;
+        return TRUE;
+    }
     if (d3d8_vsh_is_programmable(handle)) {
         int reg = d3d8_vsh_bound_pos_input();
 
@@ -2242,15 +2361,39 @@ int xbox_D3D8GetTwoDPlacement(uint32_t *tag)
  * otherwise the renderer's judgement from the draw's extent. */
 void d3d8_place_2d_draw(const void *vertices, UINT stride, UINT count)
 {
-    if (!g_2d_screen_space)
+    /* A fixed-function draw through the title's projection is 3D to the
+     * shader path. The title may know better: Max Payne draws its HUD, its
+     * menus and its graphic novel as quads at one depth under the camera
+     * that draws the world. */
+    g_title_2d_draw = FALSE;
+    if (!g_2d_screen_space && g_title_2d_test && vertices && stride && count &&
+        !d3d8_vsh_is_programmable(g_device_state.vertex_shader)) {
+        float lo = 0.0f, hi = 0.0f;
+
+        if (g_title_2d_test(g_device_state.vertex_shader, vertices, stride, count,
+                            (const float *)&g_device_state.transforms[D3DTS_WORLD],
+                            (const float *)&g_device_state.transforms[D3DTS_VIEW],
+                            (const float *)&g_device_state.transforms[D3DTS_PROJECTION],
+                            &lo, &hi)) {
+            g_title_2d_draw = TRUE;
+            g_title_2d_lo = lo;
+            g_title_2d_hi = hi;
+            d3d8_SetTwoDSqueeze(TRUE);
+        }
+    }
+    if (!g_2d_screen_space) {
+        /* In perspective, onto the screen: xbox_D3D8SetWideFramesAuto. */
+        if (!g_cur_rt)
+            d3d8_display_note_3d_draw();
         return;
+    }
     if (two_d_tag_log())
         two_d_tag_note(vertices, stride, count);
     if (!g_2d_squeeze)
         return;
     switch (g_2d_placement) {
     case XBOX_D3D8_2D_STRETCH:
-        d3d8_SetTwoDSqueeze(FALSE);
+        set_squeeze(FALSE);
         break;
     case XBOX_D3D8_2D_CENTRE:
     case XBOX_D3D8_2D_LEFT:
@@ -2267,7 +2410,7 @@ void d3d8_place_2d_draw(const void *vertices, UINT stride, UINT count)
     }
     default:
         if (d3d8_draw_escapes_squeeze(vertices, stride, count))
-            d3d8_SetTwoDSqueeze(FALSE);
+            set_squeeze(FALSE);
         break;
     }
 }

@@ -1210,12 +1210,35 @@ BOOL xbox_D3D8GetScissors(UINT *count, BOOL *exclusive, D3DRECT *rect);
  * is what a backend without Hor+ returns. */
 float xbox_D3D8ClaimHorPlus(void);
 
+/* Hor+ for a title that can widen its field of view but not change its
+ * aspect: the engine takes a horizontal field of view and works the vertical
+ * out from a 4:3 rectangle it also uses for other things. Such a title
+ * widens its field of view by 1/factor (the factor from
+ * xbox_D3D8ClaimHorPlus), which grows its picture by that much both ways and
+ * keeps its own culling in step, and passes the same 1/factor here; the
+ * renderer then draws each 3D viewport on the screen that much taller about
+ * the middle, so the rows that added are cropped and the vertical view is
+ * what it was. Screen-space draws, offscreen targets and frames shown at
+ * 4:3 (xbox_D3D8SetWideFrames) are left alone; a depth-only Clear rectangle
+ * grows with the viewports. 1 turns it off. Not recorded in a frame
+ * capture: a replay draws the title's own viewports. */
+void xbox_D3D8SetVerticalZoom(float zoom);
+
 /* Widescreen by screen, for a 4:3 title widened with Hor+ whose menus
  * cannot be. FALSE: the frames drawn from now on are shown at 4:3 between
  * bars, with their 2D left unsqueezed; TRUE (the default) puts them back
  * at 16:9. Holds until changed, so call it between frames. Without
  * widescreen, nothing. */
 void xbox_D3D8SetWideFrames(BOOL wide);
+
+/* The same choice made by the renderer, for a title whose 2D screens draw
+ * nothing in perspective: a frame is shown at 16:9 if the frame before it
+ * drew anything onto the screen through a perspective projection (or a
+ * vertex program that is not placing screen coordinates), and at 4:3 between
+ * bars otherwise -- menus, movies, loading screens. A title whose front end
+ * mixes 3D with 2D panels (TimeSplitters 2) has to say which is which itself,
+ * with xbox_D3D8SetWideFrames. Call once; without widescreen, nothing. */
+void xbox_D3D8SetWideFramesAuto(BOOL on);
 
 /* The window now fills its screen (borderless fullscreen), or no longer
  * does. While it does, and the vrr setting allows (RECOMP_VRR, on by
@@ -1263,6 +1286,25 @@ enum {
     XBOX_D3D8_2D_SIDE
 };
 void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag);
+
+/* A title's own test for which of its fixed-function draws are screen-space.
+ * The renderer knows two kinds: pre-transformed vertices, and a vertex
+ * program that does not use the projection. A title can draw its 2D a third
+ * way that only it can recognise -- Max Payne places its HUD, menus and
+ * graphic novel as quads at one depth in front of the camera that draws the
+ * world -- and in widescreen those have to be told from the world, which is
+ * widened, to be placed like any other 2D.
+ *
+ * Called for each fixed-function draw whose vertices are not pre-transformed,
+ * with the handle (the FVF), the vertices as drawn and the world, view and
+ * projection matrices in force (16 floats each, D3D row order). Return
+ * non-zero for a screen-space draw, with the leftmost and rightmost x it
+ * reaches in the title's own screen pixels in *x_lo and *x_hi: that extent
+ * is what the placement rules above go by. NULL takes the test away. */
+typedef int (*XboxD3D8ScreenSpaceTest)(DWORD handle, const void *vertices, UINT stride,
+                                       UINT count, const float *world, const float *view,
+                                       const float *projection, float *x_lo, float *x_hi);
+void xbox_D3D8SetScreenSpaceTest(XboxD3D8ScreenSpaceTest test);
 int  xbox_D3D8GetTwoDPlacement(uint32_t *tag);
 
 /* The Xbox's CopyRects, for the one case a title uses it for in anger:

@@ -108,6 +108,20 @@ int d3d8_display_wide_now(void)
     return d3d8_display_policy()->widescreen && !g_title_narrow;
 }
 
+/* Widescreen by what a frame draws (xbox_D3D8SetWideFramesAuto): whether
+ * the frame in hand has drawn anything in perspective onto the screen. */
+static int g_auto_wide, g_frame_drew_3d;
+
+void xbox_D3D8SetWideFramesAuto(BOOL on)
+{
+    g_auto_wide = on ? 1 : 0;
+}
+
+void d3d8_display_note_3d_draw(void)
+{
+    g_frame_drew_3d = 1;
+}
+
 void d3d8_display_frame_done(void)
 {
     int wide = d3d8_display_wide_now();
@@ -118,6 +132,14 @@ void d3d8_display_frame_done(void)
                 wide ? "16:9" : "4:3");
         g_last_wide = wide;
     }
+    /* The next frame takes the shape this one called for. A frame's draws
+     * are not all in when it starts, and a screen lasts many frames, so the
+     * cost is one frame at each change. */
+    if (g_auto_wide) {
+        g_title_said = 1;
+        g_title_narrow = g_frame_drew_3d ? 0 : 1;
+    }
+    g_frame_drew_3d = 0;
 }
 
 void d3d8_display_scene_size(UINT guest_w, UINT guest_h,
